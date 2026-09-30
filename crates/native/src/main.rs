@@ -286,7 +286,7 @@ fn main() {
         }
 
         frames += 1;
-        if frames % 60 == 0 {
+        if frames.is_multiple_of(60) {
             let fps = 60.0 / t0.elapsed().as_secs_f64();
             window.set_title(&format!("Setun-386 — {:.0} fps, {:.1} MIPS", fps, fps * per_frame as f64 / 1e6));
             t0 = std::time::Instant::now();
