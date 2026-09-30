@@ -1,0 +1,282 @@
+<meta charset="utf-8">
+<title>Setun-386</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600;800&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: an instrument front panel. Screen in a bezel on the left; lamp
+   rows, status and controls in a side column; serial console below.
+   Deliberately single-theme (a dark console), set explicitly. */
+:root {
+  --panel: #151916;      /* graphite, slight green bias */
+  --bezel: #1f2520;
+  --line: #333c35;
+  --ink: #dadfcd;
+  --dim: #8c9483;
+  --plus: #f2a73b;       /* lamp lit +1 (amber) */
+  --minus: #58c3d0;      /* lamp lit −1 (cyan) */
+  --off: #2b322c;        /* lamp at 0 */
+  --screen: #000;
+  --font-display: "Martian Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  color-scheme: dark;
+}
+html, body { background: var(--panel); color: var(--ink); }
+body { font: 15px/1.5 var(--font-body); padding-inline: 16px; padding-block: 20px 32px; }
+.wrap { max-width: 1180px; margin-inline: auto; display: grid; gap: 18px; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.mark { font: 800 clamp(26px, 4vw, 38px)/1 var(--font-display); letter-spacing: 0.02em; margin: 0; }
+.mark span { color: var(--plus); }
+.tag { color: var(--dim); margin: 0; }
+.facts { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px/1.4 var(--font-display); color: var(--dim); }
+.facts b { color: var(--ink); font-weight: 600; }
+
+.deck { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; align-items: start; }
+@media (max-width: 900px) { .deck { grid-template-columns: minmax(0, 1fr); } }
+
+.bezel { background: var(--bezel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; position: relative; }
+canvas#screen { display: block; width: 100%; aspect-ratio: 4 / 3; max-width: 100%; background: var(--screen); image-rendering: pixelated; border-radius: 3px; outline: none; cursor: crosshair; }
+canvas#screen:focus-visible { box-shadow: 0 0 0 2px var(--plus); }
+.hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); background: rgba(21,25,22,.88); border: 1px solid var(--line); color: var(--ink); font: 12px var(--font-display); padding: 6px 10px; border-radius: 6px; pointer-events: none; white-space: nowrap; }
+.hint[hidden] { display: none; }
+
+.side { display: grid; gap: 14px; min-width: 0; }
+.group { display: grid; gap: 8px; }
+.label { font: 600 11px/1 var(--font-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+.lamps { display: grid; grid-template-columns: repeat(27, 1fr); gap: 2px; }
+.lamp { aspect-ratio: 1; border-radius: 50%; background: var(--off); }
+.lamp.p { background: var(--plus); box-shadow: 0 0 5px var(--plus); }
+.lamp.m { background: var(--minus); box-shadow: 0 0 5px var(--minus); }
+.lamps .lamp:nth-child(9n) { margin-right: 3px; }
+.readout { display: flex; justify-content: space-between; font: 13px var(--font-display); font-variant-numeric: tabular-nums; }
+.readout .b27 { color: var(--ink); letter-spacing: 0.08em; }
+.readout .dec { color: var(--dim); }
+
+.status { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font: 13px var(--font-display); font-variant-numeric: tabular-nums; margin: 0; }
+.status dt { color: var(--dim); }
+.status dd { margin: 0; text-align: right; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px; }
+button, select { font: 600 12px var(--font-display); color: var(--ink); background: var(--bezel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--dim); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--plus); outline-offset: 1px; }
+.legend { color: var(--dim); font-size: 13px; margin: 0; }
+.legend kbd { font: 11px var(--font-display); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; color: var(--ink); }
+.legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: 0; margin-right: 4px; }
+
+.console { display: grid; gap: 8px; }
+pre#serial { margin: 0; min-height: 7.5em; max-height: 14em; overflow: auto; background: var(--bezel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: 13px/1.45 var(--font-display); white-space: pre-wrap; overflow-wrap: anywhere; }
+form#send { display: flex; gap: 8px; }
+input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(--ink); background: var(--bezel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+.error { color: #ff8a7a; font: 13px var(--font-display); }
+@media (prefers-reduced-motion: reduce) { .lamp.p, .lamp.m { box-shadow: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1 class="mark">SETUN<span>-386</span></h1>
+    <p class="tag">A balanced-ternary computer, running in your browser.</p>
+    <div class="facts" aria-label="Machine facts">
+      <span>tryte <b>3² trits</b></span>
+      <span>word <b>3³ trits</b></span>
+      <span>address space <b>3^27</b></span>
+      <span>colours <b>3^9</b></span>
+    </div>
+  </header>
+
+  <div class="deck">
+    <div class="bezel">
+      <canvas id="screen" width="640" height="480" tabindex="0" aria-label="Setun-386 display. Click to type."></canvas>
+      <div class="hint" id="hint">Click the screen to type</div>
+    </div>
+
+    <aside class="side">
+      <div class="group">
+        <div class="label">Program counter</div>
+        <div class="lamps" id="lamps-pc" aria-hidden="true"></div>
+        <div class="readout"><span class="b27" id="pc-b27">000000000</span><span class="dec" id="pc-dec">0</span></div>
+      </div>
+      <div class="group">
+        <div class="label">Register r1</div>
+        <div class="lamps" id="lamps-r1" aria-hidden="true"></div>
+        <div class="readout"><span class="b27" id="r1-b27">000000000</span><span class="dec" id="r1-dec">0</span></div>
+      </div>
+      <p class="legend"><span class="sw" style="background:var(--plus)"></span>+1 &nbsp; <span class="sw" style="background:var(--off)"></span>0 &nbsp; <span class="sw" style="background:var(--minus)"></span>−1 &nbsp;· base 27: A–M = +1…+13, a–m = −1…−13</p>
+
+      <dl class="status">
+        <dt>Speed</dt><dd id="st-mips">–</dd>
+        <dt>Ring</dt><dd id="st-ring">–</dd>
+        <dt>CPU</dt><dd id="st-cpu">–</dd>
+        <dt>Display</dt><dd id="st-mode">–</dd>
+      </dl>
+
+      <div class="controls">
+        <button type="button" id="btn-gfx">Graphics (Tab)</button>
+        <button type="button" id="btn-text">Text (Esc)</button>
+        <button type="button" id="btn-reset">Power-cycle</button>
+        <label class="label" for="speed" style="align-self:center">Clock</label>
+        <select id="speed">
+          <option value="1">1 MIPS</option>
+          <option value="10" selected>10 MIPS</option>
+          <option value="20">20 MIPS</option>
+          <option value="0">Max</option>
+        </select>
+      </div>
+      <p class="legend">Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
+    </aside>
+  </div>
+
+  <section class="console" aria-label="Serial console">
+    <div class="label">Serial console</div>
+    <pre id="serial" aria-live="polite"></pre>
+    <form id="send">
+      <input id="line" autocomplete="off" placeholder="Send text to the machine, e.g. Привет, Setun!" aria-label="Text to send over serial">
+      <button type="submit">Send</button>
+    </form>
+    <div class="error" id="error" hidden></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const HID = { Enter: 40, Escape: 41, Backspace: 42, Tab: 43, Space: 44, Minus: 45, Equal: 46,
+    BracketLeft: 47, BracketRight: 48, Backslash: 49, Semicolon: 51, Quote: 52, Backquote: 53,
+    Comma: 54, Period: 55, Slash: 56, CapsLock: 57, Insert: 73, Home: 74, PageUp: 75, Delete: 76,
+    End: 77, PageDown: 78, ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
+    ControlLeft: 224, ShiftLeft: 225, AltLeft: 226, MetaLeft: 227, ControlRight: 228,
+    ShiftRight: 229, AltRight: 230, MetaRight: 231 };
+  for (let i = 0; i < 26; i++) HID["Key" + String.fromCharCode(65 + i)] = 4 + i;
+  for (let i = 1; i <= 9; i++) HID["Digit" + i] = 29 + i;
+  HID.Digit0 = 39;
+  for (let i = 1; i <= 12; i++) HID["F" + i] = 57 + i;
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("screen"), ctx = canvas.getContext("2d"), serialEl = $("serial");
+  const B27 = "mlkjihgfedcba0ABCDEFGHIJKLM";
+
+  // Balanced-ternary trits (MSB first) of an integer that fits a double exactly.
+  function trits(v, n) {
+    const t = new Array(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+      let r = ((v % 3) + 3) % 3;
+      if (r === 2) r = -1;
+      t[i] = r;
+      v = (v - r) / 3;
+    }
+    return t;
+  }
+  function b27(t) {
+    let s = "";
+    for (let i = 0; i < t.length; i += 3) s += B27[t[i] * 9 + t[i + 1] * 3 + t[i + 2] + 13];
+    return s;
+  }
+  function makeLamps(el) {
+    const out = [];
+    for (let i = 0; i < 27; i++) { const d = document.createElement("div"); d.className = "lamp"; el.appendChild(d); out.push(d); }
+    return out;
+  }
+  const lamps = { pc: makeLamps($("lamps-pc")), r1: makeLamps($("lamps-r1")) };
+  function showWord(name, v) {
+    const t = trits(v, 27);
+    lamps[name].forEach((d, i) => { d.className = t[i] > 0 ? "lamp p" : t[i] < 0 ? "lamp m" : "lamp"; });
+    $(name + "-b27").textContent = b27(t);
+    $(name + "-dec").textContent = v.toLocaleString("en-US").replace(/,/g, " ");
+  }
+  function showError(msg) { const e = $("error"); e.textContent = msg; e.hidden = false; }
+
+  async function start() {
+    let wasm;
+    try {
+      const res = await fetch("setun.wasm");
+      if (!res.ok) throw new Error("setun.wasm: HTTP " + res.status);
+      const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+      wasm = instance.exports;
+    } catch (err) {
+      showError("The emulator could not start: " + err.message + ". This browser may block WebAssembly here.");
+      return;
+    }
+    wasm.setun_init(19683, Date.now() / 1000);
+    const decoder = new TextDecoder();
+
+    function press(code) { wasm.setun_key(code, 1); wasm.setun_key(code, 0); }
+    canvas.addEventListener("keydown", (e) => {
+      const c = HID[e.code];
+      if (c !== undefined) { wasm.setun_key(c, 1); e.preventDefault(); }
+    });
+    canvas.addEventListener("keyup", (e) => {
+      const c = HID[e.code];
+      if (c !== undefined) { wasm.setun_key(c, 0); e.preventDefault(); }
+    });
+    canvas.addEventListener("focus", () => { $("hint").hidden = true; });
+    canvas.addEventListener("blur", () => { $("hint").hidden = false; });
+    let buttons = 0;
+    function mouse(e) {
+      const r = canvas.getBoundingClientRect();
+      const x = Math.floor((e.clientX - r.left) * canvas.width / r.width);
+      const y = Math.floor((e.clientY - r.top) * canvas.height / r.height);
+      wasm.setun_mouse(x, y, buttons);
+    }
+    canvas.addEventListener("mousemove", mouse);
+    canvas.addEventListener("mousedown", (e) => { buttons |= [1, 2, 4][e.button] || 0; mouse(e); canvas.focus(); });
+    canvas.addEventListener("mouseup", (e) => { buttons &= ~([1, 2, 4][e.button] || 0); mouse(e); });
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    canvas.addEventListener("wheel", (e) => { wasm.setun_wheel(Math.sign(e.deltaY)); e.preventDefault(); }, { passive: false });
+
+    $("send").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = $("line").value + "\n";
+      for (const ch of text) wasm.setun_serial_char(ch.codePointAt(0));
+      $("line").value = "";
+    });
+    $("btn-gfx").addEventListener("click", () => press(43));
+    $("btn-text").addEventListener("click", () => press(41));
+    $("btn-reset").addEventListener("click", () => { wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
+
+    let img = null, last = performance.now(), executed = 0, statT = last, off = false;
+    const modes = { "-1": "text 80×30", "0": "640×480", "1": "800×600" };
+    const ringNames = { "-1": "−1 user", "0": "0 drivers", "1": "+1 kernel" };
+
+    function frame(now) {
+      // Catch up after throttled frames, but never more than half a second.
+      const dt = Math.min(now - last, 500); last = now;
+      const target = Number($("speed").value);
+      // Max: spend about 12 ms of each frame emulating.
+      let n = target > 0 ? Math.round(target * 1e6 * dt / 1000) : 0;
+      if (target === 0) {
+        const t0 = performance.now(); n = 0;
+        while (performance.now() - t0 < 12) { off = wasm.setun_run(50000) === 1; n += 50000; if (off) break; }
+      } else if (n > 0) {
+        off = wasm.setun_run(n) === 1;
+      }
+      executed += n;
+
+      const ptr = wasm.setun_render();
+      const w = wasm.setun_width(), h = wasm.setun_height();
+      if (canvas.width !== w || canvas.height !== h || !img) { canvas.width = w; canvas.height = h; img = ctx.createImageData(w, h); }
+      img.data.set(new Uint8Array(wasm.memory.buffer, ptr, w * h * 4));
+      ctx.putImageData(img, 0, 0);
+
+      const len = wasm.setun_serial_take();
+      if (len > 0) {
+        serialEl.textContent += decoder.decode(new Uint8Array(wasm.memory.buffer, wasm.setun_serial_ptr(), len));
+        if (serialEl.textContent.length > 20000) serialEl.textContent = serialEl.textContent.slice(-15000);
+        serialEl.scrollTop = serialEl.scrollHeight;
+      }
+
+      showWord("pc", wasm.setun_pc());
+      showWord("r1", wasm.setun_reg(1));
+      if (now - statT > 500) {
+        $("st-mips").textContent = (executed / (now - statT) / 1000).toFixed(1) + " MIPS";
+        executed = 0; statT = now;
+        $("st-ring").textContent = ringNames[wasm.setun_ring()];
+        $("st-cpu").textContent = off ? "powered off" : wasm.setun_halted() ? "halted (HLT)" : "running";
+        $("st-mode").textContent = modes[wasm.setun_display_mode()];
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+  start();
+})();
+</script>

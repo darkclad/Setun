@@ -17,8 +17,8 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
    - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages ✅ (TLB cache: later, as an optimization)
    - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T1B2 image, DMA), display (text + 3^9-colour framebuffer) ✅
    - tests ✅: 20 CPU/MMU tests and 13 device tests (timer-interrupt program, ROM boot, DMA)
-4. **Front ends**: native (window + framebuffer + serial on stdio) and **WASM** (canvas framebuffer, keyboard/mouse events, console panel)
-5. **Assembler and disassembler**
+4. **Front ends** ✅: native (`setun`: minifb window, stdio serial, headless PNG screenshots) and **WASM** (`web/`: canvas, keyboard/mouse, serial console, front-panel lamps)
+5. **Assembler and disassembler**: back end (`setun-asm` builder) ✅; text syntax and disassembler to do
 6. **Compiler**: a small C-like language → Setun-386 assembly (`char` = tryte = a Unicode character, `int` = pointer = word, no `unsigned`)
 7. **BIOS**: vectors, RAM size, text console, disk boot sector
 8. **Kernel**: paging, processes and a scheduler, syscalls, drivers in ring 0, a disk file system

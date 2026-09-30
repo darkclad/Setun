@@ -29,12 +29,23 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 |---|---|
 | `crates/ternary` | balanced-ternary fixed-width integers (`Trit`, `Tryte`, `Word`, `Tern<N>`) |
 | `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, memory map, devices (interrupt controller, timer, RTC, keyboard, mouse, serial, DMA disks, display renderer), `Machine` |
+| `crates/asm` | assembler back end (`setun-asm`): label-resolving program builder |
+| `crates/demo` | demo ROM (`setun-demo`): text screen, keyboard/serial echo, 3^9-colour graphics |
+| `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio |
+| `crates/web` + `web/` | browser front end: WebAssembly exports and the front-panel page |
 
-## Build
+## Build and run
 
 ```
 cargo test
+cargo run --release -p setun-native            # window with the demo ROM
+cargo run --release -p setun-native -- --help  # options: --rom, --disk, --ram, --mips, --headless, --screenshot
+sh web/build.sh                                # rebuild web/setun.wasm
+python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```
+
+Speed: about 20 MIPS native and 16 MIPS in the browser (release build); the
+machine is paced at 10 MIPS, a 386DX-33.
 
 ## Credits
 

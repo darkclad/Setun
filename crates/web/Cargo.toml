@@ -1,0 +1,14 @@
+[package]
+name = "setun-web"
+description = "Setun-386 browser front end: WebAssembly exports for a canvas page"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+setun-core = { path = "../core" }
+setun-demo = { path = "../demo" }

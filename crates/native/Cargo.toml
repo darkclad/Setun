@@ -1,0 +1,17 @@
+[package]
+name = "setun-native"
+description = "Setun-386 native front end: window, keyboard/mouse, serial console on stdio"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "setun"
+path = "src/main.rs"
+
+[dependencies]
+minifb = "0.28.0"
+png = "0.18.1"
+setun-core = { path = "../core" }
+setun-demo = { path = "../demo" }
