@@ -126,7 +126,7 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 | 8 | `SCRATCH` | free for the kernel |
 | 9 | `CPUID` | read-only: ISA version and feature trits |
 | 10 | `CYCLE` | read-only instruction counter |
-| others | – | reserved: reads return 0, writes trap |
+| others | – | reserved: reads return 0. Writes to these, and to the read-only `CPUID`/`CYCLE`, raise `ILL` (vector −1). |
 
 ## 3. Instruction encoding
 
@@ -190,7 +190,7 @@ word 2:                                                           [ imm27 ]
 ### 3.3 ALU functions (B, for ALU / ALUQ / ALUI)
 
 - **Every ALU operation sets `S := sign(result)`.**
-- Arithmetic operations also set `C`.
+- `ADD`, `SUB`, `ADC`, `SBC` and `MUL` also set `C`. Every other operation, including `MULH`, leaves `C` unchanged.
 - `b` is `rb`, `q3` or `imm27`, depending on the form.
 
 | B | Mnemonic | Operation |
@@ -270,7 +270,7 @@ Each trit position belongs to one sign value: `cond[1]` ↔ −1, `cond[2]` ↔ 
 |---|---|---|---|
 | 0 | `ILL` | any | illegal instruction trap (vector −1) |
 | 1 | `NOP` | any | no operation |
-| 2 | `HLT` | +1 | wait for an interrupt |
+| 2 | `HLT` | +1 | wait for an interrupt; `PC` already points at the next instruction, which is where the handler returns to |
 | 3 | `BRK` | any | breakpoint trap (vector −7) |
 | 4 | `SYS n` | any | system call: vector 0, with `n` = the 9 operand trits (±9841) placed in `FCAUSE[1:18]` |
 | 5 | `IRET` | +1 | return from trap (§7.3) |
