@@ -15,8 +15,8 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
 3. **Emulator core** (`setun-core`, Rust)
    - CPU: decode, ALU, branches, traps, rings, `MODE`/control registers ✅
    - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages ✅ (TLB cache: later, as an optimization)
-   - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T1B2 image, DMA), display (text + 3^9-colour framebuffer)
-   - tests: per-instruction tests and MMU walk tests ✅ (20 CPU/MMU tests)
+   - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T1B2 image, DMA), display (text + 3^9-colour framebuffer) ✅
+   - tests ✅: 20 CPU/MMU tests and 13 device tests (timer-interrupt program, ROM boot, DMA)
 4. **Front ends**: native (window + framebuffer + serial on stdio) and **WASM** (canvas framebuffer, keyboard/mouse events, console panel)
 5. **Assembler and disassembler**
 6. **Compiler**: a small C-like language → Setun-386 assembly (`char` = tryte = a Unicode character, `int` = pointer = word, no `unsigned`)

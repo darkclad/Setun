@@ -572,7 +572,7 @@ Control values are ternary wherever that is natural.
   - Negating a pixel inverts its colour.
 - Pixel `(x, y)` is the tryte at `FB_BASE + y·PITCH + x`.
 - 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
-- **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480. Cell  occupies trytes  (character),  (attribute) and  (reserved). The v1 emulator's font is 8×8 with doubled rows. It covers Latin, Greek, box drawing and blocks. Cyrillic is still missing and shows as a hollow box.
+- **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480. Cell `k` occupies trytes `FB_BASE + 3k` (character), `FB_BASE + 3k + 1` (attribute) and `FB_BASE + 3k + 2` (reserved). The v1 emulator's font is 8×8 with doubled rows. It covers Latin, Greek, box drawing and blocks. Cyrillic is still missing and shows as a hollow box.
   - The **attribute tryte** is foreground RGB in trits 1–3 and background RGB in trits 4–6, each trit 0%, 50% or 100%, so 27 colours each. Trits 7–9 are style: underline, blink, bold.
 
 ### 8.4 Characters: a tryte holds Unicode directly
