@@ -6,11 +6,15 @@ in **Setun-70 compatibility mode**, the ternary two-stack machine built at
 Moscow State University by N. P. Brusentsov and E. A. Zhogolev (1967–1970).
 The BIOS then switches it to native mode.
 
-- 24-trit words (4 six-trit trytes, ≈38 bits), with the tryte as the smallest addressable unit
-- 27 general registers, a load/store ISA, a sign-trit flag, and Setun ternary operations (tritwise multiply, threshold add, 3-way branch)
-- 3 privilege rings on one trit, 2-level paging with 2187-tryte pages
-- 3^15-tryte default RAM, 3^10 I/O ports, 243 interrupt vectors
-- 640×480 framebuffer with one tryte per pixel (729 colours = 9³)
+**Everything is a power of 3:**
+
+- 9-trit tryte (3²), the smallest addressable unit
+- 27-trit word = register = pointer (3³)
+- 3^27-tryte address space (3^3^3), paged 9|9|9 with 3^9-tryte pages
+- 27 general registers, a load/store 3-operand ISA, a sign trit and a carry trit, and Setun ternary operations (tritwise multiply, threshold add, 3-way branch)
+- 3 privilege rings on one trit, 243 interrupt vectors, 3^9 I/O ports (a port number is one tryte)
+- 640×480 framebuffer, one tryte per pixel = 3^9 colours (27 levels per channel)
+- a tryte holds a Unicode code point directly
 
 ## Docs
 
