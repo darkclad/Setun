@@ -1,12 +1,13 @@
 # Setun-386 Instruction Set Architecture
 
-**Status: DRAFT v0.3, under design review. Nothing is implemented yet.**
-Items marked **⚠ REVIEW** are my proposals beyond the brief. §13 lists them.
+**Status: v0.4, design accepted (2026-09-30).** §13 records the decisions.
 
 The Setun-386 is a balanced-ternary machine sized like an Intel 386: rich
-enough for a kernel with processes and a windowing GUI. Like the 386, which
-boots as an 8086, it boots in **Setun-70 compatibility mode**. The BIOS then
-switches it to **native mode**.
+enough for a kernel with processes and a windowing GUI. It is a new CPU
+designed from scratch. From the Setun lineage it keeps balanced arithmetic, the
+tritwise multiply and threshold-add operations, and the 3-way branch. It has no
+hardware Setun-70 compatibility mode. A Setun-70 emulator may one day run on it
+as an ordinary program.
 
 ## 0. Design principle: everything is a power of 3
 
@@ -29,7 +30,8 @@ address (24 = 2³·3) or a 6-trit unit (6 = 2·3) is out.
 Version history:
 - v0.1: 24-trit words.
 - v0.2: 6-trit trytes and 18-trit words.
-- v0.3: this pure-ternary revision.
+- v0.3: the pure-ternary revision.
+- v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 
 ---
 
@@ -43,7 +45,7 @@ Version history:
 
 - The **tryte** is the smallest addressable unit, and addresses count trytes.
 - The **word** is the register width, the pointer width and the instruction unit.
-- **Addressed by the centre ⚠ REVIEW.**
+- **Addressed by the centre.**
   - The word at address `A` occupies trytes `A−1, A, A+1`.
   - Inside a word the order is big-endian: the most significant tryte is at `A−1`.
   - Pages, tables and frames are centred the same way, which balanced ternary forces anyway: a page runs from −9841 to +9841 around its address.
@@ -55,7 +57,7 @@ Version history:
   - Dropping low trits rounds to nearest.
 - **Trit positions** are 1-based and most significant first, in the Setun convention. In a word, `x[1]` has weight 3^26 and `x[27]` has weight 3^0. `x[a:b]` is a field.
 
-### 1.1 Notation ⚠ REVIEW
+### 1.1 Notation
 
 - **Trits** are written `+ 0 -`.
 - **Base 27, "heptavigesimal"**: one digit = 3 trits.
@@ -96,7 +98,7 @@ There are 27 general registers of 27 trits, `r-13 … r0 … r13`. A register in
 | 27 | `RING` | current ring: −1 user, 0 drivers, +1 kernel |
 | 26 | `IE` | +1 maskable interrupts enabled, 0 disabled, −1 reserved |
 | 25 | `PG` | +1 paging on, 0 off |
-| 24 | `CM` | +1 Setun-70 compatibility mode, 0 native |
+| 24 | – | reserved |
 | 23 | `IOPL` | lowest ring allowed to use port I/O (reset value 0) |
 | 22 | `TF` | +1 single-step trap after each instruction |
 | 21 | `S` | **sign of the last result**: −1, 0, +1 |
@@ -124,7 +126,6 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 | 8 | `SCRATCH` | free for the kernel |
 | 9 | `CPUID` | read-only: ISA version and feature trits |
 | 10 | `CYCLE` | read-only instruction counter |
-| −13..−1 | – | reserved for future virtual Setun-70 (V70) state (§9.4) |
 | others | – | reserved: reads return 0, writes trap |
 
 ## 3. Instruction encoding
@@ -308,8 +309,7 @@ Memory is divided into **frames of 3^9 = 19 683 trytes**. Frame `f` is centred o
 
 | Frames | Physical addresses | Contents |
 |---|---|---|
-| `0 … N−1` | from −9 841 upward | **RAM**. The default is N = 3^6 = 729 frames = 3^15 trytes (14 348 907 trytes ≈ 25 MB), configurable. |
-| **0**, centre part | −1 093 … +1 093 | **Setun-70 window** in compat mode (§9) |
+| `0 … N−1` | from −9 841 upward | **RAM**. The default is **N = 3^9 frames = 3^18 = 9^9 trytes** (387 420 489 trytes ≈ 691 MB), a "page of pages". Configurable from 3^15 up to host RAM; the browser (WASM) build is capped at 3^18. |
 | −3 … −1 | −68 890 … −9 842 | **BIOS ROM**, 3^10 trytes (§9.2) |
 | −81 … −55 | −1 604 164 … −1 072 724 | **framebuffer**, 27 frames = 3^12 trytes (§8.3) |
 | other negative frames | – | reserved for devices; accessing them raises a bus error (vector −10) |
@@ -333,7 +333,7 @@ A virtual address is a whole word, **27 trits = 3^3^3**. It needs no canonical-f
 - Each table has 3^9 entries × 3 trytes = **3^10 trytes = 3 contiguous pages**, and must sit at a multiple of 3^10.
 - Entry `i` (−9841..9841) of a table centred at `T` is the word at `T + 3·i`.
 
-**⚠ REVIEW (memory cost)**: a minimal process needs an L1 table plus one L2 table, 6 pages or about 118k trytes. That is under 1% of the default RAM. A sparse "small L1" option can come later if it matters.
+**(memory cost)**: a minimal process needs an L1 table plus one L2 table, 6 pages or about 118k trytes. That is under 1% of the default RAM. A sparse "small L1" option can come later if it matters.
 
 ### 5.2 Page-table entry (1 word = 27 trits = frame 18 + flags 9)
 
@@ -418,10 +418,10 @@ Faults are negative, the system call sits at the centre, and the outside world i
 
 1. `EMODE := MODE`, `EPC :=` the address from the table above, and `FADDR`/`FCAUSE` are set.
 2. If `MODE.RING < +1`: **swap `r13 ↔ KSP`** (switch to the kernel stack).
-3. `MODE.RING := +1; IE := 0; TF := 0; CM := 0`.
+3. `MODE.RING := +1; IE := 0; TF := 0`.
 4. `PC := word at ITB + 3·vector`.
 
-**⚠ REVIEW**: every trap enters ring +1. The kernel dispatches to driver-ring code in software.
+every trap enters ring +1. The kernel dispatches to driver-ring code in software.
 
 ### 7.3 `IRET`
 
@@ -432,7 +432,7 @@ A kernel must save `EPC`/`EMODE` before re-enabling interrupts if it wants neste
 
 ## 8. Devices
 
-### 8.1 I/O port map ⚠ REVIEW (3^9 ports instead of 3^10)
+### 8.1 I/O port map (3^9 ports instead of 3^10)
 
 - There are **3^9 = 19 683 ports**, so **a port number is exactly one tryte** (−9841..9841).
 - Each device gets a **block of 27 ports, centred**: block `b` holds ports `27·b − 13 … 27·b + 13`.
@@ -572,10 +572,10 @@ Control values are ternary wherever that is natural.
   - Negating a pixel inverts its colour.
 - Pixel `(x, y)` is the tryte at `FB_BASE + y·PITCH + x`.
 - 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
-- **Text mode ⚠ REVIEW: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480.
+- **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480.
   - The **attribute tryte** is foreground RGB in trits 1–3 and background RGB in trits 4–6, each trit 0%, 50% or 100%, so 27 colours each. Trits 7–9 are style: underline, blink, bold.
 
-### 8.4 Characters ⚠ REVIEW: a tryte holds Unicode directly
+### 8.4 Characters: a tryte holds Unicode directly
 
 - A 9-trit tryte covers ±9841.
 - **A positive tryte is a Unicode code point, U+0000..U+2671.** That covers ASCII, Latin-1, Latin Extended, Greek, **Cyrillic**, Hebrew, Arabic, Devanagari, general punctuation, arrows, box drawing, blocks and geometric shapes.
@@ -588,43 +588,20 @@ Disk images, ROM images and memory dumps store **one tryte per little-endian `i1
 
 One sector is 39 366 bytes.
 
-## 9. Setun-70 compatibility mode
+## 9. Reset and boot
 
-### 9.1 Mapping
-
-- **Memory.** The Setun-70's first-level memory is 27 pages × 81 syllables = 2187 = 3^7 syllables.
-  - In compat mode **each 6-trit Setun-70 syllable occupies one native tryte**, in its low 6 trits, with the top 3 trits 0.
-  - Setun-70 address (page `p`, offset `a`) is **physical `81·p + a`**, the centre 2187 trytes of frame 0 (−1093..+1093). No translation is needed.
-- **ROM protection.** Setun-70 RAM pages −4..4 are physical −364..+364. Its "ROM" pages are ordinary RAM, protected by the Setun-70 ISA itself: `W=S` and `COPYF` refuse pages with `|p| > 4`.
-- **Emulated, not overlaid.** Because syllables are 6 trits and native trytes are 9, compat mode is a separate decoder over this window, like the 386's real mode.
-
-### 9.2 Reset and boot flow
-
-1. **Reset**: the hardware copies the compat image (2187 trytes) from ROM frame −1 into the centre of frame 0 and enters compat mode (`MODE.CM = +1`). The Setun-70 registers take their 1970 reset values (`c1 = +1, ch = 12, ca = −40`), so execution starts at physical 12·81 − 40 = **932**. The display is in text mode.
-2. **Compat BIOS stage** (Setun-70 code): banner on the console channel, a check of the Setun-70 memory, then the mode switch.
-3. **Switch to native ⚠ REVIEW**: every Setun-70 operation code is already taken, so the switch is a **Setun-70 I/O device**, much as the 386's A20 gate hung off the keyboard controller.
-   - Select device +4 on character channel +1 for output (`LU3`).
-   - Write the syllable `++++++` (`LG3`).
-   - The CPU enters native mode with `RING = +1`, `PG = 0`, `IE = 0` and `PC = −59 049` (−3^10, the centre of ROM frame −3).
-4. **Native BIOS** (ROM frames −3..−2):
+1. **Reset state**:
+   - native mode, `RING = +1`, `PG = 0`, `IE = 0`;
+   - all general and control registers 0;
+   - every TPIC IRQ masked;
+   - display in text mode;
+   - **`PC = −59 049`** (−3^10, the centre of ROM frame −3).
+2. **BIOS** (ROM frames −3..−1, 3^10 trytes of native code):
    - set `ITB`;
    - read the RAM size from `SYSCTL`;
    - clear the text screen and run a self-test;
    - load **disk sector 0 into frame 1**, then jump to its centre (physical 19 683 = 3^9) with `r1` = boot disk and `r2` = RAM frame count. This is the analogue of the PC's 0x7C00 boot sector.
-
-### 9.3 Compat devices
-
-| Setun-70 | Native device |
-|---|---|
-| character channel −1 | serial console (Unicode ↔ the Setun-70 7-bit code) |
-| character channel 0 | keyboard (in) and text screen (out) |
-| channel +1, device +4 | the native-mode switch |
-| drum channel −1 | disk 0: drum page `q` = the 81 trytes starting at `81·q` in the disk image |
-| timer interrupt `v[1]` | interval timer |
-
-### 9.4 Later: virtual Setun-70 (V70)
-
-This is the analogue of the 386's virtual-8086 mode. The kernel `IRET`s into a task with `EMODE.CM = +1`, and that task's virtual page 0 becomes its Setun-70 memory. Setun-70 special operations and macro-operations trap to the kernel. `cr-13..cr-1` expose the compat state. This is not in v1.
+3. **Boot sector / loader**: loads the kernel, builds page tables, sets `PTB`, turns on `PG`, and enters the kernel.
 
 ## 10. Notes for the compiler
 
@@ -674,9 +651,9 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
 | I/O ports | 2^16 | 3^9 |
 | interrupt vectors | 256 | 243 |
 | colours (VGA-class) | 256 | 19 683 |
-| boots as | 8086 | Setun-70 |
+| reset | real mode (8086) | native, ring +1, paging off |
 
-## 13. Review points
+## 13. Decisions
 
 1. **The pure-ternary sizes** (§0): the tryte is 9 trits, the word, register and pointer are 27 trits, addresses are 3^27, and the split is 9|9|9.
 2. **Centre addressing** and **required alignment** (§1). Only 2-word instructions can cross a page.
@@ -686,5 +663,5 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
 6. **Vectors are numbered −121..121**: faults negative, the system call at 0, IRQs positive (§7.1).
 7. **Characters: a tryte is a Unicode code point** (U+0000..U+2671, with negative leads for the rest) (§8.4).
 8. **Colours: 3^9, with 27 levels per channel.** A pixel's three base-27 digits are R, G, B (§8.3).
-9. **Setun-70 compat is emulated** (6-trit syllables in 9-trit trytes) but still identity-mapped to physical `81·p + a` (§9).
+9. **No Setun-70 compatibility mode**: a new CPU from scratch that resets straight into native mode (§9). **Default RAM is 3^18 = 9^9 trytes** (§4).
 10. A **carry trit C**, **two kinds of division**, **every trap enters ring +1**, and **text mode**. These carry over from v0.2.
