@@ -210,6 +210,9 @@ impl Disk {
         if self.lba < 0 || self.count < 0 || self.lba + self.count > store.sectors() {
             return error::LBA_RANGE;
         }
+        if self.count == 0 {
+            return error::NONE; // nothing to move, so the DMA address is irrelevant
+        }
         if (self.dma + HALF_PAGE).rem_euclid(PAGE) != 0 {
             return error::DMA_ALIGN;
         }
