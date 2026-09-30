@@ -58,9 +58,23 @@ pub struct Cpu {
     regs: [Word; 27],
     pub pc: Word,
     crs: [Word; 27],
+    /// `MODE` kept unpacked, one trit per slot (index = trit position), so
+    /// flag reads and writes cost nothing. Packed on `MFC`/trap entry.
+    mode_trits: [i8; 28],
+    /// Instruction counter behind the read-only `CYCLE` register.
+    cycle: u64,
     pub halted: bool,
     /// Current instruction's address, for fault reporting.
     inst_pc: Word,
+}
+
+/// Split `v` into `(v div m, v mod m)` with a balanced remainder. Called with
+/// constant `m` so the divisions compile to multiplications.
+#[inline(always)]
+fn bal_split(v: i64, m: i64) -> (i64, i64) {
+    let h = (m - 1) / 2;
+    let lo = (v + h).rem_euclid(m) - h;
+    ((v - lo) / m, lo)
 }
 
 fn idx(r: i64) -> usize {
@@ -83,6 +97,8 @@ impl Cpu {
             regs: [Word::ZERO; 27],
             pc: Word::ZERO,
             crs: [Word::ZERO; 27],
+            mode_trits: [0; 28],
+            cycle: 0,
             halted: false,
             inst_pc: Word::ZERO,
         };
@@ -95,6 +111,8 @@ impl Cpu {
         self.regs = [Word::ZERO; 27];
         self.crs = [Word::ZERO; 27];
         self.crs[idx(cr::CPUID)] = Word::new(CPUID_VERSION).unwrap();
+        self.mode_trits = [0; 28];
+        self.cycle = 0;
         self.set_mode(mode::RING, 1);
         self.pc = Word::new(RESET_PC).unwrap();
         self.halted = false;
@@ -113,20 +131,34 @@ impl Cpu {
     }
 
     pub fn cr(&self, n: i64) -> Word {
-        self.crs[idx(n)]
+        match n {
+            cr::MODE => {
+                let v = self.mode_trits[1..].iter().fold(0i64, |acc, &t| acc * 3 + t as i64);
+                Word::new(v).unwrap()
+            }
+            cr::CYCLE => Word::wrap(self.cycle as i128),
+            _ => self.crs[idx(n)],
+        }
     }
 
     pub fn set_cr(&mut self, n: i64, v: Word) {
-        self.crs[idx(n)] = v;
+        if n == cr::MODE {
+            for (i, t) in v.trits().iter().enumerate() {
+                self.mode_trits[i + 1] = *t as i8;
+            }
+        } else {
+            self.crs[idx(n)] = v;
+        }
     }
 
+    #[inline]
     pub fn mode(&self, pos: usize) -> i64 {
-        self.crs[idx(cr::MODE)].trit(pos) as i64
+        self.mode_trits[pos] as i64
     }
 
+    #[inline]
     pub fn set_mode(&mut self, pos: usize, v: i64) {
-        let m = self.crs[idx(cr::MODE)];
-        self.crs[idx(cr::MODE)] = m.with_field(pos..=pos, v);
+        self.mode_trits[pos] = v.signum() as i8;
     }
 
     pub fn ring(&self) -> i64 {
@@ -259,8 +291,7 @@ impl Cpu {
 
         let tf = self.mode(mode::TF) == 1;
         self.inst_pc = self.pc;
-        let cycle = self.cr(cr::CYCLE);
-        self.set_cr(cr::CYCLE, w(cycle.value() as i128 + 1));
+        self.cycle = self.cycle.wrapping_add(1);
 
         match self.execute(m, io) {
             Ok(()) => {
@@ -283,15 +314,20 @@ impl Cpu {
     fn execute(&mut self, m: &mut Memory, io: &mut dyn Io) -> Result<(), Fault> {
         let pc = self.pc.value();
         let w1 = self.load_word_as(m, pc, Access::Fetch)?;
-        let a = w1.field(1..=9);
-        let b = w1.field(10..=18);
-        let (x, y, z) = (w1.field(19..=21), w1.field(22..=24), w1.field(25..=27));
+        // Decode: A = trits 1–9, B = 10–18, operand tryte = 19–27 (X Y Z).
+        let (ab, opnd) = bal_split(w1.value(), 19_683);
+        let (a, b) = bal_split(ab, 19_683);
+        let (xy, z) = bal_split(opnd, 27);
+        let (x, y) = bal_split(xy, 27);
+        let imm6 = y * 27 + z;
         let ill = || Fault::new(vector::ILLEGAL);
 
-        let (imm, next) = match w1.trit(1) {
-            Trit::Z => (0, pc + 3),
-            Trit::P => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
-            Trit::N => return Err(ill()),
+        // A[1], the length trit, is the leading trit of A.
+        let len_trit = bal_split(a, 6561).0;
+        let (imm, next) = match len_trit {
+            0 => (0, pc + 3),
+            1 => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
+            _ => return Err(ill()),
         };
         let next_w = w(next as i128);
         let rel = |off: i64| w(pc as i128 + 3 * off as i128);
@@ -354,7 +390,7 @@ impl Cpu {
                 self.pc = target;
                 return Ok(());
             }
-            op::LIQ => self.set_reg(x, Word::new(w1.field(22..=27)).unwrap()),
+            op::LIQ => self.set_reg(x, Word::new(imm6).unwrap()),
             op::LI => self.set_reg(x, Word::new(imm).unwrap()),
             op::LEA => self.set_reg(x, w(pc as i128 + imm as i128)),
             op::JAL => {
@@ -363,7 +399,7 @@ impl Cpu {
                 return Ok(());
             }
             op::BRQ | op::BR => {
-                let off = if a == op::BRQ { w1.field(22..=27) } else { imm };
+                let off = if a == op::BRQ { imm6 } else { imm };
                 if self.condition(x)? {
                     self.pc = rel(off);
                     return Ok(());
@@ -504,18 +540,20 @@ impl Cpu {
                 if y == 0 {
                     return Err(div0());
                 }
-                w(if f == alu::DIV { x / y } else { x % y })
+                let (x, y) = (x as i64, y as i64); // 64-bit: much faster than i128
+                w((if f == alu::DIV { x / y } else { x % y }) as i128)
             }
             alu::DIVR | alu::MODR => {
                 if y == 0 {
                     return Err(div0());
                 }
+                let (x, y) = (x as i64, y as i64);
                 let md = y.abs();
                 let mut r = x.rem_euclid(md);
                 if 2 * r > md {
                     r -= md;
                 }
-                w(if f == alu::DIVR { (x - r) / y } else { r })
+                w((if f == alu::DIVR { (x - r) / y } else { r }) as i128)
             }
             alu::MIN => a.tritwise_min(b),
             alu::MAX => a.tritwise_max(b),

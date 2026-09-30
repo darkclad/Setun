@@ -1,0 +1,11 @@
+[package]
+name = "setun-asm"
+description = "Setun-386 assembler back end: a label-resolving program builder"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+setun-core = { path = "../core" }
+ternary = { path = "../ternary" }

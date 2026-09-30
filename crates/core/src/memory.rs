@@ -95,6 +95,23 @@ impl Memory {
     /// Word at centre address `pa` (trytes `pa−1, pa, pa+1`, big-endian).
     /// Alignment is the caller's business.
     pub fn read_word(&self, pa: i64) -> Result<Word, BusError> {
+        // Fast path: when all three trytes are in one frame, a single lookup
+        // covers them (always true for aligned words).
+        if let Ok((region, i)) = self.locate(pa) {
+            let off = i % PAGE as usize;
+            if off >= 1 && off + 1 < PAGE as usize {
+                let s: &[i16] = match region {
+                    Region::Ram(f) => match &self.ram[f] {
+                        Some(fr) => fr,
+                        None => return Ok(Word::ZERO),
+                    },
+                    Region::Rom => &self.rom,
+                    Region::Fb => &self.fb,
+                };
+                let v = s[i - 1] as i64 * 387_420_489 + s[i] as i64 * 19_683 + s[i + 1] as i64;
+                return Ok(Word::new(v).expect("word from trytes"));
+            }
+        }
         let t0 = self.read_tryte(pa - 1)?.value() as i128;
         let t1 = self.read_tryte(pa)?.value() as i128;
         let t2 = self.read_tryte(pa + 1)?.value() as i128;

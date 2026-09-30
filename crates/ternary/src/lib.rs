@@ -72,27 +72,54 @@ impl std::ops::Mul for Trit {
     }
 }
 
-/// 3^n as i128 (n ≤ 80).
-pub const fn pow3(n: u32) -> i128 {
-    let mut r: i128 = 1;
-    let mut i = 0;
-    while i < n {
-        r *= 3;
+const POW3: [i128; 81] = {
+    let mut t = [1i128; 81];
+    let mut i = 1;
+    while i < 81 {
+        t[i] = t[i - 1] * 3;
         i += 1;
     }
-    r
+    t
+};
+
+const POW3_I64: [i64; 40] = {
+    let mut t = [1i64; 40];
+    let mut i = 1;
+    while i < 40 {
+        t[i] = t[i - 1] * 3;
+        i += 1;
+    }
+    t
+};
+
+/// 3^n as i128 (n ≤ 80), from a table.
+#[inline]
+pub const fn pow3(n: u32) -> i128 {
+    POW3[n as usize]
 }
 
 /// Round `v / 3^k` to the nearest integer. In balanced ternary this is exactly
 /// "drop the low k trits": ties are impossible because 3^k is odd.
+#[inline]
 pub fn div_pow3_round(v: i128, k: u32) -> i128 {
+    // Fast path: 128-bit division is a slow software routine.
+    if k <= 39 && (-(1i128 << 62)..(1i128 << 62)).contains(&v) {
+        let d = POW3_I64[k as usize];
+        return (v as i64 + (d - 1) / 2).div_euclid(d) as i128;
+    }
     let d = pow3(k);
     (v + (d - 1) / 2).div_euclid(d)
 }
 
 /// Wrap `v` into the balanced range of an `n`-trit number, i.e. keep the low
 /// `n` trits and drop the rest.
+#[inline]
 pub fn wrap_trits(v: i128, n: u32) -> i128 {
+    if n <= 39 && (-(1i128 << 62)..(1i128 << 62)).contains(&v) {
+        let m = POW3_I64[n as usize];
+        let h = (m - 1) / 2;
+        return ((v as i64 + h).rem_euclid(m) - h) as i128;
+    }
     let m = pow3(n);
     let h = (m - 1) / 2;
     (v + h).rem_euclid(m) - h
@@ -177,7 +204,7 @@ impl<const N: usize> Tern<N> {
     /// Trit at 1-based, MSB-first position `i` (spec notation `x[i]`).
     pub fn trit(self, i: usize) -> Trit {
         assert!((1..=N).contains(&i), "trit index {i} out of 1..={N}");
-        self.trits()[i - 1]
+        Trit::from_i64(self.field_unchecked(i, i))
     }
 
     /// Value of the trit field `x[a:b]` (1-based, inclusive, MSB first),
@@ -185,9 +212,14 @@ impl<const N: usize> Tern<N> {
     pub fn field(self, r: RangeInclusive<usize>) -> i64 {
         let (a, b) = (*r.start(), *r.end());
         assert!(1 <= a && a <= b && b <= N, "field {a}:{b} out of 1..={N}");
-        self.trits()[a - 1..b]
-            .iter()
-            .fold(0i64, |acc, &t| acc * 3 + t as i64)
+        self.field_unchecked(a, b)
+    }
+
+    /// Constant-time field extraction: dropping the low `N − b` trits is
+    /// exact rounding in balanced ternary, then keep `b − a + 1` trits.
+    fn field_unchecked(self, a: usize, b: usize) -> i64 {
+        let shifted = div_pow3_round(self.0 as i128, (N - b) as u32);
+        wrap_trits(shifted, (b - a + 1) as u32) as i64
     }
 
     /// Replace the trit field `x[a:b]` with the low trits of `v`.

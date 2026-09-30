@@ -1,0 +1,12 @@
+[package]
+name = "setun-demo"
+description = "Setun-386 demo ROM: text screen, keyboard/serial echo, 3^9-colour graphics"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+setun-asm = { path = "../asm" }
+setun-core = { path = "../core" }
+ternary = { path = "../ternary" }
