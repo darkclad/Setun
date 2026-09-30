@@ -1,0 +1,91 @@
+# Setun-386 assembly language
+
+The assembler lives in `crates/asm` (`setun_asm::text`), along with the
+disassembler (`setun_asm::disasm`) and the `setun-asm` command-line tool. The demo
+ROM, [`crates/demo/src/demo.s`](../crates/demo/src/demo.s), is a complete
+example program.
+
+## Lines
+
+```
+label:  mnemonic operand, operand, …   ; comment
+NAME = expression                      ; constant (also: .equ NAME, expression)
+```
+
+- Labels end with `:`, and a line may carry several.
+- Mnemonics are case-insensitive.
+- `;` starts a comment, except inside quotes.
+
+## Values
+
+| Syntax | Meaning |
+|---|---|
+| `42`, `-7`, `1_000` | decimal |
+| `0t+-0` | balanced ternary (`+` `0` `-`, most significant first) = 6 |
+| `0zMMm` | base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13 |
+| `'A'`, `'Ж'`, `'\n'` | a Unicode character (escapes: `\n \t \r \0 \\ \' \"`) |
+| `$` | address of the current instruction |
+| `label`, `NAME` | a label's address or a constant |
+| `+ - * / ( )` | integer arithmetic (`/` truncates) |
+
+**Registers:** `r-13` … `r13`. Aliases: `zero` = r0, `fp` = r11, `lr` = r12, `sp` = r13.
+
+**Addresses** are word addresses, where a word's address is its centre tryte and a multiple of 3. A string's first tryte is at `label − 1`.
+
+## Automatic form selection
+
+Where an instruction has a short (1-word) and a long (2-word) encoding, the assembler picks the short one when it fits. Adding `.l` to the mnemonic forces the long one.
+
+| Written | Short form when | Long form |
+|---|---|---|
+| `add r1, r2, imm` (any ALU op), `cmp r1, imm` | the constant fits ±13 | ALUI, 27-bit immediate |
+| `li r1, imm` | the constant fits ±364 | LI |
+| `ldw r1, [r2+off]` (`ldt stt stw swap`) | `off` is a multiple of the access size and `off/size` fits ±13 | MEMD with `off` in trytes |
+| `blt label` (any branch) | the target is within ±364 words | BR. **Relaxed automatically**: a short branch that turns out to be out of range becomes long. |
+
+A value that depends on a label is not known before layout, so it always gets the long form.
+
+## Instructions
+
+| Group | Syntax |
+|---|---|
+| ALU, 3 operands | `add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit  rd, ra, rb\|imm` |
+| ALU, 2 operands | `neg not sgn abs tlz  rd, ra` · `cmp ra, rb\|imm` · `mov rd, ra\|imm` |
+| constants | `li rd, value` · `la rd, label` (always 2 words) · `lea rd, target` (PC-relative) |
+| memory | `ldt ldw stt stw swap  rd, [ra ± off]` or `[label]` (offsets are always in **trytes**) |
+| port I/O | `in rd, [ra ± q]` (q ±13) · `in rd, port` · `out` likewise |
+| branches | `b blt beq bgt ble bge bne bov bnov bnever  target` · `br3 negative, positive` |
+| calls | `call target` · `jal rd, target` · `jalr rd, ra[, q]` · `ret` |
+| stack | `push r` · `pop r` (each 2 instructions, 3 trytes per word) |
+| trit fields | `ext rd, ra, pos, len` · `ins rd, ra, pos, len` |
+| system | `nop hlt brk iret tlbflush fence ill` · `tlbinv ra` · `sys n` · `mfc rd, creg` · `mtc creg, ra` |
+
+**Control register names:** `mode ptb faddr fcause itb epc emode ksp scratch cpuid cycle`, or `cr-13` … `cr13`.
+
+## Directives
+
+| Directive | Effect |
+|---|---|
+| `.org addr` | start a segment at a word address (a multiple of 3) |
+| `.word v, …` | one word per value (labels allowed) |
+| `.tryte v, …` | trytes packed 3 per word. Consecutive `.tryte` lines pack as one run. |
+| `.string "text"` | one tryte per character plus a terminating 0 |
+| `.zero n` | `n` zero words |
+| `.fill n, v` | `n` words of `v` |
+| `.equ NAME, v` / `NAME = v` | constant |
+
+## Disassembly
+
+Every line the disassembler prints reassembles to exactly the same words. Anything that would not (data, non-canonical encodings) comes out as `.word`. It prints `.l` wherever the long form was used although the short one would fit.
+
+## Command line
+
+```
+setun-asm build demo.s -o demo.t1b2 --rom --listing   # full BIOS ROM image
+setun-asm build prog.s -o prog.t1b2                   # one segment's trytes
+setun-asm dis demo.t1b2 --rom                         # listing
+setun-asm dis demo.t1b2 --rom --source > again.s      # reassemblable source
+setun --rom demo.t1b2                                 # run it
+```
+
+Images use the T1B2 format: one tryte per little-endian `i16` (ISA §8.5).

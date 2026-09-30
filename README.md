@@ -29,8 +29,8 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 |---|---|
 | `crates/ternary` | balanced-ternary fixed-width integers (`Trit`, `Tryte`, `Word`, `Tern<N>`) |
 | `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, memory map, devices (interrupt controller, timer, RTC, keyboard, mouse, serial, DMA disks, display renderer), `Machine` |
-| `crates/asm` | assembler back end (`setun-asm`): label-resolving program builder |
-| `crates/demo` | demo ROM (`setun-demo`): text screen, keyboard/serial echo, 3^9-colour graphics |
+| `crates/asm` | assembler, disassembler and the `setun-asm` tool ([`docs/ASSEMBLER.md`](docs/ASSEMBLER.md)) |
+| `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
 | `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio |
 | `crates/web` + `web/` | browser front end: WebAssembly exports and the front-panel page |
 
