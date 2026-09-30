@@ -1,0 +1,10 @@
+[package]
+name = "setun-core"
+description = "Setun-386 emulator core: CPU, MMU and physical memory"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ternary = { path = "../ternary" }

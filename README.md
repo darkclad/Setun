@@ -28,6 +28,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | Path | What |
 |---|---|
 | `crates/ternary` | balanced-ternary fixed-width integers (`Trit`, `Tryte`, `Word`, `Tern<N>`) |
+| `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, physical memory map |
 
 ## Build
 
