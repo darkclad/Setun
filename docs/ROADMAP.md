@@ -1,28 +1,27 @@
 # Roadmap
 
-Target: a Setun-70 emulator in Rust (native + WASM front panel), then a ROM
-BIOS, then an OS, all written for the ternary machine itself.
+Target: **Setun-386**, a balanced-ternary machine sized like a 386 (24-trit
+words, paging, 3 rings, 640×480 framebuffer). It boots in **Setun-70
+compatibility mode** and the BIOS switches it to native mode. Then come a
+compiler, a kernel and a window system, all written for the machine itself.
 
-## Machine profiles
-
-The core implements the 1970 ISA exactly (**`classic`** profile). Our own
-extensions live behind a **`setun70x`** profile so faithful programs keep
-running unchanged. The candidate extensions below are to be pinned down one by one:
-
-| Extension | Why | Faithful to the design? |
-|---|---|---|
-| Wider page registers (`h`, `ph`, `ch` 3 → 6 trits: 729 pages ≈ 59k trytes) | room for an OS + user programs | yes: the 1971 paper says memory grows by lengthening the page registers |
-| Drum/disk channels backed by host image files | persistence, a file system | yes: same `LQ/CF/LF` protocol |
-| Host-terminal console on channel 1 (UTF-8 ↔ tryte charset) | usable shell | device-level only |
-| 1975 return stack | structured programming, DSSP-style OS | historical revision |
-| Debug trap / trace hooks | tooling | host-only, invisible to programs |
+- ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (draft, under review)
+- Compatibility mode: [`ARCHITECTURE.md`](ARCHITECTURE.md), the Setun-70 as specified in 1970
 
 ## Milestones
 
-1. **`ternary` crate**: trits, trytes, words, fields, nonary notation ✅
-2. **`setun-core`**: CPU from the ALGOL spec (fetch/decode, B1–B27, S1–S27, macro-ops, interrupts, modes), memory with a RAM/ROM split, drum and I/O channels as host-side devices. Tests: one per opcode against the ALGOL semantics.
-3. **`setun-asm`**: POLIZ assembler and disassembler (labels, page directives, nonary and trit literals, macro-op names).
-4. **`setun-cli`**: run images, single-step, trace, dump pages; front panel in the terminal (TUI).
-5. **ROM BIOS** (ROM pages): interrupt vectors (page 13), stack page extension on overflow and underflow, program page chaining (`v[9]`), console driver, drum boot loader, machine-code monitor.
-6. **OS**: macro-op syscall table (page −13), drum paging, a small drum file system, timer-driven tasks, and a DSSP/Forth-style interactive shell.
-7. **`setun-web`**: WASM build with a browser front panel (R-register lamps, stack view, typewriter console).
+1. **`ternary` crate**: trits, trytes, fields, nonary notation ✅
+2. **ISA spec**: `SETUN386_ISA.md` 🟡 draft, waiting for design review
+3. **Emulator core** (`setun-core`, Rust)
+   - native CPU: decode, ALU, branches, traps, rings, `MODE`/control registers
+   - MMU: 2-level walk, TLB, faults, accesses that cross pages
+   - Setun-70 compat CPU (the 1970 ALGOL semantics) and the mode switch
+   - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T3B4 image, DMA), display (text + 729-colour framebuffer)
+   - tests: per-instruction tests, MMU walk tests, the Setun-70 spec cases
+4. **Front ends**: native (window + framebuffer + serial on stdio) and **WASM** (canvas framebuffer, keyboard/mouse events, console panel)
+5. **Assemblers**: Setun-386 native assembler/disassembler, plus a Setun-70 assembler for the compat BIOS stage
+6. **Compiler**: a small C-like language → Setun-386 assembly (`char` = tryte, `int` = word, no `unsigned`)
+7. **BIOS**: compat stage in Setun-70 code → mode switch → native BIOS (vectors, RAM size, text console, disk boot sector)
+8. **Kernel**: paging, processes and a scheduler, syscalls, drivers in ring 0, a disk file system
+9. **Window system**: framebuffer compositor, mouse cursor, windows, a terminal app
+10. Later: virtual Setun-70 (V70) tasks, a 3rd page-table level (full 3^24 virtual addresses), a "Setun-387" floating-point unit
