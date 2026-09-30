@@ -9,6 +9,9 @@ use ternary::{pow3, split_product, wrap_trits, Trit, Tryte, Word};
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
 pub const RESET_PC: i64 = -59_049;
 
+/// `CPUID` value: ISA version (v0.4).
+pub const CPUID_VERSION: i64 = 4;
+
 /// Kind of memory access, encoded as in `FCAUSE[22]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -91,6 +94,7 @@ impl Cpu {
     pub fn reset(&mut self) {
         self.regs = [Word::ZERO; 27];
         self.crs = [Word::ZERO; 27];
+        self.crs[idx(cr::CPUID)] = Word::new(CPUID_VERSION).unwrap();
         self.set_mode(mode::RING, 1);
         self.pc = Word::new(RESET_PC).unwrap();
         self.halted = false;

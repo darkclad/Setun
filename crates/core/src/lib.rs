@@ -5,14 +5,20 @@
 //! * [`isa`]: opcode numbers and instruction encoders, shared with the
 //!   assembler and the tests.
 //! * [`io`]: the port-I/O and interrupt interface that devices implement.
+//! * [`devices`]: the standard devices (ISA §8).
+//! * [`machine`]: CPU + memory + devices + emulated time.
 
 pub mod cpu;
+pub mod devices;
 pub mod io;
 pub mod isa;
+pub mod machine;
 pub mod memory;
 
 pub use cpu::{Cpu, Step};
+pub use devices::Devices;
 pub use io::{Io, NullIo};
+pub use machine::Machine;
 pub use memory::Memory;
 
 /// Trytes per page / frame (3^9).

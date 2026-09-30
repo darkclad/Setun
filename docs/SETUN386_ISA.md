@@ -460,7 +460,7 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `SYSID` (read-only) |
+| 0 | `SYSID` (read-only): 386 |
 | 1 | `RAM_FRAMES` (read-only) |
 | 2 | `POWER`: write +1 to reset, −1 to power off |
 | 3 | `DEBUG`: write a tryte and it appears in the host log |
@@ -471,14 +471,14 @@ Control values are ternary wherever that is natural.
 | Offset | Register |
 |---|---|
 | 0 | `VECBASE`: vector of IRQ 0, default +1 |
-| 1 | `CLAIM` (read): returns the highest-priority pending unmasked IRQ and marks it in service, or −1 if there is none |
+| 1 | `CLAIM` (read): returns the highest-priority pending unmasked IRQ and marks it in service, or −1 if there is none. A line interrupts the CPU only while no line of equal or higher priority is in service. |
 | 2 | `EOI` (write): the IRQ number |
 | 3 | `UNMASK` (write): the IRQ number |
 | 4 | `MASK` (write): the IRQ number |
 | 5 | `SELECT` |
 | 6 | `STATE` of the selected IRQ: −1 masked, 0 idle, +1 pending |
 
-**Timer (54).** 1 MHz time base.
+**Timer (54).** 1 MHz time base. Writing `CTRL` reloads `COUNT` from `PERIOD`. A periodic timer keeps its phase, and several missed periods raise the IRQ once.
 
 | Offset | Register |
 |---|---|
@@ -491,7 +491,7 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `SECONDS`: Unix time. A word holds ±3.8·10^12 seconds, so there is no year-2038 problem. |
+| 0 | `SECONDS`: Unix time. A word holds ±3.8·10^12 seconds, so there is no year-2038 problem. Writing it also zeroes `MICROS`. |
 | 1 | `MICROS` |
 | 2 | `ALARM`: Unix time, or 0 for off. Raises IRQ 5. |
 
@@ -522,7 +522,7 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `DATA`: one tryte character (§8.4) |
+| 0 | `DATA`: one tryte character (§8.4). Reading returns 0 if nothing has been received. |
 | 1 | `RX_COUNT` |
 | 2 | `TX_READY`: +1 ready, 0 busy |
 | 3 | `CTRL`: +1 IRQ on receive |
@@ -537,7 +537,7 @@ Control values are ternary wherever that is natural.
 | 3 | `COUNT` (sectors) |
 | 4 | `DMA` (physical address) |
 | 5 | `SECTORS` (read-only capacity) |
-| 6 | `ERROR` |
+| 6 | `ERROR`: 0 none, 1 no media, 2 LBA out of range, 3 DMA address not page-aligned, 4 bus error during DMA, 5 host I/O error, 6 bad command |
 | 7 | `CTRL`: +1 IRQ on completion |
 
 **Display (243)**
@@ -548,7 +548,7 @@ Control values are ternary wherever that is natural.
 | 1 | `FB_BASE` (read-only physical address of the first tryte) |
 | 2 | `WIDTH` |
 | 3 | `HEIGHT` |
-| 4 | `PITCH` (trytes per line) |
+| 4 | `PITCH` (trytes per line). In text mode `WIDTH`/`HEIGHT` count cells (80×30) and `PITCH` is 240 (80 one-word cells). |
 | 5 | `FRAME` (vsync counter) |
 | 6 | `CTRL`: +1 IRQ on vsync |
 | 7 | `CURSOR` (text cell index) |
@@ -572,7 +572,7 @@ Control values are ternary wherever that is natural.
   - Negating a pixel inverts its colour.
 - Pixel `(x, y)` is the tryte at `FB_BASE + y·PITCH + x`.
 - 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
-- **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480.
+- **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480. Cell  occupies trytes  (character),  (attribute) and  (reserved). The v1 emulator's font is 8×8 with doubled rows. It covers Latin, Greek, box drawing and blocks. Cyrillic is still missing and shows as a hollow box.
   - The **attribute tryte** is foreground RGB in trits 1–3 and background RGB in trits 4–6, each trit 0%, 50% or 100%, so 27 colours each. Trits 7–9 are style: underline, blink, bold.
 
 ### 8.4 Characters: a tryte holds Unicode directly
