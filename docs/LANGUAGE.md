@@ -1,0 +1,328 @@
+# Trine: a C-like language for Setun-386
+
+**Status: DRAFT v0.1, under design review. Nothing is implemented yet.**
+Items marked **⚠ REVIEW** are open choices. §14 lists them.
+
+Trine is the systems language for Setun-386: the language of the BIOS,
+kernel, drivers, window system and applications. It is a small language in
+the spirit of C: statically typed, with pointers and manual memory, compiled
+ahead of time to Setun-386 assembly, and suited to bare metal. Its
+arithmetic is balanced ternary all the way down.
+
+The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
+
+## 1. Goals and non-goals
+
+**Goals**
+- **Enough for an OS:** pointers, structs, arrays, function pointers, interrupt handlers, port I/O, control registers and inline assembly.
+- **Honest about ternary:** there are no unsigned types, comparisons can be three-way, operators are tritwise, and shifts count trits.
+- **Simple to compile:** one compilation unit, no preprocessor, and a declaration syntax that parses without C's declarator puzzles.
+- **Predictable:** every memory access in the source happens in the output. The v1 compiler does no optimisation that could reorder or drop them, so there is no need for `volatile`.
+
+**Not in v1:** floating point (it waits for a "Setun-387"), 81-trit `long`, generics, a preprocessor or macros, variadic functions, and passing or returning structs by value.
+
+## 2. Lexical structure
+
+- **Comments:** `// to end of line` and `/* block */`, which do not nest.
+- **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. Case matters.
+- **Integer literals**, the same forms as the assembler:
+  - `42` and `1_000` (decimal)
+  - `0t+-0` (balanced ternary: `+` `0` `-`, most significant first) = 6
+  - `0zMMm` (base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13)
+- **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \0 \\ \' \"`.
+- **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
+- **Keywords:** `fn var const struct return if else while for loop break continue sign neg zero pos switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
+
+## 3. Types
+
+| Type | Size (trytes) | Values | Notes |
+|---|---|---|---|
+| `trit` | 1 | −1, 0, +1 | three-state flags, signs. Stored in a tryte. |
+| `tryte`, alias `char` | 1 | −9 841 … 9 841 | a `char` holds one Unicode code point |
+| `int` | 3 | ±3 812 798 742 493 | the machine word: 27 trits |
+| `*T` | 3 | an address | a pointer is a word |
+| `[N]T` | N·sizeof(T), rounded up (§4) | | fixed-size array |
+| `struct S` | a multiple of 3 | | §4 |
+| `fn(A, B) -> R` | 3 | | function pointer |
+| `void` | – | | only as a return type or `*void` |
+
+- **There are no unsigned types.** Every integer is balanced signed, so negation is exact and `abs` never overflows.
+- **Truthiness:** a condition is true when it is non-zero. `true` = 1, `false` = 0, `null` = a pointer 0.
+- **Conversions:** implicit only when a value always fits (`trit` → `tryte` → `int`). Everything else needs `as`.
+  - Narrowing keeps the low trits: `x as tryte` is `x` wrapped to 9 trits, and `x as trit` is its lowest trit. This is balanced wrapping, so `9842 as tryte` = −9841.
+  - Use `sgn(x)` for the sign.
+  - `as` also converts between pointer types, and between pointers and `int`.
+- **Overflow wraps** modulo 3^27 (balanced) and is never undefined. `ovf()` reads the carry trit after `+`, `-` or `*` (§8).
+
+## 4. Memory layout and addresses ⚠ REVIEW
+
+Setun-386 addresses a multi-tryte value by its **centre tryte**: the word at address `A` occupies `A−1, A, A+1`. Trine keeps this rule, so **a pointer is always the hardware address used to access the object**.
+
+| Object | Its address | Alignment |
+|---|---|---|
+| `trit`, `tryte`, `char` | the tryte itself | none |
+| `int`, pointer, function pointer | the centre of the word | a multiple of 3 |
+| array of trytes (e.g. a string) | its first tryte | none |
+| array of words or structs | the address of element 0 | a multiple of 3 |
+| `struct` | the centre of its first word | a multiple of 3 |
+
+**Structs** are laid out in word *slots*:
+- Each slot has three tryte positions: offsets −1, 0 and +1 from the slot centre.
+- Fields go in declaration order. A word field takes a whole fresh slot, at offset `3j`.
+- Tryte fields fill the next free positions. A tryte array can run across slots.
+- The struct's size is a whole number of slots.
+
+```
+struct Entry { tag: tryte; name: [4]tryte; id: int; }
+
+slot:      0             1             2
+offset:   -1   0  +1  |  2   3   4  |  5   6   7
+field:    tag n0  n1  | n2  n3  pad | id id  id      sizeof = 9, id at offset 6
+```
+
+- `p + n` on a `*T` advances by `n · sizeof(T)` trytes.
+- `&arr[i]` = `&arr[0] + i · sizeof(T)`.
+- `bytes(p)` gives the first tryte of a word-addressed object (`p − 1` as `*tryte`), for code that copies memory tryte by tryte.
+- This is the one place where centre addressing shows through. Everywhere else, pointers just work.
+
+## 5. Declarations
+
+The declaration syntax is **name first**, in the style of Go and Rust rather than C. It is easier to read and to parse: `*[4]int` is a pointer to an array, and `[4]*int` is an array of pointers. **⚠ REVIEW**
+
+```
+var count: int = 0;                  // global or local variable
+var buf: [80]char;                   // zero-initialised
+const WIDTH: int = 640;              // compile-time constant (no storage)
+const GREETING: *tryte = "Hello";
+
+struct Point { x: int; y: int; }
+var origin: Point = { 0, 0 };
+
+fn add(a: int, b: int) -> int { return a + b; }
+fn reset() { ... }                   // no `->` means void
+
+extern fn puts(s: *tryte);           // defined in assembly or elsewhere
+extern var ticks: int;
+```
+
+- **Locals** may be declared anywhere in a block. Their scope runs from the declaration to the end of the block. An uninitialised local has an unspecified value; an uninitialised global is zero.
+- **Initialisers:** `{ … }` for arrays and structs, and string literals for `[N]char`.
+- **Placement attributes** (for the BIOS and kernel):
+  - `@align(729) var itb: [243]int;` aligns a global.
+  - `@at(-1604164) var fb: [307200]tryte;` places a global at a fixed address without allocating it (memory-mapped devices).
+
+## 6. Expressions
+
+Precedence, from highest to lowest:
+
+| Level | Operators | Notes |
+|---|---|---|
+| 1 | `f(x)` `a[i]` `s.f` `p.f` | `.` looks through pointers automatically, so there is no `->` |
+| 2 | `-x` `~x` `!x` `*p` `&x` `x as T` `sizeof(T)` | `~` is tritwise NOT, which in balanced ternary **equals `-x`** |
+| 3 | `*` `/` `%` | `/` truncates toward zero and `%` has the sign of the dividend (C rules). `divr`/`modr` round (§8). |
+| 4 | `+` `-` | pointer ± integer scales by sizeof |
+| 5 | `<<` `>>` | shift by **trits**: `x << n` = x·3^n; `x >> n` drops n trits, **rounding to nearest** |
+| 6 | `&` | tritwise **minimum** (ternary AND) |
+| 7 | `\|` | tritwise **maximum** (ternary OR) |
+| 8 | `<=>` | **three-way compare**: a `trit`, −1 / 0 / +1. Exact, never fooled by overflow. |
+| 9 | `<` `<=` `>` `>=` | `int` 1 or 0 |
+| 10 | `==` `!=` | `int` 1 or 0 |
+| 11 | `&&` | short-circuit |
+| 12 | `\|\|` | short-circuit |
+| 13 | `c ? a : b` | |
+| 14 | `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `\|=` | assignment is an expression, right-associative |
+
+**Evaluation order:** operands left to right, and function arguments left to right.
+
+There is **no binary `^`**. Ternary has no single "exclusive or", so the tritwise product, threshold add and consensus are builtins (§8).
+
+## 7. Statements
+
+```
+if (x > 0) { ... } else if (x == 0) { ... } else { ... }
+while (n > 0) { n -= 1; }
+for (var i: int = 0; i < 10; i += 1) { ... }
+loop { ... if (done) break; }        // endless loop
+break; continue; return e;
+
+sign (a <=> b) {                     // three-way branch: a single CMP + BR3
+    neg:  lesser();
+    zero: same();
+    pos:  greater();
+}
+
+switch (c) {                         // no fall-through; `case` takes constants
+    case 'a', 'b': vowel_like();
+    case 10: newline();
+    default: other();
+}
+
+asm { "hlt" }                        // inline assembly, §9
+```
+
+`sign (e)` takes any integer expression and branches on its sign. With `e = a <=> b`, or `e = a - b` when it cannot overflow, it compiles to one `CMP` and one `BR3`, the Setun's native three-way jump. Every arm is optional.
+
+## 8. Builtins
+
+These are not functions: each compiles to one instruction or a few.
+
+| Builtin | Meaning | Instruction |
+|---|---|---|
+| `sgn(x)` `abs(x)` | sign, absolute value | `SGN`, `ABS` |
+| `divr(a, b)` `modr(a, b)` | rounding division, balanced remainder | `DIVR`, `MODR` |
+| `tmul(a, b)` `tsat(a, b)` `cons(a, b)` | tritwise product / threshold add / consensus | `TMUL`, `TSAT`, `CONS` |
+| `trit(x, i)` | trit `i` (1 = most significant … 27) | `TRIT` |
+| `ext(x, pos, len)` `ins(x, v, pos, len)` | read / write a trit field (constant `pos`, `len`) | `EXT`, `INS` |
+| `tlz(x)` | leading zero trits | `TLZ` |
+| `mulh(a, b)` | high word of the 54-trit product | `MULH` |
+| `ovf()` | carry trit after the last `+ - *` | `BOV`/`BNOV` |
+| `bytes(p)` | first tryte of a word-addressed object | `SUB 1` |
+| `in(port)` `out(port, v)` | port I/O | `IN`, `OUT` |
+| `mfc(REG)` `mtc(REG, v)` | control registers (`MODE`, `PTB`, `ITB`, …) | `MFC`, `MTC` |
+| `hlt()` `brk()` `tlbflush()` `tlbinv(a)` `fence()` | system | as named |
+| `syscall(n, …)` | trap to the kernel, arguments in r1–r6 | `SYS n` |
+
+## 9. Low-level features
+
+**Interrupt and trap handlers:**
+
+```
+interrupt fn on_timer() {
+    ticks += 1;
+    out(TPIC_EOI, in(TPIC_CLAIM));
+}
+```
+
+An `interrupt fn` takes no arguments. The compiler saves every register the handler uses, including `lr`, and ends with `IRET` instead of `RET`. The handler's address is `&on_timer`, ready to store in the vector table:
+
+```
+@align(729) var itb: [243]int;
+itb[121 + 1] = &on_timer as int;     // vector +1 = IRQ 0; the table is centred
+mtc(ITB, &itb[121] as int);
+```
+
+**Inline assembly:** `asm { "line1" "line2" }`. The strings are pasted into the output verbatim. Trine locals are not visible inside; pass values in globals, or use a small `extern fn` written in assembly.
+
+**Entry point:** `fn main()`. A startup file, `crt0.s`, sets `sp`, sets up a fault vector and calls `main`. For a ROM, the compiler places the code with `--org` and puts `crt0` at the reset vector.
+
+## 10. Modules
+
+```
+import "console.tri";
+```
+
+`import` includes a file once, textually (a second import of the same file does nothing), and the whole program compiles as one unit. Symbol names are global. A module keeps a name private by prefixing it with `_`, which hides it from other files. **⚠ REVIEW**
+
+## 11. Calling convention (ABI)
+
+| | |
+|---|---|
+| Arguments | `r1`–`r6`, left to right; more are pushed on the stack, the last one first |
+| Return value | `r1` |
+| Caller-saved | `r1`–`r10`, `r-10`–`r-13` |
+| Callee-saved | `r-1`–`r-9`, `r11` (`fp`), `r13` (`sp`) |
+| Return address | `r12` (`lr`), set by `CALL`/`JAL` |
+| Stack | grows toward negative addresses, always word-aligned |
+| Frame | `fp` points at the saved `fp`; locals sit below it |
+
+Structs and arrays are passed as pointers. This is the same convention as the ISA's suggested ABI, so assembly and Trine can call each other.
+
+## 12. Standard library (v1, small)
+
+| Module | Contents |
+|---|---|
+| `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal, and base 27 via `itoa27`) |
+| `console.tri` | serial `putc`/`puts`/`getc`; a text-mode screen writer with cursor, colours and scrolling |
+| `ports.tri` | named constants for every device register in ISA §8 |
+| `crt0.s` | startup code |
+
+## 13. Examples
+
+**Hello, serial:**
+
+```
+import "ports.tri";
+
+fn putc(c: char) {
+    while (in(SERIAL_TX_READY) <= 0) {}
+    out(SERIAL_DATA, c);
+}
+
+fn puts(s: *char) {
+    while (*s != 0) { putc(*s); s = s + 1; }
+}
+
+fn main() {
+    puts("Привет, Setun!\n");
+}
+```
+
+**Three-way search:**
+
+```
+fn find(a: *int, n: int, key: int) -> int {
+    var lo: int = 0;
+    var hi: int = n - 1;
+    while (lo <= hi) {
+        var mid: int = (lo + hi) / 2;
+        sign (a[mid] <=> key) {
+            neg:  lo = mid + 1;
+            zero: return mid;
+            pos:  hi = mid - 1;
+        }
+    }
+    return -1;
+}
+```
+
+**Pixels (27 levels per channel):**
+
+```
+const FB: *tryte = -1604164 as *tryte;
+
+fn rgb(r: int, g: int, b: int) -> tryte {       // each −13..13
+    return (r * 729 + g * 27 + b) as tryte;
+}
+
+fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
+```
+
+## 14. Review points
+
+1. **The name "Trine"** and the `.tri` extension.
+2. **Name-first declarations** (`var x: int`, `fn f(a: int) -> int`, `*[4]int`) instead of C's declarator syntax.
+3. **Addresses and layout (§4):** a pointer is the hardware address, so word objects are addressed by their centre; structs are laid out in word slots; `bytes(p)` gives a tryte view.
+4. **Operators:** `&` and `|` are tritwise min and max, there is no `^`, `~x == -x`, shifts count trits with `>>` rounding, and `<=>` returns a trit.
+5. **The `sign` statement** as the language's 3-way branch.
+6. **C division semantics** for `/` and `%`, with rounding division available through builtins.
+7. **One compilation unit** with textual `import`, and `_` for private names.
+8. **No optimiser in v1**, so every memory access happens as written and there is no `volatile`.
+9. **What v1 leaves out:** floats, `long`, struct values, varargs, generics and macros.
+
+## Appendix: grammar (EBNF)
+
+```
+program     = { import | decl } ;
+import      = "import" STRING ";" ;
+decl        = [ attr ] ( var | const | struct | func | extern ) ;
+attr        = "@align" "(" expr ")" | "@at" "(" expr ")" ;
+var         = "var" IDENT ":" type [ "=" init ] ";" ;
+const       = "const" IDENT ":" type "=" expr ";" ;
+struct      = "struct" IDENT "{" { IDENT ":" type ";" } "}" ;
+func        = [ "interrupt" ] "fn" IDENT "(" [ param { "," param } ] ")" [ "->" type ] block ;
+extern      = "extern" ( "fn" IDENT "(" [ param { "," param } ] ")" [ "->" type ]
+                       | "var" IDENT ":" type ) ";" ;
+param       = IDENT ":" type ;
+type        = "int" | "tryte" | "char" | "trit" | "void" | IDENT
+            | "*" type | "[" expr "]" type | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
+init        = expr | "{" [ init { "," init } ] "}" ;
+block       = "{" { stmt } "}" ;
+stmt        = var | block | "if" "(" expr ")" stmt [ "else" stmt ]
+            | "while" "(" expr ")" stmt | "loop" stmt
+            | "for" "(" [ var | expr ";" ] [ expr ] ";" [ expr ] ")" stmt
+            | "sign" "(" expr ")" "{" { ( "neg" | "zero" | "pos" ) ":" { stmt } } "}"
+            | "switch" "(" expr ")" "{" { ( "case" expr { "," expr } | "default" ) ":" { stmt } } "}"
+            | "break" ";" | "continue" ";" | "return" [ expr ] ";"
+            | "asm" "{" { STRING } "}" | expr ";" ;
+expr        = assignment ;   (* precedence as in §6 *)
+```

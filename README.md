@@ -20,6 +20,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 ## Docs
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
+- [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (draft, under review)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 

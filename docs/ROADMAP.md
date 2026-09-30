@@ -19,7 +19,7 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
    - tests ✅: 20 CPU/MMU tests and 13 device tests (timer-interrupt program, ROM boot, DMA)
 4. **Front ends** ✅: native (`setun`: minifb window, stdio serial, headless PNG screenshots) and **WASM** (`web/`: canvas, keyboard/mouse, serial console, front-panel lamps)
 5. **Assembler and disassembler** ✅: text syntax with form selection and branch relaxation, round-trip-safe disassembler, `setun-asm` CLI; the demo ROM is now `demo.s`
-6. **Compiler**: a small C-like language → Setun-386 assembly (`char` = tryte = a Unicode character, `int` = pointer = word, no `unsigned`)
+6. **Compiler** for **Trine**, the C-like language: spec [`LANGUAGE.md`](LANGUAGE.md) 🟡 draft, under review
 7. **BIOS**: vectors, RAM size, text console, disk boot sector
 8. **Kernel**: paging, processes and a scheduler, syscalls, drivers in ring 0, a disk file system
 9. **Window system**: framebuffer compositor, mouse cursor, windows, a terminal app
