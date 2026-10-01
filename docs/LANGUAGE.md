@@ -1,7 +1,7 @@
 # Trine: a C-like language for Setun-386
 
-**Status: DRAFT v0.1, under design review. Nothing is implemented yet.**
-Items marked **⚠ REVIEW** are open choices. §14 lists them.
+**Status: v0.2, implemented by the v1 compiler (`crates/trine`, binary `trine`).**
+§14 records the design decisions; §15 lists the changes from v0.1.
 
 Trine is the systems language for Setun-386: the language of the BIOS,
 kernel, drivers, window system and applications. It is a small language in
@@ -31,7 +31,8 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - `0zMMm` (base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13)
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \0 \\ \' \"`.
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
-- **Keywords:** `fn var const struct return if else while for loop break continue sign neg zero pos switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
+- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
+- `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.
 
 ## 3. Types
 
@@ -52,7 +53,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - Narrowing keeps the low trits: `x as tryte` is `x` wrapped to 9 trits, and `x as trit` is its lowest trit. This is balanced wrapping, so `9842 as tryte` = −9841.
   - Use `sgn(x)` for the sign.
   - `as` also converts between pointer types, and between pointers and `int`.
-- **Overflow wraps** modulo 3^27 (balanced) and is never undefined. `ovf()` reads the carry trit after `+`, `-` or `*` (§8).
+- **Overflow wraps** modulo 3^27 (balanced) and is never undefined.
 
 ## 4. Memory layout and addresses ⚠ REVIEW
 
@@ -118,7 +119,7 @@ Precedence, from highest to lowest:
 | Level | Operators | Notes |
 |---|---|---|
 | 1 | `f(x)` `a[i]` `s.f` `p.f` | `.` looks through pointers automatically, so there is no `->` |
-| 2 | `-x` `~x` `!x` `*p` `&x` `x as T` `sizeof(T)` | `~` is tritwise NOT, which in balanced ternary **equals `-x`** |
+| 2 | `-x` `~x` `!x` `*p` `&x` `sizeof(T)`, then `x as T` | `~` is tritwise NOT, which in balanced ternary **equals `-x`**. `as` applies after prefix operators: `&x as int` is `(&x) as int`. |
 | 3 | `*` `/` `%` | `/` truncates toward zero and `%` has the sign of the dividend (C rules). `divr`/`modr` round (§8). |
 | 4 | `+` `-` | pointer ± integer scales by sizeof |
 | 5 | `<<` `>>` | shift by **trits**: `x << n` = x·3^n; `x >> n` drops n trits, **rounding to nearest** |
@@ -175,7 +176,6 @@ These are not functions: each compiles to one instruction or a few.
 | `ext(x, pos, len)` `ins(x, v, pos, len)` | read / write a trit field (constant `pos`, `len`) | `EXT`, `INS` |
 | `tlz(x)` | leading zero trits | `TLZ` |
 | `mulh(a, b)` | high word of the 54-trit product | `MULH` |
-| `ovf()` | carry trit after the last `+ - *` | `BOV`/`BNOV` |
 | `bytes(p)` | first tryte of a word-addressed object | `SUB 1` |
 | `in(port)` `out(port, v)` | port I/O | `IN`, `OUT` |
 | `mfc(REG)` `mtc(REG, v)` | control registers (`MODE`, `PTB`, `ITB`, …) | `MFC`, `MTC` |
@@ -203,7 +203,16 @@ mtc(ITB, &itb[121] as int);
 
 **Inline assembly:** `asm { "line1" "line2" }`. The strings are pasted into the output verbatim. Trine locals are not visible inside; pass values in globals, or use a small `extern fn` written in assembly.
 
-**Entry point:** `fn main()`. A startup file, `crt0.s`, sets `sp`, sets up a fault vector and calls `main`. For a ROM, the compiler places the code with `--org` and puts `crt0` at the reset vector.
+**Entry point:** `fn main()`. The compiler generates startup code (`crt0`) at the reset vector. In order, it:
+1. sets `sp`;
+2. installs a vector table that reports CPU faults;
+3. zeroes the globals;
+4. runs the global initialisers;
+5. calls `main`.
+
+When `main` returns, its value goes to `SYSCTL.DEBUG` and the machine powers off. `trine run` reads that value back as the program's exit code.
+
+**Where things live:** code and string literals in ROM; globals in RAM (by default from address 9843 upward, with the stack below them). Global initialisers run as generated code at start-up, so ROM programs get ordinary writable globals.
 
 ## 10. Modules
 
@@ -234,7 +243,7 @@ Structs and arrays are passed as pointers. This is the same convention as the IS
 | `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal, and base 27 via `itoa27`) |
 | `console.tri` | serial `putc`/`puts`/`getc`; a text-mode screen writer with cursor, colours and scrolling |
 | `ports.tri` | named constants for every device register in ISA §8 |
-| `crt0.s` | startup code |
+| (generated) | startup code, see §9 |
 
 ## 13. Examples
 
@@ -287,7 +296,7 @@ fn rgb(r: int, g: int, b: int) -> tryte {       // each −13..13
 fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 ```
 
-## 14. Review points
+## 14. Design decisions (accepted 2026-09-30)
 
 1. **The name "Trine"** and the `.tri` extension.
 2. **Name-first declarations** (`var x: int`, `fn f(a: int) -> int`, `*[4]int`) instead of C's declarator syntax.
@@ -298,6 +307,14 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 7. **One compilation unit** with textual `import`, and `_` for private names.
 8. **No optimiser in v1**, so every memory access happens as written and there is no `volatile`.
 9. **What v1 leaves out:** floats, `long`, struct values, varargs, generics and macros.
+
+## 15. Changes from v0.1
+
+- **`ovf()` was removed.** Address arithmetic in the generated code overwrites the carry trit, so the builtin could not be reliable. It may return with an optimising compiler.
+- **`neg`, `zero` and `pos` became contextual** instead of keywords, so they stay usable as variable names.
+- **`as` binds after prefix operators.**
+- **Globals live in RAM** and are filled in by generated start-up code (§9).
+- **Compound assignment narrows implicitly:** `t += 1` on a `tryte` wraps, while `t = t + 1` still needs `as tryte`.
 
 ## Appendix: grammar (EBNF)
 

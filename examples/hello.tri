@@ -1,0 +1,25 @@
+// Hello on the serial console and the text screen.
+//
+//   trine run examples/hello.tri
+//   trine build examples/hello.tri -o hello.t1b2 && setun --rom hello.t1b2
+
+import "console.tri";
+
+fn main() -> int {
+    screen_clear();
+    print("Привет, Setun-386!\n");
+    print("A tryte holds 3^9 = ");
+    print_int(3 * 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3);
+    print(" values; a word holds 3^27.\n");
+
+    var cmp: trit = 2 <=> 3;
+    print("2 <=> 3 = ");
+    print_int(cmp);
+    print("\n");
+
+    var buf: [10]char;
+    print("9841 in base 27: ");
+    print(itoa27(9841, &buf[0]));
+    print("\n");
+    return 0;
+}

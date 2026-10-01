@@ -20,7 +20,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 ## Docs
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
-- [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (draft, under review)
+- [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 
@@ -34,6 +34,8 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
 | `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio |
 | `crates/web` + `web/` | browser front end: WebAssembly exports and the front-panel page |
+| `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
+| `examples/` | Trine programs, e.g. `mandel.tri` |
 
 ## Build and run
 
@@ -41,6 +43,9 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 cargo test
 cargo run --release -p setun-native            # window with the demo ROM
 cargo run --release -p setun-native -- --help  # options: --rom, --disk, --ram, --mips, --headless, --screenshot
+cargo run --release -p trine -- run examples/hello.tri        # compile + run headless
+cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
+cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 sh web/build.sh                                # rebuild web/setun.wasm
 python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```

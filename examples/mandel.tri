@@ -1,0 +1,51 @@
+// The Mandelbrot set in 3^9 colours, in fixed point (no floats on Setun-386).
+//
+//   trine build examples/mandel.tri -o mandel.t1b2
+//   setun --rom mandel.t1b2
+
+import "ports.tri";
+
+const W: int = 640;
+const H: int = 480;
+const ONE: int = 19683;          // fixed-point 1.0 = 3^9
+const MAX_ITER: int = 27;        // 3^3
+
+// Pixel colour: three base-27 digits R, G, B, each -13..13.
+fn rgb(r: int, g: int, b: int) -> tryte {
+    return (r * 729 + g * 27 + b) as tryte;
+}
+
+fn colour(n: int) -> tryte {
+    if (n == MAX_ITER) { return rgb(-13, -13, -13); }    // inside: black
+    var t: int = n * 26 / MAX_ITER;                      // 0..25
+    return rgb(t - 13, 13 - abs(2 * t - 26), 13 - t);
+}
+
+fn main() -> int {
+    out(DISPLAY_MODE, 0);                                // 640x480 graphics
+    var fb: *tryte = FB_BASE as *tryte;
+    var y: int = 0;
+    while (y < H) {
+        var ci: int = (y - H / 2) * (ONE * 12 / 5) / H;   // -1.2 .. 1.2
+        var x: int = 0;
+        while (x < W) {
+            var cr: int = (x - W * 11 / 15) * (ONE * 3) / W;   // -2.2 .. 0.8
+            var zr: int = 0;
+            var zi: int = 0;
+            var n: int = 0;
+            while (n < MAX_ITER) {
+                var zr2: int = zr * zr / ONE;
+                var zi2: int = zi * zi / ONE;
+                if (zr2 + zi2 > 4 * ONE) { break; }
+                zi = 2 * zr * zi / ONE + ci;
+                zr = zr2 - zi2 + cr;
+                n += 1;
+            }
+            fb[y * W + x] = colour(n);
+            x += 1;
+        }
+        y += 1;
+    }
+    loop { hlt(); }                                       // keep the picture up
+    return 0;
+}
