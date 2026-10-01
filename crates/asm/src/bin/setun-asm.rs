@@ -37,7 +37,7 @@ fn write_t1b2(path: &Path, trytes: &[i16]) {
 
 fn read_t1b2(path: &Path) -> Vec<i16> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         fail(format!("{}: odd length, not a T1B2 image", path.display()));
     }
     bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()

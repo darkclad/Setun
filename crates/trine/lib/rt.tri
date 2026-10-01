@@ -1,0 +1,61 @@
+// Runtime: memory and string routines.
+
+fn memset(p: *tryte, value: tryte, n: int) {
+    var i: int = 0;
+    while (i < n) { p[i] = value; i += 1; }
+}
+
+fn memcpy(dst: *tryte, src: *tryte, n: int) {
+    var i: int = 0;
+    while (i < n) { dst[i] = src[i]; i += 1; }
+}
+
+fn strlen(s: *char) -> int {
+    var n: int = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+// Three-way string comparison: -1, 0 or +1.
+fn strcmp(a: *char, b: *char) -> trit {
+    var i: int = 0;
+    loop {
+        var c: trit = a[i] <=> b[i];
+        if (c != 0 || a[i] == 0) { return c; }
+        i += 1;
+    }
+}
+
+// Decimal text of `v` into `buf` (at least 15 trytes); returns `buf`.
+fn itoa(v: int, buf: *char) -> *char {
+    var tmp: [15]char;
+    var n: int = 0;
+    var neg: int = v < 0;
+    if (neg) { v = -v; }
+    loop {
+        tmp[n] = ('0' + v % 10) as char;
+        n += 1;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    var j: int = 0;
+    if (neg) { buf[0] = '-'; j = 1; }
+    while (n > 0) { n -= 1; buf[j] = tmp[n]; j += 1; }
+    buf[j] = 0;
+    return buf;
+}
+
+// Base-27 text of `v` (9 digits: 0, A-M = +1..+13, a-m = -1..-13).
+fn itoa27(v: int, buf: *char) -> *char {
+    var i: int = 8;
+    while (i >= 0) {
+        var d: int = modr(v, 27);
+        v = divr(v, 27);
+        if (d > 0) { buf[i] = ('A' + d - 1) as char; }
+        else if (d < 0) { buf[i] = ('a' - d - 1) as char; }
+        else { buf[i] = '0'; }
+        i -= 1;
+    }
+    buf[9] = 0;
+    return buf;
+}

@@ -399,6 +399,7 @@ enum Kind {
     Str(String),
     Zero(Expr),
     Fill(Expr, Expr),
+    Align(Expr),
     Inst { m: String, long: bool, ops: Vec<Operand> },
 }
 
@@ -456,6 +457,7 @@ fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
             ".tryte" => Kind::Trytes(exprs(&ops)?),
             ".string" => Kind::Str(parse_string(rest).map_err(e)?),
             ".zero" => Kind::Zero(one(&exprs(&ops)?, line)?),
+            ".align" => Kind::Align(one(&exprs(&ops)?, line)?),
             ".fill" => match exprs(&ops)?.as_slice() {
                 [n, v] => Kind::Fill(n.clone(), v.clone()),
                 _ => return err(line, ".fill COUNT, VALUE"),
@@ -808,6 +810,13 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                 Kind::Words(v) => v.len(),
                 Kind::Trytes(v) => v.len().div_ceil(3),
                 Kind::Str(t) => (t.chars().count() + 1).div_ceil(3),
+                Kind::Align(e) => {
+                    let n = e.constant(&consts).ok_or_else(|| Error { line: s.line, msg: ".align needs a constant".into() })?;
+                    if n <= 0 || n % 3 != 0 {
+                        return err(s.line, format!(".align {n}: must be a positive multiple of 3"));
+                    }
+                    ((n - at.rem_euclid(n)) % n / 3) as usize
+                }
                 Kind::Zero(e) | Kind::Fill(e, _) => {
                     let n = e.constant(&consts).ok_or_else(|| Error { line: s.line, msg: "count needs a constant".into() })?;
                     if n < 0 {
@@ -865,7 +874,7 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                     t.push(0);
                     pack_trytes(&t)
                 }
-                Kind::Zero(_) => vec![Word::ZERO; sizes[i]],
+                Kind::Zero(_) | Kind::Align(_) => vec![Word::ZERO; sizes[i]],
                 Kind::Fill(_, v) => {
                     let x = env.val(v)?;
                     let w = Word::new(x).ok_or_else(|| Error { line: s.line, msg: format!("word {x} out of range") })?;
@@ -880,6 +889,9 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                     }
                 },
             };
+            if words.is_empty() {
+                continue;
+            }
             if segments.is_empty() {
                 segments.push(Segment { origin: 0, words: Vec::new() });
             }

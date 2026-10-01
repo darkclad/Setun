@@ -1,0 +1,16 @@
+[package]
+name = "trine"
+description = "Compiler for Trine, the C-like systems language of Setun-386"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "trine"
+path = "src/main.rs"
+
+[dependencies]
+setun-asm = { path = "../asm" }
+setun-core = { path = "../core" }
+ternary = { path = "../ternary" }

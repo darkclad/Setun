@@ -1,0 +1,84 @@
+// Setun-386 device registers (ISA §8). Port = 27·block + register.
+
+// SYSCTL (block 0)
+const SYSCTL_SYSID: int = 0;
+const SYSCTL_RAM_FRAMES: int = 1;
+const SYSCTL_POWER: int = 2;          // write +1 reset, -1 power off
+const SYSCTL_DEBUG: int = 3;
+
+// Interrupt controller (block 1)
+const TPIC_VECBASE: int = 27;
+const TPIC_CLAIM: int = 28;
+const TPIC_EOI: int = 29;
+const TPIC_UNMASK: int = 30;
+const TPIC_MASK: int = 31;
+const TPIC_SELECT: int = 32;
+const TPIC_STATE: int = 33;
+
+// Interval timer (block 2), microseconds
+const TIMER_CTRL: int = 54;           // -1 one-shot, 0 stop, +1 periodic
+const TIMER_PERIOD: int = 55;
+const TIMER_COUNT: int = 56;
+const TIMER_UPTIME: int = 57;
+
+// Real-time clock (block 3)
+const RTC_SECONDS: int = 81;
+const RTC_MICROS: int = 82;
+const RTC_ALARM: int = 83;
+
+// Keyboard (block 4): +code press, -code release (USB HID usages)
+const KBD_DATA: int = 108;
+const KBD_COUNT: int = 109;
+const KBD_CTRL: int = 110;
+const KBD_LEDS: int = 111;
+
+// Mouse (block 5)
+const MOUSE_DX: int = 135;
+const MOUSE_DY: int = 136;
+const MOUSE_BUTTONS: int = 137;       // L + 3*M + 9*R
+const MOUSE_WHEEL: int = 138;
+const MOUSE_CTRL: int = 139;
+const MOUSE_X: int = 140;
+const MOUSE_Y: int = 141;
+
+// Serial console (block 6)
+const SERIAL_DATA: int = 162;
+const SERIAL_RX_COUNT: int = 163;
+const SERIAL_TX_READY: int = 164;
+const SERIAL_CTRL: int = 165;
+
+// Disk 0 (block 7); disk 1 = +27
+const DISK_CMD: int = 189;            // -1 read, +1 write, 0 flush
+const DISK_STATUS: int = 190;         // -1 error, 0 idle, +1 busy
+const DISK_LBA: int = 191;
+const DISK_COUNT: int = 192;
+const DISK_DMA: int = 193;
+const DISK_SECTORS: int = 194;
+const DISK_ERROR: int = 195;
+const DISK_CTRL: int = 196;
+
+// Display (block 9)
+const DISPLAY_MODE: int = 243;        // -1 text 80x30, 0 = 640x480, +1 = 800x600
+const DISPLAY_FB_BASE: int = 244;
+const DISPLAY_WIDTH: int = 245;
+const DISPLAY_HEIGHT: int = 246;
+const DISPLAY_PITCH: int = 247;
+const DISPLAY_FRAME: int = 248;
+const DISPLAY_CTRL: int = 249;
+const DISPLAY_CURSOR: int = 250;
+const DISPLAY_HWC_X: int = 251;
+const DISPLAY_HWC_Y: int = 252;
+const DISPLAY_HWC_ON: int = 253;
+
+// IRQ lines (vector = IRQ + 1)
+const IRQ_TIMER: int = 0;
+const IRQ_KEYBOARD: int = 1;
+const IRQ_MOUSE: int = 2;
+const IRQ_SERIAL: int = 3;
+const IRQ_DISK0: int = 4;
+const IRQ_RTC: int = 5;
+const IRQ_DISPLAY: int = 6;
+
+// Memory
+const FB_BASE: int = -1604164;        // first framebuffer tryte
+const PAGE: int = 19683;              // 3^9 trytes

@@ -1,0 +1,103 @@
+// Console output: the serial port and the 80x30 text screen.
+
+import "ports.tri";
+import "rt.tri";
+
+// ---- serial ----------------------------------------------------------------
+
+fn putc(c: char) {
+    while (in(SERIAL_TX_READY) <= 0) {}
+    out(SERIAL_DATA, c);
+}
+
+fn puts(s: *char) {
+    while (*s != 0) { putc(*s); s = s + 1; }
+}
+
+fn put_int(v: int) {
+    var buf: [15]char;
+    puts(itoa(v, &buf[0]));
+}
+
+// Next character from the serial console, or 0 if none is waiting.
+fn getc() -> char {
+    if (in(SERIAL_RX_COUNT) > 0) { return in(SERIAL_DATA) as char; }
+    return 0;
+}
+
+// ---- text screen -------------------------------------------------------------
+
+const COLS: int = 80;
+const ROWS: int = 30;
+
+// Attribute tryte: foreground R G B, background R G B, style (one trit each).
+fn attr(fr: trit, fg: trit, fb: trit, br: trit, bg: trit, bb: trit) -> tryte {
+    return (fr * 2187 + fg * 729 + fb * 243 + br * 81 + bg * 27 + bb * 9) as tryte;
+}
+
+var screen_row: int = 0;
+var screen_col: int = 0;
+var screen_attr: tryte = 0t+++---000;     // white on black
+
+fn cell(i: int) -> *tryte { return (FB_BASE + 3 * i) as *tryte; }
+
+fn screen_clear() {
+    out(DISPLAY_MODE, -1);
+    var i: int = 0;
+    while (i < COLS * ROWS) {
+        var c: *tryte = cell(i);
+        c[0] = ' ';
+        c[1] = screen_attr;
+        i += 1;
+    }
+    screen_row = 0;
+    screen_col = 0;
+    out(DISPLAY_CURSOR, 0);
+}
+
+fn screen_scroll() {
+    var i: int = 0;
+    while (i < COLS * (ROWS - 1)) {
+        var d: *tryte = cell(i);
+        var s: *tryte = cell(i + COLS);
+        d[0] = s[0];
+        d[1] = s[1];
+        i += 1;
+    }
+    while (i < COLS * ROWS) {
+        var c: *tryte = cell(i);
+        c[0] = ' ';
+        c[1] = screen_attr;
+        i += 1;
+    }
+}
+
+fn screen_putc(c: char) {
+    if (c == '\n') {
+        screen_col = 0;
+        screen_row += 1;
+    } else {
+        var p: *tryte = cell(screen_row * COLS + screen_col);
+        p[0] = c;
+        p[1] = screen_attr;
+        screen_col += 1;
+        if (screen_col == COLS) { screen_col = 0; screen_row += 1; }
+    }
+    if (screen_row == ROWS) { screen_scroll(); screen_row = ROWS - 1; }
+    out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+}
+
+fn screen_puts(s: *char) {
+    while (*s != 0) { screen_putc(*s); s = s + 1; }
+}
+
+// Print to both the serial console and the screen.
+fn print(s: *char) {
+    puts(s);
+    screen_puts(s);
+}
+
+fn print_int(v: int) {
+    var buf: [15]char;
+    print(itoa(v, &buf[0]));
+}
