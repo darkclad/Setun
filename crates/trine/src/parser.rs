@@ -202,6 +202,7 @@ impl Parser {
     fn ty(&mut self) -> R<TypeExpr> {
         let t = match self.next() {
             Tok::Kw("int") => TypeExpr::Int,
+            Tok::Kw("real") => TypeExpr::Real,
             Tok::Kw("tryte") | Tok::Kw("char") => TypeExpr::Tryte,
             Tok::Kw("trit") => TypeExpr::Trit,
             Tok::Kw("void") => TypeExpr::Void,
@@ -515,6 +516,7 @@ impl Parser {
         let pos = self.pos();
         let kind = match self.next() {
             Tok::Int(v) => ExprKind::Int(v),
+            Tok::Real(s) => ExprKind::Real(s),
             Tok::Char(v) => ExprKind::Char(v),
             Tok::Str(s) => ExprKind::Str(s),
             Tok::Kw("true") => ExprKind::Int(1),
@@ -546,6 +548,7 @@ impl Parser {
 fn describe(t: &Tok) -> String {
     match t {
         Tok::Int(v) => format!("number {v}"),
+        Tok::Real(s) => format!("number {s}"),
         Tok::Char(_) => "a character literal".into(),
         Tok::Str(_) => "a string".into(),
         Tok::Ident(s) => format!("`{s}`"),

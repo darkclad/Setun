@@ -5,6 +5,8 @@ use crate::lexer::Pos;
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     Int,
+    /// The Setun-387 real81.
+    Real,
     Tryte,
     Trit,
     Void,
@@ -53,6 +55,8 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
+    /// A decimal real literal.
+    Real(String),
     Char(i64),
     Str(String),
     Null,

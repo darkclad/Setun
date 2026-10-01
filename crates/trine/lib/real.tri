@@ -1,0 +1,138 @@
+// real.tri: decimal text for the Setun-387's `real` (real81).
+//
+//   rtoa(x, digits, buf)  x as decimal text with up to `digits` significant
+//                         digits (1..12), like C's %g: "3.14159", "1e+100",
+//                         "-0.001", "inf", "nan"; buf holds 24 trytes
+//   strtor(s, end)        parse decimal text ([-]d[.d][e[-]d]); *end is set
+//                         to the first character not used (if end is not null)
+//   atof(s)               strtor(s, null)
+//   pow10(k)              10^k for any integer k
+//   floor(x), ceil(x)     rounded down / up to an integer
+
+fn pow10(k: int) -> real {
+    var r: real = 1.0;
+    var b: real = 10.0;
+    var n: int = k < 0 ? -k : k;
+    while (n > 0) {
+        if (n % 2 == 1) { r = r * b; }
+        n = n / 2;
+        if (n > 0) { b = b * b; }
+    }
+    return k < 0 ? 1.0 / r : r;
+}
+
+fn floor(x: real) -> real {
+    var t: real = trunc(x);
+    return t > x ? t - 1 : t;
+}
+
+fn ceil(x: real) -> real {
+    var t: real = trunc(x);
+    return t < x ? t + 1 : t;
+}
+
+fn rtoa_put(buf: *char, at: int, s: *char) -> int {
+    var k: int = 0;
+    while (s[k] != 0) { buf[at] = s[k]; at += 1; k += 1; }
+    return at;
+}
+
+fn rtoa(x: real, digits: int, buf: *char) -> *char {
+    if (digits < 1) { digits = 1; }
+    if (digits > 12) { digits = 12; }
+    var c: int = fclass(x);
+    if (c == 4) { rtoa_put(buf, 0, "nan"); buf[3] = 0; return buf; }
+    if (c == 3 || c == -3) {
+        var n: int = rtoa_put(buf, 0, c < 0 ? "-inf" : "inf");
+        buf[n] = 0;
+        return buf;
+    }
+    if (c == 0) { buf[0] = '0'; buf[1] = 0; return buf; }
+    var at: int = 0;
+    if (x < 0) { buf[0] = '-'; at = 1; x = -x; }
+    // the decimal exponent: 10^e10 <= x < 10^(e10+1), first estimated from
+    // the ternary one (x = m·3^e3 with 1/6 < m <= 1/2)
+    var e3: int = exponent3(x);
+    var e10: int = divr(e3 * 47712 - 50000, 100000);
+    var y: real = x / pow10(e10);
+    while (y >= 10.0) { y = y / 10; e10 += 1; }
+    while (y < 1.0) { y = y * 10; e10 -= 1; }
+    // `digits` significant digits as an integer, rounded to nearest
+    var top: int = 1;
+    var k: int = 1;
+    while (k < digits) { top = top * 10; k += 1; }
+    var z: int = (y * top) as int;
+    if (z >= top * 10) { z = z / 10; e10 += 1; }
+    var d: [13]char;
+    k = digits;
+    while (k > 0) { k -= 1; d[k] = ('0' + z % 10) as char; z = z / 10; }
+    var nd: int = digits;
+    while (nd > 1 && d[nd - 1] == '0') { nd -= 1; }       // trailing zeros go
+    if (e10 >= -5 && e10 < 12) {
+        if (e10 < 0) {
+            buf[at] = '0'; buf[at + 1] = '.'; at += 2;
+            var z0: int = -e10 - 1;
+            while (z0 > 0) { buf[at] = '0'; at += 1; z0 -= 1; }
+            k = 0;
+            while (k < nd) { buf[at] = d[k]; at += 1; k += 1; }
+        } else {
+            k = 0;
+            while (k <= e10) { buf[at] = k < nd ? d[k] : '0'; at += 1; k += 1; }
+            if (nd > e10 + 1) {
+                buf[at] = '.'; at += 1;
+                while (k < nd) { buf[at] = d[k]; at += 1; k += 1; }
+            }
+        }
+    } else {
+        buf[at] = d[0]; at += 1;
+        if (nd > 1) {
+            buf[at] = '.'; at += 1;
+            k = 1;
+            while (k < nd) { buf[at] = d[k]; at += 1; k += 1; }
+        }
+        buf[at] = 'e'; at += 1;
+        if (e10 < 0) { buf[at] = '-'; at += 1; e10 = -e10; } else { buf[at] = '+'; at += 1; }
+        var eb: [6]char;
+        var ne: int = 0;
+        loop { eb[ne] = ('0' + e10 % 10) as char; ne += 1; e10 = e10 / 10; if (e10 == 0) { break; } }
+        while (ne > 0) { ne -= 1; buf[at] = eb[ne]; at += 1; }
+    }
+    buf[at] = 0;
+    return buf;
+}
+
+fn strtor(s: *char, end: **char) -> real {
+    var i: int = 0;
+    while (s[i] == ' ' || s[i] == '\t') { i += 1; }
+    var neg: int = 0;
+    if (s[i] == '-' || s[i] == '+') { neg = s[i] == '-'; i += 1; }
+    var v: real = 0.0;
+    var any: int = 0;
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i += 1; any = 1; }
+    var frac: int = 0;
+    if (s[i] == '.') {
+        i += 1;
+        while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i += 1; frac += 1; any = 1; }
+    }
+    if (!any) {
+        if (end != null) { *end = s; }
+        return 0.0;
+    }
+    var e: int = 0;
+    if (s[i] == 'e' || s[i] == 'E') {
+        var j: int = i + 1;
+        var eneg: int = 0;
+        if (s[j] == '-' || s[j] == '+') { eneg = s[j] == '-'; j += 1; }
+        if (s[j] >= '0' && s[j] <= '9') {
+            while (s[j] >= '0' && s[j] <= '9') { if (e < 100000) { e = e * 10 + (s[j] - '0'); } j += 1; }
+            if (eneg) { e = -e; }
+            i = j;
+        }
+    }
+    if (end != null) { *end = &s[i]; }
+    var k: int = e - frac;
+    v = k >= 0 ? v * pow10(k) : v / pow10(-k);
+    return neg ? -v : v;
+}
+
+fn atof(s: *char) -> real { return strtor(s, null); }

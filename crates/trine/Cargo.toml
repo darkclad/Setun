@@ -14,3 +14,4 @@ path = "src/main.rs"
 setun-asm = { path = "../asm" }
 setun-core = { path = "../core" }
 ternary = { path = "../ternary" }
+setun-real = { path = "../real" }

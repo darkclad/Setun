@@ -1,8 +1,9 @@
 //! Type checking and code generation: Trine AST → Setun-386 assembly text.
 //!
 //! Code generation is deliberately simple (v1): every expression leaves its
-//! value in `r1`; intermediate values live on the stack (`push`/`pop`), so
-//! nothing needs saving around calls. Locals sit in the frame below `fp`.
+//! value in `r1` (a `real` in `f1`); intermediate values live on the stack
+//! (`push`/`pop`, three words for a real), so nothing needs saving around
+//! calls. Locals sit in the frame below `fp`.
 //! Globals live in RAM at addresses the compiler assigns; their
 //! initialisers run as code in `_trine_init`.
 
@@ -17,6 +18,8 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Int,
+    /// The Setun-387 real81: three words, held in f registers.
+    Real,
     Tryte,
     Trit,
     Void,
@@ -36,6 +39,9 @@ impl Ty {
     }
     fn is_scalar(&self) -> bool {
         matches!(self, Ty::Int | Ty::Tryte | Ty::Trit | Ty::Ptr(_) | Ty::Fn(..) | Ty::Null)
+    }
+    fn is_real(&self) -> bool {
+        *self == Ty::Real
     }
     fn is_tryte_sized(&self) -> bool {
         matches!(self, Ty::Tryte | Ty::Trit)
@@ -65,6 +71,7 @@ impl fmt::Display for TyFmt<'_> {
         let s = self.1;
         match self.0 {
             Ty::Int => write!(f, "int"),
+            Ty::Real => write!(f, "real"),
             Ty::Tryte => write!(f, "tryte"),
             Ty::Trit => write!(f, "trit"),
             Ty::Void => write!(f, "void"),
@@ -92,6 +99,7 @@ impl fmt::Display for TyFmt<'_> {
 enum ConstVal {
     Int(i64),
     Str(String),
+    Real(setun_real::Real),
 }
 
 #[derive(Clone)]
@@ -151,6 +159,8 @@ const CREGS: &[&str] = &["MODE", "PTB", "FADDR", "FCAUSE", "ITB", "EPC", "EMODE"
 const BUILTINS: &[&str] = &[
     "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "bytes", "in", "out",
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
+    // the Setun-387
+    "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
 ];
 
 // ---- compiler -------------------------------------------------------------------
@@ -186,6 +196,10 @@ pub struct Compiler {
     // output
     code: Vec<String>,
     strings: Vec<(String, String)>,
+    /// Real literals: label and the three words of the real81.
+    reals: Vec<(String, [i64; 3])>,
+    /// Types found by `peek_type`, by expression address.
+    peeked: HashMap<usize, Ty>,
     labels: usize,
     data_cursor: i64,
     data_start: i64,
@@ -210,6 +224,8 @@ impl Compiler {
             ret_label: String::new(),
             code: Vec::new(),
             strings: Vec::new(),
+            reals: Vec::new(),
+            peeked: HashMap::new(),
             labels: 0,
             data_cursor: 0,
             data_start: 0,
@@ -242,11 +258,99 @@ impl Compiler {
         l
     }
 
+    /// A real constant in the pool (deduplicated): its label.
+    fn real_label(&mut self, r: setun_real::Real) -> String {
+        let w = r.to_words();
+        if let Some((l, _)) = self.reals.iter().find(|(_, v)| *v == w) {
+            return l.clone();
+        }
+        let l = format!(".Lreal{}", self.reals.len());
+        self.reals.push((l.clone(), w));
+        l
+    }
+
+    /// f1 := the real r.
+    fn load_real(&mut self, r: setun_real::Real) {
+        if r == setun_real::Real::ZERO {
+            self.emit("fmov f1, f0");
+        } else {
+            let l = self.real_label(r);
+            self.emit(format!("fldd f1, [{l}]"));
+        }
+    }
+
+    fn push_f1(&mut self) {
+        self.emit("sub sp, sp, 9");
+        self.emit("fstd f1, [sp]");
+    }
+
+    fn pop_f1(&mut self) {
+        self.emit("fldd f1, [sp]");
+        self.emit("add sp, sp, 9");
+    }
+
+    /// The type of `e`, found by compiling it and throwing the code away
+    /// (remembered per expression, so each is looked at once).
+    fn peek_type(&mut self, e: &Expr) -> R<Ty> {
+        let key = e as *const Expr as usize;
+        if let Some(t) = self.peeked.get(&key) {
+            return Ok(t.clone());
+        }
+        let (code, next, lowest) = (self.code.len(), self.next_slot, self.lowest_slot);
+        let t = self.expr(e);
+        self.code.truncate(code);
+        self.next_slot = next;
+        self.lowest_slot = lowest;
+        let t = t?;
+        self.peeked.insert(key, t.clone());
+        Ok(t)
+    }
+
+    fn peek_real(&mut self, e: &Expr) -> R<bool> {
+        Ok(self.peek_type(e)?.is_real())
+    }
+
+    /// Evaluate `e` as a real into f1: a real as it is, an integer converted.
+    fn expr_real(&mut self, e: &Expr) -> R<()> {
+        let t = self.expr(e)?;
+        if t.is_real() {
+            Ok(())
+        } else if t.is_integer() {
+            self.emit("fcvtif f1, r1");
+            Ok(())
+        } else {
+            err(e.pos, format!("expected a real, found {}", self.tyname(&t)))
+        }
+    }
+
+    /// After a real is in f1: r1 := 1 if it is non-zero (a NaN counts as
+    /// non-zero, as in C), else 0, so the integer truth tests apply.
+    fn real_truth(&mut self) {
+        let done = self.new_label();
+        self.emit("fcmp f1, f0");
+        self.emit("li r1, 1");
+        self.emit(format!("bov {done}"));
+        self.emit(format!("bne {done}"));
+        self.emit("li r1, 0");
+        self.label(&done);
+    }
+
+    /// An expression used as a condition: its truth in r1 (reals included).
+    fn condition_value(&mut self, e: &Expr) -> R<()> {
+        let t = self.expr(e)?;
+        if t.is_real() {
+            self.real_truth();
+            return Ok(());
+        }
+        self.need_condition(&t, e.pos)
+    }
+
     // ---- sizes and layout ----------------------------------------------------
 
     fn size(&self, t: &Ty) -> i64 {
         match t {
             Ty::Int | Ty::Ptr(_) | Ty::Fn(..) | Ty::Null => 3,
+            Ty::Real => 9,
             Ty::Tryte | Ty::Trit => 1,
             Ty::Void => 0,
             Ty::Array(n, e) => n * self.size(e),
@@ -271,6 +375,7 @@ impl Compiler {
     fn resolve(&mut self, t: &TypeExpr, pos: Pos) -> R<Ty> {
         Ok(match t {
             TypeExpr::Int => Ty::Int,
+            TypeExpr::Real => Ty::Real,
             TypeExpr::Tryte => Ty::Tryte,
             TypeExpr::Trit => Ty::Trit,
             TypeExpr::Void => Ty::Void,
@@ -404,6 +509,7 @@ impl Compiler {
     fn sizeof_const(&self, t: &TypeExpr) -> Option<i64> {
         Some(match t {
             TypeExpr::Int | TypeExpr::Ptr(_) | TypeExpr::Fn(..) => 3,
+            TypeExpr::Real => 9,
             TypeExpr::Tryte | TypeExpr::Trit => 1,
             TypeExpr::Void => return None,
             TypeExpr::Named(n) => {
@@ -415,6 +521,19 @@ impl Compiler {
             }
             TypeExpr::Array(n, e) => self.const_eval(n)? * self.sizeof_const(e)?,
         })
+    }
+
+    /// A constant real: a literal, an integer constant, or one negated.
+    fn const_real(&self, e: &Expr) -> R<setun_real::Real> {
+        match &e.kind {
+            ExprKind::Real(t) => Ok(setun_real::Real::from_decimal(t).map(|(r, _)| r).unwrap_or(setun_real::Real::NAN)),
+            ExprKind::Unary(UnOp::Neg, x) => Ok(self.const_real(x)?.neg()),
+            ExprKind::Name(n) if self.lookup_local(n).is_none() => match self.globals.get(n) {
+                Some(Global::Const { val: ConstVal::Real(r), .. }) => Ok(*r),
+                _ => Ok(setun_real::Real::from_i64(self.const_int(e)?)),
+            },
+            _ => Ok(setun_real::Real::from_i64(self.const_int(e)?)),
+        }
     }
 
     fn const_int(&self, e: &Expr) -> R<i64> {
@@ -481,6 +600,7 @@ impl Compiler {
                     let e = d.init.as_ref().unwrap();
                     let val = match (&e.kind, &ty) {
                         (ExprKind::Str(s), Ty::Ptr(t)) if **t == Ty::Tryte => ConstVal::Str(self.intern(s)),
+                        (_, Ty::Real) => ConstVal::Real(self.const_real(e)?),
                         _ => {
                             let v = self.const_int(e)?;
                             self.check_fits(v, &ty, e.pos)?;
@@ -493,11 +613,15 @@ impl Compiler {
                     let ps = f.params.iter().map(|p| self.resolve(&p.ty, f.pos)).collect::<R<Vec<_>>>()?;
                     let ret = self.resolve(&f.ret, f.pos)?;
                     for p in &ps {
-                        if !p.is_scalar() {
+                        if !p.is_scalar() && !p.is_real() {
                             return err(f.pos, format!("parameter of type {} must be passed as a pointer", self.tyname(p)));
                         }
                     }
-                    if !ret.is_scalar() && ret != Ty::Void {
+                    let nreal = ps.iter().filter(|p| p.is_real()).count();
+                    if nreal > 9 || (nreal > 0 && ps.len() - nreal > 6) {
+                        return err(f.pos, "a function with real parameters takes at most 9 reals and 6 other parameters");
+                    }
+                    if !ret.is_scalar() && ret != Ty::Void && !ret.is_real() {
                         return err(f.pos, format!("cannot return {} by value; return a pointer", self.tyname(&ret)));
                     }
                     if f.interrupt && (!ps.is_empty() || ret != Ty::Void) {
@@ -581,6 +705,9 @@ impl Compiler {
 
         let mut text = self.code.join("\n");
         text.push('\n');
+        for (l, w) in &self.reals {
+            text += &format!("{l}: .word {}, {}, {}\n", w[0], w[1], w[2]);
+        }
         for (l, s) in &self.strings {
             text += &format!("{l}: .string \"{}\"\n", escape(s));
         }
@@ -649,16 +776,24 @@ impl Compiler {
         self.emit("push fp");
         self.emit("mov fp, sp");
         let frame_at = self.code.len();
-        // Parameters: r1..r6, then the stack (fp+6, fp+9, ...), copied into slots.
-        for (i, (p, t)) in f.params.iter().zip(&ps).enumerate() {
+        // Parameters: integers in r1..r6, then the stack (fp+6, fp+9, ...);
+        // reals in f1..f9. Each is copied into its slot.
+        let (mut i, mut j) = (0i64, 0i64);
+        for (p, t) in f.params.iter().zip(&ps) {
             let off = self.alloc_local(&p.name, t.clone(), f.pos)?;
+            if t.is_real() {
+                j += 1;
+                self.emit(format!("fstd f{j}, {}", mem("fp", off)));
+                continue;
+            }
             let st = if t.is_tryte_sized() { "stt" } else { "stw" };
             if i < 6 {
                 self.emit(format!("{st} r{}, {}", i + 1, mem("fp", off)));
             } else {
-                self.emit(format!("ldw r7, {}", mem("fp", 6 + 3 * (i as i64 - 6))));
+                self.emit(format!("ldw r7, {}", mem("fp", 6 + 3 * (i - 6))));
                 self.emit(format!("{st} r7, {}", mem("fp", off)));
             }
+            i += 1;
         }
         for s in f.body.as_ref().unwrap() {
             self.stmt(s)?;
@@ -785,7 +920,7 @@ impl Compiler {
             StmtKind::Sign { e, neg, zero, pos } => {
                 // `sign (a <=> b)` compares directly (exact); otherwise test against 0.
                 if let ExprKind::Binary(BinOp::Cmp3, a, b) = &e.kind {
-                    self.compare(a, b)?;
+                    self.compare(a, b)?; // unordered reals: S = 0, the zero arm
                 } else {
                     let t = self.expr(e)?;
                     self.need_integer(&t, e.pos)?;
@@ -858,6 +993,7 @@ impl Compiler {
                     (None, Ty::Void) => {}
                     (None, _) => return err(s.pos, format!("this function must return a {}", self.tyname(&ret))),
                     (Some(e), Ty::Void) => return err(e.pos, "a void function cannot return a value"),
+                    (Some(e), Ty::Real) => self.expr_real(e)?,
                     (Some(e), _) => {
                         let t = self.expr(e)?;
                         self.check_assign(&ret, &t, e)?;
@@ -880,7 +1016,7 @@ impl Compiler {
     fn cond_jump_false(&mut self, c: &Expr, target: &str) -> R<()> {
         // Comparisons branch directly on the flags.
         if let ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne), a, b) = &c.kind {
-            self.compare(a, b)?;
+            let real = self.compare(a, b)?;
             let inv = match op {
                 BinOp::Lt => "bge",
                 BinOp::Le => "bgt",
@@ -889,25 +1025,45 @@ impl Compiler {
                 BinOp::Eq => "bne",
                 _ => "beq",
             };
-            self.emit(format!("{inv} {target}"));
+            if real && *op == BinOp::Ne {
+                // unordered: != is true, so do not jump
+                let skip = self.new_label();
+                self.emit(format!("bov {skip}"));
+                self.emit(format!("{inv} {target}"));
+                self.label(&skip);
+            } else {
+                if real {
+                    self.emit(format!("bov {target}")); // unordered: false
+                }
+                self.emit(format!("{inv} {target}"));
+            }
             return Ok(());
         }
-        let t = self.expr(c)?;
-        self.need_condition(&t, c.pos)?;
+        self.condition_value(c)?;
         self.emit("cmp r1, 0");
         self.emit(format!("beq {target}"));
         Ok(())
     }
 
-    /// Evaluate `a` and `b` and set S = sign(a − b) (exact).
-    fn compare(&mut self, a: &Expr, b: &Expr) -> R<()> {
+    /// Evaluate `a` and `b` and set S = sign(a − b) (exact). True if they
+    /// were compared as reals (then C ≠ 0 means unordered: a NaN).
+    fn compare(&mut self, a: &Expr, b: &Expr) -> R<bool> {
+        if self.peek_real(a)? || self.peek_real(b)? {
+            self.expr_real(a)?;
+            self.push_f1();
+            self.expr_real(b)?;
+            self.emit("fmov f2, f1");
+            self.pop_f1();
+            self.emit("fcmp f1, f2");
+            return Ok(true);
+        }
         let ta = self.expr(a)?.decay();
         if let Some(v) = self.const_eval(b) {
             if !(ta.is_integer() || ta.is_pointer() && v == 0) {
                 return err(b.pos, format!("cannot compare {} with a number", self.tyname(&ta)));
             }
             self.emit(format!("cmp r1, {v}"));
-            return Ok(());
+            return Ok(false);
         }
         self.emit("push r1");
         let tb = self.expr(b)?.decay();
@@ -920,7 +1076,7 @@ impl Compiler {
         self.emit("mov r2, r1");
         self.emit("pop r1");
         self.emit("cmp r1, r2");
-        Ok(())
+        Ok(false)
     }
 
     fn need_integer(&self, t: &Ty, pos: Pos) -> R<()> {
@@ -984,6 +1140,11 @@ impl Compiler {
                 Ok(())
             }
             (_, ExprKind::List(_)) => err(init.pos, format!("a list cannot initialise {}", self.tyname(ty))),
+            (Ty::Real, _) => {
+                self.expr_real(init)?;
+                self.emit(format!("fstd f1, {}", place.operand()));
+                Ok(())
+            }
             (t, _) if t.is_scalar() => {
                 let got = self.expr(init)?;
                 self.check_assign(t, &got, init)?;
@@ -1009,6 +1170,7 @@ impl Compiler {
                     self.zero_object(place.plus(off), &ft);
                 }
             }
+            Ty::Real => self.emit(format!("fstd f0, {}", place.operand())),
             t => {
                 let st = if t.is_tryte_sized() { "stt" } else { "stw" };
                 self.emit(format!("{st} r0, {}", place.operand()));
@@ -1035,7 +1197,13 @@ impl Compiler {
         if ok {
             Ok(())
         } else {
-            let hint = if dst.is_integer() && src.is_integer() { " (use `as` to narrow)" } else { "" };
+            let hint = if dst.is_integer() && src.is_integer() {
+                " (use `as` to narrow)"
+            } else if dst.is_integer() && src.is_real() {
+                " (use `as` to convert)"
+            } else {
+                ""
+            };
             err(e.pos, format!("expected {}, found {}{hint}", self.tyname(dst), self.tyname(&src)))
         }
     }
@@ -1046,7 +1214,9 @@ impl Compiler {
     // ---- expressions -----------------------------------------------------------------
 
     fn load(&mut self, t: &Ty) {
-        if t.is_scalar() {
+        if t.is_real() {
+            self.emit("fldd f1, [r1]");
+        } else if t.is_scalar() {
             let op = if t.is_tryte_sized() { "ldt" } else { "ldw" };
             self.emit(format!("{op} r1, [r1]"));
         }
@@ -1081,6 +1251,11 @@ impl Compiler {
         }
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Char(_) => unreachable!("constants are folded"),
+            ExprKind::Real(t) => {
+                let (r, _) = setun_real::Real::from_decimal(t).map_err(|m| Error { pos: e.pos, msg: m })?;
+                self.load_real(r);
+                Ok(Ty::Real)
+            }
             ExprKind::Str(s) => {
                 let l = self.intern(s);
                 self.emit(format!("la r1, {l}"));
@@ -1094,7 +1269,9 @@ impl Compiler {
             ExprKind::Name(n) => {
                 if let Some(l) = self.lookup_local(n) {
                     let (ty, off) = (l.ty.clone(), l.off);
-                    if ty.is_scalar() {
+                    if ty.is_real() {
+                        self.emit(format!("fldd f1, {}", mem("fp", off)));
+                    } else if ty.is_scalar() {
                         let op = if ty.is_tryte_sized() { "ldt" } else { "ldw" };
                         self.emit(format!("{op} r1, {}", mem("fp", off)));
                     } else {
@@ -1104,7 +1281,9 @@ impl Compiler {
                 }
                 match self.globals.get(n).cloned() {
                     Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) => {
-                        if ty.is_scalar() {
+                        if ty.is_real() {
+                            self.emit(format!("fldd f1, [{label}]"));
+                        } else if ty.is_scalar() {
                             let op = if ty.is_tryte_sized() { "ldt" } else { "ldw" };
                             self.emit(format!("{op} r1, [{label}]"));
                         } else {
@@ -1115,6 +1294,10 @@ impl Compiler {
                     Some(Global::Const { ty, val: ConstVal::Str(l) }) => {
                         self.emit(format!("la r1, {l}"));
                         self.emit("sub r1, r1, 1");
+                        Ok(ty)
+                    }
+                    Some(Global::Const { ty, val: ConstVal::Real(r) }) => {
+                        self.load_real(r);
                         Ok(ty)
                     }
                     Some(Global::Const { .. }) => unreachable!("integer constants are folded"),
@@ -1128,13 +1311,16 @@ impl Compiler {
             ExprKind::Unary(op, x) => match op {
                 UnOp::Neg => {
                     let t = self.expr(x)?;
+                    if t.is_real() {
+                        self.emit("fneg f1, f1");
+                        return Ok(Ty::Real);
+                    }
                     self.need_integer(&t, x.pos)?;
                     self.emit("neg r1, r1");
                     Ok(Ty::Int)
                 }
                 UnOp::Not => {
-                    let t = self.expr(x)?;
-                    self.need_condition(&t, x.pos)?;
+                    self.condition_value(x)?;
                     let l = self.new_label();
                     self.emit("cmp r1, 0");
                     self.emit("li r1, 1");
@@ -1172,6 +1358,26 @@ impl Compiler {
             ExprKind::Cast(x, t) => {
                 let to = self.resolve(t, e.pos)?;
                 let from = self.expr(x)?.decay();
+                // reals: integer → real exactly; real → integer rounds to nearest
+                if to.is_real() || from.is_real() {
+                    return match (&to, &from) {
+                        (Ty::Real, Ty::Real) => Ok(Ty::Real),
+                        (Ty::Real, f) if f.is_integer() => {
+                            self.emit("fcvtif f1, r1");
+                            Ok(Ty::Real)
+                        }
+                        (t, Ty::Real) if t.is_integer() => {
+                            self.emit("fcvtfi r1, f1");
+                            match t {
+                                Ty::Tryte => self.emit("ext r1, r1, 19, 9"),
+                                Ty::Trit => self.emit("ext r1, r1, 27, 1"),
+                                _ => {}
+                            }
+                            Ok(to)
+                        }
+                        _ => err(e.pos, format!("cannot convert {} to {}", self.tyname(&from), self.tyname(&to))),
+                    };
+                }
                 let ok = (to.is_integer() && (from.is_integer() || from.is_pointer() || matches!(from, Ty::Fn(..))))
                     || (matches!(to, Ty::Ptr(_) | Ty::Fn(..)) && (from.is_integer() || from.is_pointer() || matches!(from, Ty::Fn(..))));
                 if !ok {
@@ -1193,6 +1399,15 @@ impl Compiler {
             }
             ExprKind::Cond(c, a, b) => {
                 let (lelse, lend) = (self.new_label(), self.new_label());
+                if self.peek_real(a)? || self.peek_real(b)? {
+                    self.cond_jump_false(c, &lelse)?;
+                    self.expr_real(a)?;
+                    self.emit(format!("b {lend}"));
+                    self.label(&lelse);
+                    self.expr_real(b)?;
+                    self.label(&lend);
+                    return Ok(Ty::Real);
+                }
                 self.cond_jump_false(c, &lelse)?;
                 let ta = self.expr(a)?.decay();
                 self.emit(format!("b {lend}"));
@@ -1378,8 +1593,7 @@ impl Compiler {
                 let (short, end) = (self.new_label(), self.new_label());
                 let (val_short, jump) = if op == BinOp::And { (0, "beq") } else { (1, "bne") };
                 for x in [a, b] {
-                    let t = self.expr(x)?;
-                    self.need_condition(&t, x.pos)?;
+                    self.condition_value(x)?;
                     self.emit("cmp r1, 0");
                     self.emit(format!("{jump} {short}"));
                 }
@@ -1391,7 +1605,7 @@ impl Compiler {
                 Ok(Ty::Int)
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
-                self.compare(a, b)?;
+                let real = self.compare(a, b)?;
                 let br = match op {
                     BinOp::Lt => "blt",
                     BinOp::Le => "ble",
@@ -1400,9 +1614,14 @@ impl Compiler {
                     BinOp::Eq => "beq",
                     _ => "bne",
                 };
-                let l = self.new_label();
+                let (l, zero) = (self.new_label(), self.new_label());
                 self.emit("li r1, 1");
+                if real {
+                    // unordered (a NaN): only != holds
+                    self.emit(format!("bov {}", if op == BinOp::Ne { &l } else { &zero }));
+                }
                 self.emit(format!("{br} {l}"));
+                self.label(&zero);
                 self.emit("li r1, 0");
                 self.label(&l);
                 Ok(Ty::Int)
@@ -1419,6 +1638,17 @@ impl Compiler {
                 Ok(Ty::Trit)
             }
             _ => {
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Min | BinOp::Max)
+                    && (self.peek_real(a)? || self.peek_real(b)?)
+                {
+                    self.expr_real(a)?;
+                    self.push_f1();
+                    self.expr_real(b)?;
+                    self.emit("fmov f2, f1");
+                    self.pop_f1();
+                    self.real_op(op);
+                    return Ok(Ty::Real);
+                }
                 let lt = self.expr(a)?.decay();
                 if let Some(v) = self.const_eval(b) {
                     return self.arith(op, &lt, &Ty::Int, Some(v), pos);
@@ -1432,7 +1662,51 @@ impl Compiler {
         }
     }
 
+    /// f1 := f1 op f2 for a real arithmetic operator.
+    fn real_op(&mut self, op: BinOp) {
+        let m = match op {
+            BinOp::Add => "fadd",
+            BinOp::Sub => "fsub",
+            BinOp::Mul => "fmul",
+            BinOp::Div => "fdiv",
+            BinOp::Mod => "frem",
+            BinOp::Min => "fmin",
+            _ => "fmax",
+        };
+        self.emit(format!("{m} f1, f1, f2"));
+    }
+
+    /// Assignment to a real lvalue (plain or compound).
+    fn assign_real(&mut self, op: Option<BinOp>, lhs: &Expr, rhs: &Expr) -> R<Ty> {
+        match op {
+            None => {
+                self.expr_real(rhs)?;
+                self.push_f1();
+                self.addr(lhs)?;
+                self.pop_f1();
+                self.emit("fstd f1, [r1]");
+            }
+            Some(op) => {
+                if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Min | BinOp::Max) {
+                    return err(lhs.pos, format!("cannot apply {op:?} to a real"));
+                }
+                self.addr(lhs)?;
+                self.emit("push r1");
+                self.expr_real(rhs)?;
+                self.emit("fmov f2, f1");
+                self.emit("pop r3");
+                self.emit("fldd f1, [r3]");
+                self.real_op(op);
+                self.emit("fstd f1, [r3]");
+            }
+        }
+        Ok(Ty::Real)
+    }
+
     fn assign(&mut self, op: Option<BinOp>, lhs: &Expr, rhs: &Expr) -> R<Ty> {
+        if self.peek_real(lhs)? {
+            return self.assign_real(op, lhs, rhs);
+        }
         match op {
             None => {
                 // Fast path: a named scalar variable.
@@ -1527,6 +1801,47 @@ impl Compiler {
         if params.len() != args.len() {
             return err(pos, format!("expected {} argument(s), found {}", params.len(), args.len()));
         }
+        let nreal = params.iter().filter(|p| p.is_real()).count();
+        if nreal > 0 {
+            // each argument pushed in turn (a real takes three words), then
+            // integers into r1..r6 and reals into f1..f9
+            if nreal > 9 || params.len() - nreal > 6 {
+                return err(pos, "a call with real arguments takes at most 9 reals and 6 other arguments");
+            }
+            for (a, p) in args.iter().zip(&params) {
+                if p.is_real() {
+                    self.expr_real(a)?;
+                    self.push_f1();
+                } else {
+                    let t = self.expr(a)?;
+                    self.check_assign(p, &t, a)?;
+                    self.emit("push r1");
+                }
+            }
+            let sizes: Vec<i64> = params.iter().map(|p| if p.is_real() { 9 } else { 3 }).collect();
+            let total: i64 = sizes.iter().sum();
+            let (mut i, mut j, mut off) = (0, 0, total);
+            for (p, sz) in params.iter().zip(&sizes) {
+                off -= sz;
+                if p.is_real() {
+                    j += 1;
+                    self.emit(format!("fldd f{j}, {}", mem("sp", off)));
+                } else {
+                    i += 1;
+                    self.emit(format!("ldw r{i}, {}", mem("sp", off)));
+                }
+            }
+            match &direct {
+                Some((name, _)) => self.emit(format!("call {name}")),
+                None => {
+                    self.emit(format!("ldw r7, {}", mem("sp", total)));
+                    self.emit("jalr lr, r7");
+                }
+            }
+            let cleanup = total + if direct.is_some() { 0 } else { 3 };
+            self.emit(format!("add sp, sp, {cleanup}"));
+            return Ok(*ret);
+        }
         for (a, p) in args.iter().zip(&params) {
             let t = self.expr(a)?;
             self.check_assign(p, &t, a)?;
@@ -1579,6 +1894,76 @@ impl Compiler {
             }
         };
         match n {
+            "abs" if args.len() == 1 && self.peek_real(&args[0])? => {
+                self.expr(&args[0])?;
+                self.emit("fabs f1, f1");
+                Ok(Ty::Real)
+            }
+            "sqrt" | "trunc" | "round" => {
+                want(1)?;
+                self.expr_real(&args[0])?;
+                let m = match n {
+                    "sqrt" => "fsqrt",
+                    "trunc" => "ftrunc",
+                    _ => "frnd",
+                };
+                self.emit(format!("{m} f1, f1"));
+                Ok(Ty::Real)
+            }
+            "rem" => {
+                want(2)?;
+                self.expr_real(&args[0])?;
+                self.push_f1();
+                self.expr_real(&args[1])?;
+                self.emit("fmov f2, f1");
+                self.pop_f1();
+                self.emit("frem f1, f1, f2");
+                Ok(Ty::Real)
+            }
+            "scale3" => {
+                want(2)?;
+                self.expr_real(&args[0])?;
+                self.push_f1();
+                let t = self.expr(&args[1])?;
+                self.need_integer(&t, args[1].pos)?;
+                self.pop_f1();
+                self.emit("fscl f1, f1, r1");
+                Ok(Ty::Real)
+            }
+            "exponent3" | "fclass" => {
+                want(1)?;
+                self.expr_real(&args[0])?;
+                self.emit(format!("{} r1, f1", if n == "fclass" { "fclass" } else { "fexp" }));
+                Ok(Ty::Int)
+            }
+            "real27" => {
+                want(1)?;
+                self.expr_real(&args[0])?;
+                self.emit("ftow r1, f1");
+                self.emit("ffrw f1, r1");
+                Ok(Ty::Real)
+            }
+            "fconst" => {
+                want(1)?;
+                let k = self.const_int(&args[0])?;
+                if !(0..=6).contains(&k) {
+                    return err(args[0].pos, "fconst takes 0..6: zero, one, pi, e, ln 3, log3 e, log3 10");
+                }
+                self.emit(format!("fconst f1, {k}"));
+                Ok(Ty::Real)
+            }
+            "fsr" => {
+                want(0)?;
+                self.emit("fmfs r1");
+                Ok(Ty::Int)
+            }
+            "set_fsr" => {
+                want(1)?;
+                let t = self.expr(&args[0])?;
+                self.need_integer(&t, args[0].pos)?;
+                self.emit("fmts r1");
+                Ok(Ty::Void)
+            }
             "sgn" | "abs" | "tlz" => {
                 want(1)?;
                 let t = self.expr(&args[0])?;

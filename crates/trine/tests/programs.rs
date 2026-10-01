@@ -74,6 +74,94 @@ fn ternary_literals_refused() {
 }
 
 #[test]
+fn reals() {
+    let src = r#"
+        import "console.tri";
+        import "real.tri";
+        struct P { x: real; tag: int; y: real; }
+        var g: real = 2.5;
+        const HALF: real = 0.5;
+        fn half(x: real) -> real { return x / 2; }
+        fn hyp(a: real, n: int, b: real) -> real { return sqrt(a * a + b * b) * n; }
+        fn show(x: real) { var b: [24]char; print(rtoa(x, 12, &b[0])); print(" "); }
+        fn main() -> int {
+            var a: real = 1.5;
+            var b: real = a * 4 - 1;               // 5: ints convert
+            var arr: [3]real;
+            arr[1] = b + HALF;                     // 5.5
+            var p: P;
+            p.x = 3.0; p.y = 4.0; p.tag = 7;
+            var h: real = hyp(p.x, 2, p.y);        // 10, mixed int and real arguments
+            b += 1;                                // 6
+            b *= 2;                                // 12
+            var q: *real = &arr[1];
+            *q = *q * 2;                           // 11
+            show(h); show(b); show(arr[1]); show(half(g)); show(-a); show(1.0 / 3);
+            show(10 % 3.0); show(7.0 | 2.5); show(7.0 & 2.5); show(a > 1 ? a : 0);
+            show(abs(-2.25)); show(round(2.5)); show(round(3.5)); show(trunc(-2.7)); show(rem(7.0, 2));
+            show(scale3(1.0, 4)); show(exponent3(81.0) as real); show(real27(0.1) - 0.1);
+            show(fconst(3)); show((2.5 as int) as real); show((-2.5 as int) as real); show(3.7 as tryte);
+            return (h + half(g) + arr[1]) as int;  // 10 + 1.25 + 11 = 22.25 → 22
+        }
+    "#;
+    let (o, serial) = run_with(src, "");
+    assert_eq!(o, Outcome::Exit(22));
+    assert_eq!(
+        serial,
+        "10 12 11 1.25 -1.5 0.333333333333 1 7 2.5 1.5 2.25 2 4 -2 -1 81 5 2.58117479171e-10 2.71828182846 2 -2 4 "
+    );
+}
+
+#[test]
+fn real_comparisons_and_nan() {
+    // a NaN is unordered: == < <= > >= are false and != is true; as a
+    // condition it counts as non-zero, as in C
+    let src = r#"
+        fn main() -> int {
+            var n: real = 0.0 / 0;
+            var one: real = 1.0;
+            var r: int = 0;
+            if (n == n) { r = r + 1; }
+            if (n != n) { r = r + 10; }
+            if (n < one) { r = r + 100; }
+            if (n >= one) { r = r + 1000; }
+            if (n) { r = r + 10000; }
+            if (one < 2.0 && one <= 1 && one >= 1.0 && one > 0 && one == 1 && one != 2) { r = r + 100000; }
+            var v: int = (n == n) + 2 * (n != n) + 4 * (one < 2.0);
+            sign (n <=> one) { neg: r = r - 1; zero: r = r + 1000000; pos: r = r - 1; }
+            return r + 10000000 * v;
+        }
+    "#;
+    assert_eq!(exit(src), 10 + 10000 + 100000 + 1000000 + 10000000 * 6);
+}
+
+#[test]
+fn reals_refused() {
+    let e = compile_err("fn main() -> int { var x: int = 2.5; return x; }");
+    assert!(e.contains("expected int, found real (use `as` to convert)"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 2.5; switch (x) { case 1: return 1; } return 0; }");
+    assert!(e.contains("expected an integer, found real"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 2.5; x = x << 1; return 0; }");
+    assert!(e.contains("cannot apply Shl"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 2.5; var p: *int = null; p = p + x; return 0; }");
+    assert!(e.contains("expected a real, found *int"), "{e}");
+    let e = compile_err("fn f(a: int) -> int { return a; }\nfn main() -> int { return f(1.5); }");
+    assert!(e.contains("expected int, found real"), "{e}");
+    let e = compile_err("fn f() { return 1.5; }\nfn main() -> int { return 0; }");
+    assert!(e.contains("a void function cannot return a value"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = fconst(9); return 0; }");
+    assert!(e.contains("fconst takes 0..6"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 1.5x; return 0; }");
+    assert!(e.contains("bad number `1.5x`"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 2.0; var p: *real = &x; return p as real; }");
+    assert!(e.contains("cannot convert *real to real"), "{e}");
+    let e = compile_err("fn f(a: real, b: real, c: real, d: real, e: real, f: real, g: real, h: real, i: real, j: real) {}\nfn main() -> int { return 0; }");
+    assert!(e.contains("at most 9 reals"), "{e}");
+    let e = compile_err("fn main() -> int { var x: real = 2.0; x <<= 1; return 0; }");
+    assert!(e.contains("cannot apply Shl to a real"), "{e}");
+}
+
+#[test]
 fn return_value() {
     assert_eq!(exit("fn main() -> int { return 42; }"), 42);
     assert_eq!(exit("fn main() -> int { return -7; }"), -7);

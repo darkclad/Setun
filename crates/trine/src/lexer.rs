@@ -5,6 +5,8 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
+    /// A decimal real literal, as written (checked).
+    Real(String),
     Char(i64),
     Str(String),
     Ident(String),
@@ -29,7 +31,7 @@ pub struct Token {
 const KEYWORDS: &[&str] = &[
     "fn", "var", "const", "struct", "return", "if", "else", "while", "for", "loop", "break", "continue", "sign",
     "switch", "case", "default", "as", "sizeof", "import", "extern", "interrupt", "asm", "true", "false",
-    "null", "void", "trit", "tryte", "int", "char",
+    "null", "void", "trit", "tryte", "int", "char", "real",
 ];
 
 // Longest first.
@@ -103,12 +105,42 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                 out.push(Token { tok: Tok::Int(v), pos });
                 continue;
             }
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
+                bump!();
+            }
+            // a real: digits, then a point and digits, and/or an exponent
+            let mut real = false;
+            if chars.get(i) == Some(&'.') && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+                real = true;
+                bump!();
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
+                    bump!();
+                }
+            }
+            if matches!(chars.get(i), Some('e' | 'E')) {
+                let d = if matches!(chars.get(i + 1), Some('+' | '-')) { 2 } else { 1 };
+                if chars.get(i + d).is_some_and(|c| c.is_ascii_digit()) {
+                    real = true;
+                    for _ in 0..d {
+                        bump!();
+                    }
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        bump!();
+                    }
+                }
+            }
+            // a letter right after the number (1x, 2.5q) is a mistake
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 bump!();
             }
             let t: String = chars[start..i].iter().filter(|c| **c != '_').collect();
-            let v = t.parse::<i64>().map_err(|_| err(format!("bad number `{t}`")))?;
-            out.push(Token { tok: Tok::Int(v), pos });
+            if real {
+                setun_real::Real::from_decimal(&t).map_err(|_| err(format!("bad number `{t}`")))?;
+                out.push(Token { tok: Tok::Real(t), pos });
+            } else {
+                let v = t.parse::<i64>().map_err(|_| err(format!("bad number `{t}`")))?;
+                out.push(Token { tok: Tok::Int(v), pos });
+            }
             continue;
         }
         if c.is_alphabetic() || c == '_' {

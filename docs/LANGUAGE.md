@@ -31,9 +31,10 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - `0zDD5̅` (balanced base 27: `0`–`9` and `A`–`D` = 0…13 in either case; a negative digit is overlined with U+0305 COMBINING OVERLINE; see ISA §1.1)
   - `0x1F` (hexadecimal, for values from binary systems; nothing wraps, so a sign is written with unary minus)
   - A malformed literal is an error that says what is wrong (a bar on `0`, two bars, `E` as a digit, the old `+`/`-` base-3 digits…), and a constant must fit its type.
+- **Real literals:** `2.5`, `1e10`, `6.02e-23`, `1_000.5`: digits with a point and digits, an exponent, or both (`1.` and `.5` are not reals). A letter right after a number is an error. The value is rounded to the nearest `real`.
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
-- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
+- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real`
 - `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.
 
 ## 3. Types
@@ -43,6 +44,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 | `trit` | 1 | −1, 0, +1 | three-state flags, signs. Stored in a tryte. |
 | `tryte`, alias `char` | 1 | −9 841 … 9 841 | a `char` holds one Unicode code point |
 | `int` | 3 | ±3 812 798 742 493 | the machine word: 27 trits |
+| `real` | 9 | ±3^9840, 71-trit precision, ±∞, NaN | the Setun-387's real81 (ISA §14): about 34 decimal digits |
 | `*T` | 3 | an address | a pointer is a word |
 | `[N]T` | N·sizeof(T), rounded up (§4) | | fixed-size array |
 | `struct S` | a multiple of 3 | | §4 |
@@ -56,6 +58,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - Use `sgn(x)` for the sign.
   - `as` also converts between pointer types, and between pointers and `int`.
 - **Overflow wraps** modulo 3^27 (balanced) and is never undefined.
+- **Reals:** an integer converts to `real` implicitly; `x as int` rounds a real to the nearest integer (ties to even) and saturates, with the IV flag, on NaN or out of range. Arithmetic `+ - * / %` follows the FPU (round to nearest; `%` is the exact IEEE remainder), and `|`/`&` on reals are max/min. Comparisons with a NaN are unordered: every one is false except `!=`. A real is true when it is non-zero, so a NaN is true. Exceptions are masked by default and only set the sticky flags in `fsr()`.
 
 ## 4. Memory layout and addresses ⚠ REVIEW
 
@@ -183,6 +186,14 @@ These are not functions: each compiles to one instruction or a few.
 | `mfc(REG)` `mtc(REG, v)` | control registers (`MODE`, `PTB`, `ITB`, …) | `MFC`, `MTC` |
 | `hlt()` `brk()` `tlbflush()` `tlbinv(a)` `fence()` | system | as named |
 | `syscall(n, …)` | trap to the kernel, arguments in r1–r6 | `SYS n` |
+| `abs(x)` `sqrt(x)` | on a `real` | `FABS`, `FSQRT` |
+| `trunc(x)` `round(x)` | to an integral real: toward zero / to nearest even | `FTRUNC`, `FRND` |
+| `rem(a, b)` | IEEE remainder (the same as `%`) | `FREM` |
+| `scale3(x, k)` `exponent3(x)` | x·3^k; the exponent E of x | `FSCL`, `FEXP` |
+| `fconst(k)` | 0 zero, 1 one, 2 π, 3 e, 4 ln 3, 5 log₃ e, 6 log₃ 10 (constant `k`) | `FCONST` |
+| `fclass(x)` | −3 −∞, −2 normal, −1 subnormal, 0 zero, … 3 +∞, 4 NaN | `FCLASS` |
+| `real27(x)` | x rounded to real27 precision (17 trits) | `FTOW` + `FFRW` |
+| `fsr()` `set_fsr(v)` | the FPU status register (flags, masks; ISA §14.4) | `FMFS`, `FMTS` |
 
 ## 9. Low-level features
 
@@ -229,7 +240,9 @@ import "console.tri";
 | | |
 |---|---|
 | Arguments | `r1`–`r6`, left to right; more are pushed on the stack, the last one first |
-| Return value | `r1` |
+| Return value | `r1`; a `real` in `f1` |
+| Real arguments | `f1`–`f9`, in order among the reals (the integer arguments still take `r1`–`r6` in order among themselves); a function with reals takes at most 9 reals and 6 others |
+| FPU | `f1`–`f13`, `f−1`–`f−13` are caller-saved |
 | Caller-saved | `r1`–`r10`, `r-10`–`r-13` |
 | Callee-saved | `r-1`–`r-9`, `r11` (`fp`), `r13` (`sp`) |
 | Return address | `r12` (`lr`), set by `CALL`/`JAL` |
@@ -244,6 +257,7 @@ Structs and arrays are passed as pointers. This is the same convention as the IS
 |---|---|
 | `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal), `itoa27` (a word as 9 base-27 digits, negative ones overlined), `itoa3` (base 3), `b27_digit` |
 | `console.tri` | serial `putc`/`puts`/`getc`; a text-mode screen writer with cursor, colours and scrolling |
+| `real.tri` | `rtoa(x, digits, buf)` (decimal text, like `%g`), `strtor`, `atof`, `pow10`, `floor`, `ceil` |
 | `ports.tri` | named constants for every device register in ISA §8 |
 | (generated) | startup code, see §9 |
 
