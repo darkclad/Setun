@@ -1,0 +1,8 @@
+// sync: write every dirty buffer to the disk.
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    sync();
+    return 0;
+}

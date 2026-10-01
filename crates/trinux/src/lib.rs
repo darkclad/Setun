@@ -1,5 +1,9 @@
-//! Build Trinux disk images: the loader (sector 0) and the kernel image
-//! (sectors 1..K). See docs/KERNEL.md §2 and docs/BOOT.md.
+//! Build Trinux disk images: the loader (sector 0), the kernel image
+//! (sectors 1..K) and the root file system: a tfs volume from sector 243
+//! (the default), or an initramfs at sector 28. See docs/KERNEL.md §2, §19
+//! and docs/BOOT.md.
+
+pub mod tfs;
 
 use setun_core::memory::word_to_trytes;
 use setun_core::PAGE;
@@ -11,6 +15,8 @@ use trine::{Kind, Options};
 pub const KERNEL_ORG: i64 = 4 * PAGE - 9840;
 /// Kernel globals: frames 31..57.
 pub const KERNEL_DATA: i64 = 31 * PAGE - 9840;
+/// First address past the globals (the triddy allocator owns frame 58 on).
+pub const KERNEL_DATA_END: i64 = 58 * PAGE - 9841;
 /// Kernel boot stack: the top word of frame 3.
 pub const KERNEL_STACK: i64 = 3 * PAGE + 9840;
 pub const KERNEL_MAX_SECTORS: usize = 27;
@@ -34,6 +40,30 @@ pub struct Disk {
     pub files: usize,
 }
 
+/// The tfs root volume starts here on the boot disk (kernel/params.tri).
+pub const TFS_START: usize = 243;
+/// Default disk: 3^6 sectors, so the volume has 486 blocks.
+pub const DISK_SECTORS: usize = 729;
+pub const TFS_INODES: usize = 729;
+
+/// How to lay out the root file system.
+#[derive(Clone, Debug)]
+pub enum Root {
+    /// A tfs volume of `blocks` blocks and `inodes` inodes at TFS_START.
+    Tfs { blocks: usize, inodes: usize },
+    /// The K3 initramfs (a ramfs root, nothing persists).
+    Initramfs,
+}
+
+impl Default for Root {
+    fn default() -> Self {
+        Root::Tfs { blocks: DISK_SECTORS - TFS_START, inodes: TFS_INODES }
+    }
+}
+
+/// Directories every tfs root gets (mount points and the like).
+pub const ROOT_DIRS: [&str; 6] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/etc"];
+
 /// The initramfs header sector (kernel/initramfs.tri); data follows it.
 pub const INITRAMFS_SECTOR: usize = 28;
 pub const INITRAMFS_MAGIC: i64 = 31_857_270_902;
@@ -45,12 +75,18 @@ pub fn user_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../user")
 }
 
-/// The default initramfs: (path in the file system, Trine source).
+/// The default root file system: (path in the file system, source).
 pub fn default_files() -> Vec<(String, PathBuf)> {
     let u = user_dir();
     let mut v: Vec<(String, PathBuf)> = vec![("/sbin/init".into(), u.join("init.tri"))];
-    for prog in ["sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "k3test", "sigtest"] {
+    for prog in [
+        "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
+        "df", "k3test", "sigtest", "fstest",
+    ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
+    }
+    for name in ["reboot", "poweroff", "halt"] {
+        v.push((format!("/sbin/{name}"), u.join("bin/reboot.tri")));
     }
     v.push(("/bin/hello".into(), u.join("hello.tri")));
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
@@ -96,14 +132,47 @@ pub fn tef(path: &Path) -> Result<Vec<i16>, String> {
     Ok(v)
 }
 
-/// Compile the loader, the kernel and the default initramfs; lay out the disk.
+/// Compile the loader, the kernel and the default files; lay out the disk.
 pub fn build_disk(kernel_dir: &Path) -> Result<Disk, String> {
     build_disk_with(kernel_dir, &default_files())
 }
 
+/// The default layout (a tfs root) with these files.
 pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result<Disk, String> {
+    build_disk_root(kernel_dir, files, &Root::default())
+}
+
+/// A tfs volume holding `files` (sources compiled as for the initramfs).
+pub fn build_tfs(files: &[(String, PathBuf)], blocks: usize, inodes: usize) -> Result<tfs::Tfs, String> {
+    let mut fs = tfs::Tfs::format(blocks, inodes)?;
+    for d in ROOT_DIRS {
+        fs.mkdir_p(d)?;
+    }
+    for (name, src) in files {
+        let data = initramfs_file(src)?;
+        let perm = if src.extension().is_some_and(|e| e == "tri") { 0o755 } else { 0o644 };
+        fs.write_file(name, &data, perm).map_err(|e| format!("{name}: {e}"))?;
+    }
+    Ok(fs)
+}
+
+pub fn build_disk_root(kernel_dir: &Path, files: &[(String, PathBuf)], root: &Root) -> Result<Disk, String> {
+    let mut disk = build_boot_area(kernel_dir, files, root)?;
+    if let Root::Tfs { blocks, inodes } = root {
+        let fs = build_tfs(files, *blocks, *inodes)?;
+        disk.trytes.resize(TFS_START * PAGE as usize, 0);
+        disk.trytes.extend_from_slice(&fs.trytes);
+    }
+    Ok(disk)
+}
+
+fn build_boot_area(kernel_dir: &Path, files: &[(String, PathBuf)], root: &Root) -> Result<Disk, String> {
     let loader = trine::build_file(&kernel_dir.join("boot/loader.tri"), &Options::boot())?.image;
-    let kernel = trine::build_file(&kernel_dir.join("main.tri"), &kernel_options())?.image;
+    let kb = trine::build_file(&kernel_dir.join("main.tri"), &kernel_options())?;
+    if kb.data_end > KERNEL_DATA_END {
+        return Err(format!("the kernel globals end at {}, past frame 57 ({KERNEL_DATA_END})", kb.data_end));
+    }
+    let kernel = kb.image;
     let page = PAGE as usize;
     let sectors = kernel.len().div_ceil(page);
     if sectors > KERNEL_MAX_SECTORS {
@@ -122,6 +191,9 @@ pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result
     let mut trytes = sector0;
     trytes.extend_from_slice(&kernel);
     trytes.resize((1 + sectors) * page, 0);
+    if matches!(root, Root::Tfs { .. }) {
+        return Ok(Disk { trytes, kernel_sectors: sectors, files: files.len() });
+    }
 
     // initramfs: header at sector 28, file data from sector 29.
     let mut data: Vec<i16> = Vec::new();
@@ -154,7 +226,30 @@ pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result
     trytes.extend_from_slice(&header);
     data.resize(data_sectors * page, 0);
     trytes.extend_from_slice(&data);
+    if trytes.len() > TFS_START * page {
+        return Err("the initramfs does not fit below sector 243".into());
+    }
     Ok(Disk { trytes, kernel_sectors: sectors, files: files.len() })
+}
+
+/// Everything on the machine's disk 0 (to boot it again, or inspect it).
+pub fn disk_contents(m: &mut setun_core::Machine) -> Vec<i16> {
+    let mut store = m.dev.disks[0].detach().expect("a disk in drive 0");
+    let mut out = vec![0i16; store.sectors() as usize * PAGE as usize];
+    for (lba, chunk) in out.chunks_mut(PAGE as usize).enumerate() {
+        assert!(store.read(lba as i64, chunk));
+    }
+    m.dev.disks[0].attach(store);
+    out
+}
+
+/// The tfs volume inside a disk image.
+pub fn tfs_of(trytes: &[i16]) -> Result<tfs::Tfs, String> {
+    let start = TFS_START * PAGE as usize;
+    if trytes.len() <= start {
+        return Err("no tfs volume on this disk".into());
+    }
+    tfs::Tfs::open(trytes[start..].to_vec())
 }
 
 /// Boot a disk on a fresh machine with the BIOS; run `steps` instructions.
@@ -164,10 +259,15 @@ pub fn boot(disk: &Disk, ram_frames: i64, steps: u64) -> setun_core::Machine {
 
 /// Boot with `input` waiting on the serial console (the kernel's tty reads it).
 pub fn boot_with_input(disk: &Disk, ram_frames: i64, steps: u64, input: &str) -> setun_core::Machine {
+    boot_trytes(&disk.trytes, ram_frames, steps, input)
+}
+
+/// Boot raw disk trytes (for example a disk a previous run wrote to).
+pub fn boot_trytes(trytes: &[i16], ram_frames: i64, steps: u64, input: &str) -> setun_core::Machine {
     let bios = trine::bios_rom().expect("the BIOS compiles");
     let mut m = setun_core::Machine::new(ram_frames, 1_790_000_000);
     m.load_rom(&bios);
-    m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
+    m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(trytes)));
     m.dev.serial_input(input);
     m.run(steps);
     m

@@ -1,17 +1,22 @@
-// disk: block reads from disk 0 by DMA into physical frames.
+// disk: block transfers between disk 0 and physical frames, by DMA.
 
 import "../params.tri";
 
-// Read `count` sectors starting at `lba` into frames first_frame, +1, ...
-// Returns 0 on success or the controller's error code.
-fn disk_read(lba: int, count: int, first_frame: int) -> int {
+fn disk_xfer(cmd: int, lba: int, count: int, first_frame: int) -> int {
     out(DISK_LBA, lba);
     out(DISK_COUNT, count);
     out(DISK_DMA, frame_start(first_frame));
-    out(DISK_CMD, -1);
+    out(DISK_CMD, cmd);
     while (in(DISK_STATUS) == 1) {}
     if (in(DISK_STATUS) != 0) { return in(DISK_ERROR); }
     return 0;
 }
+
+// Read `count` sectors starting at `lba` into frames first_frame, +1, ...
+// Returns 0 on success or the controller's error code.
+fn disk_read(lba: int, count: int, first_frame: int) -> int { return disk_xfer(-1, lba, count, first_frame); }
+
+// Write frames first_frame, +1, ... to `count` sectors from `lba`.
+fn disk_write(lba: int, count: int, first_frame: int) -> int { return disk_xfer(1, lba, count, first_frame); }
 
 fn disk_sectors() -> int { return in(DISK_SECTORS); }

@@ -1,0 +1,109 @@
+// bcache: the buffer cache, after Linux's buffer heads.
+//
+// 27 buffers of one sector (3^9 trytes) each, in one order-3 triddy block.
+// Reads go through the cache; writes mark a buffer dirty and reach the disk
+// when it is evicted (least recently used first), on sync, and every few
+// seconds from the idle loop.
+
+import "../params.tri";
+import "../printk.tri";
+import "../mm.tri";
+import "../drivers/disk.tri";
+
+const NBUF: int = 27;
+
+var buf_first: int;                   // frame of buffer 0
+var buf_sector: [27]int;              // the sector held, or -1
+var buf_dirty: [27]int;
+var buf_stamp: [27]int;               // for LRU
+var buf_clock: int;
+var buf_hits: int;
+var buf_misses: int;
+var buf_errors: int;
+
+fn bcache_init() {
+    var c: int = alloc_pages(3);
+    if (c < 0) { panic("no memory for the buffer cache"); }
+    buf_first = c - 13;
+    var b: int = 0;
+    while (b < NBUF) { buf_sector[b] = -1; buf_dirty[b] = 0; b += 1; }
+}
+
+// First tryte of buffer b.
+fn buf_data(b: int) -> *tryte { return frame_start(buf_first + b) as *tryte; }
+
+// Word j of buffer b.
+fn buf_word(b: int, j: int) -> *int { return (frame_start(buf_first + b) + 1 + 3 * j) as *int; }
+
+fn bwrite_out(b: int) -> int {
+    if (!buf_dirty[b]) { return 0; }
+    if (disk_write(buf_sector[b], 1, buf_first + b) != 0) {
+        buf_errors += 1;
+        printk("bcache: write error, sector ");
+        pr_int(buf_sector[b]);
+        pr_nl();
+        return -1;
+    }
+    buf_dirty[b] = 0;
+    return 0;
+}
+
+// The buffer for `sector`, read from the disk if `read` (else zeroed).
+// Returns the buffer, or -1 on an I/O error.
+fn bget(sector: int, read: int) -> int {
+    buf_clock += 1;
+    var victim: int = 0;
+    var b: int = 0;
+    while (b < NBUF) {
+        if (buf_sector[b] == sector) {
+            buf_stamp[b] = buf_clock;
+            buf_hits += 1;
+            if (!read) {
+                zero_words(buf_word(b, 0), 6561);
+                buf_dirty[b] = 1;
+            }
+            return b;
+        }
+        if (buf_stamp[b] < buf_stamp[victim]) { victim = b; }
+        b += 1;
+    }
+    buf_misses += 1;
+    if (bwrite_out(victim) < 0) { return -1; }
+    buf_sector[victim] = -1;
+    if (read) {
+        if (disk_read(sector, 1, buf_first + victim) != 0) {
+            buf_errors += 1;
+            printk("bcache: read error, sector ");
+            pr_int(sector);
+            pr_nl();
+            return -1;
+        }
+    } else {
+        zero_words(buf_word(victim, 0), 6561);
+        buf_dirty[victim] = 1;
+    }
+    buf_sector[victim] = sector;
+    buf_stamp[victim] = buf_clock;
+    return victim;
+}
+
+fn bread(sector: int) -> int { return bget(sector, 1); }
+fn bdirty(b: int) { buf_dirty[b] = 1; }
+
+fn bcache_dirty_count() -> int {
+    var n: int = 0;
+    var b: int = 0;
+    while (b < NBUF) { n += buf_dirty[b]; b += 1; }
+    return n;
+}
+
+// Write every dirty buffer. Returns 0, or -1 if any write failed.
+fn bsync() -> int {
+    var r: int = 0;
+    var b: int = 0;
+    while (b < NBUF) {
+        if (bwrite_out(b) < 0) { r = -1; }
+        b += 1;
+    }
+    return r;
+}

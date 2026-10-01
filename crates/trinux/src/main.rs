@@ -27,11 +27,15 @@ fn main() {
         eprintln!("mkdisk: {}: {e}", out.display());
         std::process::exit(1)
     });
+    let fs = trinux::tfs_of(&disk.trytes).expect("the volume just built");
     eprintln!(
-        "{}: loader + kernel ({} sector(s)) + initramfs ({} files), {} sectors in all",
+        "{}: loader + kernel ({} sector(s)) + tfs root at sector {} ({} files, {} of {} blocks free), {} sectors in all",
         out.display(),
         disk.kernel_sectors,
+        trinux::TFS_START,
         disk.files,
+        fs.sb(trinux::tfs::SB_FREE_BLOCKS),
+        fs.nblocks(),
         disk.trytes.len() / setun_core::PAGE as usize
     );
 }

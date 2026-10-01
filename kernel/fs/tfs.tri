@@ -1,0 +1,645 @@
+// tfs: the ternary file system, on the boot disk from sector TFS_START.
+//
+// The format is described in docs/KERNEL.md §19 and implemented on the
+// host by crates/trinux/src/tfs.rs (mkdisk, fsck). Everything goes through
+// the buffer cache. Every block pointer and inode number read from the disk
+// is range-checked: damage gives EIO and a message, never a wild access.
+
+import "../params.tri";
+import "../printk.tri";
+import "../mm.tri";
+import "../drivers/disk.tri";
+import "bcache.tri";
+import "vfs.tri";
+
+const TFS_MAGIC: int = 31857270904;
+const TFS_VERSION: int = 1;
+const TFS_NAME_MAX: int = 77;
+const INODE_WORDS: int = 27;
+const INODES_PER_BLOCK: int = 243;
+const DIRENT: int = 81;               // trytes per directory entry
+const DIRENTS_PER_BLOCK: int = 243;
+const NDIRECT: int = 15;
+const WPB: int = 6561;                // words per block
+const BLK: int = 19683;               // trytes per block
+
+// superblock words
+const SB_MAGIC: int = 0;
+const SB_VERSION: int = 1;
+const SB_NBLOCKS: int = 2;
+const SB_NINODES: int = 3;
+const SB_IMAP: int = 4;
+const SB_BMAP: int = 5;
+const SB_BMAP_BLOCKS: int = 6;
+const SB_ITABLE: int = 7;
+const SB_ITABLE_BLOCKS: int = 8;
+const SB_DATA: int = 9;
+const SB_FREE_BLOCKS: int = 10;
+const SB_FREE_INODES: int = 11;
+const SB_ROOT: int = 12;
+const SB_STATE: int = 13;
+
+// inode words
+const DI_MODE: int = 0;
+const DI_NLINK: int = 1;
+const DI_UID: int = 2;
+const DI_GID: int = 3;
+const DI_SIZE: int = 4;
+const DI_ATIME: int = 5;
+const DI_MTIME: int = 6;
+const DI_CTIME: int = 7;
+const DI_BLOCKS: int = 8;
+const DI_DIRECT: int = 9;
+const DI_SINGLE: int = 24;
+const DI_DOUBLE: int = 25;
+
+var tfs_start: int;                   // first sector of the volume
+var tfs_mnt: int = -1;                // its mount, or -1
+var tfs_nblocks: int;
+var tfs_ninodes: int;
+var tfs_imap: int;
+var tfs_bmap_blk: int;
+var tfs_itable: int;
+var tfs_data: int;
+var tfs_free_blocks: int;
+var tfs_free_inodes: int;
+var tfs_block_hint: int;
+
+fn tfs_bread(blk: int) -> int { return bread(tfs_start + blk); }
+
+fn tfs_bad(what: *char, v: int, ino: int) -> int {
+    printk("tfs: bad ");
+    pr(what);
+    pr(" ");
+    pr_int(v);
+    pr(" in inode ");
+    pr_int(ino);
+    pr_nl();
+    return -EIO_;
+}
+
+fn ok_block(b: int) -> int { return b >= tfs_data && b < tfs_nblocks; }
+
+// ---- the superblock ------------------------------------------------------------------------
+
+fn tfs_sync_super(state: int) -> int {
+    var b: int = tfs_bread(0);
+    if (b < 0) { return -EIO_; }
+    *buf_word(b, SB_FREE_BLOCKS) = tfs_free_blocks;
+    *buf_word(b, SB_FREE_INODES) = tfs_free_inodes;
+    *buf_word(b, SB_STATE) = state;
+    bdirty(b);
+    return 0;
+}
+
+// Mount the volume at `start` as file system `mnt`. Returns its root inode or -errno.
+fn tfs_mount(start: int, mnt: int) -> int {
+    tfs_start = start;
+    if (disk_sectors() <= start) { return -ENODEV; }
+    var b: int = tfs_bread(0);
+    if (b < 0) { return -EIO_; }
+    if (*buf_word(b, SB_MAGIC) != TFS_MAGIC) { return -EINVAL_; }
+    tfs_nblocks = *buf_word(b, SB_NBLOCKS);
+    tfs_ninodes = *buf_word(b, SB_NINODES);
+    tfs_imap = *buf_word(b, SB_IMAP);
+    tfs_bmap_blk = *buf_word(b, SB_BMAP);
+    tfs_itable = *buf_word(b, SB_ITABLE);
+    tfs_data = *buf_word(b, SB_DATA);
+    tfs_free_blocks = *buf_word(b, SB_FREE_BLOCKS);
+    tfs_free_inodes = *buf_word(b, SB_FREE_INODES);
+    var bmap_blocks: int = *buf_word(b, SB_BMAP_BLOCKS);
+    var itable_blocks: int = *buf_word(b, SB_ITABLE_BLOCKS);
+    var state: int = *buf_word(b, SB_STATE);
+    if (*buf_word(b, SB_VERSION) != TFS_VERSION || tfs_nblocks <= 0 || start + tfs_nblocks > disk_sectors()
+        || tfs_ninodes <= 0 || tfs_ninodes > BLK || tfs_ninodes != itable_blocks * INODES_PER_BLOCK
+        || tfs_imap != 1 || tfs_bmap_blk != 2 || bmap_blocks * BLK < tfs_nblocks
+        || tfs_itable != tfs_bmap_blk + bmap_blocks || tfs_data != tfs_itable + itable_blocks || tfs_data >= tfs_nblocks
+        || tfs_free_blocks < 0 || tfs_free_blocks > tfs_nblocks || tfs_free_inodes < 0 || tfs_free_inodes > tfs_ninodes
+        || *buf_word(b, SB_ROOT) != 1) {
+        printk("tfs: inconsistent superblock, not mounting\n");
+        return -EINVAL_;
+    }
+    if (state != 1) { printk("tfs: volume was not cleanly unmounted (run fsck)\n"); }
+    tfs_block_hint = tfs_data;
+    tfs_mnt = mnt;
+    var root: int = iget(FS_TFS, mnt, 1);
+    if (root < 0) { tfs_mnt = -1; return root; }
+    if (inodes[root].type != I_DIR) { tfs_mnt = -1; printk("tfs: the root is not a directory\n"); return -EINVAL_; }
+    tfs_sync_super(0);                           // mounted: not clean until unmounted
+    return root;
+}
+
+// Flush everything and mark the volume clean (before reboot or power off).
+fn tfs_shutdown() -> int {
+    if (tfs_mnt < 0) { return bsync(); }
+    tfs_sync_super(1);
+    return bsync();
+}
+
+fn tfs_sync() -> int {
+    if (tfs_mnt >= 0) { tfs_sync_super(0); }
+    return bsync();
+}
+
+// ---- maps -------------------------------------------------------------------------------------
+
+// Entry `k` of a map starting at block `first` (one tryte per entry).
+fn map_get(first: int, k: int) -> int {
+    var b: int = tfs_bread(first + k / BLK);
+    if (b < 0) { return -EIO_; }
+    return buf_data(b)[k % BLK];
+}
+
+fn map_set(first: int, k: int, v: int) -> int {
+    var b: int = tfs_bread(first + k / BLK);
+    if (b < 0) { return -EIO_; }
+    buf_data(b)[k % BLK] = v as tryte;
+    bdirty(b);
+    return 0;
+}
+
+// A free block, zeroed. Returns its number or -errno.
+fn balloc() -> int {
+    if (tfs_free_blocks <= 0) { return -ENOSPC; }
+    var n: int = tfs_nblocks - tfs_data;
+    var k: int = 0;
+    var blk: int = tfs_block_hint;
+    while (k < n) {
+        if (blk >= tfs_nblocks) { blk = tfs_data; }
+        var v: int = map_get(tfs_bmap_blk, blk);
+        if (v < 0) { return v; }
+        if (v == 0) {
+            if (map_set(tfs_bmap_blk, blk, 1) < 0) { return -EIO_; }
+            if (bget(tfs_start + blk, 0) < 0) { return -EIO_; }     // a zeroed, dirty buffer
+            tfs_free_blocks -= 1;
+            tfs_block_hint = blk + 1;
+            return blk;
+        }
+        blk += 1;
+        k += 1;
+    }
+    return -ENOSPC;
+}
+
+fn bfree(blk: int) {
+    if (!ok_block(blk)) { return; }
+    if (map_get(tfs_bmap_blk, blk) == 1) {
+        map_set(tfs_bmap_blk, blk, 0);
+        tfs_free_blocks += 1;
+    }
+}
+
+fn ialloc() -> int {
+    if (tfs_free_inodes <= 0) { return -ENOSPC; }
+    var k: int = 0;
+    while (k < tfs_ninodes) {
+        var v: int = map_get(tfs_imap, k);
+        if (v < 0) { return v; }
+        if (v == 0) {
+            map_set(tfs_imap, k, 1);
+            tfs_free_inodes -= 1;
+            return k + 1;
+        }
+        k += 1;
+    }
+    return -ENOSPC;
+}
+
+// ---- disk inodes ----------------------------------------------------------------------------------
+
+// Word f of disk inode `ino`, as a pointer into its buffer (null on I/O error).
+fn dinode(ino: int, f: int) -> *int {
+    var b: int = tfs_bread(tfs_itable + (ino - 1) / INODES_PER_BLOCK);
+    if (b < 0) { return null; }
+    return buf_word(b, (ino - 1) % INODES_PER_BLOCK * INODE_WORDS + f);
+}
+
+fn dinode_set(ino: int, f: int, v: int) {
+    var p: *int = dinode(ino, f);
+    if (p == null) { return; }
+    *p = v;
+    bdirty(tfs_bread(tfs_itable + (ino - 1) / INODES_PER_BLOCK));
+}
+
+fn tfs_iload(i: int) -> int {
+    var ino: int = inodes[i].ino_no;
+    if (ino < 1 || ino > tfs_ninodes) { return tfs_bad("inode number", ino, ino); }
+    var p: *int = dinode(ino, 0);
+    if (p == null) { return -EIO_; }
+    var mode: int = p[DI_MODE];
+    var type: int = mode / 4096 % 16 * 4096;
+    if (type == S_IFDIR) { inodes[i].type = I_DIR; }
+    else if (type == S_IFREG) { inodes[i].type = I_REG; }
+    else { return tfs_bad("mode", mode, ino); }
+    inodes[i].mode = mode % 4096;
+    inodes[i].nlink = p[DI_NLINK];
+    inodes[i].size = p[DI_SIZE];
+    inodes[i].mtime = p[DI_MTIME];
+    if (inodes[i].size < 0 || inodes[i].nlink < 0) { return tfs_bad("size", inodes[i].size, ino); }
+    return 0;
+}
+
+// Write the in-core fields back (mode, links, size, times).
+fn tfs_isave(i: int) {
+    var ino: int = inodes[i].ino_no;
+    dinode_set(ino, DI_MODE, st_mode(i));
+    dinode_set(ino, DI_NLINK, inodes[i].nlink);
+    dinode_set(ino, DI_SIZE, inodes[i].size);
+    dinode_set(ino, DI_MTIME, inodes[i].mtime);
+    dinode_set(ino, DI_CTIME, inodes[i].mtime);
+}
+
+fn add_blocks(ino: int, d: int) {
+    var p: *int = dinode(ino, DI_BLOCKS);
+    if (p != null) { dinode_set(ino, DI_BLOCKS, *p + d); }
+}
+
+// A pointer in an indirect block (or the inode), allocating when asked.
+// Returns the block, 0 for a hole, or -errno.
+fn slot_get(ino: int, holder: int, idx: int, alloc: int) -> int {
+    var v: int;
+    if (holder == 0) {
+        var p: *int = dinode(ino, idx);
+        if (p == null) { return -EIO_; }
+        v = *p;
+    } else {
+        var b: int = tfs_bread(holder);
+        if (b < 0) { return -EIO_; }
+        v = *buf_word(b, idx);
+    }
+    if (v != 0 && !ok_block(v)) { return tfs_bad("block", v, ino); }
+    if (v == 0 && alloc) {
+        v = balloc();
+        if (v < 0) { return v; }
+        add_blocks(ino, 1);
+        if (holder == 0) { dinode_set(ino, idx, v); }
+        else {
+            var b2: int = tfs_bread(holder);
+            if (b2 < 0) { return -EIO_; }
+            *buf_word(b2, idx) = v;
+            bdirty(b2);
+        }
+    }
+    return v;
+}
+
+// The disk block holding logical block `lbn` of inode i: 0 for a hole, or -errno.
+fn tfs_bmap(i: int, lbn: int, alloc: int) -> int {
+    var ino: int = inodes[i].ino_no;
+    if (lbn < NDIRECT) { return slot_get(ino, 0, DI_DIRECT + lbn, alloc); }
+    lbn -= NDIRECT;
+    if (lbn < WPB) {
+        var ind: int = slot_get(ino, 0, DI_SINGLE, alloc);
+        if (ind <= 0) { return ind; }
+        return slot_get(ino, ind, lbn, alloc);
+    }
+    lbn -= WPB;
+    if (lbn >= WPB * WPB) { return -27; }        // EFBIG
+    var d: int = slot_get(ino, 0, DI_DOUBLE, alloc);
+    if (d <= 0) { return d; }
+    var ind2: int = slot_get(ino, d, lbn / WPB, alloc);
+    if (ind2 <= 0) { return ind2; }
+    return slot_get(ino, ind2, lbn % WPB, alloc);
+}
+
+// ---- file data --------------------------------------------------------------------------------------
+
+fn tfs_read(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var size: int = inodes[i].size;
+    if (pos >= size) { return 0; }
+    if (n > size - pos) { n = size - pos; }
+    var done: int = 0;
+    while (done < n) {
+        var p: int = pos + done;
+        var off: int = p % BLK;
+        var chunk: int = BLK - off;
+        if (chunk > n - done) { chunk = n - done; }
+        var blk: int = tfs_bmap(i, p / BLK, 0);
+        if (blk < 0) { return done > 0 ? done : blk; }
+        if (blk == 0) {
+            zero_trytes(&buf[done], chunk);          // a hole
+        } else {
+            var b: int = tfs_bread(blk);
+            if (b < 0) { return done > 0 ? done : -EIO_; }
+            copy_trytes(&buf[done], &buf_data(b)[off], chunk);
+        }
+        done += chunk;
+    }
+    return done;
+}
+
+fn tfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var done: int = 0;
+    while (done < n) {
+        var p: int = pos + done;
+        var off: int = p % BLK;
+        var chunk: int = BLK - off;
+        if (chunk > n - done) { chunk = n - done; }
+        var blk: int = tfs_bmap(i, p / BLK, 1);
+        if (blk <= 0) {
+            if (done > 0) { break; }
+            return blk < 0 ? blk : -EIO_;
+        }
+        var b: int = tfs_bread(blk);
+        if (b < 0) { if (done > 0) { break; } return -EIO_; }
+        copy_trytes(&buf_data(b)[off], &buf[done], chunk);
+        bdirty(b);
+        done += chunk;
+    }
+    if (pos + done > inodes[i].size) { inodes[i].size = pos + done; }
+    inodes[i].mtime = in(RTC_SECONDS);
+    tfs_isave(i);
+    return done;
+}
+
+// Free the blocks listed in indirect block `ind` (and, if `depth` is 2, theirs).
+fn free_indirect(ind: int, depth: int) {
+    if (!ok_block(ind)) { return; }
+    var j: int = 0;
+    while (j < WPB) {
+        var b: int = tfs_bread(ind);
+        if (b < 0) { return; }
+        var v: int = *buf_word(b, j);
+        if (v != 0) {
+            if (depth == 2) { free_indirect(v, 1); }
+            bfree(v);
+        }
+        j += 1;
+    }
+}
+
+fn tfs_truncate(i: int) -> int {
+    var ino: int = inodes[i].ino_no;
+    var k: int = 0;
+    while (k < NDIRECT) {
+        var p: *int = dinode(ino, DI_DIRECT + k);
+        if (p == null) { return -EIO_; }
+        if (*p != 0) { bfree(*p); dinode_set(ino, DI_DIRECT + k, 0); }
+        k += 1;
+    }
+    var s: *int = dinode(ino, DI_SINGLE);
+    if (s != null && *s != 0) { var v: int = *s; free_indirect(v, 1); bfree(v); dinode_set(ino, DI_SINGLE, 0); }
+    var d: *int = dinode(ino, DI_DOUBLE);
+    if (d != null && *d != 0) { var v2: int = *d; free_indirect(v2, 2); bfree(v2); dinode_set(ino, DI_DOUBLE, 0); }
+    dinode_set(ino, DI_BLOCKS, 0);
+    inodes[i].size = 0;
+    inodes[i].mtime = in(RTC_SECONDS);
+    tfs_isave(i);
+    return 0;
+}
+
+// The in-core inode is going away: if it was unlinked, free it on disk.
+fn tfs_ifree(i: int) {
+    if (!inodes[i].unlinked) { return; }
+    tfs_truncate(i);
+    var ino: int = inodes[i].ino_no;
+    dinode_set(ino, DI_MODE, 0);
+    dinode_set(ino, DI_NLINK, 0);
+    if (map_get(tfs_imap, ino - 1) == 1) {
+        map_set(tfs_imap, ino - 1, 0);
+        tfs_free_inodes += 1;
+    }
+}
+
+// ---- directories ---------------------------------------------------------------------------------------
+
+// The buffer holding slot `s` of directory i and the entry's first tryte
+// offset in it, via *off. Returns the buffer, 0 for a hole... (-1 on error).
+var dir_off: int;
+
+fn dir_slot_buf(i: int, s: int, alloc: int) -> int {
+    var blk: int = tfs_bmap(i, s / DIRENTS_PER_BLOCK, alloc);
+    if (blk <= 0) { return blk == 0 ? -2 : -1; }
+    var b: int = tfs_bread(blk);
+    if (b < 0) { return -1; }
+    dir_off = s % DIRENTS_PER_BLOCK * DIRENT;
+    return b;
+}
+
+fn ent_ino(b: int) -> int { return *((buf_data(b) as int + dir_off + 1) as *int); }
+
+fn ent_name_eq(b: int, s: *char, len: int) -> int {
+    var e: *tryte = &buf_data(b)[dir_off + 3];
+    var k: int = 0;
+    while (k < len) {
+        if (e[k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return len == 78 || e[len] == 0;
+}
+
+// The slot holding `name`, or -ENOENT / -EIO. Its inode number goes in *ino.
+fn dir_find(i: int, s: *char, len: int, ino: *int) -> int {
+    var slots: int = inodes[i].size / DIRENT;
+    var k: int = 0;
+    while (k < slots) {
+        var b: int = dir_slot_buf(i, k, 0);
+        if (b == -1) { return -EIO_; }
+        if (b >= 0) {
+            var v: int = ent_ino(b);
+            if (v != 0 && ent_name_eq(b, s, len)) {
+                *ino = v;
+                return k;
+            }
+        }
+        k += 1;
+    }
+    return -ENOENT_;
+}
+
+fn dir_set(i: int, slot: int, ino: int, s: *char, len: int) -> int {
+    var b: int = dir_slot_buf(i, slot, 1);
+    if (b < 0) { return b == -2 ? -EIO_ : (tfs_free_blocks <= 0 ? -ENOSPC : -EIO_); }
+    var e: *tryte = &buf_data(b)[dir_off];
+    *((e as int + 1) as *int) = ino;
+    if (s != null) {
+        var k: int = 0;
+        while (k < 78) {
+            e[3 + k] = (k < len ? s[k] : 0) as tryte;
+            k += 1;
+        }
+    }
+    bdirty(b);
+    return 0;
+}
+
+// Add an entry, reusing a free slot or growing the directory.
+fn dir_add(i: int, s: *char, len: int, ino: int) -> int {
+    var slots: int = inodes[i].size / DIRENT;
+    var k: int = 0;
+    while (k < slots) {
+        var b: int = dir_slot_buf(i, k, 0);
+        if (b == -1) { return -EIO_; }
+        if (b == -2 || ent_ino(b) == 0) { return dir_set(i, k, ino, s, len); }
+        k += 1;
+    }
+    var r: int = dir_set(i, slots, ino, s, len);
+    if (r < 0) { return r; }
+    inodes[i].size = (slots + 1) * DIRENT;
+    inodes[i].mtime = in(RTC_SECONDS);
+    tfs_isave(i);
+    return 0;
+}
+
+fn dir_is_empty(i: int) -> int {
+    var slots: int = inodes[i].size / DIRENT;
+    var k: int = 2;
+    while (k < slots) {
+        var b: int = dir_slot_buf(i, k, 0);
+        if (b == -1) { return -EIO_; }
+        if (b >= 0 && ent_ino(b) != 0) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+fn check_ino(ino: int, dir: int) -> int {
+    if (ino < 1 || ino > tfs_ninodes) { return tfs_bad("entry inode", ino, inodes[dir].ino_no); }
+    return 0;
+}
+
+fn tfs_lookup(dir: int, s: *char, len: int) -> int {
+    if (len > TFS_NAME_MAX) { return -ENAMETOOLONG; }
+    var ino: int = 0;
+    var slot: int = dir_find(dir, s, len, &ino);
+    if (slot < 0) { return slot; }
+    if (check_ino(ino, dir) < 0) { return -EIO_; }
+    return iget(FS_TFS, inodes[dir].mnt, ino);
+}
+
+fn tfs_create(dir: int, s: *char, len: int, type: int, mode: int) -> int {
+    if (len > TFS_NAME_MAX) { return -ENAMETOOLONG; }
+    if (type != I_REG && type != I_DIR) { return -EPERM; }
+    var ino: int = ialloc();
+    if (ino < 0) { return ino; }
+    var w: int = 0;
+    while (w < INODE_WORDS) { dinode_set(ino, w, 0); w += 1; }
+    var i: int = iget_new(ino, type, mode, dir);
+    if (i < 0) { return i; }
+    var r: int = 0;
+    if (type == I_DIR) {
+        r = dir_add(i, ".", 1, ino);
+        if (r >= 0) { r = dir_add(i, "..", 2, inodes[dir].ino_no); }
+    }
+    if (r >= 0) { r = dir_add(dir, s, len, ino); }
+    if (r < 0) {                                  // undo: the inode and any blocks
+        inodes[i].unlinked = 1;
+        inode_free(i);
+        return r;
+    }
+    if (type == I_DIR) {
+        inodes[dir].nlink += 1;
+        tfs_isave(dir);
+    }
+    return i;
+}
+
+// An in-core inode for a freshly allocated disk inode.
+fn iget_new(ino: int, type: int, mode: int, dir: int) -> int {
+    var i: int = inode_slot();
+    if (i < 0) {
+        map_set(tfs_imap, ino - 1, 0);
+        tfs_free_inodes += 1;
+        return -ENFILE;
+    }
+    inode_init(i, type, mode % 4096, FS_TFS, inodes[dir].mnt);
+    inodes[i].ino_no = ino;
+    inodes[i].nlink = type == I_DIR ? 2 : 1;
+    tfs_isave(i);
+    return i;
+}
+
+fn tfs_unlink(dir: int, s: *char, len: int, i: int) -> int {
+    var ino: int = 0;
+    var slot: int = dir_find(dir, s, len, &ino);
+    if (slot < 0) { return slot; }
+    if (inodes[i].type == I_DIR) {
+        var e: int = dir_is_empty(i);
+        if (e < 0) { return e; }
+        if (!e) { return -ENOTEMPTY; }
+        if (is_some_cwd(i)) { return -EBUSY; }
+    }
+    var r: int = dir_set(dir, slot, 0, null, 0);
+    if (r < 0) { return r; }
+    if (inodes[i].type == I_DIR) {
+        inodes[dir].nlink -= 1;
+        inodes[i].nlink = 0;
+    } else {
+        inodes[i].nlink -= 1;
+    }
+    inodes[dir].mtime = in(RTC_SECONDS);
+    tfs_isave(dir);
+    tfs_isave(i);
+    return 0;
+}
+
+fn tfs_rename(od: int, oname: *char, olen: int, src: int, nd: int, nname: *char, nlen: int, dst: int) -> int {
+    if (nlen > TFS_NAME_MAX) { return -ENAMETOOLONG; }
+    if (dst >= 0) {
+        var r: int = tfs_unlink(nd, nname, nlen, dst);
+        if (r < 0) { return r; }
+        inodes[dst].unlinked = 1;
+        inode_release(dst);
+    }
+    var r2: int = dir_add(nd, nname, nlen, inodes[src].ino_no);
+    if (r2 < 0) { return r2; }
+    var ino: int = 0;
+    var slot: int = dir_find(od, oname, olen, &ino);
+    if (slot >= 0) { dir_set(od, slot, 0, null, 0); }
+    if (inodes[src].type == I_DIR && od != nd) {
+        var dd: int = 0;
+        var s2: int = dir_find(src, "..", 2, &dd);
+        if (s2 >= 0) { dir_set(src, s2, inodes[nd].ino_no, null, 0); }
+        inodes[od].nlink -= 1;
+        inodes[nd].nlink += 1;
+        tfs_isave(od);
+        tfs_isave(nd);
+    }
+    return 0;
+}
+
+// getcwd support: the name under which `parent` holds `child`.
+fn tfs_name_of(parent: int, child: int, buf: *char) -> int {
+    var slots: int = inodes[parent].size / DIRENT;
+    var want: int = inodes[child].ino_no;
+    var k: int = 2;
+    while (k < slots) {
+        var b: int = dir_slot_buf(parent, k, 0);
+        if (b == -1) { return -EIO_; }
+        if (b >= 0 && ent_ino(b) == want) {
+            var e: *tryte = &buf_data(b)[dir_off + 3];
+            var n: int = 0;
+            while (n < 78 && e[n] != 0) { buf[n] = e[n]; n += 1; }
+            buf[n] = 0;
+            return n;
+        }
+        k += 1;
+    }
+    return -ENOENT_;
+}
+
+fn tfs_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
+    var slots: int = inodes[dir].size / DIRENT;
+    while (pos < slots) {
+        var b: int = dir_slot_buf(dir, pos, 0);
+        if (b == -1) { return -EIO_; }
+        if (b >= 0) {
+            var ino: int = ent_ino(b);
+            if (ino != 0) {
+                var e: *tryte = &buf_data(b)[dir_off + 3];
+                var n: int = 0;
+                while (n < 78 && e[n] != 0) { name[n] = e[n]; n += 1; }
+                name[n] = 0;
+                info[0] = ino;
+                info[1] = 0;                              // DT_UNKNOWN unless the inode is readable
+                if (ino >= 1 && ino <= tfs_ninodes) {             // quietly: lookup reports damage
+                    var p: *int = dinode(ino, DI_MODE);
+                    if (p != null) { info[1] = *p / 4096 % 16 * 4096 == S_IFDIR ? DT_DIR : DT_REG; }
+                }
+                return pos + 1;
+            }
+        }
+        pos += 1;
+    }
+    return 0;
+}

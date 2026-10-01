@@ -68,8 +68,8 @@ fn k1_kernel_boots_with_paging_and_timer() {
         "Memory: 671 pages free (frames 58..728), triddy orders 0..9",
         "mm: triddy self-test OK",
         "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 759 pages",
-        "VFS: ramfs root, devfs on /dev, console tty",
-        "initramfs: 15 files",
+        "VFS: Mounted root (tfs filesystem): 486 blocks",
+        "VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty",
         "init: started /sbin/init as pid 1",
         "Timer: 100 Hz",
     ] {
@@ -201,10 +201,10 @@ fn k4_shell_files_dirs_and_status() {
         "cat f\none\ntwo\n",
         "cat < f | cat | cat\none\ntwo\n",
         "&& ls\n/tmp/a/b\na\nf\n",
-        "$ ls /\nbin\ndev\netc\nsbin\ntmp\n",
+        "$ ls /\nbin\ndev\netc\nhome\nmnt\nproc\nsbin\ntmp\n",
         "-rwxr-xr-x 1 root root",
         "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root root ",
-        "/etc:\n-rwxr-xr-x 1 root root      65 motd\n",
+        "/etc:\n-rw-r--r-- 1 root root      65 motd\n",
         "Welcome to Trinux on Setun-386.\nEverything here is a power of 3.\n",
         "status 1\n",
         "or-ran\nand-ran\n",
@@ -302,7 +302,7 @@ fn k5_job_control() {
     for want in [
         "$ sleep 50 &\n[1] 3\n",
         "$ jobs\n[1]  Running                 sleep 50 &\n",
-        "$ true\n[1]  Terminated              sleep 50\n",
+        "[1]  Terminated              sleep 50\n$ ",
         "$ sleep 100\n^Z\n[1]  Stopped                 sleep 100\n",
         "$ jobs\n[1]  Stopped                 sleep 100\n",
         "$ bg\n[1] sleep 100 &\n$ jobs\n[1]  Running                 sleep 100 &\n$ fg\nsleep 100\n^C\n",
@@ -310,7 +310,7 @@ fn k5_job_control() {
         "$ cat | cat\n^C\n$ ",
         "$ abc^C\n$ echo after\nafter\n",                       // ^C at the prompt drops the line
         "$ true\n[1]  Stopped                 cat\n",             // SIGTTIN for a background read
-        "$ kill -9 %1\n[1]  Killed                  cat\n",
+        "[1]  Killed                  cat\n",
         "init: /bin/sh exited with 3",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");

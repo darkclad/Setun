@@ -167,7 +167,7 @@ All of these fit `SYS`'s ±9841 range.
 
 **`tfs`, the "ternary file system":**
 - A block is one disk sector (3^9 trytes).
-- On-disk structures: a superblock, an inode table, a block bitmap (one trit per block: free / used / bad), and directories holding (inode, name) entries.
+- On-disk structures: a superblock, an inode table, a block map (a tryte per block holding a trit: free / used / bad), and directories holding (inode, name) entries. As built: §19.
 - Inodes have direct, single- and double-indirect block pointers, as in ext2.
 - File names are Unicode, one tryte per character, up to 81 characters.
 
@@ -255,7 +255,7 @@ fmt_nl(f);
 | K3 ✅ | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
 | K4 ✅ | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
 | K5 ✅ | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
-| K6 | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
+| K6 ✅ | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
 | K7 | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
 | K8 | (then) the window system on the framebuffer | – |
 
@@ -583,3 +583,96 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
 - `sleep 100`, then `^C`, prints a prompt, and `$?` is 130;
 - 18 `sigtest` checks: handlers, pending while blocked, nested handlers, `SIG_IGN`, uncatchable `SIGKILL`, `SIGPIPE`, `EINTR` with the time left, `SA_RESTART`, stop/continue through `WUNTRACED`, and group kills;
 - a job-control session: `&`, `jobs`, `kill %1`, `^Z`, `bg`, `fg`, `^C`, `^C` in a pipeline and at the prompt, and `SIGTTIN` for `cat &`.
+
+## 19. K6 as built
+
+**Boot disk** (`mkdisk`, 3^6 = 729 sectors):
+
+| Sectors | Contents |
+|---|---|
+| 0 | loader |
+| 1…27 | kernel |
+| 28…242 | the initramfs, only on a `Root::Initramfs` disk (the fallback) |
+| 243…728 | the **tfs root volume**, 486 blocks and 729 inodes |
+
+At boot the kernel mounts the tfs volume as `/`, and prints `VFS: Mounted root (tfs filesystem)`. Without one it unpacks the initramfs into a ramfs. With neither it stops, with Linux's `Kernel panic - not syncing: VFS: Unable to mount root fs`. It then mounts devfs on `/dev`, procfs on `/proc` and a tmpfs (ramfs) on `/tmp`.
+
+**tfs on disk** ([`kernel/fs/tfs.tri`](../kernel/fs/tfs.tri); host side [`crates/trinux/src/tfs.rs`](../crates/trinux/src/tfs.rs)):
+- **Blocks:** a block is one sector, 3^9 trytes = 6561 words. Block numbers count from the start of the volume.
+
+  | Block | Contents |
+  |---|---|
+  | 0 | superblock: magic `31857270904`, version, block and inode counts, the block numbers of the maps, inode table and data, free counts, root inode (1), state (1 clean, 0 mounted) |
+  | 1 | inode map, a tryte per inode |
+  | 2… | block map, a tryte per block (0 free, 1 used, −1 bad) |
+  | then | inode table: 243 inodes of 27 words per block |
+  | then | data |
+
+- **Inode** (27 words): mode, nlink, uid, gid, size in trytes, atime, mtime, ctime, block count, 15 direct pointers, single indirect, double indirect, generation. An indirect block holds 6561 pointers.
+- **Directory:** a file of 81-tryte entries, 243 per block. Each entry is an inode-number word (0 = free slot) and a name of up to 77 characters, one code point per tryte. Every directory starts with `.` and `..`.
+- **Mounting:** the kernel checks every superblock field against the disk size and the fixed layout, and refuses an inconsistent volume. The superblock state is set to "mounted" while in use; a volume that was not cleanly unmounted is reported at the next boot.
+- **Damage gives EIO:** every block pointer, inode number and inode mode read from the disk is range-checked. Damage gives `EIO` and a `tfs: bad …` message, never a stray access.
+
+**Buffer cache** ([`kernel/fs/bcache.tri`](../kernel/fs/bcache.tri)):
+- 27 one-sector buffers in one order-3 triddy block, LRU, write-back.
+- Dirty buffers reach the disk:
+  - on eviction;
+  - on `sync`/`fsync`;
+  - from the idle loop once 5 s have passed with dirty buffers (like `bdflush`);
+  - on `reboot`/`poweroff`, which also marks the volume clean.
+
+**VFS** ([`kernel/fs/vfs.tri`](../kernel/fs/vfs.tri)):
+- **Inode table:** one table of 243 in-core inodes for ramfs, tfs and procfs.
+  - A ramfs inode *is* its file.
+  - A tfs or procfs inode is a cache entry. It can be evicted unless it is held by an open file, a working directory, a mount, or use in the current system call (a per-syscall stamp).
+- **Mounts** link a directory (`mounted`) and a file-system root (`covered`). Lookup crosses them both ways, including for `..` and `getcwd`. Mounts stack, as on Linux.
+- **getcwd** walks `..` and finds each name in the parent directory (tfs), or from the inode (ramfs, procfs).
+
+**procfs** ([`kernel/fs/procfs.tri`](../kernel/fs/procfs.tri)): contents are generated on every read.
+
+| File | Contents |
+|---|---|
+| `/proc/meminfo` | memory totals |
+| `/proc/uptime` | seconds since boot |
+| `/proc/mounts` | the mount table |
+| `/proc/<pid>/stat` | Linux field order: pid, comm, state, ppid, pgrp, session, tty, tpgid, …, utime as field 14, starttime as field 22 |
+| `/proc/<pid>/status` | name, state, pid, ppid, pgid, sid |
+| `/proc/<pid>/cmdline` | the arguments, NUL-separated |
+
+`execve` records `comm` (the last path component) and `cmdline`.
+
+**System calls** (in addition to K5's):
+
+| Call | Number |
+|---|---|
+| `renameat` | 38 |
+| `umount2` | 39 |
+| `mount` | 40 (`ramfs`/`tmpfs` and `proc`; `tfs` is the root, so `EBUSY`; anything else `ENODEV`) |
+| `statfs` | 43 (one word per field) |
+| `sync` / `fsync` | 81 / 82 |
+| `reboot` | 142 (Linux magic numbers; restart, power off, halt) |
+
+**Errors:**
+- **rename:** `EXDEV` across file systems, `EINVAL` when moving a directory into itself, `ENOTEMPTY` when the target is a full directory, and `ENOTDIR`/`EISDIR` when the types differ.
+- **Busy:** `EBUSY` for unmounting or removing something in use, and for removing a working directory (Linux allows the last one).
+- **Names:** `ENAMETOOLONG` past 77 characters on tfs, or 26 on ramfs.
+- **Space:** `ENOSPC` for blocks and for inodes.
+
+**User space:**
+- **tlibc:** `rename`, `sync`, `fsync`, `mount`, `umount`, `statfs`, `reboot`.
+- **New programs:**
+  - `/bin`: `ps`, `mount`, `umount`, `sync`, `mv`, `touch`, `df`, and `fstest` (the K6 scenarios);
+  - `/sbin`: `reboot`, `poweroff`, `halt`.
+- The shell looks commands up in `/bin`, then `/sbin`.
+
+**Verified** (`crates/trinux/tests/fs.rs`, `tests/tfs.rs`):
+- **Persistence:** files written, moved and powered off survive a reboot; the host reads them back and its fsck finds the volume clean.
+- **Shutdown:** pulling the plug is detected at the next boot; `sync` and the 5-second flush put data on the disk.
+- **fstest:** about 90 checks pass, most of them error paths (the `ENO*`/`E*` cases above, plus `EBADF`, `EFAULT`, `EMFILE`, `ESPIPE`, `EACCES`/`ENOEXEC` for `exec`, and the mount and `/proc` refusals). Afterwards the host fsck finds no damage.
+- **A full volume** (81 blocks) gives `ENOSPC` for data, `mkdir` and inodes, and gets every block and inode back.
+- **Damaged disks:**
+  - a bad superblock magic, or an inconsistent superblock, leads to the root-fs panic;
+  - a damaged block pointer, inode mode or directory entry gives `EIO` and a message, and the system carries on.
+- **Fallback:** the initramfs root still boots.
+- **`ps` and `/proc`:** `ps` and the `/proc` files show the expected processes and fields.
+- **Host refusals:** the host tfs refuses bad names, duplicates, impossible geometry and damaged superblocks, and its fsck reports out-of-range or doubly used blocks, wrong link and free counts, unreachable inodes and bad entries. It found a real inode leak in `mkdisk` on the way.

@@ -1,0 +1,20 @@
+// reboot | poweroff | halt: flush the disks and restart or stop the machine.
+// The same program under three names; argv[0] picks the action.
+
+import "../lib/tlibc.tri";
+
+fn ends_with(s: *char, tail: *char) -> int {
+    var n: int = strlen(s);
+    var m: int = strlen(tail);
+    return n >= m && streq(&s[n - m], tail);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var cmd: int = RB_AUTOBOOT;
+    if (ends_with(argv[0], "poweroff")) { cmd = RB_POWER_OFF; }
+    if (ends_with(argv[0], "halt")) { cmd = RB_HALT_SYSTEM; }
+    sync();
+    reboot(cmd);
+    perror2(argv[0], "reboot");
+    return 1;
+}

@@ -8,6 +8,9 @@ import "sched.tri";
 import "initramfs.tri";
 import "fs/vfs.tri";
 import "fs/devfs.tri";
+import "fs/bcache.tri";
+import "fs/tfs.tri";
+import "fs/procfs.tri";
 import "drivers/tty.tri";
 
 var boot_disk: int;
@@ -21,6 +24,37 @@ fn time_init() {
     pr(" Hz (");
     pr_int(1000000 / HZ);
     pr(" us per tick)\n");
+}
+
+// The root file system: the tfs volume on the boot disk, or else the
+// initramfs unpacked into a ramfs.
+fn mount_root() {
+    var m: int = mount_add(FS_TFS, -1, -1, "/dev/hda", "/");
+    var r: int = tfs_mount(TFS_START, m);
+    if (r >= 0) {
+        mounts[m].root = r;
+        root_ino = r;
+        printk("VFS: Mounted root (tfs filesystem): ");
+        pr_int(tfs_nblocks);
+        pr(" blocks, ");
+        pr_int(tfs_free_blocks);
+        pr(" free, ");
+        pr_int(tfs_free_inodes);
+        pr(" inodes free\n");
+        return;
+    }
+    mounts[m].used = 0;
+    m = mount_add(FS_RAM, -1, -1, "rootfs", "/");
+    root_ino = ram_new_root(m);
+    mounts[m].root = root_ino;
+    if (!initramfs_init()) {
+        printk("Kernel panic - not syncing: VFS: Unable to mount root fs\n");
+        panic("no root file system");
+    }
+    vfs_mkdirs("/dev");
+    vfs_mkdirs("/proc");
+    vfs_mkdirs("/tmp");
+    printk("VFS: Mounted root (ramfs from the initramfs)\n");
 }
 
 fn start_kernel(disk: int, frames: int) {
@@ -60,11 +94,16 @@ fn start_kernel(disk: int, frames: int) {
 
     sched_init();
     vfs_init();
+    bcache_init();
+    mount_root();
     devfs_init();
-    vfs_mkdirs("/tmp");
+    var point: int = path_lookup("/proc", root_ino);
+    if (point < 0 || do_mount(FS_PROC, point, "proc", "/proc") < 0) { printk("VFS: cannot mount /proc\n"); }
+    point = path_lookup("/tmp", root_ino);
+    if (point < 0 || do_mount(FS_RAM, point, "tmpfs", "/tmp") < 0) { printk("VFS: cannot mount /tmp\n"); }
     tty_init();
-    printk("VFS: ramfs root, devfs on /dev, console tty\n");
-    if (initramfs_init()) {
+    printk("VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty\n");
+    {
         var pid: int = spawn_init("/sbin/init");
         if (pid < 0) {
             printk("init: cannot run /sbin/init (error ");
@@ -80,9 +119,14 @@ fn start_kernel(disk: int, frames: int) {
 
     // The idle task: schedule user tasks, sleep until the next interrupt.
     var announced: int = 0;
+    var last_flush: int = 0;
     loop {
         local_irq_disable();
         schedule();
+        if (jiffies - last_flush >= 5 * HZ && bcache_dirty_count() > 0) {   // like bdflush
+            tfs_sync();
+            last_flush = jiffies;
+        }
         local_irq_enable();
         if (user_tasks_alive == 0 && !announced) {
             printk("Idle: no user processes left (");

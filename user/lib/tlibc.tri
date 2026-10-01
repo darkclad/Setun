@@ -35,6 +35,9 @@ const ERANGE: int = 34;
 const ENAMETOOLONG: int = 36;
 const ENOSYS: int = 38;
 const ENOTEMPTY: int = 39;
+const EXDEV: int = 18;
+const ENODEV: int = 19;
+const EFBIG: int = 27;
 
 // signal.h (Linux numbers)
 const SIGHUP: int = 1;
@@ -117,6 +120,37 @@ fn pipe(fds: *int) -> int { return _ret(syscall(59, fds, 0)); }
 fn chdir(path: *char) -> int { return _ret(syscall(49, path)); }
 fn rmdir(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, AT_REMOVEDIR)); }
 fn unlink(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, 0)); }
+fn rename(old: *char, new: *char) -> int { return _ret(syscall(38, AT_FDCWD, old, AT_FDCWD, new)); }
+fn sync() { syscall(81); }
+fn fsync(fd: int) -> int { return _ret(syscall(82, fd)); }
+
+// sys/mount.h
+fn mount(source: *char, target: *char, type: *char, flags: int, data: *char) -> int {
+    return _ret(syscall(40, source, target, type, flags, data));
+}
+fn umount(target: *char) -> int { return _ret(syscall(39, target, 0)); }
+
+// sys/reboot.h (glibc's reboot(cmd) adds Linux's magic numbers)
+const RB_AUTOBOOT: int = 19088743;
+const RB_POWER_OFF: int = 1126301404;
+const RB_HALT_SYSTEM: int = 3454992675;
+fn reboot(cmd: int) -> int { return _ret(syscall(142, 4276215469, 672274793, cmd, 0)); }
+
+// sys/statfs.h, one word per field
+struct statfs_t {
+    f_type: int;
+    f_bsize: int;
+    f_blocks: int;
+    f_bfree: int;
+    f_bavail: int;
+    f_files: int;
+    f_ffree: int;
+    f_fsid: int;
+    f_namelen: int;
+    f_frsize: int;
+    f_flags: int;
+}
+fn statfs(path: *char, buf: *statfs_t) -> int { return _ret(syscall(43, path, buf)); }
 fn getpid() -> int { return syscall(172); }
 fn setpgid(pid: int, pgid: int) -> int { return _ret(syscall(154, pid, pgid)); }
 fn getpgid(pid: int) -> int { return _ret(syscall(155, pid)); }
@@ -478,6 +512,9 @@ fn strerror(e: int) -> *char {
         case ENAMETOOLONG: return "File name too long";
         case ENOSYS: return "Function not implemented";
         case ENOTEMPTY: return "Directory not empty";
+        case EXDEV: return "Invalid cross-device link";
+        case ENODEV: return "No such device";
+        case EFBIG: return "File too large";
     }
     return "Unknown error";
 }

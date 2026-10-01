@@ -1,0 +1,134 @@
+// ps: list processes from /proc (PID PPID PGID S TIME CMD).
+
+import "../lib/tlibc.tri";
+
+var buf: [729]char;
+
+// The file's contents into buf (NUL-terminated); its length, or -1.
+fn slurp(path: *char) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    var n: int = 0;
+    loop {
+        var r: int = read(fd, &buf[n], 728 - n);
+        if (r <= 0) { break; }
+        n += r;
+    }
+    close(fd);
+    buf[n] = 0;
+    return n;
+}
+
+fn pad(s: *char, width: int) {
+    var n: int = strlen(s);
+    while (n < width) { puts(" "); n += 1; }
+    puts(s);
+}
+
+fn pad_int(v: int, width: int) {
+    var b: [15]char;
+    pad(itoa(v, &b[0]), width);
+}
+
+// Field k (1-based, after the "(comm)") of a stat line, as an integer.
+fn field(line: *char, k: int) -> int {
+    var i: int = 0;
+    while (line[i] != 0 && line[i] != ')') { i += 1; }   // past the comm
+    var f: int = 2;
+    while (line[i] != 0 && f < k) {
+        if (line[i] == ' ') { f += 1; }
+        i += 1;
+    }
+    var neg: int = 0;
+    if (line[i] == '-') { neg = 1; i += 1; }
+    var v: int = 0;
+    while (line[i] >= '0' && line[i] <= '9') { v = v * 10 + line[i] - '0'; i += 1; }
+    return neg ? -v : v;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var d: *DIR = opendir("/proc");
+    if (d == null) { perror2("ps", "/proc"); return 1; }
+    var pids: [27]int;
+    var n: int = 0;
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        if (e.d_name[0] < '0' || e.d_name[0] > '9' || n == 27) { continue; }
+        var v: int = 0;
+        var k: int = 0;
+        while (e.d_name[k] != 0) { v = v * 10 + e.d_name[k] - '0'; k += 1; }
+        pids[n] = v;
+        n += 1;
+    }
+    closedir(d);
+    // sort by pid
+    var i: int = 1;
+    while (i < n) {
+        var x: int = pids[i];
+        var j: int = i - 1;
+        while (j >= 0 && pids[j] > x) { pids[j + 1] = pids[j]; j -= 1; }
+        pids[j + 1] = x;
+        i += 1;
+    }
+    puts("  PID  PPID  PGID S   TIME CMD\n");
+    i = 0;
+    while (i < n) {
+        var path: [27]char;
+        var b: [15]char;
+        var p: *char = "/proc/";
+        var k: int = 0;
+        while (p[k] != 0) { path[k] = p[k]; k += 1; }
+        var s: *char = itoa(pids[i], &b[0]);
+        var j: int = 0;
+        while (s[j] != 0) { path[k] = s[j]; k += 1; j += 1; }
+        path[k] = 0;
+        var base: int = k;
+        var tail: *char = "/stat";
+        j = 0;
+        while (tail[j] != 0) { path[base + j] = tail[j]; j += 1; }
+        path[base + j] = 0;
+        if (slurp(&path[0]) <= 0) { i += 1; continue; }       // gone meanwhile
+        var stat: [243]char;
+        k = 0;
+        while (buf[k] != 0 && k < 242) { stat[k] = buf[k]; k += 1; }
+        stat[k] = 0;
+        var state: char = '?';
+        k = 0;
+        while (stat[k] != 0 && stat[k] != ')') { k += 1; }
+        if (stat[k] == ')') { state = stat[k + 2]; }
+        var ticks: int = field(&stat[0], 14);
+        pad_int(pids[i], 5);
+        pad_int(field(&stat[0], 4), 6);
+        pad_int(field(&stat[0], 5), 6);
+        puts(" ");
+        write(STDOUT_FILENO, &state, 1);
+        var secs: int = ticks / 100;
+        pad_int(secs / 60, 4);
+        puts(":");
+        if (secs % 60 < 10) { puts("0"); }
+        put_int(secs % 60);
+        puts(" ");
+        tail = "/cmdline";
+        j = 0;
+        while (tail[j] != 0) { path[base + j] = tail[j]; j += 1; }
+        path[base + j] = 0;
+        var len: int = slurp(&path[0]);
+        if (len > 0) {
+            k = 0;
+            while (k < len - 1) { if (buf[k] == 0) { buf[k] = ' '; } k += 1; }
+            puts(&buf[0]);
+        } else {
+            // [comm] from the stat line
+            puts("[");
+            k = 0;
+            while (stat[k] != '(' && stat[k] != 0) { k += 1; }
+            k += 1;
+            while (stat[k] != ')' && stat[k] != 0) { write(STDOUT_FILENO, &stat[k], 1); k += 1; }
+            puts("]");
+        }
+        puts("\n");
+        i += 1;
+    }
+    return 0;
+}

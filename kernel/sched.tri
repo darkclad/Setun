@@ -10,6 +10,8 @@ import "fs/vfs.tri";
 import "fs/file.tri";
 import "drivers/tty.tri";
 import "signal.tri";
+import "fs/tfs.tri";
+import "fs/procfs.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
@@ -59,6 +61,13 @@ const SYS_EXIT_GROUP: int = 94;
 const SYS_SCHED_YIELD: int = 124;
 const SYS_GETPID: int = 172;
 const SYS_GETPPID: int = 173;
+const SYS_RENAMEAT: int = 38;
+const SYS_UMOUNT2: int = 39;
+const SYS_MOUNT: int = 40;
+const SYS_STATFS: int = 43;
+const SYS_SYNC: int = 81;
+const SYS_FSYNC: int = 82;
+const SYS_REBOOT: int = 142;
 const SYS_NANOSLEEP: int = 101;
 const SYS_KILL: int = 129;
 const SYS_RT_SIGSUSPEND: int = 133;
@@ -112,6 +121,10 @@ struct Task {
     orig_r1: int;                     // its first argument, for a restart
     restart_nanosleep: int;           // the restarted nanosleep resumes at...
     nanosleep_until: int;             // ...this jiffy
+    start_time: int;                  // jiffies at fork
+    cmdline_len: int;
+    comm: [27]char;                   // the program's name (procfs)
+    cmdline: [81]char;                // its arguments, NUL-separated
 }
 
 var tasks: [27]Task;
@@ -244,6 +257,8 @@ fn spawn_init(path: *char) -> int {
     t.pid = next_pid;
     next_pid += 1;
     t.ppid = 0;
+    t.start_time = jiffies;
+    set_comm(t);
     t.pgid = t.pid;
     t.sid = t.pid;
     var sig: int = 0;
@@ -279,6 +294,11 @@ fn do_fork(f: *int) -> int {
     child.brk = parent.brk;
     fs_fork(parent, child);
     signals_fork(parent, child);
+    child.start_time = jiffies;
+    copy_str(&child.comm[0], &parent.comm[0], 27);
+    var k: int = 0;
+    while (k < 81) { child.cmdline[k] = parent.cmdline[k]; k += 1; }
+    child.cmdline_len = parent.cmdline_len;
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     var cf: *int = task_frame(child);
@@ -306,6 +326,7 @@ fn do_execve(f: *int) -> int {
     tlbflush();
     if (old != 0) { free_address_space(old); }
     signals_exec(t);
+    set_comm(t);
     set_user_entry(f, load_entry, load_sp, exec_argc, load_argv);
     return exec_argc;                                 // r1 = argc (set_user_entry already wrote it)
 }
@@ -531,8 +552,32 @@ fn sys_sysinfo(info: int) -> int {
 }
 
 // Arguments are r1..r6 in the frame; the result goes back in r1.
+// comm = the last component of exec_path; cmdline = the arguments.
+fn set_comm(t: *Task) {
+    var start: int = 0;
+    var k: int = 0;
+    while (exec_path[k] != 0) { if (exec_path[k] == '/') { start = k + 1; } k += 1; }
+    copy_str(&t.comm[0], &exec_path[start], 16);
+    var n: int = 0;
+    var a: int = 0;
+    while (a < exec_argc && n < 80) {
+        var s: *char = &exec_buf[exec_arg[a]];
+        var j: int = 0;
+        loop {
+            if (n >= 80) { break; }
+            t.cmdline[n] = s[j];
+            n += 1;
+            if (s[j] == 0) { break; }
+            j += 1;
+        }
+        a += 1;
+    }
+    t.cmdline_len = n;
+}
+
 fn do_syscall(f: *int, n: int) {
     var t: *Task = current_task();
+    vfs_stamp += 1;
     t.orig_r1 = f[F_R1];
     t.in_syscall = n != SYS_RT_SIGRETURN;
     if (n != SYS_NANOSLEEP) { t.restart_nanosleep = 0; }
@@ -569,6 +614,13 @@ fn do_syscall(f: *int, n: int) {
         }
         case SYS_WAIT4: f[F_R1] = do_wait4(f[0], f[1], f[2]);
         case SYS_NANOSLEEP: f[F_R1] = sys_nanosleep(f[0], f[1]);
+        case SYS_RENAMEAT: f[F_R1] = sys_renameat(f[0], f[1], f[2], f[3]);
+        case SYS_UMOUNT2: f[F_R1] = sys_umount2(f[0], f[1]);
+        case SYS_MOUNT: f[F_R1] = sys_mount(f[0], f[1], f[2], f[3], f[4]);
+        case SYS_STATFS: f[F_R1] = sys_statfs(f[0], f[1]);
+        case SYS_SYNC: f[F_R1] = sys_sync();
+        case SYS_FSYNC: f[F_R1] = sys_fsync(f[0]);
+        case SYS_REBOOT: f[F_R1] = sys_reboot(f[0], f[1], f[2]);
         case SYS_KILL: f[F_R1] = sys_kill(f[0], f[1]);
         case SYS_RT_SIGSUSPEND: f[F_R1] = sys_rt_sigsuspend(f[0]);
         case SYS_RT_SIGACTION: f[F_R1] = sys_rt_sigaction(f[0], f[1], f[2]);

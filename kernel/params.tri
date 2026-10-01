@@ -12,6 +12,9 @@ const KERNEL_MAX_SECTORS: int = 27;   // frames 4..30
 const FRAME_KDATA: int = 31;          // kernel globals: frames 31..57
 const FRAME_FIRST_FREE: int = 58;     // the page allocator owns frames 58..
 
+// The tfs root volume starts at this sector of the boot disk (mkdisk).
+const TFS_START: int = 243;
+
 // Loader handoff: mkdisk patches these words into the loader sector.
 const LOADER_KERNEL_SECTORS: int = 29520;
 const LOADER_KERNEL_ENTRY: int = 29517;

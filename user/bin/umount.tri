@@ -1,0 +1,9 @@
+// umount dir: unmount the file system mounted on dir.
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc != 2) { fputs(STDERR_FILENO, "usage: umount dir\n"); return 2; }
+    if (umount(argv[1]) < 0) { perror2("umount", argv[1]); return 1; }
+    return 0;
+}

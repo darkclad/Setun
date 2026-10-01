@@ -120,6 +120,8 @@ fn mm_init(frames: int) {
 // instructions a word, and zeroing page tables dominated fork and exec.
 extern fn zero_words(p: *int, n: int);
 extern fn copy_words(dst: *int, src: *int, n: int);
+extern fn copy_trytes(dst: *tryte, src: *tryte, n: int);
+extern fn zero_trytes(dst: *tryte, n: int);
 
 fn _mm_asm() {
     asm {
@@ -147,6 +149,30 @@ fn _mm_asm() {
         "        cmp   r3, 0"
         "        bgt   copy_words_loop"
         "copy_words_done:"
+        "        ret"
+        "copy_trytes:"
+        "        cmp   r3, 0"
+        "        ble   copy_trytes_done"
+        "copy_trytes_loop:"
+        "        ldt   r4, [r2]"
+        "        stt   r4, [r1]"
+        "        add   r1, r1, 1"
+        "        add   r2, r2, 1"
+        "        sub   r3, r3, 1"
+        "        cmp   r3, 0"
+        "        bgt   copy_trytes_loop"
+        "copy_trytes_done:"
+        "        ret"
+        "zero_trytes:"
+        "        cmp   r2, 0"
+        "        ble   zero_trytes_done"
+        "zero_trytes_loop:"
+        "        stt   r0, [r1]"
+        "        add   r1, r1, 1"
+        "        sub   r2, r2, 1"
+        "        cmp   r2, 0"
+        "        bgt   zero_trytes_loop"
+        "zero_trytes_done:"
         "        ret"
         "_mm_asm_end:"
     }

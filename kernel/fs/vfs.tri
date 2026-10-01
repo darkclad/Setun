@@ -1,10 +1,17 @@
-// vfs: inodes, directories, path lookup, regular-file data, open files.
+// vfs: in-core inodes, mounts, path lookup and dispatch to the file systems.
 //
-// The root file system is a ramfs. In v1 a directory entry is merged into
-// the inode it names (one name per inode: no hard links yet); directories
-// keep their children on a sibling list. Regular files hold their data in
-// a triddy block that grows on demand; files from the initramfs point into
-// the archive until their first write.
+// One table of 243 in-core inodes serves every file system:
+//   ramfs  the inode IS the file: directories keep children on a sibling
+//          list, data lives in a triddy block (initramfs root, /tmp, devfs);
+//   tfs    a cached copy of an on-disk inode (kernel/fs/tfs.tri);
+//   procfs generated on lookup (kernel/fs/procfs.tri).
+// tfs and procfs inodes are evicted when the table fills, unless something
+// holds them: an open file, a working directory, a mount, or use in the
+// current system call (Inode.stamp == vfs_stamp).
+//
+// A mount joins a file system's root to a directory: the directory's
+// `mounted` names the root, the root's `covered` names the directory. Path
+// lookup crosses both ways.
 
 import "../params.tri";
 import "../printk.tri";
@@ -12,13 +19,19 @@ import "../mm.tri";
 
 const NINODES: int = 243;
 const NFILES: int = 243;
-const NAME_MAX: int = 26;
+const NAME_MAX: int = 77;             // longest name (tfs); ramfs keeps 26
+const RAM_NAME_MAX: int = 26;
+const NMOUNTS: int = 9;
 
 const I_FREE: int = 0;
 const I_REG: int = 1;
 const I_DIR: int = 2;
 const I_CHR: int = 3;
 const I_FIFO: int = 4;
+
+const FS_RAM: int = 0;
+const FS_TFS: int = 1;
+const FS_PROC: int = 2;
 
 // st_mode file types (Linux values)
 const S_IFIFO: int = 4096;
@@ -29,34 +42,49 @@ const S_IFREG: int = 32768;
 // errno (Linux)
 const EPERM: int = 1;
 const ENOENT_: int = 2;
+const EIO_: int = 5;
+const EBUSY: int = 16;
 const EEXIST: int = 17;
+const EXDEV: int = 18;
+const ENODEV: int = 19;
 const ENOTDIR: int = 20;
 const EISDIR: int = 21;
+const EINVAL_: int = 22;
 const ENFILE: int = 23;
 const ENOSPC: int = 28;
+const EROFS: int = 30;
 const ENAMETOOLONG: int = 36;
 const ENOTEMPTY: int = 39;
+const EACCES_: int = 13;
 
 struct Inode {
     type: int;
     mode: int;                        // permission bits
     size: int;                        // trytes
     nlink: int;
-    parent: int;                      // directory containing it
-    child: int;                       // DIR: first child, or -1
-    sibling: int;                     // next entry in the parent, or -1
-    data: int;                        // REG: first tryte of the contents
-    cap: int;                         // REG: capacity in trytes
-    block: int;                       // REG: centre frame of the owned block, or -1
-    order: int;                       // REG: triddy order of that block
+    fs: int;                          // FS_*
+    mnt: int;                         // the mount it belongs to, or -1 (pipes)
+    ino_no: int;                      // tfs: the disk inode; procfs: what it shows
+    mtime: int;                       // seconds (RTC)
+    parent: int;                      // ramfs: the directory containing it
+    child: int;                       // ramfs DIR: first child, or -1
+    sibling: int;                     // ramfs: next entry in the parent, or -1
+    data: int;                        // ramfs REG: first tryte of the contents
+    cap: int;                         // ramfs REG: capacity in trytes
+    block: int;                       // ramfs REG: centre frame of the owned block, or -1
+    order: int;                       // ramfs REG: triddy order of that block
     rdev: int;                        // CHR: device number; FIFO: pipe index
     opens: int;                       // open files referring to it
     unlinked: int;                    // removed from its directory, freed on last close
-    name: [27]char;
+    mounted: int;                     // root of a file system mounted here, or -1
+    covered: int;                     // for a mounted root: the directory it covers, or -1
+    stamp: int;                       // the system call that last used it
+    name: [27]char;                   // ramfs only
 }
 
 var inodes: [243]Inode;
 var root_ino: int;
+var vfs_stamp: int;                   // bumped once per system call
 
 struct File {
     refs: int;                        // descriptors (in any process) sharing it
@@ -66,6 +94,17 @@ struct File {
 }
 
 var files: [243]File;
+
+struct Mount {
+    used: int;
+    fs: int;
+    root: int;
+    point: int;                       // -1 for the root file system
+    source: [27]char;
+    target: [81]char;
+}
+
+var mounts: [9]Mount;
 
 // O_* flags (Linux values)
 const O_ACCMODE: int = 3;
@@ -78,28 +117,54 @@ const O_DIRECTORY: int = 65536;
 
 fn has(flags: int, bit: int) -> int { return flags / bit % 2 != 0; }
 
-// ---- inodes and directories ------------------------------------------------
+fn names_equal(a: *char, b: *char) -> int {
+    var i: int = 0;
+    while (a[i] == b[i]) {
+        if (a[i] == 0) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
 
-fn inode_alloc(type: int, mode: int) -> int {
+fn copy_str(dst: *char, src: *char, max: int) {
+    var k: int = 0;
+    while (src[k] != 0 && k < max - 1) { dst[k] = src[k]; k += 1; }
+    dst[k] = 0;
+}
+
+// ---- the inode table -------------------------------------------------------------------
+
+fn touch(i: int) -> int {
+    inodes[i].stamp = vfs_stamp;
+    return i;
+}
+
+fn is_some_cwd(i: int) -> int {
+    var t: int = 1;
+    while (t < NTASKS) {
+        if (tasks[t].state != TASK_UNUSED && tasks[t].cwd == i) { return 1; }
+        t += 1;
+    }
+    return 0;
+}
+
+fn evictable(i: int) -> int {
+    var n: *Inode = &inodes[i];
+    return n.fs != FS_RAM && n.opens == 0 && n.mounted < 0 && n.covered < 0 && n.stamp != vfs_stamp
+        && i != root_ino && !n.unlinked && !is_some_cwd(i);
+}
+
+// A free slot, evicting a cached disk or proc inode if the table is full.
+fn inode_slot() -> int {
     var i: int = 1;
     while (i < NINODES) {
-        if (inodes[i].type == I_FREE) {
-            var n: *Inode = &inodes[i];
-            n.type = type;
-            n.mode = mode;
-            n.size = 0;
-            n.nlink = 1;
-            n.parent = i;
-            n.child = -1;
-            n.sibling = -1;
-            n.data = 0;
-            n.cap = 0;
-            n.block = -1;
-            n.order = 0;
-            n.rdev = 0;
-            n.opens = 0;
-            n.unlinked = 0;
-            n.name[0] = 0;
+        if (inodes[i].type == I_FREE) { return i; }
+        i += 1;
+    }
+    i = 1;
+    while (i < NINODES) {
+        if (evictable(i)) {
+            inodes[i].type = I_FREE;
             return i;
         }
         i += 1;
@@ -107,25 +172,94 @@ fn inode_alloc(type: int, mode: int) -> int {
     return -1;
 }
 
+fn inode_init(i: int, type: int, mode: int, fs: int, mnt: int) {
+    var n: *Inode = &inodes[i];
+    n.type = type;
+    n.mode = mode;
+    n.size = 0;
+    n.nlink = 1;
+    n.fs = fs;
+    n.mnt = mnt;
+    n.ino_no = 0;
+    n.mtime = in(RTC_SECONDS);
+    n.parent = i;
+    n.child = -1;
+    n.sibling = -1;
+    n.data = 0;
+    n.cap = 0;
+    n.block = -1;
+    n.order = 0;
+    n.rdev = 0;
+    n.opens = 0;
+    n.unlinked = 0;
+    n.mounted = -1;
+    n.covered = -1;
+    n.stamp = vfs_stamp;
+    n.name[0] = 0;
+}
+
+// A ramfs (or anonymous) inode.
+fn inode_alloc(type: int, mode: int) -> int {
+    var i: int = inode_slot();
+    if (i < 0) { return -1; }
+    inode_init(i, type, mode, FS_RAM, -1);
+    return i;
+}
+
+// The in-core inode for (fs, ino_no), loading it if needed. -errno on failure.
+fn iget(fs: int, mnt: int, ino_no: int) -> int {
+    var i: int = 1;
+    while (i < NINODES) {
+        if (inodes[i].type != I_FREE && inodes[i].fs == fs && inodes[i].ino_no == ino_no && inodes[i].mnt == mnt) { return touch(i); }
+        i += 1;
+    }
+    i = inode_slot();
+    if (i < 0) { return -ENFILE; }
+    inode_init(i, I_REG, 0, fs, mnt);
+    inodes[i].ino_no = ino_no;
+    var r: int = 0;
+    if (fs == FS_TFS) { r = tfs_iload(i); }
+    else if (fs == FS_PROC) { r = proc_iload(i); }
+    if (r < 0) {
+        inodes[i].type = I_FREE;
+        return r;
+    }
+    return i;
+}
+
 fn inode_free(i: int) {
     var n: *Inode = &inodes[i];
-    if (n.block >= 0) { free_pages(n.block, n.order); }
+    if (n.fs == FS_RAM && n.block >= 0) { free_pages(n.block, n.order); }
+    if (n.fs == FS_TFS) { tfs_ifree(i); }
     n.type = I_FREE;
 }
 
-fn set_name(i: int, s: *char, len: int) {
+// The last reference to an unlinked inode is gone.
+fn inode_release(i: int) {
+    if (inodes[i].opens == 0 && inodes[i].unlinked) { inode_free(i); }
+}
+
+fn vfs_init() {
+    vfs_stamp = 1;
+    var m: int = 0;
+    while (m < NMOUNTS) { mounts[m].used = 0; m += 1; }
+}
+
+// ---- ramfs ---------------------------------------------------------------------------------
+
+fn ram_set_name(i: int, s: *char, len: int) {
     var k: int = 0;
     while (k < len) { inodes[i].name[k] = s[k]; k += 1; }
     inodes[i].name[len] = 0;
 }
 
-fn dir_add(dir: int, i: int) {
+fn ram_dir_add(dir: int, i: int) {
     inodes[i].parent = dir;
     inodes[i].sibling = inodes[dir].child;
     inodes[dir].child = i;
 }
 
-fn dir_remove(dir: int, i: int) {
+fn ram_dir_remove(dir: int, i: int) {
     var p: *int = &inodes[dir].child;
     while (*p != -1) {
         if (*p == i) { *p = inodes[i].sibling; return; }
@@ -133,8 +267,8 @@ fn dir_remove(dir: int, i: int) {
     }
 }
 
-// The child of `dir` named s[0..len), or -1.
-fn dir_lookup(dir: int, s: *char, len: int) -> int {
+fn ram_lookup(dir: int, s: *char, len: int) -> int {
+    if (len == 2 && s[0] == '.' && s[1] == '.') { return inodes[dir].parent; }
     var c: int = inodes[dir].child;
     while (c != -1) {
         var k: int = 0;
@@ -142,24 +276,105 @@ fn dir_lookup(dir: int, s: *char, len: int) -> int {
         if (k == len && inodes[c].name[len] == 0) { return c; }
         c = inodes[c].sibling;
     }
-    return -1;
+    return -ENOENT_;
 }
 
-fn vfs_init() {
-    root_ino = inode_alloc(I_DIR, 493);         // 0755
-    inodes[root_ino].parent = root_ino;
+fn ram_create(dir: int, s: *char, len: int, type: int, mode: int) -> int {
+    if (len > RAM_NAME_MAX) { return -ENAMETOOLONG; }
+    var i: int = inode_alloc(type, mode);
+    if (i < 0) { return -ENOSPC; }
+    inodes[i].mnt = inodes[dir].mnt;
+    if (type == I_DIR) { inodes[i].nlink = 2; inodes[dir].nlink += 1; }
+    ram_set_name(i, s, len);
+    ram_dir_add(dir, i);
+    return i;
 }
 
-// ---- path lookup ---------------------------------------------------------------
+// A ramfs instance: a new root directory (the caller mounts it).
+fn ram_new_root(mnt: int) -> int {
+    var r: int = inode_alloc(I_DIR, 493);
+    if (r < 0) { return -1; }
+    inodes[r].mnt = mnt;
+    inodes[r].nlink = 2;
+    return r;
+}
 
-var leaf: [27]char;                          // last component found by path_parent
+// Make room for `size` trytes, moving the data into an owned block if needed.
+fn ram_reserve(i: int, size: int) -> int {
+    var n: *Inode = &inodes[i];
+    if (size <= n.cap && n.block >= 0) { return 1; }
+    var k: int = 0;
+    var frames: int = 1;
+    while (frames * PAGE < size) { frames *= 3; k += 1; }
+    if (k > MAX_ORDER) { return 0; }
+    var c: int = alloc_pages(k);
+    if (c < 0) { return 0; }
+    var start: int = frame_start(c - (frames - 1) / 2);
+    copy_trytes(start as *tryte, n.data as *tryte, n.size);
+    if (n.block >= 0) { free_pages(n.block, n.order); }
+    n.block = c;
+    n.order = k;
+    n.data = start;
+    n.cap = frames * PAGE;
+    return 1;
+}
+
+fn ram_read(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var node: *Inode = &inodes[i];
+    if (pos >= node.size) { return 0; }
+    if (n > node.size - pos) { n = node.size - pos; }
+    copy_trytes(buf, (node.data + pos) as *tryte, n);
+    return n;
+}
+
+fn ram_write(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var node: *Inode = &inodes[i];
+    if (!ram_reserve(i, pos + n)) { return -ENOSPC; }
+    if (node.size < pos) { zero_trytes((node.data + node.size) as *tryte, pos - node.size); }   // a hole reads as zeros
+    copy_trytes((node.data + pos) as *tryte, buf, n);
+    if (pos + n > node.size) { node.size = pos + n; }
+    return n;
+}
+
+// ---- dispatch --------------------------------------------------------------------------------
+
+// The entry `name` (len characters, not "." ) of directory `dir`, without
+// crossing mounts. ".." is the file system's own parent.
+fn fs_lookup(dir: int, s: *char, len: int) -> int {
+    var fs: int = inodes[dir].fs;
+    var r: int;
+    if (fs == FS_TFS) { r = tfs_lookup(dir, s, len); }
+    else if (fs == FS_PROC) { r = proc_lookup(dir, s, len); }
+    else { r = ram_lookup(dir, s, len); }
+    if (r >= 0) { touch(r); }
+    return r;
+}
+
+fn follow_mounts(i: int) -> int {
+    while (inodes[i].mounted >= 0) { i = inodes[i].mounted; }
+    return touch(i);
+}
+
+// The parent of directory i, crossing mount points upwards.
+fn dotdot(i: int) -> int {
+    loop {
+        if (i == root_ino) { return i; }
+        if (inodes[i].covered < 0) { break; }
+        i = inodes[i].covered;
+    }
+    return fs_lookup(i, "..", 2);
+}
+
+// ---- path lookup -------------------------------------------------------------------------------
+
+var leaf: [81]char;                          // last component found by walk(.., want_parent)
 var leaf_len: int;
 
 // Walk `path` (absolute, or relative to `cwd`). With `want_parent`, stop
 // before the last component, leave it in `leaf`, and return its directory.
 // Returns an inode or -errno.
 fn walk(path: *char, cwd: int, want_parent: int) -> int {
-    var cur: int = path[0] == '/' ? root_ino : cwd;
+    var cur: int = follow_mounts(path[0] == '/' ? root_ino : cwd);
     var i: int = 0;
     loop {
         while (path[i] == '/') { i += 1; }
@@ -185,35 +400,38 @@ fn walk(path: *char, cwd: int, want_parent: int) -> int {
         }
         var next: int;
         if (len == 1 && path[start] == '.') { next = cur; }
-        else if (len == 2 && path[start] == '.' && path[start + 1] == '.') { next = inodes[cur].parent; }
-        else { next = dir_lookup(cur, &path[start], len); }
-        if (next < 0) { return -ENOENT_; }
-        cur = next;
+        else if (len == 2 && path[start] == '.' && path[start + 1] == '.') { next = dotdot(cur); }
+        else { next = fs_lookup(cur, &path[start], len); }
+        if (next < 0) { return next; }
+        cur = follow_mounts(next);
         if (last) { return cur; }
     }
 }
 
 fn path_lookup(path: *char, cwd: int) -> int { return walk(path, cwd, 0); }
 
+fn leaf_is_dot() -> int { return (leaf_len == 1 && leaf[0] == '.') || (leaf_len == 2 && leaf[0] == '.' && leaf[1] == '.'); }
+
 // Create a new inode at `path`. Returns it, or -errno.
 fn vfs_create(path: *char, cwd: int, type: int, mode: int) -> int {
     var dir: int = walk(path, cwd, 1);
     if (dir < 0) { return dir; }
-    if ((leaf_len == 1 && leaf[0] == '.') || (leaf_len == 2 && leaf[0] == '.' && leaf[1] == '.')) { return -EEXIST; }
-    if (dir_lookup(dir, &leaf[0], leaf_len) >= 0) { return -EEXIST; }
-    var i: int = inode_alloc(type, mode);
-    if (i < 0) { return -ENOSPC; }
-    set_name(i, &leaf[0], leaf_len);
-    dir_add(dir, i);
-    return i;
+    if (leaf_is_dot()) { return -EEXIST; }
+    var found: int = fs_lookup(dir, &leaf[0], leaf_len);
+    if (found >= 0) { return -EEXIST; }
+    if (found != -ENOENT_) { return found; }
+    var fs: int = inodes[dir].fs;
+    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_TFS) { return tfs_create(dir, &leaf[0], leaf_len, type, mode); }
+    return ram_create(dir, &leaf[0], leaf_len, type, mode);
 }
 
-// Make every directory along `path` (like mkdir -p); returns the last.
+// Make every directory along an absolute `path` (like mkdir -p); returns the last.
 fn vfs_mkdirs(path: *char) -> int {
     var buf: [81]char;
     var i: int = 0;
     var cur: int = root_ino;
-    while (path[i] != 0) {
+    while (path[i] != 0 && i < 80) {
         buf[i] = path[i];
         i += 1;
         if (path[i] == '/' || path[i] == 0) {
@@ -227,40 +445,136 @@ fn vfs_mkdirs(path: *char) -> int {
     return cur;
 }
 
+fn is_mount_root(i: int) -> int { return i == root_ino || inodes[i].covered >= 0 || inodes[i].mounted >= 0; }
+
 fn vfs_unlink(path: *char, cwd: int, want_dir: int) -> int {
-    var i: int = path_lookup(path, cwd);
+    var dir: int = walk(path, cwd, 1);
+    if (dir < 0) { return dir; }
+    if (leaf_is_dot()) { return want_dir ? -EINVAL_ : -EISDIR; }
+    var i: int = fs_lookup(dir, &leaf[0], leaf_len);
     if (i < 0) { return i; }
-    if (i == root_ino) { return -EPERM; }
+    if (is_mount_root(i)) { return -EBUSY; }
     var n: *Inode = &inodes[i];
+    if (n.type == I_DIR && is_some_cwd(i)) { return -EBUSY; }      // Linux allows it; we keep cwd alive
     if (want_dir) {
         if (n.type != I_DIR) { return -ENOTDIR; }
-        if (n.child != -1) { return -ENOTEMPTY; }
     } else if (n.type == I_DIR) { return -EISDIR; }
-    dir_remove(n.parent, i);
-    n.unlinked = 1;
-    if (n.opens == 0) { inode_free(i); }
+    var fs: int = inodes[dir].fs;
+    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_TFS) {
+        var r: int = tfs_unlink(dir, &leaf[0], leaf_len, i);
+        if (r < 0) { return r; }
+    } else {
+        if (want_dir && n.child != -1) { return -ENOTEMPTY; }
+        ram_dir_remove(dir, i);
+        if (n.type == I_DIR) { inodes[dir].nlink -= 1; }
+        n.nlink = 0;
+    }
+    if (n.nlink <= 0 || n.type == I_DIR) {
+        n.unlinked = 1;
+        inode_release(i);
+    }
     return 0;
 }
 
-// The absolute path of directory `i` into buf (size max); returns its length.
-fn vfs_path_of(i: int, buf: *char, max: int) -> int {
-    if (i == root_ino) {
-        buf[0] = '/';
-        buf[1] = 0;
-        return 1;
-    }
-    var n: int = vfs_path_of(inodes[i].parent, buf, max);
-    if (n == 1) { n = 0; }                       // avoid "//"
-    buf[n] = '/';
-    n += 1;
+// Is `a` the directory `d` or one of its ancestors' descendants... i.e. is
+// `d` inside the tree rooted at `a`?
+fn is_inside(d: int, a: int) -> int {
     var k: int = 0;
-    while (inodes[i].name[k] != 0 && n < max - 1) {
-        buf[n] = inodes[i].name[k];
-        n += 1;
+    loop {
+        if (d == a) { return 1; }
+        if (d == root_ino || k > 243) { return 0; }
+        var p: int = dotdot(d);
+        if (p < 0 || p == d) { return 0; }
+        d = p;
         k += 1;
     }
-    buf[n] = 0;
-    return n;
+}
+
+var leaf2: [81]char;
+
+fn vfs_rename(oldpath: *char, newpath: *char, cwd: int) -> int {
+    var od: int = walk(oldpath, cwd, 1);
+    if (od < 0) { return od; }
+    if (leaf_is_dot()) { return -EBUSY; }
+    var olen: int = leaf_len;
+    copy_str(&leaf2[0], &leaf[0], 81);
+    var src: int = fs_lookup(od, &leaf2[0], olen);
+    if (src < 0) { return src; }
+    var nd: int = walk(newpath, cwd, 1);
+    if (nd < 0) { return nd; }
+    if (leaf_is_dot()) { return -EBUSY; }
+    if (inodes[nd].mnt != inodes[od].mnt) { return -EXDEV; }
+    if (inodes[src].mounted >= 0) { return -EBUSY; }
+    if (inodes[src].type == I_DIR && is_inside(nd, src)) { return -EINVAL_; }
+    var dst: int = fs_lookup(nd, &leaf[0], leaf_len);
+    if (dst == src) { return 0; }
+    if (dst >= 0) {
+        if (inodes[dst].mounted >= 0) { return -EBUSY; }
+        if (inodes[src].type == I_DIR && inodes[dst].type != I_DIR) { return -ENOTDIR; }
+        if (inodes[src].type != I_DIR && inodes[dst].type == I_DIR) { return -EISDIR; }
+    } else if (dst != -ENOENT_) {
+        return dst;
+    }
+    var fs: int = inodes[od].fs;
+    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_TFS) { return tfs_rename(od, &leaf2[0], olen, src, nd, &leaf[0], leaf_len, dst); }
+    // ramfs
+    if (leaf_len > RAM_NAME_MAX) { return -ENAMETOOLONG; }
+    if (dst >= 0) {
+        if (inodes[dst].type == I_DIR && inodes[dst].child != -1) { return -ENOTEMPTY; }
+        ram_dir_remove(nd, dst);
+        if (inodes[dst].type == I_DIR) { inodes[nd].nlink -= 1; }
+        inodes[dst].unlinked = 1;
+        inode_release(dst);
+    }
+    ram_dir_remove(od, src);
+    ram_set_name(src, &leaf[0], leaf_len);
+    ram_dir_add(nd, src);
+    if (inodes[src].type == I_DIR && od != nd) {
+        inodes[od].nlink -= 1;
+        inodes[nd].nlink += 1;
+    }
+    return 0;
+}
+
+// The name of `child` inside directory `parent` into buf. Returns its length.
+fn name_in_dir(parent: int, child: int, buf: *char) -> int {
+    var fs: int = inodes[child].fs;
+    if (fs == FS_TFS) { return tfs_name_of(parent, child, buf); }
+    if (fs == FS_PROC) { return proc_name_of(child, buf); }
+    copy_str(buf, &inodes[child].name[0], 27);
+    return strlen(buf);
+}
+
+// The absolute path of directory `i` into buf (size max); returns its length or -errno.
+fn vfs_path_of(i: int, buf: *char, max: int) -> int {
+    var tmp: [243]char;
+    var at: int = 242;                           // fill tmp from the end
+    tmp[at] = 0;
+    var comp: [81]char;
+    var depth: int = 0;
+    loop {
+        while (i != root_ino && inodes[i].covered >= 0) { i = inodes[i].covered; }
+        if (i == root_ino) { break; }
+        var p: int = fs_lookup(i, "..", 2);
+        if (p < 0) { return p; }
+        var n: int = name_in_dir(p, i, &comp[0]);
+        if (n < 0) { return n; }
+        if (at - n - 1 < 0 || depth > 81) { return -ENAMETOOLONG; }
+        at -= n;
+        var k: int = 0;
+        while (k < n) { tmp[at + k] = comp[k]; k += 1; }
+        at -= 1;
+        tmp[at] = '/';
+        i = p;
+        depth += 1;
+    }
+    if (at == 242) { at -= 1; tmp[at] = '/'; }
+    var len: int = 242 - at;
+    if (len + 1 > max) { return -ENAMETOOLONG; }
+    copy_str(buf, &tmp[at], max);
+    return len;
 }
 
 fn st_mode(i: int) -> int {
@@ -272,34 +586,68 @@ fn st_mode(i: int) -> int {
     return S_IFREG + m;
 }
 
-// ---- regular-file data ---------------------------------------------------------
+// st_ino: the disk inode for tfs, the table slot otherwise.
+fn stat_ino(i: int) -> int { return inodes[i].fs == FS_RAM ? i : inodes[i].ino_no; }
 
-// Make room for `size` trytes, moving the data into an owned block if needed.
-fn reg_reserve(i: int, size: int) -> int {
-    var n: *Inode = &inodes[i];
-    if (size <= n.cap && n.block >= 0) { return 1; }
-    var k: int = 0;
-    var frames: int = 1;
-    while (frames * PAGE < size) { frames *= 3; k += 1; }
-    if (k > MAX_ORDER) { return 0; }
-    var c: int = alloc_pages(k);
-    if (c < 0) { return 0; }
-    var start: int = frame_start(c - (frames - 1) / 2);
-    var old: *tryte = n.data as *tryte;
-    var dst: *tryte = start as *tryte;
-    var j: int = 0;
-    while (j < n.size) { dst[j] = old[j]; j += 1; }
-    if (n.block >= 0) { free_pages(n.block, n.order); }
-    n.block = c;
-    n.order = k;
-    n.data = start;
-    n.cap = frames * PAGE;
-    return 1;
+// ---- file data ----------------------------------------------------------------------------------
+
+fn vfs_read(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var fs: int = inodes[i].fs;
+    if (fs == FS_TFS) { return tfs_read(i, pos, buf, n); }
+    if (fs == FS_PROC) { return proc_read(i, pos, buf, n); }
+    return ram_read(i, pos, buf, n);
 }
 
-fn reg_truncate(i: int) { inodes[i].size = 0; }
+fn vfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
+    var fs: int = inodes[i].fs;
+    if (fs == FS_TFS) { return tfs_write(i, pos, buf, n); }
+    if (fs == FS_PROC) { return -EACCES_; }
+    return ram_write(i, pos, buf, n);
+}
 
-// ---- open files ------------------------------------------------------------------
+fn vfs_truncate(i: int) -> int {
+    if (inodes[i].fs == FS_TFS) { return tfs_truncate(i); }
+    inodes[i].size = 0;
+    return 0;
+}
+
+// Directory entry number `pos`: its name into `name`, and d_ino and d_type
+// into `info` (two words). Returns the position of the next entry, or 0
+// when there are no more (or -errno).
+fn vfs_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
+    var fs: int = inodes[dir].fs;
+    if (fs == FS_TFS) { return tfs_readdir(dir, pos, name, info); }
+    if (fs == FS_PROC) { return proc_readdir(dir, pos, name, info); }
+    var ino: int;
+    if (pos == 0) { copy_str(name, ".", 2); ino = dir; }
+    else if (pos == 1) { copy_str(name, "..", 3); ino = dotdot(dir); }
+    else {
+        ino = inodes[dir].child;
+        var k: int = 2;
+        while (ino != -1 && k < pos) { ino = inodes[ino].sibling; k += 1; }
+        if (ino == -1) { return 0; }
+        copy_str(name, &inodes[ino].name[0], 27);
+    }
+    info[0] = stat_ino(ino);
+    info[1] = dirent_type_of(inodes[ino].type);
+    return pos + 1;
+}
+
+const DT_FIFO: int = 1;
+const DT_CHR: int = 2;
+const DT_DIR: int = 4;
+const DT_REG: int = 8;
+
+fn dirent_type_of(type: int) -> int {
+    switch (type) {
+        case I_DIR: return DT_DIR;
+        case I_CHR: return DT_CHR;
+        case I_FIFO: return DT_FIFO;
+    }
+    return DT_REG;
+}
+
+// ---- open files ------------------------------------------------------------------------------------
 
 fn file_alloc(ino: int, flags: int) -> int {
     var f: int = 0;
@@ -319,3 +667,73 @@ fn file_alloc(ino: int, flags: int) -> int {
 
 fn readable(f: int) -> int { return files[f].flags % 4 != O_WRONLY; }
 fn writable(f: int) -> int { var m: int = files[f].flags % 4; return m == O_WRONLY || m == O_RDWR; }
+
+// ---- mounts ------------------------------------------------------------------------------------------
+
+fn mount_add(fs: int, root: int, point: int, source: *char, target: *char) -> int {
+    var m: int = 0;
+    while (m < NMOUNTS) {
+        if (!mounts[m].used) {
+            mounts[m].used = 1;
+            mounts[m].fs = fs;
+            mounts[m].root = root;
+            mounts[m].point = point;
+            copy_str(&mounts[m].source[0], source, 27);
+            copy_str(&mounts[m].target[0], target, 81);
+            return m;
+        }
+        m += 1;
+    }
+    return -1;
+}
+
+fn fs_type_name(fs: int) -> *char {
+    if (fs == FS_TFS) { return "tfs"; }
+    if (fs == FS_PROC) { return "proc"; }
+    return "ramfs";
+}
+
+// Mount a new file system of type `fs` on directory `point`.
+fn do_mount(fs: int, point: int, source: *char, target: *char) -> int {
+    if (inodes[point].type != I_DIR) { return -ENOTDIR; }
+    if (inodes[point].mounted >= 0) { return -EBUSY; }
+    var m: int = mount_add(fs, -1, point, source, target);
+    if (m < 0) { return -ENOSPC; }
+    var root: int;
+    if (fs == FS_PROC) {
+        var k: int = 0;
+        while (k < NMOUNTS) {
+            if (k != m && mounts[k].used && mounts[k].fs == FS_PROC) { mounts[m].used = 0; return -EBUSY; }
+            k += 1;
+        }
+        root = proc_root(m);
+    } else {
+        root = ram_new_root(m);
+    }
+    if (root < 0) { mounts[m].used = 0; return -ENOSPC; }
+    mounts[m].root = root;
+    inodes[point].mounted = root;
+    inodes[root].covered = point;
+    return m;
+}
+
+fn do_umount(root: int) -> int {
+    var m: int = inodes[root].mnt;
+    if (inodes[root].covered < 0 || m < 0 || !mounts[m].used || mounts[m].root != root) { return -EINVAL_; }
+    var i: int = 1;
+    while (i < NINODES) {                        // busy: open files, working directories, mounts inside
+        if (inodes[i].type != I_FREE && inodes[i].mnt == m) {
+            if (inodes[i].opens > 0 || is_some_cwd(i) || inodes[i].mounted >= 0) { return -EBUSY; }
+        }
+        i += 1;
+    }
+    var point: int = inodes[root].covered;
+    i = 1;
+    while (i < NINODES) {
+        if (inodes[i].type != I_FREE && inodes[i].mnt == m) { inode_free(i); }
+        i += 1;
+    }
+    inodes[point].mounted = -1;
+    mounts[m].used = 0;
+    return 0;
+}

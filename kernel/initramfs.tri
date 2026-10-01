@@ -1,4 +1,4 @@
-// initramfs: the root file system mkdisk packs onto the boot disk.
+// initramfs: the fallback root file system (a disk built with Root::Initramfs).
 //
 // Sector 28 is a header of words: magic, file count, data sectors, then per
 // file 11 words: the path (27 trytes, NUL-padded), size, offset (trytes from

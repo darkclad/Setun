@@ -1,0 +1,15 @@
+// touch file ...: create empty files (existing ones are left alone).
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc < 2) { fputs(STDERR_FILENO, "usage: touch file ...\n"); return 2; }
+    var status: int = 0;
+    var i: int = 1;
+    while (i < argc) {
+        var fd: int = open(argv[i], O_WRONLY + O_CREAT, 420);
+        if (fd < 0) { perror2("touch", argv[i]); status = 1; } else { close(fd); }
+        i += 1;
+    }
+    return status;
+}

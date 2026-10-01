@@ -1,0 +1,249 @@
+// procfs: /proc, generated from kernel state on every read.
+//
+//   /proc/meminfo  /proc/uptime  /proc/mounts
+//   /proc/<pid>/stat     Linux's field order (the first 24 fields)
+//   /proc/<pid>/status   Name, State, Pid, PPid, PGid, Sid
+//   /proc/<pid>/cmdline  the arguments, NUL-separated
+//
+// An inode's ino_no says what it shows: kind + 16 * pid.
+
+import "../params.tri";
+import "../printk.tri";
+import "../mm.tri";
+import "vfs.tri";
+import "bcache.tri";
+import "../sched.tri";
+
+const PROC_ROOT: int = 1;
+const PROC_MEMINFO: int = 2;
+const PROC_UPTIME: int = 3;
+const PROC_MOUNTS: int = 4;
+const PROC_PID: int = 5;
+const PROC_STAT: int = 6;
+const PROC_STATUS: int = 7;
+const PROC_CMDLINE: int = 8;
+const ESRCH_: int = 3;
+
+var proc_mnt: int = -1;
+
+fn proc_kind(i: int) -> int { return inodes[i].ino_no % 16; }
+fn proc_pid(i: int) -> int { return inodes[i].ino_no / 16; }
+
+fn proc_root(mnt: int) -> int {
+    proc_mnt = mnt;
+    return iget(FS_PROC, mnt, PROC_ROOT);
+}
+
+fn live_task(pid: int) -> int {
+    var t: int = find_task(pid);
+    if (t < 0 || tasks[t].state == TASK_UNUSED) { return -1; }
+    return t;
+}
+
+fn proc_iload(i: int) -> int {
+    var k: int = proc_kind(i);
+    if (k == PROC_ROOT || k == PROC_PID) {
+        inodes[i].type = I_DIR;
+        inodes[i].mode = 365;                     // 0555
+        inodes[i].nlink = 2;
+    } else {
+        inodes[i].type = I_REG;
+        inodes[i].mode = k == PROC_CMDLINE || k == PROC_STAT || k == PROC_STATUS ? 292 : 292;   // 0444
+    }
+    if (k >= PROC_PID && live_task(proc_pid(i)) < 0) { return -ENOENT_; }
+    return 0;
+}
+
+fn proc_name_eq(s: *char, len: int, name: *char) -> int {
+    var k: int = 0;
+    while (k < len) {
+        if (name[k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return name[len] == 0;
+}
+
+fn proc_lookup(dir: int, s: *char, len: int) -> int {
+    var m: int = inodes[dir].mnt;
+    var k: int = proc_kind(dir);
+    if (k == PROC_PID) {
+        if (len == 2 && s[0] == '.' && s[1] == '.') { return iget(FS_PROC, m, PROC_ROOT); }
+        var base: int = 16 * proc_pid(dir);
+        if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, base + PROC_STAT); }
+        if (proc_name_eq(s, len, "status")) { return iget(FS_PROC, m, base + PROC_STATUS); }
+        if (proc_name_eq(s, len, "cmdline")) { return iget(FS_PROC, m, base + PROC_CMDLINE); }
+        return -ENOENT_;
+    }
+    if (proc_name_eq(s, len, "meminfo")) { return iget(FS_PROC, m, PROC_MEMINFO); }
+    if (proc_name_eq(s, len, "uptime")) { return iget(FS_PROC, m, PROC_UPTIME); }
+    if (proc_name_eq(s, len, "mounts")) { return iget(FS_PROC, m, PROC_MOUNTS); }
+    var pid: int = 0;
+    var j: int = 0;
+    while (j < len) {
+        if (s[j] < '0' || s[j] > '9' || j > 9) { return -ENOENT_; }
+        pid = pid * 10 + s[j] - '0';
+        j += 1;
+    }
+    if (len == 0 || live_task(pid) < 0) { return -ENOENT_; }
+    return iget(FS_PROC, m, 16 * pid + PROC_PID);
+}
+
+fn proc_name_of(i: int, buf: *char) -> int {
+    switch (proc_kind(i)) {
+        case PROC_MEMINFO: copy_str(buf, "meminfo", 8);
+        case PROC_UPTIME: copy_str(buf, "uptime", 7);
+        case PROC_MOUNTS: copy_str(buf, "mounts", 7);
+        case PROC_STAT: copy_str(buf, "stat", 5);
+        case PROC_STATUS: copy_str(buf, "status", 7);
+        case PROC_CMDLINE: copy_str(buf, "cmdline", 8);
+        case PROC_PID: itoa(proc_pid(i), buf);
+        default: copy_str(buf, "proc", 5);
+    }
+    return strlen(buf);
+}
+
+// Entries of the root: . .. meminfo uptime mounts, then one per process.
+fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
+    var k: int = proc_kind(dir);
+    info[1] = DT_REG;
+    if (pos == 0) { copy_str(name, ".", 2); info[0] = inodes[dir].ino_no; info[1] = DT_DIR; return 1; }
+    if (pos == 1) { copy_str(name, "..", 3); info[0] = PROC_ROOT; info[1] = DT_DIR; return 2; }
+    if (k == PROC_PID) {
+        var base: int = 16 * proc_pid(dir);
+        if (pos == 2) { copy_str(name, "cmdline", 8); info[0] = base + PROC_CMDLINE; return 3; }
+        if (pos == 3) { copy_str(name, "stat", 5); info[0] = base + PROC_STAT; return 4; }
+        if (pos == 4) { copy_str(name, "status", 7); info[0] = base + PROC_STATUS; return 5; }
+        return 0;
+    }
+    if (pos == 2) { copy_str(name, "meminfo", 8); info[0] = PROC_MEMINFO; return 3; }
+    if (pos == 3) { copy_str(name, "mounts", 7); info[0] = PROC_MOUNTS; return 4; }
+    if (pos == 4) { copy_str(name, "uptime", 7); info[0] = PROC_UPTIME; return 5; }
+    var t: int = pos - 4;                          // task slots 1..26
+    while (t < NTASKS) {
+        if (tasks[t].state != TASK_UNUSED) {
+            itoa(tasks[t].pid, name);
+            info[0] = 16 * tasks[t].pid + PROC_PID;
+            info[1] = DT_DIR;
+            return t + 5;
+        }
+        t += 1;
+    }
+    return 0;
+}
+
+// ---- generated text ---------------------------------------------------------------------------
+
+var pbuf: [2187]char;
+var plen: int;
+
+fn ps(s: *char) {
+    var k: int = 0;
+    while (s[k] != 0 && plen < 2186) { pbuf[plen] = s[k]; plen += 1; k += 1; }
+}
+
+fn pi(v: int) {
+    var b: [15]char;
+    ps(itoa(v, &b[0]));
+}
+
+fn pc(c: char) { if (plen < 2186) { pbuf[plen] = c; plen += 1; } }
+
+fn pfield(label: *char, v: int, unit: *char) {
+    ps(label);
+    var b: [15]char;
+    var s: *char = itoa(v, &b[0]);
+    var pad: int = 16 - strlen(label) - strlen(s);
+    while (pad > 0) { pc(' '); pad -= 1; }
+    ps(s);
+    ps(unit);
+    pc('\n');
+}
+
+fn state_char(t: *Task) -> char {
+    switch (t.state) {
+        case TASK_RUNNABLE: return 'R';
+        case TASK_SLEEPING: return 'S';
+        case TASK_STOPPED: return 'T';
+        case TASK_ZOMBIE: return 'Z';
+    }
+    return '?';
+}
+
+fn state_name(t: *Task) -> *char {
+    switch (t.state) {
+        case TASK_RUNNABLE: return "R (running)";
+        case TASK_SLEEPING: return "S (sleeping)";
+        case TASK_STOPPED: return "T (stopped)";
+        case TASK_ZOMBIE: return "Z (zombie)";
+    }
+    return "?";
+}
+
+fn proc_generate(i: int) -> int {
+    plen = 0;
+    var k: int = proc_kind(i);
+    if (k == PROC_MEMINFO) {
+        pfield("MemTotal:", ram_frames * PAGE, " trytes");
+        pfield("MemFree:", free_frames * PAGE, " trytes");
+        pfield("Buffers:", NBUF * PAGE, " trytes");
+        pfield("PageSize:", PAGE, " trytes");
+        return 0;
+    }
+    if (k == PROC_UPTIME) {
+        pi(jiffies / HZ);
+        pc('.');
+        var cs: int = jiffies % HZ;
+        if (cs < 10) { pc('0'); }
+        pi(cs);
+        ps(" 0.00\n");
+        return 0;
+    }
+    if (k == PROC_MOUNTS) {
+        var m: int = 0;
+        while (m < NMOUNTS) {
+            if (mounts[m].used) {
+                ps(&mounts[m].source[0]);
+                pc(' ');
+                ps(&mounts[m].target[0]);
+                pc(' ');
+                ps(fs_type_name(mounts[m].fs));
+                ps(" rw 0 0\n");
+            }
+            m += 1;
+        }
+        return 0;
+    }
+    var ti: int = live_task(proc_pid(i));
+    if (ti < 0) { return -ESRCH_; }
+    var t: *Task = &tasks[ti];
+    if (k == PROC_STAT) {
+        pi(t.pid); ps(" ("); ps(&t.comm[0]); ps(") "); pc(state_char(t)); pc(' ');
+        pi(t.ppid); pc(' '); pi(t.pgid); pc(' '); pi(t.sid); ps(" 1281 "); pi(tty_pgrp);
+        ps(" 0 0 0 0 0 "); pi(t.ticks); ps(" 0 0 0 20 0 1 0 "); pi(t.start_time);
+        ps(" 0 0\n");
+        return 0;
+    }
+    if (k == PROC_STATUS) {
+        ps("Name:\t"); ps(&t.comm[0]); pc('\n');
+        ps("State:\t"); ps(state_name(t)); pc('\n');
+        ps("Pid:\t"); pi(t.pid); pc('\n');
+        ps("PPid:\t"); pi(t.ppid); pc('\n');
+        ps("PGid:\t"); pi(t.pgid); pc('\n');
+        ps("Sid:\t"); pi(t.sid); pc('\n');
+        return 0;
+    }
+    // cmdline
+    var j: int = 0;
+    while (j < t.cmdline_len && plen < 2186) { pbuf[plen] = t.cmdline[j]; plen += 1; j += 1; }
+    return 0;
+}
+
+fn proc_read(i: int, pos: int, buf: *tryte, n: int) -> int {
+    if (inodes[i].type == I_DIR) { return -EISDIR; }
+    var r: int = proc_generate(i);
+    if (r < 0) { return r; }
+    if (pos >= plen) { return 0; }
+    if (n > plen - pos) { n = plen - pos; }
+    copy_trytes(buf, &pbuf[pos] as *tryte, n);
+    return n;
+}

@@ -7,7 +7,7 @@
 // Supported: pipelines (|), lists (; && || &), redirections (< > >> and
 // n> n>> n< n>&m), quoting ('...', "...", \), comments (#), $? $$ $!, and
 // the builtins cd, pwd, exit, jobs, fg, bg, kill. Commands without a / are
-// looked up in /bin.
+// looked up in /bin, then /sbin.
 //
 // Job control (interactive only): every pipeline is a process group; the
 // foreground one owns the terminal (tcsetpgrp), so ^C and ^Z reach it and
@@ -543,14 +543,20 @@ fn exec_command(argc: int, argv: **char) {
     if (has_slash) {
         execve(argv[0], argv, null);
     } else {
-        var path: [243]char;
-        var p: *char = "/bin/";
-        var n: int = 0;
-        while (p[n] != 0) { path[n] = p[n]; n += 1; }
-        k = 0;
-        while (argv[0][k] != 0 && n < 242) { path[n] = argv[0][k]; n += 1; k += 1; }
-        path[n] = 0;
-        execve(&path[0], argv, null);
+        var dirs: [2]*char = { "/bin/", "/sbin/" };         // PATH=/bin:/sbin
+        var d: int = 0;
+        while (d < 2) {
+            var path: [243]char;
+            var p: *char = dirs[d];
+            var n: int = 0;
+            while (p[n] != 0) { path[n] = p[n]; n += 1; }
+            k = 0;
+            while (argv[0][k] != 0 && n < 242) { path[n] = argv[0][k]; n += 1; k += 1; }
+            path[n] = 0;
+            execve(&path[0], argv, null);
+            if (errno != ENOENT) { break; }
+            d += 1;
+        }
     }
     if (errno == ENOENT) {
         err(argv[0], ": not found");

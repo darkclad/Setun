@@ -3,6 +3,7 @@
 // Device numbers follow Linux (major * 256 + minor). Every terminal node is
 // the one console tty in K4; virtual consoles come with the window system.
 
+import "../printk.tri";
 import "vfs.tri";
 import "../drivers/tty.tri";
 
@@ -28,16 +29,22 @@ fn dev_write(rdev: int, buf: *tryte, n: int) -> int {
     return tty_write(buf, n);
 }
 
-fn mknod(name: *char, rdev: int, mode: int) {
-    var i: int = vfs_create(name, root_ino, I_CHR, mode);
+fn mknod(dir: int, name: *char, rdev: int, mode: int) {
+    var i: int = ram_create(dir, name, strlen(name), I_CHR, mode);
     if (i >= 0) { inodes[i].rdev = rdev; }
 }
 
-fn devfs_init() {
-    vfs_mkdirs("/dev");
-    mknod("/dev/null", DEV_NULL, 438);          // 0666
-    mknod("/dev/zero", DEV_ZERO, 438);
-    mknod("/dev/tty", DEV_TTY, 438);
-    mknod("/dev/console", DEV_CONSOLE, 384);    // 0600
-    mknod("/dev/ttyS0", DEV_TTYS0, 432);        // 0660
+// Mount a devfs (a ramfs instance holding the device nodes) on /dev.
+fn devfs_init() -> int {
+    var point: int = path_lookup("/dev", root_ino);
+    if (point < 0) { printk("devfs: no /dev to mount on\n"); return point; }
+    var m: int = do_mount(FS_RAM, point, "devfs", "/dev");
+    if (m < 0) { return m; }
+    var dir: int = mounts[m].root;
+    mknod(dir, "null", DEV_NULL, 438);          // 0666
+    mknod(dir, "zero", DEV_ZERO, 438);
+    mknod(dir, "tty", DEV_TTY, 438);
+    mknod(dir, "console", DEV_CONSOLE, 384);    // 0600
+    mknod(dir, "ttyS0", DEV_TTYS0, 432);        // 0660
+    return 0;
 }
