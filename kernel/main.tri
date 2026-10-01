@@ -1,0 +1,74 @@
+// Trinux kernel entry: start_kernel(), after Linux's init/main.c.
+
+import "params.tri";
+import "printk.tri";
+import "mm.tri";
+import "arch.tri";
+
+var boot_disk: int;
+
+fn time_init() {
+    out(TPIC_UNMASK, IRQ_TIMER);
+    out(TIMER_PERIOD, 1000000 / HZ);
+    out(TIMER_CTRL, 1);                       // periodic
+    printk("Timer: ");
+    pr_int(HZ);
+    pr(" Hz (");
+    pr_int(1000000 / HZ);
+    pr(" us per tick)\n");
+}
+
+fn start_kernel(disk: int, frames: int) {
+    boot_disk = disk;
+    screen_clear();
+    printk("Trinux version ");
+    pr(TRINUX_VERSION);
+    pr(" (trine) on Setun-386, balanced ternary\n");
+    printk("Booted from disk ");
+    pr_int(disk);
+    pr(", RAM ");
+    pr_int(frames);
+    pr(" pages x 3^9 trytes = ");
+    pr_int(frames * PAGE);
+    pr(" trytes\n");
+
+    traps_init();
+    printk("Traps: 243 vectors at ");
+    pr_int(mfc(ITB));
+    pr_nl();
+
+    mm_init(frames);
+    printk("Memory: ");
+    pr_int(free_frames);
+    pr(" pages free (frames ");
+    pr_int(FRAME_FIRST_FREE);
+    pr("..");
+    pr_int(frames - 1);
+    pr("), triddy orders 0..");
+    pr_int(MAX_ORDER);
+    pr_nl();
+    if (!mm_self_test()) { panic("page allocator self-test failed"); }
+    printk("mm: triddy self-test OK\n");
+
+    paging_init();
+    if (!paging_enabled()) { panic("paging did not turn on"); }
+
+    time_init();
+    local_irq_enable();
+
+    var reported: int = 0;
+    loop {
+        hlt();                                // idle until the next interrupt
+        if (!reported && jiffies >= 10) {
+            printk("K1 OK: ");
+            pr_int(jiffies);
+            pr(" timer ticks, idle\n");
+            reported = 1;
+        }
+    }
+}
+
+fn main(disk: int, frames: int) -> int {
+    start_kernel(disk, frames);
+    return 0;
+}

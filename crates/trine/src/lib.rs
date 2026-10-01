@@ -36,6 +36,8 @@ pub enum Kind {
     /// A one-sector boot disk image: the BIOS loads it into frame 1 and
     /// jumps to `BOOT_ENTRY` (see `docs/BOOT.md`).
     Boot,
+    /// The program's words from `org − 1` (e.g. a kernel image for a loader).
+    Flat,
 }
 
 /// Memory layout of a compiled program.
@@ -205,6 +207,10 @@ fn finish(loader: Loader, opts: &Options) -> Result<Build, String> {
     let image = match opts.kind {
         Kind::Rom => setun_asm::rom_image(&program.segments)?,
         Kind::Boot => boot_sector(&program.segments)?,
+        Kind::Flat => match program.segments.as_slice() {
+            [s] if s.origin == opts.org => setun_asm::words_to_trytes(&s.words),
+            _ => return Err("a flat image must be one segment starting at its origin".into()),
+        },
     };
     Ok(Build { asm, program, image })
 }

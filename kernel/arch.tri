@@ -1,0 +1,120 @@
+// arch: traps, interrupts and the kernel page tables.
+
+import "params.tri";
+import "printk.tri";
+import "mm.tri";
+
+// ---- traps and interrupts ----------------------------------------------------
+
+@align(729) var idt: [243]int;        // the vector table; vector v is idt[121 + v]
+var irq_count: [81]int;
+var jiffies: int;
+
+const HZ: int = 100;
+
+fn fault_name(v: int) -> *char {
+    switch (v) {
+        case -1: return "illegal instruction";
+        case -2: return "privilege violation";
+        case -3: return "page fault";
+        case -4: return "protection fault";
+        case -5: return "misaligned access";
+        case -6: return "divide by zero";
+        case -7: return "breakpoint";
+        case -8: return "single step";
+        case -9: return "double fault";
+        case -10: return "bus error";
+    }
+    return "unknown trap";
+}
+
+fn timer_interrupt() {
+    jiffies += 1;
+}
+
+// Every vector enters here. Faults in the kernel are fatal (for now);
+// hardware interrupts are claimed from the TPIC and dispatched.
+interrupt fn trap_entry() {
+    var cause: int = mfc(FCAUSE);
+    var v: int = ext(cause, 23, 5);
+    if (v >= 1) {
+        var irq: int = in(TPIC_CLAIM);
+        if (irq >= 0) {
+            irq_count[irq] += 1;
+            if (irq == IRQ_TIMER) { timer_interrupt(); }
+            out(TPIC_EOI, irq);
+        }
+        return;
+    }
+    printk("trap: ");
+    pr(fault_name(v));
+    pr(" (vector ");
+    pr_int(v);
+    pr(") at ");
+    pr_int(mfc(EPC));
+    pr(", address ");
+    pr_int(mfc(FADDR));
+    pr_nl();
+    panic("unhandled trap in the kernel");
+}
+
+fn traps_init() {
+    var i: int = 0;
+    while (i < 243) { idt[i] = &trap_entry as int; i += 1; }
+    mtc(ITB, &idt[121] as int);
+}
+
+fn local_irq_enable() {
+    if (trit(mfc(MODE), 26) != 1) { mtc(MODE, mfc(MODE) + MODE_IE); }
+}
+
+// ---- paging -----------------------------------------------------------------------
+
+var kernel_l1: int;                   // centre frame of the L1 table
+var kernel_l2: [2]int;                // centre frames of the L2 tables for slots 0, +1
+
+fn table_entry(table_centre_frame: int, i: int) -> *int {
+    return (frame_centre(table_centre_frame) + 3 * i) as *int;
+}
+
+fn kernel_pte(frame: int) -> int {
+    return frame * PTE_FRAME + PTE_V + PTE_X + PTE_RING + PTE_G;
+}
+
+fn is_device_frame(f: int) -> int {
+    return (f >= -3 && f <= -1) || (f >= -81 && f <= -55);     // BIOS ROM, framebuffer
+}
+
+// Build the kernel half: L1 slots 0 and +1 map all RAM, the ROM and the
+// framebuffer at their physical addresses (ring +1, global).
+fn paging_init() {
+    kernel_l1 = alloc_table();
+    var slot: int = 0;
+    var mapped: int = 0;
+    while (slot <= 1) {
+        var l2: int = alloc_table();
+        if (l2 < 0 || kernel_l1 < 0) { panic("out of memory for page tables"); }
+        kernel_l2[slot] = l2;
+        var i: int = -9841;
+        while (i <= 9841) {
+            var f: int = slot * 19683 + i;
+            if ((f >= 0 && f < ram_frames) || is_device_frame(f)) {
+                *table_entry(l2, i) = kernel_pte(f);
+                mapped += 1;
+            }
+            i += 1;
+        }
+        *table_entry(kernel_l1, slot) = kernel_pte(l2);
+        slot += 1;
+    }
+    mtc(PTB, frame_centre(kernel_l1));
+    tlbflush();
+    mtc(MODE, mfc(MODE) + MODE_PG);
+    printk("Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, ");
+    pr_int(mapped);
+    pr(" pages, PTB ");
+    pr_int(frame_centre(kernel_l1));
+    pr_nl();
+}
+
+fn paging_enabled() -> int { return trit(mfc(MODE), 25) == 1; }

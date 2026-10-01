@@ -1,7 +1,7 @@
 # Trinux: the Setun-386 kernel
 
-**Status: DRAFT v0.1, under design review. Nothing is implemented yet.**
-Items marked **⚠ REVIEW** are open choices. §13 lists them.
+**Status: v0.1, accepted. Milestone K1 is implemented** (`kernel/`, built by `mkdisk`).
+Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
 
 Trinux is a Unix kernel for Setun-386, **modelled on Linux** and providing
 **POSIX.1-2017 interfaces**. It is written in Trine and boots through the BIOS
@@ -250,7 +250,7 @@ fmt_nl(f);
 
 | # | Milestone | Done when |
 |---|---|---|
-| K1 | loader, `start_kernel`, paging on, `printk`, frame allocator, timer interrupt | the kernel boots from a disk image and prints its banner |
+| K1 ✅ | loader, `start_kernel`, paging on, `printk`, frame allocator, timer interrupt | the kernel boots from a disk image and prints its banner |
 | K2 | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
 | K3 | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
 | K4 | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
@@ -269,3 +269,34 @@ fmt_nl(f);
 7. **TEF** as the executable format.
 8. **No `printf`:** typed formatting instead, unless we add varargs to Trine.
 9. **"POSIX" means interfaces and semantics with the tryte as the byte** (§0, §12).
+
+## 14. K1 as built
+
+```
+BIOS → disk 0 sector 0 (kernel/boot/loader.tri)
+     → loader reads sectors 1..K into frames 4..  (K and the entry are patched in by mkdisk)
+     → kernel crt0 → main(disk, ram) → start_kernel()
+```
+
+**Physical layout:**
+
+| Frames | Contents |
+|---|---|
+| 1 | loader |
+| 2 | loader stack |
+| 3 | kernel boot stack |
+| 4…30 | kernel image (≤ 27 sectors) |
+| 31…39 | kernel globals |
+| 40… | the triddy allocator |
+
+**Files:**
+
+| File | Contents |
+|---|---|
+| `kernel/params.tri` | layout and PTE constants |
+| `kernel/printk.tri` | `printk` with uptime stamps, `panic` |
+| `kernel/mm.tri` | the triddy allocator: blocks of 3^k frames centred on multiples of 3^k, split into three, merge three siblings; self-test |
+| `kernel/arch.tri` | one `interrupt fn trap_entry` for all 243 vectors (IRQs are claimed from the TPIC; kernel faults panic with vector, EPC and address), plus `paging_init` (the L1 table and two L2 tables, each a 3-frame order-1 triddy block) |
+| `kernel/main.tri` | `start_kernel`: banner, traps, mm, paging, 100 Hz timer, idle in `hlt` |
+
+`cargo run -p trinux --bin mkdisk -- -o trinux.disk` builds the disk, and `setun --disk trinux.disk` boots it. `crates/trinux/tests/boot.rs` boots it on the emulator.

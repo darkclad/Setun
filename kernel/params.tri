@@ -1,0 +1,31 @@
+// Trinux: physical memory layout and boot constants (docs/KERNEL.md §2-3).
+
+import "ports.tri";
+
+const TRINUX_VERSION: *char = "0.1";
+
+// Frames (3^9 trytes each). Frame f covers PAGE*f - 9841 .. PAGE*f + 9841.
+const FRAME_LOADER: int = 1;          // the boot sector / loader
+const FRAME_KSTACK: int = 3;          // the kernel's boot stack
+const FRAME_KERNEL: int = 4;          // first frame of the kernel image
+const KERNEL_MAX_SECTORS: int = 27;   // frames 4..30
+const FRAME_KDATA: int = 31;          // kernel globals: frames 31..39
+const FRAME_FIRST_FREE: int = 40;     // the page allocator owns frames 40..
+
+// Loader handoff: mkdisk patches these words into the loader sector.
+const LOADER_KERNEL_SECTORS: int = 29520;
+const LOADER_KERNEL_ENTRY: int = 29517;
+
+// Page-table entry fields (ISA §5.2): frame in trits 1-18, then flags.
+const PTE_FRAME: int = 19683;         // multiplier for the frame number
+const PTE_V: int = 6561;              // trit 19: +1 read/write, -1 read-only
+const PTE_X: int = 2187;              // trit 20: execute
+const PTE_RING: int = 729;            // trit 21: lowest ring allowed
+const PTE_G: int = 81;                // trit 23: global
+
+// MODE trit weights (ISA §2.2)
+const MODE_IE: int = 3;               // trit 26
+const MODE_PG: int = 9;               // trit 25
+
+fn frame_start(f: int) -> int { return f * PAGE - 9841; }
+fn frame_centre(f: int) -> int { return f * PAGE; }

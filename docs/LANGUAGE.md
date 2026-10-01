@@ -314,6 +314,7 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 - **`neg`, `zero` and `pos` became contextual** instead of keywords, so they stay usable as variable names.
 - **`as` binds after prefix operators.**
 - **Globals live in RAM** and are filled in by generated start-up code (§9).
+- **`trit(x, i)` parses as the builtin** even though `trit` is a type keyword.
 - **Compound assignment narrows implicitly:** `t += 1` on a `tryte` wraps, while `t = t + 1` still needs `as tryte`.
 
 ## Appendix: grammar (EBNF)

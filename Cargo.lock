@@ -667,6 +667,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "trinux"
+version = "0.1.0"
+dependencies = [
+ "setun-core",
+ "ternary",
+ "trine",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -22,7 +22,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
-- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (design draft)
+- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1 running)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 
@@ -39,6 +39,8 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
 | `examples/` | Trine programs, e.g. `mandel.tri` |
 | `bios/` | the BIOS (`bios.tri`, built into `setun`) and a sample boot sector |
+| `kernel/` | Trinux, the kernel (Trine) |
+| `crates/trinux` | `mkdisk`: builds bootable Trinux disks; boot tests |
 
 ## Build and run
 
@@ -51,6 +53,8 @@ cargo run --release -p setun-native -- --help  # options: --rom, --disk, --ram, 
 cargo run --release -p trine -- run examples/hello.tri        # compile + run headless
 cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
+cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
+cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux
 sh web/build.sh                                # rebuild web/setun.wasm
 python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```

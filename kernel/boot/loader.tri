@@ -1,0 +1,49 @@
+// Trinux loader: the boot sector. The BIOS loads it into frame 1 and jumps
+// here; it reads the kernel image from sectors 1..K into frames 4.. and
+// jumps to the kernel entry. mkdisk patches K and the entry address into
+// this sector (LOADER_KERNEL_SECTORS, LOADER_KERNEL_ENTRY).
+
+import "console.tri";
+
+const KERNEL_SECTORS_AT: int = 29520;
+const KERNEL_ENTRY_AT: int = 29517;
+const KERNEL_LOAD: int = 68891;           // first tryte of frame 4
+
+var boot_disk: int;
+var boot_ram: int;
+var kernel_entry: int;
+
+fn main(disk: int, ram: int) -> int {
+    boot_disk = disk;
+    boot_ram = ram;
+    var sectors: int = *(KERNEL_SECTORS_AT as *int);
+    kernel_entry = *(KERNEL_ENTRY_AT as *int);
+    print("Trinux loader: kernel ");
+    print_int(sectors);
+    print(" sector(s) from disk ");
+    print_int(disk);
+    print(" ... ");
+    if (sectors <= 0 || sectors > 27) {
+        print("no kernel image\n");
+        return 1;
+    }
+    out(DISK_LBA, 1);
+    out(DISK_COUNT, sectors);
+    out(DISK_DMA, KERNEL_LOAD);
+    out(DISK_CMD, -1);
+    while (in(DISK_STATUS) == 1) {}
+    if (in(DISK_STATUS) != 0) {
+        print("read error ");
+        print_int(in(DISK_ERROR));
+        print("\n");
+        return 1;
+    }
+    print("ok\n");
+    asm {
+        "        ldw   r1, [boot_disk]"
+        "        ldw   r2, [boot_ram]"
+        "        ldw   r3, [kernel_entry]"
+        "        jalr  r0, r3"
+    }
+    return 0;
+}

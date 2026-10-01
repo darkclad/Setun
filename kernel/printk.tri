@@ -1,0 +1,43 @@
+// printk: kernel messages on the console (screen + serial), each line
+// prefixed with the uptime like Linux's "[    0.012345] ".
+
+import "console.tri";
+
+fn print_padded(v: int, width: int, pad: char) {
+    var buf: [15]char;
+    var s: *char = itoa(v, &buf[0]);
+    var n: int = strlen(s);
+    while (n < width) { putc(pad); screen_putc(pad); n += 1; }
+    print(s);
+}
+
+// Start a message line: "[seconds.micros] text".
+fn printk(s: *char) {
+    var us: int = in(TIMER_UPTIME);
+    print("[");
+    print_padded(us / 1000000, 5, ' ');
+    print(".");
+    print_padded(us % 1000000, 6, '0');
+    print("] ");
+    print(s);
+}
+
+// Continue the current line.
+fn pr(s: *char) { print(s); }
+fn pr_int(v: int) { print_int(v); }
+fn pr_nl() { print("\n"); }
+
+fn pr_b27(v: int) {
+    var buf: [10]char;
+    print(itoa27(v, &buf[0]));
+}
+
+// Stop the machine with a message. Never returns.
+fn panic(s: *char) {
+    screen_attr = 0t++++--000;          // white on red
+    printk("Kernel panic: ");
+    pr(s);
+    pr_nl();
+    mtc(MODE, mfc(MODE) - MODE_IE * trit(mfc(MODE), 26));   // interrupts off
+    loop { hlt(); }
+}

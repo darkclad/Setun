@@ -1,0 +1,16 @@
+[package]
+name = "trinux"
+description = "Builds Trinux disk images (loader + kernel) and runs them"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mkdisk"
+path = "src/main.rs"
+
+[dependencies]
+setun-core = { path = "../core" }
+trine = { path = "../trine" }
+ternary = { path = "../ternary" }
