@@ -305,6 +305,90 @@ fn sh_functions_eval_heredocs_errors() {
 }
 
 #[test]
+fn sh_aliases_and_local() {
+    let out = session(
+        &[
+            "alias hi='echo hi-from-alias'; hi there",
+            "alias hi",
+            "alias q=\"echo \\\"it's\\\"\"; q; alias q",
+            "type hi",
+            "alias echo='echo [aliased]'; echo x; \\echo y; 'echo' z; unalias echo; echo w",
+            "alias run='env '; alias greet2='echo ch\"\"ained'; run greet2",
+            "alias up='grep -c .'; echo n=$(cat /etc/motd | up)",
+            "af() { hi inside; }; af",
+            "alias c=cat",
+            "c <<EOF",
+            "via-alias $((1+1))",
+            "EOF",
+            "unalias -a; hi",
+            "x=global; lf() { local x=inner y; x=changed; echo in:$x; y=set; }; lf; echo out:$x [$y]",
+            "outer() { local v=outer; inner; echo back:$v; }; inner() { echo sees:$v; v=modified; }; outer; echo top:[$v]",
+            "cnt() { local n=$1; if [ $n -gt 0 ]; then cnt $((n-1)); fi; echo n=$n; }; cnt 2",
+            "sp() { local s=$1; echo \"[$s]\"; }; sp 'a  b'",
+            "w='p  q'; export E3=$w; sh -c 'echo \"<$E3>\"'",
+            "export EX=outer; ef() { local EX=in; sh -c 'echo child:$EX'; }; ef; sh -c 'echo after:$EX'",
+            "exit",
+        ],
+        700_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "hi-from-alias there\n",
+            "$ alias hi\nalias hi='echo hi-from-alias'\n",
+            "it's\nalias q='echo \"it'\\''s\"'\n",
+            "hi is aliased to `echo hi-from-alias'\n",
+            "[aliased] x\ny\nz\nw\n",
+            "chained\n",
+            "n=2\n",
+            "hi-from-alias inside\n",
+            "via-alias 2\n",
+            "sh: hi: not found\n",
+            "in:changed\nout:global []\n",
+            "sees:outer\nback:modified\ntop:[]\n",
+            "n=0\nn=1\nn=2\n",
+            "[a  b]\n",
+            "<p  q>\n",
+            "child:in\nafter:outer\n",
+        ],
+    );
+}
+
+#[test]
+fn sh_aliases_and_local_errors() {
+    let out = session(
+        &[
+            "local z=1; echo status $?",
+            "bad() { local 1x=2; echo st=$?; }; bad",
+            "alias 'bad name=x'; echo status $?",
+            "alias nope; echo status $?",
+            "unalias nope; echo status $?",
+            "unalias; echo status $?",
+            "alias loop=loop2; alias loop2=loop; loop; echo status $?",
+            "alias self='self'; self; echo status $?",
+            "echo ok-after-errors",
+            "exit 6",
+        ],
+        400_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "sh: local: not in a function\nstatus 1\n",
+            "sh: local: `1x=2': not a valid identifier\nst=1\n",
+            "sh: alias: `bad name=x': invalid alias name\nstatus 1\n",
+            "sh: alias: nope: not found\nstatus 1\n",
+            "sh: unalias: nope: not found\nstatus 1\n",
+            "sh: unalias: usage: unalias [-a] name ...\nstatus 2\n",
+            "sh: loop: not found\nstatus 127\n",
+            "sh: self: not found\nstatus 127\n",
+            "ok-after-errors\n",
+            "init: /bin/sh exited with 6",
+        ],
+    );
+}
+
+#[test]
 fn k7_utilities() {
     let out = session(
         &[

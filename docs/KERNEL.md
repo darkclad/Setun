@@ -734,7 +734,7 @@ There is still no `printf`; the typed writers replace it (§12).
   - `$((…))`: `+ - * / %`, comparisons, `&& || !`, parentheses, variables;
   - `~`, field splitting of unquoted results, and globbing (`* ? [...] [!...]`, sorted; a pattern that matches nothing stays literal).
 - **Variables:** `export`, `unset`, and prefix assignments (`VAR=x cmd` exports to that command only). The shell imports the environment at startup, and `PATH` defaults to `/bin:/sbin`.
-- **Builtins:** `: true false echo cd pwd exit export unset set shift read test [ break continue jobs fg bg kill wait exec umask type eval . return`.
+- **Builtins:** `: true false echo cd pwd exit export unset set shift read test [ break continue jobs fg bg kill wait exec umask type eval . return local alias unalias`.
   - `eval args` joins its arguments with spaces and runs the result. `. file` runs a file in the current shell (a name without `/` is looked up in `PATH`), and `return` inside it ends the file;
   - `unset -f name` removes a function, and `type` reports functions and special builtins;
   - how it works: a function is kept as the source text of its body. Function bodies, `eval` text and `.` files are lexed and parsed after the running program's text, tokens and syntax nodes, run, and then dropped, so the running program is never disturbed;
@@ -747,7 +747,10 @@ There is still no `printf`; the typed writers replace it (§12).
   - syntax errors print bash's message ("syntax error near unexpected token `fi'") and set status 2;
   - an expansion error (division by zero, `${x:?}`, a bad substitution) abandons the whole command line, and makes a non-interactive shell exit;
   - commands that are not found give 127, and ones that are not executable give 126.
-- **Not yet:** aliases, `local`. A here-document's body must lie inside its function's text: if the operator is in a function body, the body text has to come before the closing `}` line.
+- **`local` and aliases:**
+  - `local name[=value]` in a function saves the variable, and the call puts it back (value and export flag) when it returns. Scope is dynamic, as in dash: functions called from there see the local. `local name` without a value keeps the current value. `export` and `local` are declaration utilities, so `local s=$1` is not split or globbed.
+  - `alias name=value`, `alias [name]` (prints `alias name='value'`), `unalias name` and `unalias -a`. An unquoted command word that names an alias is replaced when the command runs, and the command is re-read as text. While a value ends in a blank, the next word is checked too. An alias is never expanded inside its own expansion, so `alias ls='ls -l'` works and alias loops end with "not found". `\ls` or `'ls'` skips the alias. Unlike bash, an alias defined earlier on the same line already applies, and aliases work in scripts too.
+- **Not yet:** a here-document's body must lie inside its function's text: if the operator is in a function body, the body text has to come before the closing `}` line.
 
 **Utilities** (`/bin`):
 - `head`, `tail`, `wc`;

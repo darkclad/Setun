@@ -14,8 +14,8 @@
 // $((arithmetic)), ~, field splitting and globbing (* ? [...]).
 // Variables and export; prefix assignments (VAR=x cmd).
 // Builtins: : true false echo cd pwd exit export unset set shift read
-// test [ break continue jobs fg bg kill wait exec umask type eval . return.
-// Not yet: aliases, local.
+// test [ break continue jobs fg bg kill wait exec umask type eval . return
+// local alias unalias.
 //
 // Function bodies, eval text and . files are lexed and parsed into the tail
 // of src and the token and node arrays, run, and then that tail is dropped
@@ -765,6 +765,287 @@ fn func_unset(name: *char) {
     free(fbody[i] as *tryte);
     fname[i] = null;
     fbody[i] = null;
+}
+
+// ---- local variables ---------------------------------------------------------------------------
+//
+// `local name` in a function saves the variable on this stack; the call
+// puts every variable saved since it started back when it returns. Scope
+// is dynamic, as in dash: functions called from there see the local.
+
+const LOCAL_MAX: int = 243;
+
+var lname: [243]*char;
+var lold: [243]*char;                 // null: it was unset
+var lexported: [243]int;
+var nlocal: int;
+var local_base: int;                  // the running call's first entry
+
+fn local_restore(base: int) {
+    while (nlocal > base) {
+        nlocal -= 1;
+        if (lold[nlocal] == null) {
+            var_unset(lname[nlocal]);
+        } else {
+            var_set(lname[nlocal], lold[nlocal], 0);
+            vexported[var_find(lname[nlocal])] = lexported[nlocal];
+            free(lold[nlocal] as *tryte);
+        }
+        free(lname[nlocal] as *tryte);
+    }
+}
+
+// local name[=value] ...: without a value the variable keeps its value.
+fn builtin_local(argc: int, argv: **char) -> int {
+    if (func_depth == 0) { err("local: not in a function", null); return 1; }
+    var status: int = 0;
+    var k: int = 1;
+    while (k < argc) {
+        var a: *char = argv[k];
+        k += 1;
+        var name: [81]char;
+        var n: int = 0;
+        while (a[n] != 0 && a[n] != '=' && n < 80) { name[n] = a[n]; n += 1; }
+        name[n] = 0;
+        if (!valid_name(&name[0])) {
+            fputs(STDERR_FILENO, "sh: local: `");
+            fputs(STDERR_FILENO, a);
+            fputs(STDERR_FILENO, "': not a valid identifier\n");
+            status = 1;
+            continue;
+        }
+        var seen: int = 0;
+        var i: int = local_base;
+        while (i < nlocal) { if (streq(lname[i], &name[0])) { seen = 1; } i += 1; }
+        if (!seen) {
+            if (nlocal == LOCAL_MAX) { err("local: too many local variables", null); status = 1; continue; }
+            var old: *char = var_get(&name[0]);
+            lname[nlocal] = strdup(&name[0]);
+            lold[nlocal] = old == null ? null : strdup(old);
+            lexported[nlocal] = is_exported(&name[0]);
+            nlocal += 1;
+        }
+        if (a[n] == '=') { var_set(&name[0], &a[n + 1], 0); }
+    }
+    return status;
+}
+
+// ---- aliases -----------------------------------------------------------------------------------
+//
+// An alias is replaced when its command runs: an unquoted command word that
+// names one is swapped for the value (and, while a value ends in a blank,
+// the next word too) and the command is run again as text (run_alias). An
+// alias being expanded is not expanded again inside itself.
+
+const NALIASES: int = 81;
+
+var aname: [81]*char;
+var aval: [81]*char;
+var aactive: [81]int;
+var naliases: int;
+
+fn is_alias_char(c: int) -> int {
+    return isalnum(c) || c == '_' || c == '!' || c == '%' || c == ',' || c == '@' || c == '-' || c == '.';
+}
+
+fn alias_find(name: *char) -> int {
+    var i: int = 0;
+    while (i < naliases) {
+        if (aname[i] != null && streq(aname[i], name)) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// The alias that token t names as written (no quoting), or -1.
+fn alias_of(t: int) -> int {
+    if (naliases == 0 || tkind[t] != T_WORD) { return -1; }
+    var len: int = tend[t] - tstart[t];
+    if (len > 80) { return -1; }
+    var name: [81]char;
+    var k: int = 0;
+    while (k < len) {
+        var c: char = src[tstart[t] + k];
+        if (!is_alias_char(c)) { return -1; }
+        name[k] = c;
+        k += 1;
+    }
+    name[k] = 0;
+    var i: int = alias_find(&name[0]);
+    if (i < 0 || aactive[i]) { return -1; }
+    return i;
+}
+
+fn alias_set(name: *char, value: *char) -> int {
+    var i: int = alias_find(name);
+    if (i < 0) {
+        i = 0;
+        while (i < naliases && aname[i] != null) { i += 1; }
+        if (i == naliases) {
+            if (naliases == NALIASES) { err("too many aliases", null); return 1; }
+            naliases += 1;
+        }
+        aname[i] = strdup(name);
+        aval[i] = null;
+        aactive[i] = 0;
+    }
+    if (aval[i] != null) { free(aval[i] as *tryte); }
+    aval[i] = strdup(value);
+    return 0;
+}
+
+fn alias_unset(i: int) {
+    free(aname[i] as *tryte);
+    free(aval[i] as *tryte);
+    aname[i] = null;
+    aval[i] = null;
+}
+
+// alias name='value' with the value in single quotes (' as '\'').
+fn alias_print(i: int) {
+    puts("alias ");
+    puts(aname[i]);
+    puts("='");
+    var v: *char = aval[i];
+    var k: int = 0;
+    while (v[k] != 0) {
+        if (v[k] == '\'') { puts("'\\''"); }
+        else { var c: [2]char; c[0] = v[k]; c[1] = 0; puts(&c[0]); }
+        k += 1;
+    }
+    puts("'\n");
+}
+
+fn builtin_alias(argc: int, argv: **char) -> int {
+    if (argc == 1) {
+        var i: int = 0;
+        while (i < naliases) { if (aname[i] != null) { alias_print(i); } i += 1; }
+        return 0;
+    }
+    var status: int = 0;
+    var k: int = 1;
+    while (k < argc) {
+        var a: *char = argv[k];
+        k += 1;
+        var name: [81]char;
+        var n: int = 0;
+        while (a[n] != 0 && a[n] != '=' && n < 80) { name[n] = a[n]; n += 1; }
+        name[n] = 0;
+        var ok: int = n > 0 && (a[n] == 0 || a[n] == '=');
+        var j: int = 0;
+        while (j < n) { if (!is_alias_char(name[j])) { ok = 0; } j += 1; }
+        if (!ok) {
+            fputs(STDERR_FILENO, "sh: alias: `");
+            fputs(STDERR_FILENO, a);
+            fputs(STDERR_FILENO, "': invalid alias name\n");
+            status = 1;
+        } else if (a[n] == '=') {
+            if (alias_set(&name[0], &a[n + 1]) != 0) { status = 1; }
+        } else {
+            var i2: int = alias_find(&name[0]);
+            if (i2 < 0) {
+                fputs(STDERR_FILENO, "sh: alias: ");
+                fputs(STDERR_FILENO, a);
+                fputs(STDERR_FILENO, ": not found\n");
+                status = 1;
+            }
+            else { alias_print(i2); }
+        }
+    }
+    return status;
+}
+
+fn builtin_unalias(argc: int, argv: **char) -> int {
+    if (argc < 2) { err("unalias: usage: unalias [-a] name ...", null); return 2; }
+    if (streq(argv[1], "-a")) {
+        var i: int = 0;
+        while (i < naliases) { if (aname[i] != null) { alias_unset(i); } i += 1; }
+        return 0;
+    }
+    var status: int = 0;
+    var k: int = 1;
+    while (k < argc) {
+        var i2: int = alias_find(argv[k]);
+        if (i2 < 0) {
+            fputs(STDERR_FILENO, "sh: unalias: ");
+            fputs(STDERR_FILENO, argv[k]);
+            fputs(STDERR_FILENO, ": not found\n");
+            status = 1;
+        } else {
+            alias_unset(i2);
+        }
+        k += 1;
+    }
+    return status;
+}
+
+fn append(dst: *char, len: int, s: *char, n: int) -> int {
+    var k: int = 0;
+    while (k < n) { dst[len + k] = s[k]; k += 1; }
+    return len + n;
+}
+
+// Run simple command n with the alias al standing for its command word fw.
+fn run_alias(n: int, fw: int, al: int) -> int {
+    var a: int = na[n];
+    var b: int = nb[n];
+    // the chain of replaced words: a value ending in a blank expands the next
+    var ctok: [27]int;
+    var cal: [27]int;
+    var nc: int = 0;
+    var t: int = fw;
+    var cur: int = al;
+    var size: int = tend[b - 1] - tstart[a] + 3;
+    loop {
+        ctok[nc] = t;
+        cal[nc] = cur;
+        nc += 1;
+        var v: *char = aval[cur];
+        var vl: int = strlen(v);
+        size += vl;
+        if (vl == 0 || (v[vl - 1] != ' ' && v[vl - 1] != '\t') || t + 1 >= b || nc == 27) { break; }
+        var nxt: int = alias_of(t + 1);
+        var dup: int = 0;
+        var j: int = 0;
+        while (j < nc) { if (cal[j] == nxt) { dup = 1; } j += 1; }
+        if (nxt < 0 || dup) { break; }
+        t += 1;
+        cur = nxt;
+    }
+    // here-document bodies are re-attached after the command
+    t = a;
+    while (t < b) {
+        if (tkind[t] == T_REDIR && tmode[t] == R_HEREDOC) { size += hd_b[t] - hd_a[t] + 245; }
+        t += 1;
+    }
+    var text: *char = malloc(size) as *char;
+    if (text == null) { err("out of memory", null); return 1; }
+    var len: int = append(text, 0, &src[tstart[a]], tstart[fw] - tstart[a]);
+    var i: int = 0;
+    while (i < nc) { len = append(text, len, aval[cal[i]], strlen(aval[cal[i]])); i += 1; }
+    var last: int = ctok[nc - 1];
+    len = append(text, len, &src[tend[last]], tend[b - 1] - tend[last]);
+    var nl: int = 0;
+    t = a;
+    while (t < b) {
+        if (tkind[t] == T_REDIR && tmode[t] == R_HEREDOC) {
+            if (!nl) { text[len] = '\n'; len += 1; nl = 1; }
+            len = append(text, len, &src[hd_a[t]], hd_b[t] - hd_a[t]);
+            var d: [243]char;
+            hd_delim(t, &d[0]);
+            len = append(text, len, &d[0], strlen(&d[0]));
+            text[len] = '\n';
+            len += 1;
+        }
+        t += 1;
+    }
+    i = 0;
+    while (i < nc) { aactive[cal[i]] = 1; i += 1; }
+    var status: int = eval_text(text, len);
+    i = 0;
+    while (i < nc) { aactive[cal[i]] = 0; i += 1; }
+    free(text as *tryte);
+    return status;
 }
 
 fn import_environ() {
@@ -1716,9 +1997,9 @@ var continue_count: int;
 var loop_depth: int;
 
 fn is_builtin(name: *char) -> int {
-    var list: [28]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
+    var list: [31]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
         "test", "[", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", "eval", ".",
-        "return", null };
+        "return", "local", "alias", "unalias", null };
     var k: int = 0;
     while (list[k] != null) {
         if (streq(list[k], name)) { return 1; }
@@ -2092,6 +2373,9 @@ fn builtin(argc: int, argv: **char) -> int {
     if (streq(name, "eval")) { return builtin_eval(argc, argv); }
     if (streq(name, ".")) { return builtin_dot(argc, argv); }
     if (streq(name, "return")) { return builtin_return(argc, argv); }
+    if (streq(name, "local")) { return builtin_local(argc, argv); }
+    if (streq(name, "alias")) { return builtin_alias(argc, argv); }
+    if (streq(name, "unalias")) { return builtin_unalias(argc, argv); }
     if (streq(name, "set")) { return builtin_set(argc, argv); }
     if (streq(name, "shift")) { return builtin_shift(argc, argv); }
     if (streq(name, "read")) { return builtin_read(argc, argv); }
@@ -2162,7 +2446,9 @@ fn builtin(argc: int, argv: **char) -> int {
         var i: int = 1;
         while (i < argc) {
             puts(argv[i]);
-            if (is_special(argv[i])) { puts(" is a special shell builtin\n"); }
+            var ai: int = alias_find(argv[i]);
+            if (ai >= 0) { puts(" is aliased to `"); puts(aval[ai]); puts("'\n"); }
+            else if (is_special(argv[i])) { puts(" is a special shell builtin\n"); }
             else if (func_find(argv[i]) >= 0) { puts(" is a function\n"); }
             else if (is_builtin(argv[i])) { puts(" is a shell builtin\n"); }
             else {
@@ -2332,6 +2618,8 @@ fn call_function(f: int, a: int, b: int, first_word: int, argc: int, argv: **cha
     }
     var save_loops: int = loop_depth;
     loop_depth = 0;                                     // break/continue stay inside
+    var save_local_base: int = local_base;
+    local_base = nlocal;
     var status: int = 1;
     save_begin();
     if (redirect(a, b, 1) == 0) {
@@ -2347,6 +2635,8 @@ fn call_function(f: int, a: int, b: int, first_word: int, argc: int, argv: **cha
     }
     save_restore();
     loop_depth = save_loops;
+    local_restore(local_base);
+    local_base = save_local_base;
     k = 0;
     while (k < npos) { free(pos_args[k] as *tryte); k += 1; }
     npos = save_npos;
@@ -2381,11 +2671,18 @@ fn exec_simple(n: int, in_child: int) -> int {
         if (assignment_eq(t) < 0) { first_word = t; break; }
         t += 1;
     }
+    if (first_word < b) {
+        var al: int = alias_of(first_word);
+        if (al >= 0) { return run_alias(n, first_word, al); }
+    }
     var argv_start: int = nfields;
+    // export and local are declaration utilities: NAME=value arguments are
+    // not split or globbed
+    var declaring: int = first_word < b && (tok_is(first_word, "export") || tok_is(first_word, "local"));
     t = first_word;
     while (t < b && !expand_error) {
         if (tkind[t] == T_REDIR) { t += 2; continue; }
-        expand_word(t, 1);
+        expand_word(t, !(declaring && t > first_word && assignment_eq(t) >= 0));
         t += 1;
     }
     var status: int = 0;
