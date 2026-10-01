@@ -1,0 +1,13 @@
+// sleep seconds: suspend for a whole number of seconds.
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc != 2) { fputs(STDERR_FILENO, "usage: sleep seconds\n"); return 2; }
+    var n: int = 0;
+    var k: int = 0;
+    while (argv[1][k] >= '0' && argv[1][k] <= '9') { n = n * 10 + argv[1][k] - '0'; k += 1; }
+    if (k == 0 || argv[1][k] != 0) { fputs(STDERR_FILENO, "sleep: invalid time\n"); return 1; }
+    sleep(n);
+    return 0;
+}

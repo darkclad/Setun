@@ -17,6 +17,7 @@ import "drivers/tty.tri";
 
 const FRAME_WORDS: int = 28;
 const F_R1: int = 0;
+const F_LR: int = 11;                 // r12
 const F_EPC: int = 25;
 const F_EMODE: int = 26;
 const F_KSP: int = 27;
@@ -159,6 +160,7 @@ fn trap_handler(f: *int) {
     var v: int = ext(cause, 23, 5);
     if (v == 0) {
         do_syscall(f, ext(cause, 1, 18));
+        do_signal(f);                       // a system call always comes from user mode
         return;
     }
     if (v >= 1) {
@@ -173,6 +175,7 @@ fn trap_handler(f: *int) {
                 scheduler_tick();
             }
         }
+        if (trit(f[F_EMODE], 27) == -1) { do_signal(f); }
         return;
     }
     var from_user: int = trit(f[F_EMODE], 27) == -1;
@@ -181,7 +184,8 @@ fn trap_handler(f: *int) {
     // User faults, and kernel faults on user memory (a system call touching
     // a demand-zero or copy-on-write page), go to the VM.
     if (from_user || ((v == -3 || v == -4) && current_task().l1 != 0 && is_user_address(addr))) {
-        user_fault(v, f[F_EPC], addr, access, fault_name(v));
+        user_fault(v, f[F_EPC], addr, access, fault_name(v), from_user);
+        if (from_user) { do_signal(f); }
         return;
     }
     printk("trap: ");

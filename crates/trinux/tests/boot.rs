@@ -22,23 +22,36 @@ fn with_init(test: &str, src: &str) -> Vec<(String, PathBuf)> {
 }
 
 /// Boot the default disk and type each line at the shell prompt, waiting
-/// for "$ " before the next one. Returns the console transcript.
+/// for "$ " before the next one. An entry starting with `~` is typed as is
+/// (no newline) 0.5 s of emulated time after the previous one, without
+/// waiting for a prompt: that is how ^C and ^Z arrive. Returns the console
+/// transcript.
 fn shell(lines: &[&str], max_steps: u64) -> String {
     let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot(&disk, 729, 0);
     let mut out = String::new();
     let mut next = 0;
     let mut steps = 0;
+    let mut since_input = 0;
     while steps < max_steps {
         m.run(1_000_000);
         steps += 1_000_000;
+        since_input += 1_000_000;
         out.push_str(&m.dev.serial.take_output());
         if out.contains("Kernel panic") {
             break;
         }
-        if out.ends_with("$ ") && next < lines.len() {
-            m.dev.serial_input(&format!("{}\n", lines[next]));
+        let Some(line) = lines.get(next) else { continue };
+        if let Some(raw) = line.strip_prefix('~') {
+            if since_input >= 5_000_000 {
+                m.dev.serial_input(raw);
+                next += 1;
+                since_input = 0;
+            }
+        } else if out.ends_with("$ ") {
+            m.dev.serial_input(&format!("{line}\n"));
             next += 1;
+            since_input = 0;
         }
     }
     out
@@ -56,7 +69,7 @@ fn k1_kernel_boots_with_paging_and_timer() {
         "mm: triddy self-test OK",
         "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 759 pages",
         "VFS: ramfs root, devfs on /dev, console tty",
-        "initramfs: 13 files",
+        "initramfs: 15 files",
         "init: started /sbin/init as pid 1",
         "Timer: 100 Hz",
     ] {
@@ -89,7 +102,8 @@ fn k2_processes_interleave_under_the_timer() {
     }";
     let (out, _) = boot_log(&with_init("interleave", src), 100_000_000);
     let first_child = out.find("child 0").unwrap_or_else(|| panic!("{out}"));
-    let last_parent = out.find("parent 3").unwrap_or_else(|| panic!("{out}"));
+    // Each line is two writes, so a preemption can split "parent 3" itself.
+    let last_parent = out.rfind("parent ").unwrap_or_else(|| panic!("{out}"));
     assert!(first_child < last_parent, "no preemption:\n{out}");
     assert!(out.contains("child exit 7"), "{out}");
 }
@@ -217,5 +231,88 @@ fn copy_dir(from: &Path, to: &Path) {
         } else {
             std::fs::copy(&p, to.join(e.file_name())).unwrap();
         }
+    }
+}
+
+#[test]
+fn k5_ctrl_c_interrupts_sleep() {
+    let out = shell(&["sleep 100", "~\u{3}", "echo $?", "exit"], 100_000_000);
+    assert!(out.contains("$ sleep 100\n^C\n$ echo $?\n130\n"), "{out}");
+    assert!(out.contains("init: /bin/sh exited with 0"), "{out}");
+}
+
+#[test]
+fn k5_signal_semantics() {
+    let out = shell(&["sigtest", "exit"], 300_000_000);
+    for check in [
+        "handler for SIGUSR1",
+        "blocked signal is pending",
+        "delivered on unblock",
+        "nested handlers unwind",
+        "SIG_IGN",
+        "SIGKILL cannot be caught",
+        "SIGPIPE kills the writer",
+        "SIGINT ends a sleeping child",
+        "SIGTERM ignored",
+        "SIGKILL after an ignored SIGTERM",
+        "nanosleep interrupted with EINTR",
+        "SA_RESTART resumes read",
+        "WUNTRACED sees SIGSTOP",
+        "SIGCONT then SIGTERM",
+        "getpgid of the new group",
+        "kill(-pgrp)",
+        "group leader terminated",
+        "ESRCH for an empty group",
+    ] {
+        assert!(out.contains(&format!("sigtest: {check} ok\n")), "missing {check:?} in:\n{out}");
+    }
+    assert!(out.contains("sigtest: done"), "{out}");
+    assert!(!out.contains("FAILED"), "{out}");
+}
+
+#[test]
+fn k5_job_control() {
+    let out = shell(
+        &[
+            "sleep 50 &",
+            "jobs",
+            "kill %1",
+            "true",
+            "sleep 100",
+            "~\u{1a}",
+            "jobs",
+            "bg",
+            "jobs",
+            "fg",
+            "~\u{3}",
+            "echo $?",
+            "cat | cat",
+            "~\u{3}",
+            "~abc",
+            "~\u{3}",
+            "echo after",
+            "cat &",
+            "true",
+            "kill -9 %1",
+            "true",
+            "exit 3",
+        ],
+        400_000_000,
+    );
+    for want in [
+        "$ sleep 50 &\n[1] 3\n",
+        "$ jobs\n[1]  Running                 sleep 50 &\n",
+        "$ true\n[1]  Terminated              sleep 50\n",
+        "$ sleep 100\n^Z\n[1]  Stopped                 sleep 100\n",
+        "$ jobs\n[1]  Stopped                 sleep 100\n",
+        "$ bg\n[1] sleep 100 &\n$ jobs\n[1]  Running                 sleep 100 &\n$ fg\nsleep 100\n^C\n",
+        "$ echo $?\n130\n",
+        "$ cat | cat\n^C\n$ ",
+        "$ abc^C\n$ echo after\nafter\n",                       // ^C at the prompt drops the line
+        "$ true\n[1]  Stopped                 cat\n",             // SIGTTIN for a background read
+        "$ kill -9 %1\n[1]  Killed                  cat\n",
+        "init: /bin/sh exited with 3",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
 }

@@ -12,6 +12,9 @@ const STDERR_FILENO: int = 2;
 // errno values (Linux)
 const EPERM: int = 1;
 const ENOENT: int = 2;
+const ESRCH: int = 3;
+const EINTR: int = 4;
+const EIO: int = 5;
 const ENOEXEC: int = 8;
 const EBADF: int = 9;
 const ECHILD: int = 10;
@@ -33,8 +36,39 @@ const ENAMETOOLONG: int = 36;
 const ENOSYS: int = 38;
 const ENOTEMPTY: int = 39;
 
+// signal.h (Linux numbers)
+const SIGHUP: int = 1;
+const SIGINT: int = 2;
+const SIGQUIT: int = 3;
+const SIGILL: int = 4;
+const SIGTRAP: int = 5;
+const SIGABRT: int = 6;
+const SIGBUS: int = 7;
+const SIGFPE: int = 8;
+const SIGKILL: int = 9;
+const SIGUSR1: int = 10;
+const SIGSEGV: int = 11;
+const SIGUSR2: int = 12;
+const SIGPIPE: int = 13;
+const SIGALRM: int = 14;
+const SIGTERM: int = 15;
 const SIGCHLD: int = 17;
+const SIGCONT: int = 18;
+const SIGSTOP: int = 19;
+const SIGTSTP: int = 20;
+const SIGTTIN: int = 21;
+const SIGTTOU: int = 22;
+const NSIG: int = 32;
+const SIG_DFL: int = 0;
+const SIG_IGN: int = 1;
+const SIG_ERR: int = -1;
+const SIG_BLOCK: int = 0;
+const SIG_UNBLOCK: int = 1;
+const SIG_SETMASK: int = 2;
+const SA_RESTORER: int = 67108864;
+
 const WNOHANG: int = 1;
+const WUNTRACED: int = 2;
 
 // fcntl.h
 const O_RDONLY: int = 0;
@@ -84,6 +118,11 @@ fn chdir(path: *char) -> int { return _ret(syscall(49, path)); }
 fn rmdir(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, AT_REMOVEDIR)); }
 fn unlink(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, 0)); }
 fn getpid() -> int { return syscall(172); }
+fn setpgid(pid: int, pgid: int) -> int { return _ret(syscall(154, pid, pgid)); }
+fn getpgid(pid: int) -> int { return _ret(syscall(155, pid)); }
+fn getpgrp() -> int { return syscall(155, 0); }
+fn getsid(pid: int) -> int { return _ret(syscall(156, pid)); }
+fn setsid() -> int { return _ret(syscall(157)); }
 fn getppid() -> int { return syscall(173); }
 fn sched_yield() -> int { return _ret(syscall(124)); }
 fn _exit(code: int) { syscall(93, code); }
@@ -217,11 +256,19 @@ const VMIN: int = 6;
 const TCSANOW: int = 0;
 const TCGETS: int = 21505;
 const TCSETS: int = 21506;
+const TIOCGPGRP: int = 21519;
+const TIOCSPGRP: int = 21520;
 const TIOCGWINSZ: int = 21523;
 
 fn ioctl(fd: int, cmd: int, arg: int) -> int { return _ret(syscall(29, fd, cmd, arg)); }
 fn tcgetattr(fd: int, t: *termios) -> int { return ioctl(fd, TCGETS, t as int); }
 fn tcsetattr(fd: int, when: int, t: *termios) -> int { return ioctl(fd, TCSETS + when, t as int); }
+fn tcgetpgrp(fd: int) -> int {
+    var g: int;
+    if (ioctl(fd, TIOCGPGRP, &g as int) < 0) { return -1; }
+    return g;
+}
+fn tcsetpgrp(fd: int, pgrp: int) -> int { return ioctl(fd, TIOCSPGRP, &pgrp as int); }
 fn isatty(fd: int) -> int {
     var t: termios;
     return tcgetattr(fd, &t) == 0;
@@ -234,11 +281,96 @@ fn waitpid(pid: int, status: *int, options: int) -> int {
 }
 fn wait(status: *int) -> int { return waitpid(-1, status, 0); }
 
-// Status encoding as on Linux: exit code * 256, or the terminating signal.
+// Status encoding as on Linux: exit code * 256, the terminating signal, or
+// stop signal * 256 + 127 for a stopped child (WUNTRACED).
 fn WIFEXITED(s: int) -> int { return s % 256 == 0; }
 fn WEXITSTATUS(s: int) -> int { return s / 256 % 256; }
-fn WIFSIGNALED(s: int) -> int { return s % 256 != 0; }
+fn WIFSIGNALED(s: int) -> int { return s % 256 != 0 && s % 256 != 127; }
 fn WTERMSIG(s: int) -> int { return s % 256; }
+fn WIFSTOPPED(s: int) -> int { return s % 256 == 127; }
+fn WSTOPSIG(s: int) -> int { return s / 256 % 256; }
+
+// ---- signal.h --------------------------------------------------------------------
+//
+// Sets are one word, bit (sig - 1). Handlers return through __restore_rt,
+// which calls rt_sigreturn (139).
+
+struct sigaction_t {
+    sa_handler: int;                   // SIG_DFL, SIG_IGN, or &handler as int
+    sa_flags: int;
+    sa_restorer: int;
+    sa_mask: int;
+}
+
+extern fn __restore_rt();
+
+fn _tlibc_asm() {
+    asm {
+        "        b     _tlibc_asm_end"
+        "__restore_rt:"
+        "        sys   139"
+        "_tlibc_asm_end:"
+    }
+}
+
+fn sigbit(sig: int) -> int {
+    var b: int = 1;
+    while (sig > 1) { b *= 2; sig -= 1; }
+    return b;
+}
+fn sigemptyset(set: *int) -> int { *set = 0; return 0; }
+fn sigismember(set: *int, sig: int) -> int { return *set / sigbit(sig) % 2 != 0; }
+fn sigaddset(set: *int, sig: int) -> int { if (!sigismember(set, sig)) { *set += sigbit(sig); } return 0; }
+fn sigdelset(set: *int, sig: int) -> int { if (sigismember(set, sig)) { *set -= sigbit(sig); } return 0; }
+
+fn sigaction(sig: int, act: *sigaction_t, old: *sigaction_t) -> int {
+    if (act != null) {
+        if (act.sa_flags / SA_RESTORER % 2 == 0) { act.sa_flags += SA_RESTORER; }
+        act.sa_restorer = &__restore_rt as int;
+    }
+    return _ret(syscall(134, sig, act, old, 3));
+}
+
+// signal(sig, SIG_DFL | SIG_IGN | &handler as int): returns the old handler.
+fn signal(sig: int, handler: int) -> int {
+    var sa: sigaction_t;
+    var old: sigaction_t;
+    sa.sa_handler = handler;
+    sa.sa_flags = 0;
+    sa.sa_mask = 0;
+    if (sigaction(sig, &sa, &old) < 0) { return SIG_ERR; }
+    return old.sa_handler;
+}
+
+fn sigprocmask(how: int, set: *int, old: *int) -> int { return _ret(syscall(135, how, set, old, 3)); }
+fn sigpending(set: *int) -> int { return _ret(syscall(136, set, 3)); }
+fn sigsuspend(mask: *int) -> int { return _ret(syscall(133, mask, 3)); }
+fn kill(pid: int, sig: int) -> int { return _ret(syscall(129, pid, sig)); }
+fn raise(sig: int) -> int { return kill(getpid(), sig); }
+fn pause() -> int {
+    var m: int;
+    sigprocmask(SIG_BLOCK, null, &m);
+    return sigsuspend(&m);
+}
+
+// ---- time.h, unistd.h sleep ---------------------------------------------------------
+
+struct timespec {
+    tv_sec: int;
+    tv_nsec: int;
+}
+
+fn nanosleep(req: *timespec, rem: *timespec) -> int { return _ret(syscall(101, req, rem)); }
+
+// sleep: returns the seconds left if a signal cut it short.
+fn sleep(seconds: int) -> int {
+    var req: timespec;
+    var rem: timespec;
+    req.tv_sec = seconds;
+    req.tv_nsec = 0;
+    if (nanosleep(&req, &rem) < 0) { return rem.tv_sec + (rem.tv_nsec > 0); }
+    return 0;
+}
 
 // ---- sys/sysinfo.h ---------------------------------------------------------------
 
@@ -265,10 +397,67 @@ fn sysinfo(info: *sysinfo_t) -> int { return _ret(syscall(179, info)); }
 
 fn streq(a: *char, b: *char) -> int { return strcmp(a, b) == 0; }
 
+// Signal names without "SIG", indexed by number ("" where there is none).
+fn signame(sig: int) -> *char {
+    switch (sig) {
+        case 1: return "HUP";
+        case 2: return "INT";
+        case 3: return "QUIT";
+        case 4: return "ILL";
+        case 5: return "TRAP";
+        case 6: return "ABRT";
+        case 7: return "BUS";
+        case 8: return "FPE";
+        case 9: return "KILL";
+        case 10: return "USR1";
+        case 11: return "SEGV";
+        case 12: return "USR2";
+        case 13: return "PIPE";
+        case 14: return "ALRM";
+        case 15: return "TERM";
+        case 17: return "CHLD";
+        case 18: return "CONT";
+        case 19: return "STOP";
+        case 20: return "TSTP";
+        case 21: return "TTIN";
+        case 22: return "TTOU";
+    }
+    return "";
+}
+
+// What a shell prints for a signal, as Linux's strsignal does.
+fn strsignal(sig: int) -> *char {
+    switch (sig) {
+        case 1: return "Hangup";
+        case 2: return "Interrupt";
+        case 3: return "Quit";
+        case 4: return "Illegal instruction";
+        case 5: return "Trace/breakpoint trap";
+        case 6: return "Aborted";
+        case 7: return "Bus error";
+        case 8: return "Floating point exception";
+        case 9: return "Killed";
+        case 10: return "User defined signal 1";
+        case 11: return "Segmentation fault";
+        case 12: return "User defined signal 2";
+        case 13: return "Broken pipe";
+        case 14: return "Alarm clock";
+        case 15: return "Terminated";
+        case 19: return "Stopped (signal)";
+        case 20: return "Stopped";
+        case 21: return "Stopped (tty input)";
+        case 22: return "Stopped (tty output)";
+    }
+    return "Unknown signal";
+}
+
 fn strerror(e: int) -> *char {
     switch (e) {
         case EPERM: return "Operation not permitted";
         case ENOENT: return "No such file or directory";
+        case ESRCH: return "No such process";
+        case EINTR: return "Interrupted system call";
+        case EIO: return "Input/output error";
         case ENOEXEC: return "Exec format error";
         case EBADF: return "Bad file descriptor";
         case ECHILD: return "No child processes";

@@ -1,13 +1,17 @@
-// /bin/sh: a small POSIX-style shell.
+// /bin/sh: a small POSIX-style shell with job control.
 //
 //   sh                  interactive on standard input (prompt "$ " on a tty)
 //   sh -c 'commands'    run one command string
 //   sh script           run a file
 //
-// Supported: pipelines (|), lists (; && ||), redirections (< > >> and
-// n> n>> n< n>&m), quoting ('...', "...", \), comments (#), $? and $$, and
-// the builtins cd, pwd, exit. Commands without a / are looked up in /bin.
-// Background jobs, signals and job control arrive with K5.
+// Supported: pipelines (|), lists (; && || &), redirections (< > >> and
+// n> n>> n< n>&m), quoting ('...', "...", \), comments (#), $? $$ $!, and
+// the builtins cd, pwd, exit, jobs, fg, bg, kill. Commands without a / are
+// looked up in /bin.
+//
+// Job control (interactive only): every pipeline is a process group; the
+// foreground one owns the terminal (tcsetpgrp), so ^C and ^Z reach it and
+// not the shell. A stopped job can be resumed with fg or bg.
 
 import "../lib/tlibc.tri";
 
@@ -17,6 +21,7 @@ const T_SEMI: int = 2;
 const T_AND: int = 3;
 const T_OR: int = 4;
 const T_REDIR: int = 5;
+const T_AMP: int = 6;
 
 const R_IN: int = 0;                  // n<file
 const R_OUT: int = 1;                 // n>file
@@ -27,26 +32,48 @@ const MAX_TOKENS: int = 243;
 const MAX_ARGS: int = 81;
 const MAX_CMDS: int = 27;
 const LINE_MAX: int = 729;
+const MAX_JOBS: int = 9;
 
 // Markers the tokenizer leaves in words, expanded when a command runs, so
 // that `false; echo $?` sees the status of `false`.
 const VAR_STATUS: char = 1;
 const VAR_PID: char = 2;
+const VAR_BANG: char = 3;
 
 var tok_kind: [243]int;
 var tok_word: [243]*char;
 var tok_fd: [243]int;                 // T_REDIR: the descriptor redirected
 var tok_mode: [243]int;               // T_REDIR: R_*
+var tok_start: [243]int;              // where the token starts in the line
+var tok_end: [243]int;                // and where it ends
 var ntok: int;
 var words: [2187]char;
 var wp: int;
+var cur_line: *char;
 
 var expbuf: [2187]char;               // expanded words of the command being run
 var ep: int;
 
 var last_status: int;
+var last_bg: int;                     // $!
 var interactive: int;
+var job_control: int;
+var shell_pgid: int;
 var syntax_error: int;
+
+struct Job {
+    used: int;
+    pgid: int;
+    npids: int;
+    pids: [27]int;                    // 0 once reaped
+    alive: int;
+    stopped: int;
+    stop_sig: int;
+    status: int;                      // wait status of the last process
+    cmd: [81]char;
+}
+
+var jobs: [9]Job;
 
 fn err(a: *char, b: *char) {
     fputs(STDERR_FILENO, "sh: ");
@@ -57,10 +84,12 @@ fn err(a: *char, b: *char) {
 
 // ---- tokens -------------------------------------------------------------------------
 
-fn add_tok(kind: int) -> int {
+fn add_tok(kind: int, at: int) -> int {
     if (ntok == MAX_TOKENS) { err("too many words", ""); syntax_error = 1; return 0; }
     tok_kind[ntok] = kind;
     tok_word[ntok] = null;
+    tok_start[ntok] = at;
+    tok_end[ntok] = at + 1;
     ntok += 1;
     return 1;
 }
@@ -75,10 +104,11 @@ fn ends_word(c: char) -> int {
     return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == '|' || c == '&' || c == ';' || c == '<' || c == '>';
 }
 
-// $? and $$ become markers; any other $ is literal.
+// $? $$ $! become markers; any other $ is literal.
 fn dollar(s: *char, i: int) -> int {
     if (s[i + 1] == '?') { put_char(VAR_STATUS); return i + 2; }
     if (s[i + 1] == '$') { put_char(VAR_PID); return i + 2; }
+    if (s[i + 1] == '!') { put_char(VAR_BANG); return i + 2; }
     put_char('$');
     return i + 1;
 }
@@ -88,24 +118,24 @@ fn tokenize(s: *char) -> int {
     ntok = 0;
     wp = 0;
     syntax_error = 0;
+    cur_line = s;
     var i: int = 0;
     loop {
         while (s[i] == ' ' || s[i] == '\t') { i += 1; }
         var c: char = s[i];
+        var start: int = i;
         if (c == 0 || c == '\n' || c == '#') { break; }
         if (c == '|') {
-            if (s[i + 1] == '|') { add_tok(T_OR); i += 2; } else { add_tok(T_PIPE); i += 1; }
+            if (s[i + 1] == '|') { add_tok(T_OR, i); i += 2; } else { add_tok(T_PIPE, i); i += 1; }
         } else if (c == '&') {
-            if (s[i + 1] != '&') { err("background jobs (&) arrive with job control", ""); return 0; }
-            add_tok(T_AND);
-            i += 2;
+            if (s[i + 1] == '&') { add_tok(T_AND, i); i += 2; } else { add_tok(T_AMP, i); i += 1; }
         } else if (c == ';') {
-            add_tok(T_SEMI);
+            add_tok(T_SEMI, i);
             i += 1;
         } else if (c == '<' || c == '>' || (is_digit(c) && (s[i + 1] == '<' || s[i + 1] == '>'))) {
             var fd: int = -1;
             if (is_digit(c)) { fd = c - '0'; i += 1; }
-            if (!add_tok(T_REDIR)) { return 0; }
+            if (!add_tok(T_REDIR, start)) { return 0; }
             var t: int = ntok - 1;
             if (s[i] == '<') {
                 tok_mode[t] = R_IN;
@@ -119,7 +149,7 @@ fn tokenize(s: *char) -> int {
                 else if (s[i] == '&') { tok_mode[t] = R_DUP; i += 1; }
             }
         } else {
-            if (!add_tok(T_WORD)) { return 0; }
+            if (!add_tok(T_WORD, start)) { return 0; }
             tok_word[ntok - 1] = &words[wp];
             while (!ends_word(s[i])) {
                 if (s[i] == '\'') {
@@ -152,26 +182,30 @@ fn tokenize(s: *char) -> int {
             }
             put_char(0);
         }
+        tok_end[ntok - 1] = i;
         if (syntax_error) { return 0; }
     }
     return 1;
 }
 
-// A word with $? and $$ substituted (in expbuf when it changes).
+// A word with $? $$ $! substituted (in expbuf when it changes).
 fn expand(w: *char) -> *char {
     var k: int = 0;
     var plain: int = 1;
     while (w[k] != 0) {
-        if (w[k] == VAR_STATUS || w[k] == VAR_PID) { plain = 0; }
+        if (w[k] == VAR_STATUS || w[k] == VAR_PID || w[k] == VAR_BANG) { plain = 0; }
         k += 1;
     }
     if (plain) { return w; }
     var start: int = ep;
     k = 0;
     while (w[k] != 0) {
-        if (w[k] == VAR_STATUS || w[k] == VAR_PID) {
+        if (w[k] == VAR_STATUS || w[k] == VAR_PID || w[k] == VAR_BANG) {
             var num: [15]char;
-            var s: *char = itoa(w[k] == VAR_STATUS ? last_status : getpid(), &num[0]);
+            var v: int = last_status;
+            if (w[k] == VAR_PID) { v = getpid(); }
+            if (w[k] == VAR_BANG) { v = last_bg; }
+            var s: *char = itoa(v, &num[0]);
             var j: int = 0;
             while (s[j] != 0 && ep < 2186) { expbuf[ep] = s[j]; ep += 1; j += 1; }
         } else if (ep < 2186) {
@@ -185,12 +219,150 @@ fn expand(w: *char) -> *char {
     return &expbuf[start];
 }
 
-// ---- running commands ----------------------------------------------------------------
+// ---- jobs --------------------------------------------------------------------------------
 
 fn status_of(st: int) -> int {
     if (WIFEXITED(st)) { return WEXITSTATUS(st); }
+    if (WIFSTOPPED(st)) { return 128 + WSTOPSIG(st); }
     return 128 + WTERMSIG(st);
 }
+
+fn new_job(a: int, b: int) -> int {
+    var j: int = 0;
+    while (j < MAX_JOBS) {
+        if (!jobs[j].used) {
+            var jb: *Job = &jobs[j];
+            jb.used = 1;
+            jb.pgid = 0;
+            jb.npids = 0;
+            jb.alive = 0;
+            jb.stopped = 0;
+            jb.status = 0;
+            var n: int = 0;
+            var k: int = tok_start[a];
+            while (k < tok_end[b - 1] && n < 80) { jb.cmd[n] = cur_line[k]; n += 1; k += 1; }
+            jb.cmd[n] = 0;
+            return j;
+        }
+        j += 1;
+    }
+    return -1;
+}
+
+fn put_job_line(j: int, state: *char, amp: int) {
+    puts("[");
+    put_int(j + 1);
+    puts("]  ");
+    puts(state);
+    var n: int = strlen(state);
+    while (n < 24) { puts(" "); n += 1; }
+    puts(&jobs[j].cmd[0]);
+    if (amp) { puts(" &"); }
+    puts("\n");
+}
+
+// Record what wait() said about `pid`. Returns its job, or -1.
+fn job_update(pid: int, st: int) -> int {
+    var j: int = 0;
+    while (j < MAX_JOBS) {
+        if (jobs[j].used) {
+            var jb: *Job = &jobs[j];
+            var i: int = 0;
+            while (i < jb.npids) {
+                if (jb.pids[i] == pid) {
+                    if (WIFSTOPPED(st)) {
+                        jb.stopped = 1;
+                        jb.stop_sig = WSTOPSIG(st);
+                    } else {
+                        jb.pids[i] = 0;
+                        jb.alive -= 1;
+                        if (i == jb.npids - 1) { jb.status = st; }
+                    }
+                    return j;
+                }
+                i += 1;
+            }
+        }
+        j += 1;
+    }
+    return -1;
+}
+
+// Wait for a foreground job to finish or stop; returns its status.
+fn wait_fg(j: int) -> int {
+    var jb: *Job = &jobs[j];
+    var i: int = 0;
+    while (i < jb.npids && !jb.stopped) {
+        var pid: int = jb.pids[i];
+        if (pid == 0) { i += 1; continue; }
+        var st: int = 0;
+        var r: int = waitpid(pid, &st, job_control ? WUNTRACED : 0);
+        if (r < 0) {
+            if (errno == EINTR) { continue; }
+            jb.pids[i] = 0;
+            jb.alive -= 1;
+            i += 1;
+            continue;
+        }
+        job_update(pid, st);
+        if (!jb.stopped) { i += 1; }
+    }
+    if (job_control) { tcsetpgrp(STDIN_FILENO, shell_pgid); }
+    if (jb.stopped) {
+        puts("\n");
+        put_job_line(j, "Stopped", 0);
+        return 128 + jb.stop_sig;
+    }
+    var st: int = jb.status;
+    jb.used = 0;
+    if (WIFSIGNALED(st)) {
+        if (WTERMSIG(st) == SIGINT) { puts("\n"); }
+        else if (WTERMSIG(st) != SIGPIPE) { fputs(STDERR_FILENO, strsignal(WTERMSIG(st))); fputs(STDERR_FILENO, "\n"); }
+    }
+    return status_of(st);
+}
+
+// Before a prompt: collect finished and stopped background jobs.
+fn reap_jobs() {
+    loop {
+        var st: int = 0;
+        var pid: int = waitpid(-1, &st, WNOHANG + (job_control ? WUNTRACED : 0));
+        if (pid <= 0) { break; }
+        var j: int = job_update(pid, st);
+        if (j >= 0 && WIFSTOPPED(st) && interactive) { put_job_line(j, "Stopped", 0); }
+    }
+    var j: int = 0;
+    while (j < MAX_JOBS) {
+        if (jobs[j].used && jobs[j].alive == 0) {
+            if (interactive) {
+                var s: int = jobs[j].status;
+                put_job_line(j, WIFSIGNALED(s) ? strsignal(WTERMSIG(s)) : (WEXITSTATUS(s) == 0 ? "Done" : "Exit"), 0);
+            }
+            jobs[j].used = 0;
+        }
+        j += 1;
+    }
+}
+
+// "%n" or nothing (the newest job). Returns the job, or -1 after a message.
+fn find_job(argc: int, argv: **char, who: *char) -> int {
+    var j: int = -1;
+    if (argc > 1) {
+        var a: *char = argv[1];
+        if (a[0] == '%') { a = &a[1]; }
+        var n: int = 0;
+        var k: int = 0;
+        while (is_digit(a[k])) { n = n * 10 + a[k] - '0'; k += 1; }
+        if (n >= 1 && n <= MAX_JOBS && jobs[n - 1].used) { j = n - 1; }
+    } else {
+        var k: int = MAX_JOBS - 1;
+        while (k >= 0 && j < 0) { if (jobs[k].used) { j = k; } k -= 1; }
+    }
+    if (j < 0) { err(who, ": no such job"); }
+    return j;
+}
+
+// ---- running commands ----------------------------------------------------------------
 
 // Apply the redirections in tokens [a, b). Returns 0, or -1 after a message.
 fn redirect(a: int, b: int) -> int {
@@ -237,7 +409,75 @@ fn collect_args(a: int, b: int, argv: **char) -> int {
     return n;
 }
 
-fn is_builtin(name: *char) -> int { return streq(name, "cd") || streq(name, "pwd") || streq(name, "exit"); }
+fn is_builtin(name: *char) -> int {
+    return streq(name, "cd") || streq(name, "pwd") || streq(name, "exit") || streq(name, "jobs")
+        || streq(name, "fg") || streq(name, "bg") || streq(name, "kill");
+}
+
+fn parse_int(s: *char, out: *int) -> int {
+    var neg: int = 0;
+    var k: int = 0;
+    if (s[0] == '-') { neg = 1; k = 1; }
+    if (!is_digit(s[k])) { return 0; }
+    var n: int = 0;
+    while (is_digit(s[k])) { n = n * 10 + s[k] - '0'; k += 1; }
+    if (s[k] != 0) { return 0; }
+    *out = neg ? -n : n;
+    return 1;
+}
+
+// A signal by number or name, with or without "SIG".
+fn parse_signal(s: *char) -> int {
+    var n: int;
+    if (parse_int(s, &n)) { return n >= 0 && n < NSIG ? n : -1; }
+    if (s[0] == 'S' && s[1] == 'I' && s[2] == 'G') { s = &s[3]; }
+    var sig: int = 1;
+    while (sig < NSIG) {
+        if (streq(s, signame(sig))) { return sig; }
+        sig += 1;
+    }
+    return -1;
+}
+
+fn builtin_kill(argc: int, argv: **char) -> int {
+    var sig: int = SIGTERM;
+    var i: int = 1;
+    if (argc > 1 && streq(argv[1], "-l")) {
+        var s: int = 1;
+        while (s < NSIG) {
+            if (signame(s)[0] != 0) { put_int(s); puts(") SIG"); puts(signame(s)); puts("\n"); }
+            s += 1;
+        }
+        return 0;
+    }
+    if (argc > 2 && streq(argv[1], "-s")) { sig = parse_signal(argv[2]); i = 3; }
+    else if (argc > 1 && argv[1][0] == '-' && !is_digit(argv[1][1]) || argc > 2 && argv[1][0] == '-' && is_digit(argv[1][1])) {
+        sig = parse_signal(&argv[1][1]);
+        i = 2;
+    }
+    if (sig < 0) { err("kill: bad signal", ""); return 1; }
+    if (i == argc) { err("usage: kill [-s sig | -sig] pid | %job ...", ""); return 2; }
+    var status: int = 0;
+    while (i < argc) {
+        var pid: int;
+        if (argv[i][0] == '%') {
+            var jargv: [2]*char = { "kill", argv[i] };
+            var j: int = find_job(2, &jargv[0], "kill");
+            if (j < 0) { status = 1; i += 1; continue; }
+            pid = -jobs[j].pgid;
+            if (sig == SIGCONT || sig == SIGKILL || sig == SIGTERM) { jobs[j].stopped = 0; }
+        } else if (!parse_int(argv[i], &pid)) {
+            err("kill: bad pid: ", argv[i]);
+            status = 1;
+            i += 1;
+            continue;
+        }
+        if (kill(pid, sig) < 0) { perror2("sh: kill", argv[i]); status = 1; }
+        else if (pid < 0 && sig != SIGCONT && sig != 0) { kill(pid, SIGCONT); }   // a stopped job must wake to die
+        i += 1;
+    }
+    return status;
+}
 
 fn builtin(argc: int, argv: **char) -> int {
     if (streq(argv[0], "cd")) {
@@ -252,6 +492,37 @@ fn builtin(argc: int, argv: **char) -> int {
         puts("\n");
         return 0;
     }
+    if (streq(argv[0], "jobs")) {
+        var j: int = 0;
+        while (j < MAX_JOBS) {
+            if (jobs[j].used) { put_job_line(j, jobs[j].stopped ? "Stopped" : "Running", !jobs[j].stopped); }
+            j += 1;
+        }
+        return 0;
+    }
+    if (streq(argv[0], "fg") || streq(argv[0], "bg")) {
+        if (!job_control) { err(argv[0], ": no job control"); return 1; }
+        var j: int = find_job(argc, argv, argv[0]);
+        if (j < 0) { return 1; }
+        var jb: *Job = &jobs[j];
+        if (streq(argv[0], "bg")) {
+            jb.stopped = 0;
+            kill(-jb.pgid, SIGCONT);
+            puts("[");
+            put_int(j + 1);
+            puts("] ");
+            puts(&jb.cmd[0]);
+            puts(" &\n");
+            return 0;
+        }
+        puts(&jb.cmd[0]);
+        puts("\n");
+        tcsetpgrp(STDIN_FILENO, jb.pgid);
+        jb.stopped = 0;
+        kill(-jb.pgid, SIGCONT);
+        return wait_fg(j);
+    }
+    if (streq(argv[0], "kill")) { return builtin_kill(argc, argv); }
     // exit [n]
     var code: int = last_status;
     if (argc > 1) {
@@ -304,8 +575,16 @@ fn run_builtin_here(a: int, b: int, argc: int, argv: **char) -> int {
     return status;
 }
 
-// Run the pipeline in tokens [a, b); returns its status.
-fn run_pipeline(a: int, b: int) -> int {
+fn default_signals() {
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
+}
+
+// Run the pipeline in tokens [a, b), in the background if `bg`; returns its status.
+fn run_pipeline(a: int, b: int, bg: int) -> int {
     var starts: [27]int;
     var ends: [27]int;
     var n: int = 0;
@@ -323,19 +602,29 @@ fn run_pipeline(a: int, b: int) -> int {
     }
     ep = 0;
     var argv: [81]*char;
-    if (n == 1) {
+    if (n == 1 && !bg) {
         var argc: int = collect_args(a, b, &argv[0]);
         if (argc > 0 && is_builtin(argv[0])) { return run_builtin_here(a, b, argc, &argv[0]); }
     }
-    var pids: [27]int;
+    var j: int = new_job(a, b);
+    if (j < 0) { err("too many jobs", ""); return 1; }
+    var jb: *Job = &jobs[j];
     var prev: int = -1;                          // read end of the previous pipe
     var i: int = 0;
     while (i < n) {
         var p: [2]int;
-        if (i < n - 1 && pipe(&p[0]) < 0) { perror2("sh", "pipe"); return 1; }
+        if (i < n - 1 && pipe(&p[0]) < 0) { perror2("sh", "pipe"); break; }
         var pid: int = fork();
-        if (pid < 0) { perror2("sh", "fork"); return 1; }
+        if (pid < 0) { perror2("sh", "fork"); break; }
         if (pid == 0) {
+            if (job_control) {
+                setpgid(0, jb.pgid);
+                if (!bg) { tcsetpgrp(STDIN_FILENO, getpgrp()); }
+                default_signals();
+            } else if (bg) {
+                signal(SIGINT, SIG_IGN);                 // POSIX: async lists ignore SIGINT/SIGQUIT
+                signal(SIGQUIT, SIG_IGN);
+            }
             if (prev >= 0) { dup2(prev, 0); close(prev); }
             if (i < n - 1) { close(p[0]); dup2(p[1], 1); close(p[1]); }
             if (redirect(starts[i], ends[i]) < 0) { _exit(1); }
@@ -344,34 +633,49 @@ fn run_pipeline(a: int, b: int) -> int {
             if (argc == 0) { _exit(0); }
             exec_command(argc, &argv[0]);
         }
-        pids[i] = pid;
+        if (jb.pgid == 0) { jb.pgid = job_control ? pid : shell_pgid; }
+        if (job_control) {
+            setpgid(pid, jb.pgid);
+            if (!bg) { tcsetpgrp(STDIN_FILENO, jb.pgid); }
+        }
+        jb.pids[jb.npids] = pid;
+        jb.npids += 1;
+        jb.alive += 1;
         if (prev >= 0) { close(prev); }
         if (i < n - 1) { close(p[1]); prev = p[0]; }
         i += 1;
     }
-    var status: int = 0;
-    i = 0;
-    while (i < n) {
-        var st: int = 0;
-        waitpid(pids[i], &st, 0);
-        if (i == n - 1) { status = status_of(st); }
-        i += 1;
+    if (prev >= 0) { close(prev); }
+    if (jb.npids == 0) { jb.used = 0; return 1; }
+    if (bg) {
+        last_bg = jb.pids[jb.npids - 1];
+        if (interactive) {
+            puts("[");
+            put_int(j + 1);
+            puts("] ");
+            put_int(last_bg);
+            puts("\n");
+        }
+        return 0;
     }
-    return status;
+    return wait_fg(j);
 }
 
-// Run a tokenized line: pipelines joined by ; && ||.
+fn is_separator(k: int) -> int { return k == T_SEMI || k == T_AND || k == T_OR || k == T_AMP; }
+
+// Run a tokenized line: pipelines joined by ; && || &.
 fn run_list() -> int {
     var status: int = last_status;
     var op: int = T_SEMI;
     var pos: int = 0;
     while (pos < ntok) {
         var end: int = pos;
-        while (end < ntok && tok_kind[end] != T_SEMI && tok_kind[end] != T_AND && tok_kind[end] != T_OR) { end += 1; }
-        if (end == pos && (end < ntok && tok_kind[end] != T_SEMI)) { err("syntax error near && or ||", ""); return 2; }
-        var go: int = op == T_SEMI || (op == T_AND && status == 0) || (op == T_OR && status != 0);
+        while (end < ntok && !is_separator(tok_kind[end])) { end += 1; }
+        if (end == pos && end < ntok && tok_kind[end] != T_SEMI) { err("syntax error near && || &", ""); return 2; }
+        var bg: int = end < ntok && tok_kind[end] == T_AMP;
+        var go: int = op == T_SEMI || op == T_AMP || (op == T_AND && status == 0) || (op == T_OR && status != 0);
         if (end > pos && go) {
-            status = run_pipeline(pos, end);
+            status = run_pipeline(pos, end, bg);
             last_status = status;
         }
         if (end < ntok) { op = tok_kind[end]; end += 1; }
@@ -390,13 +694,18 @@ fn run_line(s: *char) {
 var inbuf: [2187]char;
 var in_len: int;
 var in_pos: int;
+var got_sigint: int;
 
-// The next line from fd into `line` (without the newline). 0 at end of file.
+fn on_sigint(sig: int) { got_sigint = 1; }
+
+// The next line from fd into `line` (without the newline): 1, or 0 at end
+// of file, or -1 if a signal interrupted the read.
 fn read_line(fd: int, line: *char) -> int {
     var n: int = 0;
     loop {
         if (in_pos == in_len) {
             var r: int = read(fd, &inbuf[0], 2187);
+            if (r < 0 && errno == EINTR) { in_pos = 0; in_len = 0; return -1; }
             if (r <= 0) {
                 line[n] = 0;
                 return n > 0;
@@ -412,6 +721,7 @@ fn read_line(fd: int, line: *char) -> int {
 }
 
 fn main(argc: int, argv: **char) -> int {
+    shell_pgid = getpgrp();
     if (argc > 2 && streq(argv[1], "-c")) {
         run_line(argv[2]);
         return last_status;
@@ -422,10 +732,27 @@ fn main(argc: int, argv: **char) -> int {
         if (fd < 0) { perror2("sh", argv[1]); return 127; }
     }
     interactive = fd == STDIN_FILENO && isatty(STDIN_FILENO);
+    if (interactive) {
+        // Job control: our own process group, owning the terminal.
+        job_control = 1;
+        setpgid(0, 0);
+        shell_pgid = getpgrp();
+        tcsetpgrp(STDIN_FILENO, shell_pgid);
+        signal(SIGINT, &on_sigint as int);           // ^C at the prompt: a fresh prompt
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTSTP, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+        signal(SIGTTOU, SIG_IGN);
+    }
     var line: [729]char;
     loop {
-        if (interactive) { fputs(STDERR_FILENO, "$ "); }
-        if (!read_line(fd, &line[0])) { break; }
+        if (interactive) {
+            reap_jobs();
+            fputs(STDERR_FILENO, "$ ");
+        }
+        var r: int = read_line(fd, &line[0]);
+        if (r < 0) { puts("\n"); continue; }
+        if (r == 0) { break; }
         run_line(&line[0]);
     }
     if (interactive) { fputs(STDERR_FILENO, "exit\n"); }

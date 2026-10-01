@@ -1,0 +1,190 @@
+// /bin/sigtest: the K5 signal scenarios, one line of output per check.
+
+import "../lib/tlibc.tri";
+
+var hits: int;
+var last_sig: int;
+var depth: int;
+
+fn on_signal(sig: int) {
+    hits += 1;
+    last_sig = sig;
+}
+
+// A handler that raises another signal: delivery nests, then unwinds.
+fn on_usr2(sig: int) {
+    depth += 1;
+    raise(SIGUSR1);
+    depth += 10;
+}
+
+fn ok(what: *char, cond: int) {
+    puts("sigtest: ");
+    puts(what);
+    puts(cond ? " ok\n" : " FAILED\n");
+}
+
+// fork a child running `body`; returns its wait status.
+fn child_status(body: int) -> int {
+    var pid: int = fork();
+    if (pid == 0) {
+        if (body == 1) {                                   // SIGPIPE
+            var p: [2]int;
+            pipe(&p[0]);
+            close(p[0]);
+            write(p[1], "x", 1);
+            _exit(0);
+        }
+        if (body == 2) {                                   // killed while sleeping
+            sleep(100);
+            _exit(0);
+        }
+        if (body == 3) {                                   // SIGSEGV caught by a handler
+            signal(SIGSEGV, &on_signal as int);
+            _exit(42);
+        }
+        if (body == 4) {                                   // ignored SIGTERM, then SIGKILL
+            signal(SIGTERM, SIG_IGN);
+            loop { sleep(1); }
+        }
+        _exit(0);
+    }
+    if (body == 2 || body == 4) {
+        var t: timespec;
+        t.tv_sec = 0;
+        t.tv_nsec = 50000000;
+        nanosleep(&t, null);                               // let it get going
+        if (body == 4) {
+            kill(pid, SIGTERM);
+            nanosleep(&t, null);
+            if (kill(pid, 0) == 0) { puts("sigtest: SIGTERM ignored ok\n"); }
+            kill(pid, SIGKILL);
+        } else {
+            kill(pid, SIGINT);
+        }
+    }
+    var st: int = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    // a handler runs and returns to the interrupted code
+    signal(SIGUSR1, &on_signal as int);
+    raise(SIGUSR1);
+    ok("handler for SIGUSR1", hits == 1 && last_sig == SIGUSR1);
+
+    // a blocked signal stays pending until unblocked
+    var set: int;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, null);
+    raise(SIGUSR1);
+    var pend: int;
+    sigpending(&pend);
+    ok("blocked signal is pending", hits == 1 && sigismember(&pend, SIGUSR1));
+    sigprocmask(SIG_UNBLOCK, &set, null);
+    ok("delivered on unblock", hits == 2);
+
+    // nested delivery from inside a handler
+    signal(SIGUSR2, &on_usr2 as int);
+    raise(SIGUSR2);
+    ok("nested handlers unwind", depth == 11 && hits == 3);
+
+    // ignored signals are discarded
+    signal(SIGUSR1, SIG_IGN);
+    raise(SIGUSR1);
+    ok("SIG_IGN", hits == 3);
+
+    // SIGKILL cannot be caught
+    ok("SIGKILL cannot be caught", signal(SIGKILL, &on_signal as int) == SIG_ERR && errno == EINVAL);
+
+    // writing to a pipe with no reader
+    var st: int = child_status(1);
+    ok("SIGPIPE kills the writer", WIFSIGNALED(st) && WTERMSIG(st) == SIGPIPE);
+
+    // a signal interrupts a sleep and its default action terminates
+    st = child_status(2);
+    ok("SIGINT ends a sleeping child", WIFSIGNALED(st) && WTERMSIG(st) == SIGINT);
+
+    st = child_status(4);
+    ok("SIGKILL after an ignored SIGTERM", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+
+    // a handler interrupts nanosleep with EINTR and the time left
+    signal(SIGUSR1, &on_signal as int);
+    var parent: int = getpid();
+    var pid: int = fork();
+    if (pid == 0) {
+        var t: timespec;
+        t.tv_sec = 0;
+        t.tv_nsec = 100000000;
+        nanosleep(&t, null);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    var req: timespec;
+    var rem: timespec;
+    req.tv_sec = 30;
+    req.tv_nsec = 0;
+    var r: int = nanosleep(&req, &rem);
+    ok("nanosleep interrupted with EINTR", r == -1 && errno == EINTR && hits == 4 && rem.tv_sec > 20);
+    waitpid(pid, &st, 0);
+
+    // SA_RESTART: a read interrupted by a handler carries on
+    var sa: sigaction_t;
+    sa.sa_handler = &on_signal as int;
+    sa.sa_flags = 268435456;                               // SA_RESTART
+    sa.sa_mask = 0;
+    sigaction(SIGUSR1, &sa, null);
+    var p: [2]int;
+    pipe(&p[0]);
+    pid = fork();
+    if (pid == 0) {
+        var t: timespec;
+        t.tv_sec = 0;
+        t.tv_nsec = 50000000;
+        nanosleep(&t, null);
+        kill(parent, SIGUSR1);
+        nanosleep(&t, null);
+        write(p[1], "z", 1);
+        _exit(0);
+    }
+    close(p[1]);
+    var c: [1]char;
+    r = read(p[0], &c[0], 1);
+    ok("SA_RESTART resumes read", r == 1 && c[0] == 'z' && hits == 5);
+    close(p[0]);
+    waitpid(pid, &st, 0);
+
+    // stop and continue, seen through WUNTRACED
+    pid = fork();
+    if (pid == 0) { loop { sleep(1); } }
+    kill(pid, SIGSTOP);
+    r = waitpid(pid, &st, WUNTRACED);
+    ok("WUNTRACED sees SIGSTOP", r == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP);
+    kill(pid, SIGCONT);
+    kill(pid, SIGTERM);
+    waitpid(pid, &st, 0);
+    ok("SIGCONT then SIGTERM", WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+
+    // process groups: kill(-pgrp) reaches every member
+    pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (fork() == 0) { loop { sleep(1); } }
+        loop { sleep(1); }
+    }
+    setpgid(pid, pid);
+    var t2: timespec;
+    t2.tv_sec = 0;
+    t2.tv_nsec = 50000000;
+    nanosleep(&t2, null);
+    ok("getpgid of the new group", getpgid(pid) == pid);
+    ok("kill(-pgrp)", kill(-pid, SIGTERM) == 0);
+    waitpid(pid, &st, 0);
+    ok("group leader terminated", WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+    ok("ESRCH for an empty group", kill(-12345, SIGTERM) == -1 && errno == ESRCH);
+
+    puts("sigtest: done\n");
+    return 0;
+}

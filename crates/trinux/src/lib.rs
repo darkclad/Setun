@@ -49,7 +49,7 @@ pub fn user_dir() -> PathBuf {
 pub fn default_files() -> Vec<(String, PathBuf)> {
     let u = user_dir();
     let mut v: Vec<(String, PathBuf)> = vec![("/sbin/init".into(), u.join("init.tri"))];
-    for prog in ["sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "k3test"] {
+    for prog in ["sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "k3test", "sigtest"] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
     v.push(("/bin/hello".into(), u.join("hello.tri")));

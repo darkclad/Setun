@@ -254,7 +254,7 @@ fmt_nl(f);
 | K2 ✅ | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
 | K3 ✅ | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
 | K4 ✅ | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
-| K5 | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
+| K5 ✅ | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
 | K6 | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
 | K7 | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
 | K8 | (then) the window system on the framebuffer | – |
@@ -493,3 +493,93 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
 - `$?` after `false` and after a missing command (127), the `&&`/`||` chains and quoting;
 - error messages through `2>&1 >/dev/null | cat`, and `rm`;
 - `/bin/k3test` run from the shell.
+
+## 18. K5 as built
+
+**Signals** ([`kernel/signal.tri`](../kernel/signal.tri)): signals 1–31 with Linux numbers. A signal set is one word with bit `sig − 1`; there are no real-time signals yet.
+- **Generation:** `send_signal` adds the signal to the target's pending set. Ignored signals are discarded at once, unless blocked.
+  - `SIGCONT` resumes a stopped task and cancels pending stop signals; a stop signal cancels a pending `SIGCONT`.
+  - A signal that is not blocked wakes a sleeping task.
+- **Delivery:** on every return to user mode (after a system call, an IRQ that interrupted user code, or a user fault), the kernel takes the lowest pending signal that is not blocked.
+
+  | Action | Signals | What happens |
+  |---|---|---|
+  | ignore | `SIGCHLD`, `SIGURG`, `SIGWINCH`, `SIGCONT` | nothing |
+  | stop | `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU` | `TASK_STOPPED`; the parent gets `SIGCHLD` and a `wait4` wake-up |
+  | terminate | everything else | `exit` with the signal number as the wait status |
+  | handler | any caught signal | a signal frame is pushed (below) |
+
+  `SIGKILL` and `SIGSTOP` can be neither caught nor blocked.
+- **Signal frame:** 30 words, pushed below an 81-tryte red zone under the user `sp`:
+  - the whole 28-word trap frame;
+  - the old blocked mask;
+  - a magic word.
+
+  The handler starts with `r1` = the signal number and `lr` = `sa_restorer` (tlibc's `__restore_rt`: `sys 139`). While it runs, the signal itself and `sa_mask` are blocked.
+- **`rt_sigreturn`** restores the frame. It checks the magic word, and that the saved `MODE` trits 23–27 (IOPL, PG, IE, ring) match user mode, so a forged frame cannot raise privileges.
+- **CPU faults** go to a handler when one is installed and the signal is not blocked; otherwise the process is killed with the message as before. A fault inside a system call always kills, since retrying would fault again.
+- **System-call restart:**
+  - Interrupted sleeps return `ERESTARTSYS` (pipes, tty, `wait4`), `ERESTARTNOHAND` (`sigsuspend`) or `ERESTART_RESTARTBLOCK` (`nanosleep`).
+  - If no handler runs (for example, the process was stopped and then continued), the call is re-executed: `EPC` goes back over the 1-word `SYS`, and `r1` gets back the call's first argument.
+  - `nanosleep` resumes with the time it had left.
+  - With a handler, the call fails with `EINTR`, or restarts if the handler has `SA_RESTART` (for `ERESTARTSYS` only).
+- `execve` resets caught signals to `SIG_DFL` and keeps ignored ones; `fork` copies the handlers and the mask, and the child starts with no pending signals.
+
+**Process groups and sessions:** `Task.pgid` and `Task.sid`. Init is pid 1, group 1, session 1, and children inherit both.
+- `setpgid` works on the caller or a child in the same session, never on a session leader.
+- `getpgid`, `getsid` and `setsid` behave as in POSIX.
+- `kill(pid)`:
+
+  | `pid` | Target |
+  |---|---|
+  | > 0 | that process |
+  | 0 | the caller's group |
+  | −1 | every process but init and the caller |
+  | < −1 | group −pid |
+
+  `ESRCH` when nothing matches; signal 0 only checks.
+- `wait4` takes the same `pid` forms. `WUNTRACED` reports a stopped child once, as `stopsig·256 + 127`.
+
+**Terminal job control** ([`kernel/drivers/tty.tri`](../kernel/drivers/tty.tri)):
+- With `ISIG`, `^C`, `^\` and `^Z` (`VINTR`, `VQUIT`, `VSUSP`) echo as `^X`, flush the input, and send `SIGINT`, `SIGQUIT` or `SIGTSTP` to the foreground process group.
+- `TIOCGPGRP` and `TIOCSPGRP` read and set that group. It must exist in the caller's session.
+- A read from a background group gets `SIGTTIN`, or `EIO` if `SIGTTIN` is ignored or blocked. The read restarts once the process is back in the foreground.
+- `SIGTTOU`/`TOSTOP` are not implemented.
+
+**Timing:** `nanosleep` (101) sleeps on a channel that the timer wakes every tick; the resolution is one tick (10 ms).
+
+**System calls** (in addition to K4's):
+
+| Call | Number |
+|---|---|
+| `nanosleep` | 101 |
+| `kill` | 129 |
+| `rt_sigsuspend` | 133 |
+| `rt_sigaction` | 134 (`struct sigaction`: handler, flags, restorer, mask, one word each) |
+| `rt_sigprocmask` | 135 |
+| `rt_sigpending` | 136 |
+| `rt_sigreturn` | 139 |
+| `setpgid` / `getpgid` | 154 / 155 |
+| `getsid` / `setsid` | 156 / 157 |
+
+**User space:**
+- **tlibc:**
+  - `sigaction` and `signal`, the `sig*set` functions, `sigprocmask`, `sigpending`, `sigsuspend`;
+  - `kill`, `raise`, `pause`;
+  - `nanosleep`, `sleep`;
+  - the process-group calls, `tcgetpgrp` and `tcsetpgrp`;
+  - `WIFSTOPPED` / `WSTOPSIG`, `signame`, `strsignal`.
+- **`/bin/sh`** has job control when interactive:
+  - each pipeline is a process group, and the foreground one owns the terminal;
+  - `&` starts a background job, and `$!` holds its last pid;
+  - the builtins `jobs`, `fg`, `bg` and `kill [-s sig | -sig | -l] pid | %job`;
+  - "Done", "Stopped", "Terminated" and "Killed" notices appear before the next prompt;
+  - `^C` at the prompt drops the line and prints a fresh prompt (a `SIGINT` handler without `SA_RESTART`);
+  - the shell ignores `SIGQUIT`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU`, and puts them back to the default in its children;
+  - non-interactive `&` jobs ignore `SIGINT` and `SIGQUIT`, as POSIX asks.
+- **`/bin/sleep`**, and **`/bin/sigtest`**, which holds the signal scenarios.
+
+**Verified on the emulator:**
+- `sleep 100`, then `^C`, prints a prompt, and `$?` is 130;
+- 18 `sigtest` checks: handlers, pending while blocked, nested handlers, `SIG_IGN`, uncatchable `SIGKILL`, `SIGPIPE`, `EINTR` with the time left, `SA_RESTART`, stop/continue through `WUNTRACED`, and group kills;
+- a job-control session: `&`, `jobs`, `kill %1`, `^Z`, `bg`, `fg`, `^C`, `^C` in a pipeline and at the prompt, and `SIGTTIN` for `cat &`.

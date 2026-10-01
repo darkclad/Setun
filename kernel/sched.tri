@@ -9,12 +9,14 @@ import "exec.tri";
 import "fs/vfs.tri";
 import "fs/file.tri";
 import "drivers/tty.tri";
+import "signal.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
 const TASK_RUNNABLE: int = 1;
 const TASK_ZOMBIE: int = 2;
 const TASK_SLEEPING: int = 3;
+const TASK_STOPPED: int = 4;
 
 // MODE for a user task: ring -1, interrupts on, paging on.
 const USER_MODE: int = -1 + MODE_IE + MODE_PG;
@@ -27,7 +29,7 @@ const EFAULT: int = 14;
 const EINVAL: int = 22;
 const ENOSYS: int = 38;
 
-// Linux signal numbers (delivered for real in K5; here they only end processes)
+// Linux signal numbers for CPU faults (the rest are in signal.tri)
 const SIGILL: int = 4;
 const SIGTRAP: int = 5;
 const SIGBUS: int = 7;
@@ -57,6 +59,17 @@ const SYS_EXIT_GROUP: int = 94;
 const SYS_SCHED_YIELD: int = 124;
 const SYS_GETPID: int = 172;
 const SYS_GETPPID: int = 173;
+const SYS_NANOSLEEP: int = 101;
+const SYS_KILL: int = 129;
+const SYS_RT_SIGSUSPEND: int = 133;
+const SYS_RT_SIGACTION: int = 134;
+const SYS_RT_SIGPROCMASK: int = 135;
+const SYS_RT_SIGPENDING: int = 136;
+const SYS_RT_SIGRETURN: int = 139;
+const SYS_SETPGID: int = 154;
+const SYS_GETPGID: int = 155;
+const SYS_GETSID: int = 156;
+const SYS_SETSID: int = 157;
 const SYS_SYSINFO: int = 179;
 const SYS_BRK: int = 214;
 const SYS_CLONE: int = 220;
@@ -64,6 +77,9 @@ const SYS_EXECVE: int = 221;
 const SYS_WAIT4: int = 260;
 
 const WNOHANG: int = 1;
+const WUNTRACED: int = 2;
+const EPERM_: int = 1;
+const TIMER_CHAN: int = 40000;        // woken on every tick
 const HEAP_MAX: int = 243 * 19683;    // brk may grow 243 pages past the bss
 
 struct Task {
@@ -80,6 +96,22 @@ struct Task {
     wchan: int;                       // what a SLEEPING task waits for
     cwd: int;                         // inode of the working directory
     fds: [27]int;                     // open file + 1 per descriptor; 0 = closed
+    pgid: int;                        // process group
+    sid: int;                         // session
+    sig_pending: int;                 // signal sets: bit (sig - 1)
+    sig_blocked: int;
+    saved_mask: int;                  // the mask to restore after sigsuspend
+    has_saved_mask: int;
+    stop_sig: int;                    // STOPPED: the signal that stopped it
+    stop_reported: int;               // wait4 has reported this stop
+    sig_handler: [32]int;             // per signal: SIG_DFL, SIG_IGN or a handler
+    sig_flags: [32]int;
+    sig_restorer: [32]int;
+    sig_mask: [32]int;
+    in_syscall: int;                  // returning from a restartable system call
+    orig_r1: int;                     // its first argument, for a restart
+    restart_nanosleep: int;           // the restarted nanosleep resumes at...
+    nanosleep_until: int;             // ...this jiffy
 }
 
 var tasks: [27]Task;
@@ -166,16 +198,21 @@ fn schedule() {
 
 fn scheduler_tick() {
     tasks[current].ticks += 1;
+    wake_up(TIMER_CHAN);
     schedule();
 }
 
 // Block the current task until wake_up(chan). Callers re-check their
 // condition in a loop: a wake-up only means "look again".
-fn sleep_on(chan: int) {
+//
+// Returns 1 if a signal is pending: the caller should give up with EINTR.
+fn sleep_on(chan: int) -> int {
     var t: *Task = current_task();
+    if (signal_pending(t)) { return 1; }
     t.wchan = chan;
     t.state = TASK_SLEEPING;
     schedule();
+    return signal_pending(t);
 }
 
 fn wake_up(chan: int) {
@@ -207,6 +244,12 @@ fn spawn_init(path: *char) -> int {
     t.pid = next_pid;
     next_pid += 1;
     t.ppid = 0;
+    t.pgid = t.pid;
+    t.sid = t.pid;
+    var sig: int = 0;
+    while (sig < NSIG) { t.sig_handler[sig] = SIG_DFL; t.sig_mask[sig] = 0; sig += 1; }
+    t.sig_pending = 0;
+    t.sig_blocked = 0;
     t.heap_start = load_heap;
     t.brk = load_brk;
     fs_init_task(t);
@@ -235,6 +278,9 @@ fn do_fork(f: *int) -> int {
     child.heap_start = parent.heap_start;
     child.brk = parent.brk;
     fs_fork(parent, child);
+    signals_fork(parent, child);
+    child.pgid = parent.pgid;
+    child.sid = parent.sid;
     var cf: *int = task_frame(child);
     var i: int = 0;
     while (i < FRAME_WORDS) { cf[i] = f[i]; i += 1; }
@@ -259,6 +305,7 @@ fn do_execve(f: *int) -> int {
     mtc(PTB, frame_centre(load_l1));
     tlbflush();
     if (old != 0) { free_address_space(old); }
+    signals_exec(t);
     set_user_entry(f, load_entry, load_sp, exec_argc, load_argv);
     return exec_argc;                                 // r1 = argc (set_user_entry already wrote it)
 }
@@ -288,6 +335,8 @@ fn do_exit(status: int) {
         if (tasks[i].state != TASK_UNUSED && tasks[i].ppid == t.pid) { tasks[i].ppid = 1; }
         i += 1;
     }
+    var p: int = find_task(t.ppid);
+    if (p >= 0) { send_signal(p, SIGCHLD); }
     wake_up(child_chan(t.ppid));
     schedule();                                       // never comes back
     panic("a zombie was scheduled");
@@ -319,38 +368,132 @@ fn fault_signal(v: int) -> int {
 }
 
 // A fault in user mode, or in the kernel touching user memory.
-fn user_fault(v: int, epc: int, addr: int, access: int, what: *char) {
+fn user_fault(v: int, epc: int, addr: int, access: int, what: *char, from_user: int) {
     if ((v == -3 || v == -4) && handle_user_fault(current_task(), addr, access)) { return; }
-    kill_current(fault_signal(v), what, epc, addr);
+    // A handler can only run for a fault in user code: a system call that
+    // faults would just fault again on retry.
+    if (!from_user) { kill_current(fault_signal(v), what, epc, addr); }
+    force_signal(fault_signal(v), what, epc, addr);
+}
+
+// Is task `c` one that wait4(pid) asks about? (pid: >0 that child, -1 any,
+// 0 our process group, < -1 group -pid)
+fn wait_matches(c: *Task, me: *Task, pid: int) -> int {
+    if (c.state == TASK_UNUSED || c.ppid != me.pid) { return 0; }
+    if (pid > 0) { return c.pid == pid; }
+    if (pid == -1) { return 1; }
+    if (pid == 0) { return c.pgid == me.pgid; }
+    return c.pgid == -pid;
+}
+
+fn put_status(status_ptr: int, st: int) -> int {
+    if (status_ptr == 0) { return 0; }
+    if (!user_range_ok(status_ptr - 1, 3)) { return -EFAULT; }
+    *(status_ptr as *int) = st;
+    return 0;
 }
 
 fn do_wait4(pid: int, status_ptr: int, options: int) -> int {
-    var me: int = current_task().pid;
+    var me: *Task = current_task();
     loop {
         var children: int = 0;
         var i: int = 1;
         while (i < NTASKS) {
             var c: *Task = &tasks[i];
-            if (c.state != TASK_UNUSED && c.ppid == me && (pid == -1 || c.pid == pid)) {
+            if (wait_matches(c, me, pid)) {
                 children += 1;
                 if (c.state == TASK_ZOMBIE) {
                     var cpid: int = c.pid;
-                    if (status_ptr != 0) {
-                        if (!is_user_address(status_ptr)) { return -EFAULT; }
-                        *(status_ptr as *int) = c.status;
-                    }
+                    if (put_status(status_ptr, c.status) < 0) { return -EFAULT; }
                     free_pages(c.kstack, 0);
                     c.state = TASK_UNUSED;
                     c.pid = 0;
                     return cpid;
+                }
+                if (c.state == TASK_STOPPED && !c.stop_reported && options / WUNTRACED % 2 != 0) {
+                    if (put_status(status_ptr, c.stop_sig * 256 + 127) < 0) { return -EFAULT; }
+                    c.stop_reported = 1;
+                    return c.pid;
                 }
             }
             i += 1;
         }
         if (children == 0) { return -ECHILD; }
         if (options % 2 == WNOHANG) { return 0; }
-        sleep_on(child_chan(me));
+        if (sleep_on(child_chan(me.pid))) { return -ERESTARTSYS; }
     }
+}
+
+// nanosleep(req, rem): timespec = { seconds, nanoseconds }, one word each.
+fn sys_nanosleep(req: int, rem: int) -> int {
+    if (!user_range_ok(req - 1, 6)) { return -EFAULT; }
+    var ts: *int = req as *int;
+    if (ts[0] < 0 || ts[1] < 0 || ts[1] > 999999999) { return -EINVAL; }
+    var ticks: int = ts[0] * HZ + (ts[1] + 9999999) / 10000000;
+    var until: int = jiffies + ticks;
+    var t: *Task = current_task();
+    if (t.restart_nanosleep) {                     // resumed after a stop: the time left
+        until = t.nanosleep_until;
+        t.restart_nanosleep = 0;
+    }
+    while (jiffies < until) {
+        if (sleep_on(TIMER_CHAN)) {
+            t.nanosleep_until = until;
+            if (rem != 0 && user_range_ok(rem - 1, 6)) {
+                var left: int = until - jiffies;
+                var r: *int = rem as *int;
+                r[0] = left / HZ;
+                r[1] = left % HZ * 10000000;
+            }
+            return -ERESTART_RESTARTBLOCK;
+        }
+    }
+    return 0;
+}
+
+fn group_exists(pgid: int, sid: int) -> int {
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_ZOMBIE && tasks[i].pgid == pgid && tasks[i].sid == sid) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+// setpgid(pid, pgid): ourselves or a child, within our session.
+fn sys_setpgid(pid: int, pgid: int) -> int {
+    var me: *Task = current_task();
+    if (pid == 0) { pid = me.pid; }
+    if (pgid == 0) { pgid = pid; }
+    if (pgid < 0) { return -EINVAL; }
+    var i: int = find_task(pid);
+    if (i < 0) { return -ESRCH; }
+    var t: *Task = &tasks[i];
+    if (t.pid != me.pid && t.ppid != me.pid) { return -ESRCH; }
+    if (t.sid != me.sid || t.sid == t.pid) { return -EPERM_; }      // other session, or a session leader
+    if (pgid != pid && !group_exists(pgid, me.sid)) { return -EPERM_; }
+    t.pgid = pgid;
+    return 0;
+}
+
+fn sys_getpgid(pid: int) -> int {
+    if (pid == 0) { return current_task().pgid; }
+    var i: int = find_task(pid);
+    return i < 0 ? -ESRCH : tasks[i].pgid;
+}
+
+fn sys_getsid(pid: int) -> int {
+    if (pid == 0) { return current_task().sid; }
+    var i: int = find_task(pid);
+    return i < 0 ? -ESRCH : tasks[i].sid;
+}
+
+fn sys_setsid() -> int {
+    var t: *Task = current_task();
+    if (t.pgid == t.pid) { return -EPERM_; }                      // already a group leader
+    t.sid = t.pid;
+    t.pgid = t.pid;
+    return t.sid;
 }
 
 // ---- system calls ---------------------------------------------------------------
@@ -389,6 +532,10 @@ fn sys_sysinfo(info: int) -> int {
 
 // Arguments are r1..r6 in the frame; the result goes back in r1.
 fn do_syscall(f: *int, n: int) {
+    var t: *Task = current_task();
+    t.orig_r1 = f[F_R1];
+    t.in_syscall = n != SYS_RT_SIGRETURN;
+    if (n != SYS_NANOSLEEP) { t.restart_nanosleep = 0; }
     switch (n) {
         case SYS_READ: f[F_R1] = sys_read(f[0], f[1], f[2]);
         case SYS_WRITE: f[F_R1] = sys_write(f[0], f[1], f[2]);
@@ -421,6 +568,17 @@ fn do_syscall(f: *int, n: int) {
             if (r < 0) { f[F_R1] = r; }
         }
         case SYS_WAIT4: f[F_R1] = do_wait4(f[0], f[1], f[2]);
+        case SYS_NANOSLEEP: f[F_R1] = sys_nanosleep(f[0], f[1]);
+        case SYS_KILL: f[F_R1] = sys_kill(f[0], f[1]);
+        case SYS_RT_SIGSUSPEND: f[F_R1] = sys_rt_sigsuspend(f[0]);
+        case SYS_RT_SIGACTION: f[F_R1] = sys_rt_sigaction(f[0], f[1], f[2]);
+        case SYS_RT_SIGPROCMASK: f[F_R1] = sys_rt_sigprocmask(f[0], f[1], f[2]);
+        case SYS_RT_SIGPENDING: f[F_R1] = sys_rt_sigpending(f[0]);
+        case SYS_RT_SIGRETURN: f[F_R1] = sys_rt_sigreturn(f);
+        case SYS_SETPGID: f[F_R1] = sys_setpgid(f[0], f[1]);
+        case SYS_GETPGID: f[F_R1] = sys_getpgid(f[0]);
+        case SYS_GETSID: f[F_R1] = sys_getsid(f[0]);
+        case SYS_SETSID: f[F_R1] = sys_setsid();
         default: f[F_R1] = -ENOSYS;
     }
 }

@@ -6,10 +6,16 @@
 // (ICANON) characters are collected into a line with erase (^H, DEL), kill
 // (^U) and end of file (^D); a read returns at most one line. With ICANON
 // off every character is passed through as it arrives. Output goes to the
-// serial port and the text screen. ^C and job control arrive in K5.
+// serial port and the text screen.
+//
+// With ISIG, ^C, ^\ and ^Z send SIGINT, SIGQUIT and SIGTSTP to the
+// foreground process group (and flush the input); a read from any other
+// group gets SIGTTIN.
 
 import "../params.tri";
 import "../printk.tri";
+import "../sched.tri";
+import "../signal.tri";
 
 // termios, one word per flag field (Linux field order and bit values)
 struct Termios {
@@ -44,12 +50,16 @@ const VKILL: int = 3;
 const VEOF: int = 4;
 const VTIME: int = 5;
 const VMIN: int = 6;
+const VSUSP: int = 10;
 
 const TCGETS: int = 21505;
 const TCSETS: int = 21506;
 const TCSETSW: int = 21507;
 const TCSETSF: int = 21508;
+const TIOCGPGRP: int = 21519;
+const TIOCSPGRP: int = 21520;
 const TIOCGWINSZ: int = 21523;
+const EIO: int = 5;
 
 const TTY_CHAN: int = 20000;          // wait channel for readers
 const TTY_BUF: int = 2187;
@@ -64,6 +74,7 @@ var line: [243]char;                  // the line being edited (canonical mode)
 var line_len: int;
 var kbd_shift: int;
 var kbd_ctrl: int;
+var tty_pgrp: int = 1;                // the foreground process group
 
 fn tty_init() {
     termios.c_iflag = ICRNL;
@@ -77,6 +88,7 @@ fn tty_init() {
     termios.c_cc[VEOF] = 4;
     termios.c_cc[VTIME] = 0;
     termios.c_cc[VMIN] = 1;
+    termios.c_cc[VSUSP] = 26;
     out(KBD_CTRL, 1);
     out(SERIAL_CTRL, 1);
     out(TPIC_UNMASK, IRQ_KEYBOARD);
@@ -134,6 +146,19 @@ fn commit_line() {
 // One character through the line discipline.
 fn tty_receive(c: char) {
     if (c == '\r' && termios.c_iflag / ICRNL % 2 != 0) { c = '\n'; }
+    if (lflag(ISIG) && c != 0) {
+        var sig: int = 0;
+        if (c == termios.c_cc[VINTR]) { sig = SIGINT; }
+        else if (c == termios.c_cc[VQUIT]) { sig = SIGQUIT; }
+        else if (c == termios.c_cc[VSUSP]) { sig = SIGTSTP; }
+        if (sig != 0) {
+            tty_echo(c);                                    // "^C"
+            line_len = 0;                                   // flush, as without NOFLSH
+            ready_count = 0;
+            send_signal_pgrp(tty_pgrp, sig);
+            return;
+        }
+    }
     if (!lflag(ICANON)) {
         if (ready_put(c)) { tty_echo(c); }
         wake_up(TTY_CHAN);
@@ -226,8 +251,16 @@ fn ready_take() -> int {
 
 // Read into kernel-visible `buf`. Blocks until input is available.
 fn tty_read(buf: *tryte, n: int) -> int {
+    var t: *Task = current_task();
+    if (t.pgid != tty_pgrp && group_exists(tty_pgrp, t.sid)) {     // a background read
+        if (sig_ignored(t, SIGTTIN) || sigset_has(t.sig_blocked, SIGTTIN)) { return -EIO; }
+        send_signal_pgrp(t.pgid, SIGTTIN);
+        return -ERESTARTSYS;                                    // read again once in the foreground
+    }
     if (n == 0) { return 0; }
-    while (!tty_can_read()) { sleep_on(TTY_CHAN); }
+    while (!tty_can_read()) {
+        if (sleep_on(TTY_CHAN)) { return -ERESTARTSYS; }
+    }
     var k: int = 0;
     while (k < n && ready_count > 0) {
         if (ready[ready_head] == EOF_MARK) {
@@ -262,6 +295,17 @@ fn tty_ioctl(cmd: int, arg: int) -> int {
             memcpy(bytes(&termios), bytes(arg as *Termios), sizeof(Termios));
             if (cmd == TCSETSF) { ready_count = 0; line_len = 0; }
             if (!lflag(ICANON)) { commit_line(); }    // a half-typed line becomes input
+            return 0;
+        }
+        case TIOCGPGRP: {
+            *(arg as *int) = tty_pgrp;
+            return 0;
+        }
+        case TIOCSPGRP: {
+            var g: int = *(arg as *int);
+            if (g <= 0) { return -EINVAL; }
+            if (!group_exists(g, current_task().sid)) { return -EPERM_; }
+            tty_pgrp = g;
             return 0;
         }
         case TIOCGWINSZ: {

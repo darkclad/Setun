@@ -1,0 +1,414 @@
+// signal: POSIX signals with Linux numbers and Linux-style delivery.
+//
+// A signal is generated into the target's pending set (ignored signals are
+// discarded at once, as POSIX allows). On every return to user mode the
+// kernel delivers the lowest pending signal that is not blocked: the
+// default action (terminate, ignore, stop, continue), or a user handler.
+// For a handler it pushes a signal frame (the whole trap frame plus the old
+// mask) on the user stack and enters the handler with r1 = signo and lr =
+// the sa_restorer, which calls rt_sigreturn to restore the frame.
+//
+// Sets are one word with bit (sig - 1) for signals 1..31; there are no
+// real-time signals yet.
+
+import "params.tri";
+import "printk.tri";
+import "arch.tri";
+import "vm.tri";
+import "sched.tri";
+
+const NSIG: int = 32;
+
+const SIGHUP: int = 1;
+const SIGINT: int = 2;
+const SIGQUIT: int = 3;
+const SIGABRT: int = 6;
+const SIGKILL: int = 9;
+const SIGUSR1: int = 10;
+const SIGUSR2: int = 12;
+const SIGPIPE: int = 13;
+const SIGALRM: int = 14;
+const SIGTERM: int = 15;
+const SIGCONT: int = 18;
+const SIGSTOP: int = 19;
+const SIGTSTP: int = 20;
+const SIGTTIN: int = 21;
+const SIGTTOU: int = 22;
+const SIGURG: int = 23;
+const SIGWINCH: int = 28;
+
+const SIG_DFL: int = 0;
+const SIG_IGN: int = 1;
+const SIG_BLOCK: int = 0;
+const SIG_UNBLOCK: int = 1;
+const SIG_SETMASK: int = 2;
+const SA_RESTORER: int = 67108864;
+const SA_RESTART: int = 268435456;
+
+// Interrupted system calls return these (never seen by user code): the
+// call is restarted if no handler runs (and, for ERESTARTSYS, if the
+// handler has SA_RESTART); otherwise it fails with EINTR.
+const ERESTARTSYS: int = 512;
+const ERESTARTNOHAND: int = 514;
+const ERESTART_RESTARTBLOCK: int = 516;
+const SYS_INSN_TRYTES: int = 3;
+
+const EINTR: int = 4;
+const ESRCH: int = 3;
+
+const SIGFRAME_WORDS: int = 30;       // trap frame (28), old mask, magic
+const SIGFRAME_MAGIC: int = 31857270903;
+const RED_ZONE: int = 81;             // trytes left untouched below the user sp
+
+// struct sigaction, one word per field (Linux generic order).
+struct Sigaction {
+    sa_handler: int;
+    sa_flags: int;
+    sa_restorer: int;
+    sa_mask: int;
+}
+
+// ---- signal sets --------------------------------------------------------------------
+
+fn sig_bit(sig: int) -> int {
+    var b: int = 1;
+    var k: int = 1;
+    while (k < sig) { b *= 2; k += 1; }
+    return b;
+}
+
+fn sigset_has(set: int, sig: int) -> int { return set / sig_bit(sig) % 2 != 0; }
+fn sigset_add(set: int, sig: int) -> int { return sigset_has(set, sig) ? set : set + sig_bit(sig); }
+fn sigset_del(set: int, sig: int) -> int { return sigset_has(set, sig) ? set - sig_bit(sig) : set; }
+
+// Lowest signal in `set` and not in `mask`, or 0.
+fn sigset_first(set: int, mask: int) -> int {
+    if (set == 0) { return 0; }
+    var sig: int = 1;
+    var b: int = 1;
+    while (sig < NSIG) {
+        if (set / b % 2 != 0 && mask / b % 2 == 0) { return sig; }
+        b *= 2;
+        sig += 1;
+    }
+    return 0;
+}
+
+// Only the bits for 1..31, without SIGKILL and SIGSTOP (they cannot be blocked).
+fn sanitize_mask(m: int) -> int {
+    if (m < 0) { m = 0; }
+    m = m % sig_bit(NSIG);
+    return sigset_del(sigset_del(m, SIGKILL), SIGSTOP);
+}
+
+// ---- default actions -----------------------------------------------------------------
+
+fn sig_default_ignored(sig: int) -> int { return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT; }
+fn sig_is_stop(sig: int) -> int { return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU; }
+
+// Would `sig` do nothing at all if it arrived now?
+fn sig_ignored(t: *Task, sig: int) -> int {
+    if (sig == SIGKILL || sig == SIGSTOP) { return 0; }
+    var h: int = t.sig_handler[sig];
+    return h == SIG_IGN || (h == SIG_DFL && sig_default_ignored(sig));
+}
+
+// Can a pending signal interrupt this task's sleep?
+fn signal_pending(t: *Task) -> int {
+    if (t.sig_pending == 0) { return 0; }
+    return sigset_first(t.sig_pending, t.sig_blocked) != 0;
+}
+
+// ---- generation ------------------------------------------------------------------------
+
+fn send_signal(i: int, sig: int) {
+    var t: *Task = &tasks[i];
+    if (t.state == TASK_UNUSED || t.state == TASK_ZOMBIE) { return; }
+    if (sig == SIGCONT) {
+        var s: int = 1;
+        while (s < NSIG) {                                  // pending stops are cancelled
+            if (sig_is_stop(s)) { t.sig_pending = sigset_del(t.sig_pending, s); }
+            s += 1;
+        }
+        if (t.state == TASK_STOPPED) {
+            t.state = TASK_RUNNABLE;
+            t.stop_sig = 0;
+        }
+    }
+    if (sig_is_stop(sig)) { t.sig_pending = sigset_del(t.sig_pending, SIGCONT); }
+    if (sig_ignored(t, sig) && !sigset_has(t.sig_blocked, sig)) { return; }
+    t.sig_pending = sigset_add(t.sig_pending, sig);
+    if (sig == SIGKILL && t.state == TASK_STOPPED) { t.state = TASK_RUNNABLE; }
+    if (t.state == TASK_SLEEPING && !sigset_has(t.sig_blocked, sig)) {
+        t.state = TASK_RUNNABLE;                            // its sleep_on returns "interrupted"
+        t.wchan = 0;
+    }
+}
+
+// Signal every task in process group `pgrp`. Returns how many there were.
+fn send_signal_pgrp(pgrp: int, sig: int) -> int {
+    var n: int = 0;
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_ZOMBIE && tasks[i].pgid == pgrp) {
+            send_signal(i, sig);
+            n += 1;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+// kill(2): pid > 0 one process, 0 our group, -1 everyone but init, < -1 group -pid.
+fn sys_kill(pid: int, sig: int) -> int {
+    if (sig < 0 || sig >= NSIG) { return -EINVAL; }
+    var t: *Task = current_task();
+    if (pid > 0) {
+        var i: int = find_task(pid);
+        if (i < 0 || tasks[i].state == TASK_ZOMBIE) { return -ESRCH; }
+        if (sig != 0) { send_signal(i, sig); }
+        return 0;
+    }
+    var n: int = 0;
+    if (pid == -1) {
+        var j: int = 1;
+        while (j < NTASKS) {
+            if (tasks[j].state != TASK_UNUSED && tasks[j].state != TASK_ZOMBIE && tasks[j].pid != 1 && j != current) {
+                if (sig != 0) { send_signal(j, sig); }
+                n += 1;
+            }
+            j += 1;
+        }
+    } else {
+        var g: int = pid == 0 ? t.pgid : -pid;
+        if (sig == 0) {
+            var k: int = 1;
+            while (k < NTASKS) {
+                if (tasks[k].state != TASK_UNUSED && tasks[k].state != TASK_ZOMBIE && tasks[k].pgid == g) { n += 1; }
+                k += 1;
+            }
+        } else {
+            n = send_signal_pgrp(g, sig);
+        }
+    }
+    return n > 0 ? 0 : -ESRCH;
+}
+
+// ---- system calls -------------------------------------------------------------------------
+
+fn sys_rt_sigaction(sig: int, act: int, oact: int) -> int {
+    if (sig <= 0 || sig >= NSIG) { return -EINVAL; }
+    var t: *Task = current_task();
+    if (oact != 0) {
+        if (!user_range_ok(oact - 1, sizeof(Sigaction))) { return -EFAULT; }
+        var o: *Sigaction = oact as *Sigaction;
+        o.sa_handler = t.sig_handler[sig];
+        o.sa_flags = t.sig_flags[sig];
+        o.sa_restorer = t.sig_restorer[sig];
+        o.sa_mask = t.sig_mask[sig];
+    }
+    if (act != 0) {
+        if (sig == SIGKILL || sig == SIGSTOP) { return -EINVAL; }
+        if (!user_range_ok(act - 1, sizeof(Sigaction))) { return -EFAULT; }
+        var a: *Sigaction = act as *Sigaction;
+        t.sig_handler[sig] = a.sa_handler;
+        t.sig_flags[sig] = a.sa_flags;
+        t.sig_restorer[sig] = a.sa_restorer;
+        t.sig_mask[sig] = sanitize_mask(a.sa_mask);
+        if (sig_ignored(t, sig)) { t.sig_pending = sigset_del(t.sig_pending, sig); }   // POSIX: discard
+    }
+    return 0;
+}
+
+fn sys_rt_sigprocmask(how: int, set: int, oset: int) -> int {
+    var t: *Task = current_task();
+    if (oset != 0) {
+        if (!user_range_ok(oset - 1, 3)) { return -EFAULT; }
+        *(oset as *int) = t.sig_blocked;
+    }
+    if (set != 0) {
+        if (!user_range_ok(set - 1, 3)) { return -EFAULT; }
+        var s: int = sanitize_mask(*(set as *int));
+        var m: int = t.sig_blocked;
+        var sig: int = 1;
+        switch (how) {
+            case SIG_BLOCK: {
+                while (sig < NSIG) { if (sigset_has(s, sig)) { m = sigset_add(m, sig); } sig += 1; }
+            }
+            case SIG_UNBLOCK: {
+                while (sig < NSIG) { if (sigset_has(s, sig)) { m = sigset_del(m, sig); } sig += 1; }
+            }
+            case SIG_SETMASK: m = s;
+            default: return -EINVAL;
+        }
+        t.sig_blocked = m;
+    }
+    return 0;
+}
+
+fn sys_rt_sigpending(set: int) -> int {
+    if (!user_range_ok(set - 1, 3)) { return -EFAULT; }
+    var t: *Task = current_task();
+    var p: int = 0;
+    var sig: int = 1;
+    while (sig < NSIG) {
+        if (sigset_has(t.sig_pending, sig) && sigset_has(t.sig_blocked, sig)) { p = sigset_add(p, sig); }
+        sig += 1;
+    }
+    *(set as *int) = p;
+    return 0;
+}
+
+// Wait for a signal with `mask` blocked; the old mask returns after the handler.
+fn sys_rt_sigsuspend(mask: int) -> int {
+    if (!user_range_ok(mask - 1, 3)) { return -EFAULT; }
+    var t: *Task = current_task();
+    if (!t.has_saved_mask) {                        // not when restarted after a stop
+        t.saved_mask = t.sig_blocked;
+        t.has_saved_mask = 1;
+    }
+    t.sig_blocked = sanitize_mask(*(mask as *int));
+    while (!signal_pending(t)) { sleep_on(SIGSUSPEND_CHAN); }
+    return -ERESTARTNOHAND;
+}
+
+const SIGSUSPEND_CHAN: int = 30000;   // nothing wakes it but a signal
+
+// ---- delivery ---------------------------------------------------------------------------------
+
+// Stop the current task with `sig`; it resumes on SIGCONT.
+fn do_stop(sig: int) {
+    var t: *Task = current_task();
+    t.state = TASK_STOPPED;
+    t.stop_sig = sig;
+    t.stop_reported = 0;
+    var p: int = find_task(t.ppid);
+    if (p >= 0) { send_signal(p, SIGCHLD); }
+    wake_up(child_chan(t.ppid));
+    schedule();                                     // back here after SIGCONT
+}
+
+// Build the frame on the user stack and enter the handler. Returns 0 if
+// the stack is unusable (the caller then kills the task).
+fn setup_frame(f: *int, sig: int, t: *Task) -> int {
+    var sp: int = f[F_KSP] - RED_ZONE - 3 * SIGFRAME_WORDS;
+    sp = sp / 3 * 3;                                // a word-aligned frame
+    if (!user_range_ok(sp - 1, 3 * SIGFRAME_WORDS)) { return 0; }
+    var w: *int = sp as *int;
+    var i: int = 0;
+    while (i < FRAME_WORDS) { w[i] = f[i]; i += 1; }
+    w[FRAME_WORDS] = t.has_saved_mask ? t.saved_mask : t.sig_blocked;
+    w[FRAME_WORDS + 1] = SIGFRAME_MAGIC;
+    t.has_saved_mask = 0;
+    // Block the signal itself and sa_mask while the handler runs.
+    var m: int = t.sig_blocked;
+    var s: int = 1;
+    while (s < NSIG) {
+        if (sigset_has(t.sig_mask[sig], s)) { m = sigset_add(m, s); }
+        s += 1;
+    }
+    t.sig_blocked = sigset_add(m, sig);
+    f[F_EPC] = t.sig_handler[sig];
+    f[F_KSP] = sp;
+    f[F_R1] = sig;
+    f[F_LR] = t.sig_restorer[sig];
+    return 1;
+}
+
+fn sys_rt_sigreturn(f: *int) -> int {
+    var t: *Task = current_task();
+    var sp: int = f[F_KSP];
+    if (!user_range_ok(sp - 1, 3 * SIGFRAME_WORDS)) { kill_current(SIGSEGV, "bad signal frame", f[F_EPC], sp); }
+    var w: *int = sp as *int;
+    if (w[FRAME_WORDS + 1] != SIGFRAME_MAGIC || ext(w[F_EMODE], 23, 5) != ext(f[F_EMODE], 23, 5)) {
+        kill_current(SIGSEGV, "bad signal frame", f[F_EPC], sp);
+    }
+    var i: int = 0;
+    while (i < FRAME_WORDS) { f[i] = w[i]; i += 1; }
+    t.sig_blocked = sanitize_mask(w[FRAME_WORDS]);
+    return f[F_R1];                                 // the interrupted r1 goes back unchanged
+}
+
+// Settle an interrupted system call: restart it, or make it fail with
+// EINTR. `handler` is the signal about to run a handler, or 0. Returns 1 if
+// the call restarts.
+fn syscall_restart(f: *int, t: *Task, handler: int) -> int {
+    if (!t.in_syscall) { return 0; }
+    t.in_syscall = 0;
+    var r: int = -f[F_R1];
+    if (r != ERESTARTSYS && r != ERESTARTNOHAND && r != ERESTART_RESTARTBLOCK) { return 0; }
+    var restart: int = handler == 0 || (r == ERESTARTSYS && t.sig_flags[handler] / SA_RESTART % 2 != 0);
+    if (!restart) {
+        f[F_R1] = -EINTR;
+        return 0;
+    }
+    f[F_R1] = t.orig_r1;
+    f[F_EPC] = f[F_EPC] - SYS_INSN_TRYTES;
+    t.restart_nanosleep = r == ERESTART_RESTARTBLOCK;
+    return 1;
+}
+
+// On the way back to user mode: act on pending signals.
+fn do_signal(f: *int) {
+    var t: *Task = current_task();
+    var restarted: int = 0;
+    loop {
+        if (t.sig_pending == 0) { break; }
+        var sig: int = sigset_first(t.sig_pending, t.sig_blocked);
+        if (sig == 0) { break; }
+        t.sig_pending = sigset_del(t.sig_pending, sig);
+        var h: int = t.sig_handler[sig];
+        if (sig == SIGKILL || sig == SIGSTOP) { h = SIG_DFL; }
+        if (h == SIG_IGN) { continue; }
+        if (h == SIG_DFL) {
+            if (sig_default_ignored(sig)) { continue; }
+            if (sig_is_stop(sig)) { do_stop(sig); continue; }
+            do_exit(sig);                                       // terminate: status = signal number
+        }
+        syscall_restart(f, t, sig);
+        if (!setup_frame(f, sig, t)) {
+            kill_current(SIGSEGV, "no stack for a signal frame", f[F_EPC], f[F_KSP]);
+        }
+        break;                                                  // one handler at a time
+    }
+    restarted = syscall_restart(f, t, 0);
+    if (t.has_saved_mask && !restarted) {                       // sigsuspend ended without a handler
+        t.sig_blocked = t.saved_mask;
+        t.has_saved_mask = 0;
+    }
+}
+
+// A CPU fault: deliver it to a handler if one is ready, else kill as before.
+fn force_signal(sig: int, what: *char, epc: int, addr: int) {
+    var t: *Task = current_task();
+    var h: int = t.sig_handler[sig];
+    if (h == SIG_DFL || h == SIG_IGN || sigset_has(t.sig_blocked, sig)) { kill_current(sig, what, epc, addr); }
+    t.sig_pending = sigset_add(t.sig_pending, sig);
+}
+
+// execve: caught signals go back to their default; ignored ones stay ignored.
+fn signals_exec(t: *Task) {
+    var sig: int = 1;
+    while (sig < NSIG) {
+        if (t.sig_handler[sig] != SIG_IGN) { t.sig_handler[sig] = SIG_DFL; }
+        t.sig_flags[sig] = 0;
+        t.sig_restorer[sig] = 0;
+        t.sig_mask[sig] = 0;
+        sig += 1;
+    }
+}
+
+fn signals_fork(parent: *Task, child: *Task) {
+    var sig: int = 1;
+    while (sig < NSIG) {
+        child.sig_handler[sig] = parent.sig_handler[sig];
+        child.sig_flags[sig] = parent.sig_flags[sig];
+        child.sig_restorer[sig] = parent.sig_restorer[sig];
+        child.sig_mask[sig] = parent.sig_mask[sig];
+        sig += 1;
+    }
+    child.sig_blocked = parent.sig_blocked;
+    child.sig_pending = 0;                                      // POSIX: the child starts with none
+    child.has_saved_mask = 0;
+    child.stop_sig = 0;
+}
