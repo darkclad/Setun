@@ -1,16 +1,19 @@
 //! Setun-386 CPU: registers, decode/execute, traps and the MMU.
 
 use crate::io::Io;
-use crate::isa::{alu, cond, cr, fld, io as port, mem, mode, op, sys, vector};
+use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, mode, op, sys, vector};
 use crate::memory::Memory;
 use crate::PAGE;
+use setun_real::Real;
 use ternary::{pow3, split_product, wrap_trits, Trit, Tryte, Word};
 
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
 pub const RESET_PC: i64 = -59_049;
 
-/// `CPUID` value: ISA version (v0.4).
-pub const CPUID_VERSION: i64 = 4;
+/// `CPUID` value: ISA version (v0.5) in the low trits, and trit 1 (+1):
+/// the Setun-387 FPU is present.
+pub const CPUID_VERSION: i64 = 5;
+pub const CPUID: i64 = CPUID_VERSION + 2_541_865_828_329; // + 3^26
 
 /// Kind of memory access, encoded as in `FCAUSE[22]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,9 @@ pub struct Cpu {
     pub halted: bool,
     /// Current instruction's address, for fault reporting.
     inst_pc: Word,
+    /// The Setun-387: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
+    fregs: [Real; 27],
+    fsr: Word,
 }
 
 /// Split `v` into `(v div m, v mod m)` with a balanced remainder. Called with
@@ -101,6 +107,8 @@ impl Cpu {
             cycle: 0,
             halted: false,
             inst_pc: Word::ZERO,
+            fregs: [Real::ZERO; 27],
+            fsr: Word::ZERO,
         };
         c.reset();
         c
@@ -110,10 +118,13 @@ impl Cpu {
     pub fn reset(&mut self) {
         self.regs = [Word::ZERO; 27];
         self.crs = [Word::ZERO; 27];
-        self.crs[idx(cr::CPUID)] = Word::new(CPUID_VERSION).unwrap();
+        self.crs[idx(cr::CPUID)] = Word::new(CPUID).unwrap();
         self.mode_trits = [0; 28];
         self.cycle = 0;
         self.set_mode(mode::RING, 1);
+        self.set_mode(mode::FE, 1);
+        self.fregs = [Real::ZERO; 27];
+        self.fsr = Word::new(fsr::RESET).unwrap();
         self.pc = Word::new(RESET_PC).unwrap();
         self.halted = false;
     }
@@ -128,6 +139,21 @@ impl Cpu {
         if r != 0 {
             self.regs[idx(r)] = v;
         }
+    }
+
+    /// FPU register `f` (f0 is always zero).
+    pub fn freg(&self, f: i64) -> Real {
+        self.fregs[idx(f)]
+    }
+
+    pub fn set_freg(&mut self, f: i64, v: Real) {
+        if f != 0 {
+            self.fregs[idx(f)] = v;
+        }
+    }
+
+    pub fn fsr(&self) -> Word {
+        self.fsr
     }
 
     pub fn cr(&self, n: i64) -> Word {
@@ -327,7 +353,7 @@ impl Cpu {
         let (imm, next) = match len_trit {
             0 => (0, pc + 3),
             1 => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
-            _ => return Err(ill()),
+            _ => return self.exec_fpu(m, a, b, x, y, z, pc),
         };
         let next_w = w(next as i128);
         let rel = |off: i64| w(pc as i128 + 3 * off as i128);
@@ -437,6 +463,163 @@ impl Cpu {
             _ => return Err(ill()),
         }
         self.pc = next_w;
+        Ok(())
+    }
+
+    // ---- the Setun-387 (ISA §14) ------------------------------------------
+
+    /// Record exception flags: set the sticky FSR flags, and trap (vector
+    /// −11, before any result is written) on the first unmasked one.
+    fn fpu_flags(&mut self, flags: u8) -> Result<(), Fault> {
+        if flags == 0 {
+            return Ok(());
+        }
+        let bits = [setun_real::IV, setun_real::DZ, setun_real::OF, setun_real::UF, setun_real::IX];
+        for (i, bit) in bits.iter().enumerate() {
+            if flags & bit != 0 {
+                let k = fsr::FLAG_FIRST + i;
+                self.fsr = self.fsr.with_field(k..=k, 1);
+            }
+        }
+        for (i, bit) in bits.iter().enumerate() {
+            if flags & bit != 0 && self.fsr.trit(fsr::MASK_FIRST + i) as i64 != 1 {
+                return Err(Fault { info: i as i64 + 1, ..Fault::new(vector::FP_EXCEPTION) });
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_fpu(&mut self, m: &mut Memory, a: i64, b: i64, x: i64, y: i64, z: i64, pc: i64) -> Result<(), Fault> {
+        let ill = || Fault::new(vector::ILLEGAL);
+        // A[2] sets the length. Reserved majors are ILL whether or not the
+        // unit is enabled; known ones trap as unavailable when it is off.
+        let two_words = match bal_split(a + 6561, 2187).0 {
+            0 => false,
+            1 => true,
+            _ => return Err(ill()),
+        };
+        if !matches!(a, op::FALU | op::FCVT | op::FMEM | op::FMEMD | op::FLI) {
+            return Err(ill());
+        }
+        if self.mode(mode::FE) != 1 {
+            return Err(Fault::new(vector::FPU_UNAVAILABLE));
+        }
+        let (imm, next) =
+            if two_words { (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6) } else { (0, pc + 3) };
+        match a {
+            op::FALU => {
+                let (fa, fb) = (self.freg(y), self.freg(z));
+                let (r, flags) = match b {
+                    falu::FADD => fa.add(fb),
+                    falu::FSUB => fa.sub(fb),
+                    falu::FMUL => fa.mul(fb),
+                    falu::FDIV => fa.div(fb),
+                    falu::FREM => fa.rem(fb),
+                    falu::FMIN => (fa.min(fb), 0),
+                    falu::FMAX => (fa.max(fb), 0),
+                    falu::FSQRT => fa.sqrt(),
+                    falu::FNEG => (fa.neg(), 0),
+                    falu::FABS => (fa.abs(), 0),
+                    falu::FRND => fa.round_int(false),
+                    falu::FTRUNC => fa.round_int(true),
+                    falu::FCMP => {
+                        match fa.cmp(fb) {
+                            Some(o) => {
+                                self.set_mode(mode::S, o as i64);
+                                self.set_c(0);
+                            }
+                            None => {
+                                self.set_mode(mode::S, 0);
+                                self.set_c(1); // unordered
+                            }
+                        }
+                        self.pc = w(next as i128);
+                        return Ok(());
+                    }
+                    _ => return Err(ill()),
+                };
+                self.fpu_flags(flags)?;
+                self.set_freg(x, r);
+            }
+            op::FCVT => match b {
+                fcvt::FCVTIF => self.set_freg(x, Real::from_i64(self.reg(y).value())),
+                fcvt::FCVTFI => {
+                    let (v, f) = self.freg(y).to_i64();
+                    self.fpu_flags(f)?;
+                    self.set_reg(x, Word::new(v).unwrap());
+                }
+                fcvt::FTOW => {
+                    let (v, f) = self.freg(y).to_word27();
+                    self.fpu_flags(f)?;
+                    self.set_reg(x, Word::new(v).unwrap());
+                }
+                fcvt::FFRW => self.set_freg(x, Real::from_word27(self.reg(y).value())),
+                fcvt::FEXP => {
+                    let (e, f) = self.freg(y).exponent();
+                    self.fpu_flags(f)?;
+                    self.set_reg(x, Word::new(e).unwrap());
+                }
+                fcvt::FSCL => {
+                    let (r, f) = self.freg(y).scale(self.reg(z).value());
+                    self.fpu_flags(f)?;
+                    self.set_freg(x, r);
+                }
+                fcvt::FMFS => self.set_reg(x, self.fsr),
+                fcvt::FMTS => {
+                    // only the flag and mask fields can be written
+                    let v = self.reg(y);
+                    let mut f = Word::ZERO;
+                    for k in (fsr::MASK_FIRST..fsr::MASK_FIRST + 5).chain(fsr::FLAG_FIRST..fsr::FLAG_FIRST + 5) {
+                        f = f.with_field(k..=k, v.trit(k) as i64);
+                    }
+                    self.fsr = f;
+                }
+                fcvt::FCLASS => self.set_reg(x, Word::new(self.freg(y).class()).unwrap()),
+                fcvt::FCONST => self.set_freg(x, Real::constant(y).ok_or_else(ill)?),
+                fcvt::FMOV => self.set_freg(x, self.freg(y)),
+                _ => return Err(ill()),
+            },
+            op::FMEM | op::FMEMD => {
+                let words = b.abs();
+                if !(1..=2).contains(&words) {
+                    return Err(ill());
+                }
+                let size = if words == 1 { 3 } else { 9 };
+                let off = if a == op::FMEM { size * z as i128 } else { imm as i128 };
+                let va = w(self.reg(y).value() as i128 + off).value();
+                let n = if words == 1 { 1 } else { 3 };
+                if b > 0 {
+                    let mut ws = [0i64; 3];
+                    for (k, slot) in ws.iter_mut().enumerate().take(n) {
+                        *slot = self.load_word_as(m, va + 3 * k as i64, Access::Read)?.value();
+                    }
+                    self.set_freg(x, Real::from_words(ws));
+                } else {
+                    let ws = if words == 1 {
+                        let (v, f) = self.freg(x).to_word27();
+                        self.fpu_flags(f)?;
+                        [v, 0, 0]
+                    } else {
+                        self.freg(x).to_words()
+                    };
+                    // all or nothing: every word must be writable first
+                    for k in 0..n {
+                        let at = va + 3 * k as i64;
+                        if at.rem_euclid(3) != 0 {
+                            return Err(Fault::mem(vector::MISALIGNED, at, Access::Write));
+                        }
+                        self.translate(m, at, Access::Write)?;
+                    }
+                    for (k, v) in ws.iter().enumerate().take(n) {
+                        self.store_word(m, va + 3 * k as i64, Word::new(*v).unwrap())?;
+                    }
+                }
+            }
+            op::FLI => self.set_freg(x, Real::from_word27(imm)),
+            _ => return Err(ill()),
+        }
+        self.pc = w(next as i128);
         Ok(())
     }
 

@@ -201,7 +201,7 @@ fn read_only_and_reserved_control_registers() {
     let mut m = machine();
     assert_eq!(run(&mut m, &[liq(1, 5), rrr(op::SYS, sys::MFC, 1, -7, 0)]), NO_FAULT);
     assert_eq!(m.cpu.reg(1).value(), 0, "reserved CRs read as 0");
-    assert_eq!(m.cpu.cr(cr::CPUID).value(), 4, "CPUID untouched");
+    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "CPUID untouched");
 }
 
 // ---- alignment and bus errors ----------------------------------------------

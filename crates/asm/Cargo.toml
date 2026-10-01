@@ -9,3 +9,4 @@ authors.workspace = true
 [dependencies]
 setun-core = { path = "../core" }
 ternary = { path = "../ternary" }
+setun-real = { path = "../real" }

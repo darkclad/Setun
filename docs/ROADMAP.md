@@ -6,7 +6,7 @@ size is a power of 3: 9-trit trytes, 27-trit words, a 3^27 address space,
 colours. Then come a compiler, a kernel and a window system, all written for
 the machine itself.
 
-ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
+ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4 accepted; v0.5 adds the Setun-387 FPU).
 
 ## Milestones
 

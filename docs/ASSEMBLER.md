@@ -60,8 +60,14 @@ A value that depends on a label is not known before layout, so it always gets th
 | stack | `push r` · `pop r` (each 2 instructions, 3 trytes per word) |
 | trit fields | `ext rd, ra, pos, len` · `ins rd, ra, pos, len` |
 | system | `nop hlt brk iret tlbflush fence ill` · `tlbinv ra` · `sys n` · `mfc rd, creg` · `mtc creg, ra` |
+| FPU arithmetic (ISA §14) | `fadd fsub fmul fdiv frem fmin fmax  fd, fa, fb` · `fsqrt fneg fabs frnd ftrunc fmov  fd, fa` · `fcmp fa, fb` |
+| FPU conversions | `fcvtif fd, ra` · `fcvtfi rd, fa` · `ftow rd, fa` · `ffrw fd, ra` · `fexp rd, fa` · `fscl fd, fa, rb` · `fclass rd, fa` |
+| FPU state and constants | `fmfs rd` · `fmts ra` · `fconst fd, zero\|one\|pi\|e\|ln3\|log3e\|log3_10` (or 0…6) · `fli fd, real` (2 words: any real27, e.g. `fli f1, 2.5`) |
+| FPU memory | `flds fldd fsts fstd  fd, [ra ± off]` (real27 = 1 word, real81 = 3 words; the 1-word form when off is a multiple of the size within ±13 sizes) |
 
 **Control register names:** `mode ptb faddr fcause itb epc emode ksp scratch cpuid cycle`, or `cr-13` … `cr13`.
+
+**FPU registers** are `f-13` … `f13`; `f0` reads as zero. After `fcmp`, the usual branches test the result (`blt`, `beq`, …), and `bov` means *unordered* (a NaN was compared).
 
 ## Directives
 
@@ -73,6 +79,7 @@ A value that depends on a label is not known before layout, so it always gets th
 | `.string "text"` | one tryte per character plus a terminating 0 |
 | `.zero n` | `n` zero words |
 | `.fill n, v` | `n` words of `v` |
+| `.real27 x, …` / `.real81 x, …` | one word / three words per real, written as a decimal (`2.5`, `-1e-3`) or an integer |
 | `.equ NAME, v` / `NAME = v` | constant |
 
 ## Disassembly

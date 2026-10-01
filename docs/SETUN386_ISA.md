@@ -1,6 +1,6 @@
 # Setun-386 Instruction Set Architecture
 
-**Status: v0.4, design accepted (2026-09-30).** §13 records the decisions.
+**Status: v0.5 draft (2026-10-01): v0.4 (accepted 2026-09-30) plus the Setun-387 floating-point unit, §14.** §13 records the decisions.
 
 The Setun-386 is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
@@ -32,6 +32,7 @@ Version history:
 - v0.2: 6-trit trytes and 18-trit words.
 - v0.3: the pure-ternary revision.
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
+- v0.5: the Setun-387 floating-point unit (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 
 ---
 
@@ -123,7 +124,7 @@ There are 27 general registers of 27 trits, `r-13 … r0 … r13`. A register in
 | 27 | `RING` | current ring: −1 user, 0 drivers, +1 kernel |
 | 26 | `IE` | +1 maskable interrupts enabled, 0 disabled, −1 reserved |
 | 25 | `PG` | +1 paging on, 0 off |
-| 24 | – | reserved |
+| 24 | `FE` | +1 the floating-point unit is enabled; 0: FPU instructions raise vector −12 (§14.2) |
 | 23 | `IOPL` | lowest ring allowed to use port I/O (reset value 0) |
 | 22 | `TF` | +1 single-step trap after each instruction |
 | 21 | `S` | **sign of the last result**: −1, 0, +1 |
@@ -149,7 +150,7 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 | 6 | `EMODE` | MODE saved on trap entry |
 | 7 | `KSP` | the other stack pointer, swapped with `r13` on a ring change |
 | 8 | `SCRATCH` | free for the kernel |
-| 9 | `CPUID` | read-only: ISA version and feature trits |
+| 9 | `CPUID` | read-only: the ISA version in trits 19–27, and feature trits; trit 1 = +1: the Setun-387 FPU is present |
 | 10 | `CYCLE` | read-only instruction counter |
 | others | – | reserved: reads return 0. Writes to these, and to the read-only `CPUID`/`CYCLE`, raise `ILL` (vector −1). |
 
@@ -166,7 +167,7 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 |---|---|---|
 | 0 | −3280..3280 | 1-word instruction |
 | + | 3281..9841 | 2-word instruction (majors are numbered `6561 + n`) |
-| − | −9841..−3281 | reserved (a future "Setun-387" floating-point unit) → `ILL` trap |
+| − | −9841..−3281 | the **Setun-387 floating-point unit** (§14) |
 
 **An all-zero word is `ILL`**, so running into zeroed memory traps at once.
 
@@ -432,7 +433,9 @@ There are **243 = 3^5 vectors, numbered balanced −121..121**. Each entry is on
 | −8 | single step (`TF`) | the next instruction |
 | −9 | double fault (a fault while fetching a vector) | – |
 | −10 | bus error (no device at the physical address) | the instruction |
-| −11 … −26 | reserved CPU exceptions | |
+| −11 | floating-point exception (an unmasked FPU exception, §14.4) | the instruction |
+| −12 | FPU not available (`MODE.FE` = 0) | the instruction |
+| −13 … −26 | reserved CPU exceptions | |
 | −27 … −121 | free for OS use | |
 | **+1 … +81** | **hardware IRQ 0–80** (81 = 3^4 lines; vector = IRQ + 1) | the next instruction |
 | +82 … +121 | free for OS use | |
@@ -691,3 +694,123 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
 8. **Colours: 3^9, with 27 levels per channel.** A pixel's three base-27 digits are R, G, B (§8.3).
 9. **No Setun-70 compatibility mode**: a new CPU from scratch that resets straight into native mode (§9). **Default RAM is 3^18 = 9^9 trytes** (§4).
 10. A **carry trit C**, **two kinds of division**, **every trap enters ring +1**, and **text mode**. These carry over from v0.2.
+11. **The Setun-387 floating-point unit** (§14): real27 and real81 with one shared 9-trit exponent, a signed balanced significand (no sign trit, no −0), 27 flat registers, ±∞/NaN/subnormals, round to nearest with ties to even, and a "not available" trap for lazy context switching.
+
+## 14. The Setun-387 floating-point unit
+
+The 387 was the 386's coprocessor, and the Setun-387 is the Setun-386's. It is part of the CPU here: `CPUID` trit 1 says it is present. It owns the third of the opcode space whose first trit is −.
+
+### 14.1 Formats
+
+A floating-point value is **m · 3^E**, with E an integer and m a balanced fraction. **The significand carries the sign:** negating a value negates its significand, so there is **no sign field and no −0**.
+
+| Format | Size | Exponent E | Significand M | Precision |
+|---|---|---|---|---|
+| **real27** | 1 word | trits 1–9 (a tryte) | trits 10–27: 18 trits | 18 trits ≈ 28.5 bits (IEEE single: 24) |
+| **real81** | 3 words (81 trits) | trits 1–9 of word 0 | the other 72 trits, most significant first | 72 trits ≈ 114 bits (IEEE quad: 113) |
+
+- **Value:** M is an integer with n trits (n = 18 or 72), and m = M · 3^−n. So m is a fraction with the point just left of M's top trit, and |m| < 1/2.
+- **Both formats share the exponent**, which is one tryte, −9841…9841. The first word of a real81 *is* a real27: E and the top 18 trits of M. Dropping trits in balanced ternary rounds to nearest, so reading only the first word gives the real81 rounded to real27 (see §14.3 for the one exception, exact halves).
+- **Kinds of value**, with E_max = 9841 and E_min = −9841:
+
+| Kind | Encoding | Meaning |
+|---|---|---|
+| zero | M = 0 and E ≠ E_max | 0. Results always write E = 0. |
+| normal | top trit of M non-zero, E_min ≤ E < E_max | m · 3^E, with 1/6 < \|m\| < 1/2 |
+| subnormal | E = E_min, top trit of M zero, M ≠ 0 | gradual underflow: m · 3^E_min |
+| ±∞ | E = E_max, M = ±3^(n−1) (only the top trit set) | infinity, signed like M |
+| NaN | E = E_max, any other M | not a number; the canonical NaN has M = 0 ("an infinity with no direction"). M is its payload. All NaNs are quiet. |
+
+- **Range:** the largest real is just under ½ · 3^9840 ≈ 10^4694, and the smallest normal is about ⅙ · 3^−9841 ≈ 10^−4696. Subnormals reach 3^−(9841+n).
+- **Examples (real27, base 27, E then M):**
+  - 1 = `001 900000` (E = 1, m = 1/3: M is a single +1 trit at the top, and the first base-27 digit of M is the trits 1 0 0 = 9)
+  - −1 = `001 9̅00000`
+  - ½ ≈ `000 DDDDDD` (m = 0.111…1: ½ itself needs infinitely many 1s, so it is never exact)
+  - 3 = `002 900000`, ⅓ = `000 900000`: powers of 3 are exact, and 0.1 is not
+
+### 14.2 Registers
+
+- **f−13 … f13**: 27 registers of 81 trits, each holding a real81. **f0 reads as zero, and writes to it are ignored**, as with r0.
+- **FSR** (status and control, one word), read and written with `FMFS`/`FMTS` in any ring:
+
+| Trits | Field | Meaning |
+|---|---|---|
+| 23–27 | flags `IV DZ OF UF IX` | sticky: +1 once the exception has happened; cleared only by writing FSR |
+| 14–18 | masks `IV DZ OF UF IX` | +1 masked (the default value results, §14.4); 0 unmasked (trap) |
+| others | – | reserved, read as 0 |
+
+- **At reset** all masks are +1 and all flags are 0.
+- **MODE trit 24 is `FE`** (FPU enabled), +1 at reset. When it is 0, every FPU instruction raises **vector −12 (FPU not available)** before doing anything. A kernel clears it on a context switch and saves or restores the registers on the first FPU instruction of the next task: **lazy switching**, as on the 386 with `CR0.TS`.
+
+### 14.3 Rounding
+
+- **Every result is rounded to nearest.** There is no rounding-mode register.
+- **No ties in the common case:** in balanced ternary, dropping trits *is* rounding to nearest. Exact results of add, subtract, multiply, scale and conversions from integers have a power of 3 in the denominator, so they are never exactly halfway between two neighbours.
+- **The exception: exact halves.** Division, square root, remainder and conversions from decimal can land exactly halfway (11 ÷ 2 = 5.5 lies between 5 and 6 when both are representable). **Ties go to the even significand** (M even), as in IEEE.
+- A result that had to be rounded raises **IX** (inexact).
+
+### 14.4 Exceptions
+
+| Flag | When | Masked result |
+|---|---|---|
+| **IV** invalid | ∞ − ∞, 0 · ∞, 0 / 0, ∞ / ∞, √ of a negative, `FREM` by 0 or of ∞, a conversion to integer out of range or of NaN | the canonical NaN (integers: the largest word of the right sign, or 0 for NaN) |
+| **DZ** divide by zero | finite non-zero / 0 | ∞ signed like the dividend |
+| **OF** overflow | the rounded result's E would exceed 9840 | ±∞ (and IX) |
+| **UF** underflow | the result is subnormal (or flushed to 0) and inexact | the subnormal or 0 (and IX) |
+| **IX** inexact | the result was rounded | the rounded result |
+
+- **NaN in, NaN out:** an operation with a NaN operand returns that NaN (the first one if both are) and raises nothing. Comparisons with NaN are *unordered*.
+- **An unmasked exception traps** to **vector −11 (floating-point exception)** before anything is written. EPC holds the instruction, the flag is set, and FCAUSE[1:9] holds the exception (1 IV, 2 DZ, 3 OF, 4 UF, 5 IX).
+
+### 14.5 Encoding
+
+FPU majors have `A[1] = −`. Then `A[2]` sets the length: 0 means 1 word, + means 2 words, and − is reserved (`ILL`). The fields are the integer formats' (§3.1). The register fields name f registers or r registers as each instruction says.
+
+| A | Mnemonic | Format | Operation |
+|---|---|---|---|
+| **1-word** | | | |
+| −6561 | FALU | R | `fd := fa ⊕ fb` (functions below) |
+| −6560 | FCVT | R | conversions, moves, constants and FSR (below) |
+| −6559 | FMEM | Q | load or store at `ra + size·q3`: B = 1 `FLDS` (real27 → fd), 2 `FLDD` (real81 → fd), −1 `FSTS` (fd rounded → real27), −2 `FSTD` (fd → real81). The size is 3 or 9 trytes; addresses must be word-aligned. |
+| **2-word** | | | |
+| −4374 | FMEMD | I | as FMEM at `ra + imm27` (trytes) |
+| −4373 | `FLI` | J | `fd := imm27` read as a real27 (any single-precision constant in one instruction) |
+| other | – | – | reserved → `ILL` |
+
+**FALU functions (B):**
+
+| B | Mnemonic | Operation |
+|---|---|---|
+| 1 | `FADD` | fa + fb |
+| 2 | `FSUB` | fa − fb |
+| 3 | `FMUL` | fa · fb |
+| 4 | `FDIV` | fa / fb |
+| 5 | `FREM` | fa − fb · q, q = fa / fb rounded to the nearest integer (ties to even): the IEEE remainder, exact |
+| 6 | `FMIN` | the smaller (a NaN operand loses to a number) |
+| 7 | `FMAX` | the larger |
+| 8 | `FSQRT` | √fa |
+| 9 | `FNEG` | −fa (exact, never traps; a NaN's payload is negated) |
+| 10 | `FABS` | \|fa\| |
+| 11 | `FRND` | fa rounded to the nearest integer, ties to even |
+| 12 | `FTRUNC` | fa rounded toward zero to an integer |
+| 13 | `FCMP` | compare: MODE.S := −1, 0 or +1 for fa <, =, > fb, and C := 0. Unordered (a NaN): S := 0 and C := +1. fd is not written. |
+
+**FCVT functions (B)**, with fd/rd, fa/ra and rb as each says:
+
+| B | Mnemonic | Operation |
+|---|---|---|
+| 1 | `FCVTIF fd, ra` | integer → real (exact: 27 trits fit in 72) |
+| 2 | `FCVTFI rd, fa` | real → integer, rounded to nearest, ties to even (IV out of range) |
+| 3 | `FTOW rd, fa` | fa rounded to real27, as a raw word in rd |
+| 4 | `FFRW fd, ra` | the real27 in ra, as a real (exact) |
+| 5 | `FEXP rd, fa` | the exponent E of fa normalized (0 for zero; IV and E_max for ∞/NaN) |
+| 6 | `FSCL fd, fa, rb` | fa · 3^rb (exact unless it overflows or underflows) |
+| 7 | `FMFS rd` | rd := FSR |
+| 8 | `FMTS ra` | FSR := ra (reserved trits ignored) |
+| 9 | `FCLASS rd, fa` | 0 zero, ±1 subnormal, ±2 normal, ±3 infinite, 4 NaN (signed like the value) |
+| 10 | `FCONST fd, k` | a constant, k in the ra field: 0 zero, 1 one, 2 π, 3 e, 4 ln 3, 5 log₃ e, 6 log₃ 10 (each correctly rounded) |
+| 11 | `FMOV fd, fa` | fd := fa (a NaN keeps its payload) |
+
+**Assembler forms:** the mnemonic with operands in field order, e.g. `FADD f1, f2, f3`, `FLDD f4, 0(r13)` (a `q3` offset in units of the access size), `FLDD f4, 12(r2)` (2-word, tryte offset), `FLI f1, 2.5`, `FCONST f2, pi`. Directives: `.real27 x` emits a word, and `.real81 x` emits three, with x written as a decimal or base-27 number.
+
+**Trine:** the type `real` is a real81 (§ LANGUAGE.md).

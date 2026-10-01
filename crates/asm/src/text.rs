@@ -23,7 +23,7 @@
 //! from binary systems); `'c'` (a Unicode character). `$` is the current address.
 //! Registers: `r-13`..`r13`, `zero` = r0, `fp` = r11, `lr` = r12, `sp` = r13.
 
-use setun_core::isa::{self, alu, cond, cr, fld, mem, op, sys};
+use setun_core::isa::{self, alu, cond, cr, falu, fcvt, fld, fmem, mem, op, sys};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use ternary::Word;
@@ -290,8 +290,18 @@ fn parse_string(s: &str) -> Result<String, String> {
 #[derive(Debug, Clone)]
 enum Operand {
     Reg(i64),
+    /// An FPU register, f−13..f13.
+    FReg(i64),
     Mem(i64, Expr),
     Expr(Expr),
+    /// A real literal (decimal with a point or an exponent).
+    Real(setun_real::Real),
+}
+
+/// An FPU register name: `f-13` … `f13`.
+pub fn fregister(s: &str) -> Option<i64> {
+    let n: i64 = s.trim().strip_prefix('f')?.parse().ok()?;
+    (-13..=13).contains(&n).then_some(n)
 }
 
 pub fn register(s: &str) -> Option<i64> {
@@ -331,7 +341,22 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     if let Some(r) = register(s) {
         return Ok(Operand::Reg(r));
     }
-    parse_expr(s).map(Operand::Expr)
+    if let Some(f) = fregister(s) {
+        return Ok(Operand::FReg(f));
+    }
+    match parse_expr(s) {
+        Ok(e) => Ok(Operand::Expr(e)),
+        Err(msg) => real_literal(s).map(Operand::Real).ok_or(msg),
+    }
+}
+
+/// A decimal real literal (it has a point or an exponent), rounded to real81.
+fn real_literal(s: &str) -> Option<setun_real::Real> {
+    let t = s.trim();
+    if !t.contains(['.', 'e', 'E']) || t.starts_with("0x") {
+        return None;
+    }
+    setun_real::Real::from_decimal(t).ok().map(|(r, _)| r)
 }
 
 /// Split operands on top-level commas (not inside quotes or brackets).
@@ -395,6 +420,8 @@ enum Kind {
     Org(Expr),
     Equ(String, Expr),
     Words(Vec<Expr>),
+    /// `.real27` (one word each) or `.real81` (three words each)
+    Reals(Vec<setun_real::Real>, bool),
     Trytes(Vec<Expr>),
     Str(String),
     Zero(Expr),
@@ -454,6 +481,21 @@ fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
                 Kind::Equ(ops[0].clone(), parse_expr(&ops[1]).map_err(e)?)
             }
             ".word" => Kind::Words(exprs(&ops)?),
+            ".real27" | ".real81" => {
+                let mut v = Vec::new();
+                for o in &ops {
+                    let r = match parse_expr(o) {
+                        Ok(Expr::Num(n)) => setun_real::Real::from_i64(n),
+                        Ok(Expr::Neg(inner)) if matches!(*inner, Expr::Num(_)) => {
+                            let Expr::Num(n) = *inner else { unreachable!() };
+                            setun_real::Real::from_i64(-n)
+                        }
+                        _ => real_literal(o).ok_or_else(|| Error { line, msg: format!("real literal expected, found `{o}`") })?,
+                    };
+                    v.push(r);
+                }
+                Kind::Reals(v, m == ".real81")
+            }
             ".tryte" => Kind::Trytes(exprs(&ops)?),
             ".string" => Kind::Str(parse_string(rest).map_err(e)?),
             ".zero" => Kind::Zero(one(&exprs(&ops)?, line)?),
@@ -551,6 +593,56 @@ fn mem_op(m: &str) -> Option<(i64, i64)> {
     })
 }
 
+/// FPU loads and stores: (B function, access size in trytes).
+fn fmem_op(m: &str) -> Option<(i64, i64)> {
+    Some(match m {
+        "flds" => (fmem::FLDS, 3),
+        "fldd" => (fmem::FLDD, 9),
+        "fsts" => (fmem::FSTS, 3),
+        "fstd" => (fmem::FSTD, 9),
+        _ => return None,
+    })
+}
+
+/// FALU functions taking (fd, fa, fb) and (fd, fa).
+fn falu_binary(m: &str) -> Option<i64> {
+    Some(match m {
+        "fadd" => falu::FADD,
+        "fsub" => falu::FSUB,
+        "fmul" => falu::FMUL,
+        "fdiv" => falu::FDIV,
+        "frem" => falu::FREM,
+        "fmin" => falu::FMIN,
+        "fmax" => falu::FMAX,
+        _ => return None,
+    })
+}
+
+fn falu_unary(m: &str) -> Option<i64> {
+    Some(match m {
+        "fsqrt" => falu::FSQRT,
+        "fneg" => falu::FNEG,
+        "fabs" => falu::FABS,
+        "frnd" => falu::FRND,
+        "ftrunc" => falu::FTRUNC,
+        _ => return None,
+    })
+}
+
+/// FCONST names (or a number 0..6).
+pub fn fconst_name(s: &str) -> Option<i64> {
+    Some(match s {
+        "zero" => 0,
+        "one" => 1,
+        "pi" => 2,
+        "e" => 3,
+        "ln3" => 4,
+        "log3e" => 5,
+        "log3_10" => 6,
+        _ => return None,
+    })
+}
+
 pub fn control_register(s: &str) -> Option<i64> {
     Some(match s.trim().to_ascii_lowercase().as_str() {
         "mode" => cr::MODE,
@@ -611,7 +703,7 @@ fn inst_size(m: &str, ops: &[Operand], long: bool, consts: &HashMap<String, i64>
             _ => 1,
         };
     }
-    if let Some((_, size)) = mem_op(m) {
+    if let Some((_, size)) = mem_op(m).or(fmem_op(m)) {
         return match ops.get(1) {
             Some(Operand::Mem(_, e)) if !long && e.constant(consts).is_some_and(|v| v % size == 0 && (v / size).abs() <= 13) => 1,
             _ => 2,
@@ -622,7 +714,7 @@ fn inst_size(m: &str, ops: &[Operand], long: bool, consts: &HashMap<String, i64>
             Some(Operand::Expr(e)) if !small(e, 364) => 2,
             _ => 1,
         },
-        "la" | "lea" | "jal" | "call" | "br3" | "ext" | "ins" => 2,
+        "la" | "lea" | "jal" | "call" | "br3" | "ext" | "ins" | "fli" => 2,
         "in" | "out" => match ops.get(1) {
             Some(Operand::Mem(..)) => 1,
             _ => 2,
@@ -645,6 +737,10 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
     let exp = |o: &Operand| match o {
         Operand::Expr(e) => env.val(e),
         _ => err(line, format!("value expected for `{m}`")),
+    };
+    let freg = |o: &Operand| match o {
+        Operand::FReg(f) => Ok(*f),
+        _ => err(line, format!("FPU register expected for `{m}`")),
     };
     let rel = |target: i64| -> Result<i64, Error> {
         let d = target - env.here;
@@ -684,6 +780,66 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
         } else {
             two(isa::wide(op::MEMD, f, reg(d)?, *base, off))
         };
+    }
+    if let Some(f) = falu_binary(m) {
+        return match ops {
+            [d, a, b] => one(isa::rrr(op::FALU, f, freg(d)?, freg(a)?, freg(b)?)),
+            _ => bad(),
+        };
+    }
+    if let Some(f) = falu_unary(m) {
+        return match ops {
+            [d, a] => one(isa::rrr(op::FALU, f, freg(d)?, freg(a)?, 0)),
+            _ => bad(),
+        };
+    }
+    if let Some((f, sz)) = fmem_op(m) {
+        let [d, Operand::Mem(base, off)] = ops else { return bad() };
+        let off = env.val(off)?;
+        return if size == 1 {
+            one(isa::rrr(op::FMEM, f, freg(d)?, *base, off / sz))
+        } else {
+            two(isa::wide(op::FMEMD, f, freg(d)?, *base, off))
+        };
+    }
+    let fcv = |b: i64, x: i64, y: i64, z: i64| one(isa::rrr(op::FCVT, b, x, y, z));
+    match (m, ops) {
+        ("fcmp", [a, b]) => return one(isa::rrr(op::FALU, falu::FCMP, 0, freg(a)?, freg(b)?)),
+        ("fmov", [d, a]) => return fcv(fcvt::FMOV, freg(d)?, freg(a)?, 0),
+        ("fcvtif", [d, a]) => return fcv(fcvt::FCVTIF, freg(d)?, reg(a)?, 0),
+        ("fcvtfi", [d, a]) => return fcv(fcvt::FCVTFI, reg(d)?, freg(a)?, 0),
+        ("ftow", [d, a]) => return fcv(fcvt::FTOW, reg(d)?, freg(a)?, 0),
+        ("ffrw", [d, a]) => return fcv(fcvt::FFRW, freg(d)?, reg(a)?, 0),
+        ("fexp", [d, a]) => return fcv(fcvt::FEXP, reg(d)?, freg(a)?, 0),
+        ("fscl", [d, a, b]) => return fcv(fcvt::FSCL, freg(d)?, freg(a)?, reg(b)?),
+        ("fmfs", [d]) => return fcv(fcvt::FMFS, reg(d)?, 0, 0),
+        ("fmts", [a]) => return fcv(fcvt::FMTS, 0, reg(a)?, 0),
+        ("fclass", [d, a]) => return fcv(fcvt::FCLASS, reg(d)?, freg(a)?, 0),
+        ("fconst", [d, k]) => {
+            let k = match k {
+                Operand::Expr(Expr::Sym(name)) => fconst_name(name).ok_or_else(|| Error { line, msg: format!("unknown constant `{name}`") })?,
+                Operand::Reg(0) => 0, // `zero` reads as the register name
+                Operand::Expr(_) => env.range("constant number", exp(k)?, 6)?,
+                _ => return bad(),
+            };
+            return fcv(fcvt::FCONST, freg(d)?, k, 0);
+        }
+        ("fli", [d, v]) => {
+            let r = match v {
+                Operand::Real(r) => *r,
+                Operand::Expr(_) => setun_real::Real::from_i64(exp(v)?),
+                _ => return bad(),
+            };
+            return two(isa::wide(op::FLI, 0, freg(d)?, 0, r.to_word27().0));
+        }
+        _ if matches!(
+            m,
+            "fcmp" | "fmov" | "fcvtif" | "fcvtfi" | "ftow" | "ffrw" | "fexp" | "fscl" | "fmfs" | "fmts" | "fclass" | "fconst" | "fli"
+        ) =>
+        {
+            return bad()
+        }
+        _ => {}
     }
     if let Some(c) = condition(m) {
         let [t] = ops else { return bad() };
@@ -808,6 +964,7 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                 }
                 Kind::Equ(..) => 0,
                 Kind::Words(v) => v.len(),
+                Kind::Reals(v, wide) => v.len() * if *wide { 3 } else { 1 },
                 Kind::Trytes(v) => v.len().div_ceil(3),
                 Kind::Str(t) => (t.chars().count() + 1).div_ceil(3),
                 Kind::Align(e) => {
@@ -859,6 +1016,17 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                     .iter()
                     .map(|e| env.val(e).and_then(|x| Word::new(x).ok_or_else(|| Error { line: s.line, msg: format!("word {x} out of range") })))
                     .collect::<Result<_, _>>()?,
+                Kind::Reals(v, wide) => {
+                    let mut out = Vec::new();
+                    for r in v {
+                        if *wide {
+                            out.extend(r.to_words().iter().map(|&x| Word::new(x).unwrap()));
+                        } else {
+                            out.push(Word::new(r.to_word27().0).unwrap());
+                        }
+                    }
+                    out
+                }
                 Kind::Trytes(v) => {
                     let t = v
                         .iter()

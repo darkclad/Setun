@@ -26,6 +26,62 @@ pub mod op {
     pub const BR3: i64 = 6567;
     pub const IOI: i64 = 6568;
     pub const FLD: i64 = 6569;
+    // the Setun-387 FPU (A[1] = −; A[2] = 0: 1-word, + : 2-word; ISA §14.5)
+    pub const FALU: i64 = -6561;
+    pub const FCVT: i64 = -6560;
+    pub const FMEM: i64 = -6559;
+    pub const FMEMD: i64 = -4374;
+    pub const FLI: i64 = -4373;
+}
+
+/// FALU functions (tryte B, ISA §14.5).
+pub mod falu {
+    pub const FADD: i64 = 1;
+    pub const FSUB: i64 = 2;
+    pub const FMUL: i64 = 3;
+    pub const FDIV: i64 = 4;
+    pub const FREM: i64 = 5;
+    pub const FMIN: i64 = 6;
+    pub const FMAX: i64 = 7;
+    pub const FSQRT: i64 = 8;
+    pub const FNEG: i64 = 9;
+    pub const FABS: i64 = 10;
+    pub const FRND: i64 = 11;
+    pub const FTRUNC: i64 = 12;
+    pub const FCMP: i64 = 13;
+}
+
+/// FCVT functions (tryte B, ISA §14.5).
+pub mod fcvt {
+    pub const FCVTIF: i64 = 1;
+    pub const FCVTFI: i64 = 2;
+    pub const FTOW: i64 = 3;
+    pub const FFRW: i64 = 4;
+    pub const FEXP: i64 = 5;
+    pub const FSCL: i64 = 6;
+    pub const FMFS: i64 = 7;
+    pub const FMTS: i64 = 8;
+    pub const FCLASS: i64 = 9;
+    pub const FCONST: i64 = 10;
+    pub const FMOV: i64 = 11;
+}
+
+/// FMEM / FMEMD functions (tryte B): ± the size in words.
+pub mod fmem {
+    pub const FLDS: i64 = 1;
+    pub const FLDD: i64 = 2;
+    pub const FSTS: i64 = -1;
+    pub const FSTD: i64 = -2;
+}
+
+/// FSR fields (ISA §14.2): flag trits 23..27 and mask trits 14..18, in the
+/// order IV DZ OF UF IX.
+pub mod fsr {
+    pub const FLAG_FIRST: usize = 23;
+    pub const MASK_FIRST: usize = 14;
+    /// All masks set, no flags: the reset value.
+    /// (Trit k weighs 3^(27−k): the masks are 3^13 … 3^9.)
+    pub const RESET: i64 = 19_683 * (81 + 27 + 9 + 3 + 1);
 }
 
 /// SYS group functions (tryte B).
@@ -131,6 +187,7 @@ pub mod mode {
     pub const TF: usize = 22;
     pub const S: usize = 21;
     pub const C: usize = 20;
+    pub const FE: usize = 24;
 }
 
 /// Vector numbers (ISA §7.1).
@@ -146,6 +203,8 @@ pub mod vector {
     pub const STEP: i64 = -8;
     pub const DOUBLE_FAULT: i64 = -9;
     pub const BUS_ERROR: i64 = -10;
+    pub const FP_EXCEPTION: i64 = -11;
+    pub const FPU_UNAVAILABLE: i64 = -12;
 }
 
 fn head(a: i64, b: i64) -> Word {

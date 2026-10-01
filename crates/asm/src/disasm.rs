@@ -6,7 +6,7 @@
 //! So disassembly output always reassembles byte-for-byte.
 
 use crate::text;
-use setun_core::isa::{alu, cond, cr, fld, io, mem, op, sys};
+use setun_core::isa::{alu, cond, cr, falu, fcvt, fld, fmem, io, mem, op, sys};
 use ternary::Word;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +122,7 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
     let f = fields(w1);
     let long = w1.trit(1) as i64 == 1;
     if w1.trit(1) as i64 == -1 {
-        return None;
+        return decode_fpu(f, w1, w2);
     }
     let imm = if long { w2?.value() } else { 0 };
     let n = if long { 2 } else { 1 };
@@ -219,6 +219,88 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
                 _ => return None,
             };
             format!("{name} {}, {}, {}, {}", r(f.x), r(f.y), w2.field(1..=9), w2.field(10..=18))
+        }
+        _ => return None,
+    };
+    Some((s, n))
+}
+
+fn fr(n: i64) -> String {
+    format!("f{n}")
+}
+
+/// The Setun-387 instructions (ISA §14.5).
+fn decode_fpu(f: Fields, w1: Word, w2: Option<Word>) -> Option<(String, usize)> {
+    let long = w1.trit(2) as i64 == 1;
+    let imm = if long { w2?.value() } else { 0 };
+    let n = if long { 2 } else { 1 };
+    let s = match f.a {
+        op::FALU => {
+            let bin = match f.b {
+                falu::FADD => Some("fadd"),
+                falu::FSUB => Some("fsub"),
+                falu::FMUL => Some("fmul"),
+                falu::FDIV => Some("fdiv"),
+                falu::FREM => Some("frem"),
+                falu::FMIN => Some("fmin"),
+                falu::FMAX => Some("fmax"),
+                _ => None,
+            };
+            let un = match f.b {
+                falu::FSQRT => Some("fsqrt"),
+                falu::FNEG => Some("fneg"),
+                falu::FABS => Some("fabs"),
+                falu::FRND => Some("frnd"),
+                falu::FTRUNC => Some("ftrunc"),
+                _ => None,
+            };
+            if let Some(name) = bin {
+                format!("{name} {}, {}, {}", fr(f.x), fr(f.y), fr(f.z))
+            } else if let Some(name) = un {
+                format!("{name} {}, {}", fr(f.x), fr(f.y))
+            } else if f.b == falu::FCMP {
+                format!("fcmp {}, {}", fr(f.y), fr(f.z))
+            } else {
+                return None;
+            }
+        }
+        op::FCVT => match f.b {
+            fcvt::FCVTIF => format!("fcvtif {}, {}", fr(f.x), r(f.y)),
+            fcvt::FCVTFI => format!("fcvtfi {}, {}", r(f.x), fr(f.y)),
+            fcvt::FTOW => format!("ftow {}, {}", r(f.x), fr(f.y)),
+            fcvt::FFRW => format!("ffrw {}, {}", fr(f.x), r(f.y)),
+            fcvt::FEXP => format!("fexp {}, {}", r(f.x), fr(f.y)),
+            fcvt::FSCL => format!("fscl {}, {}, {}", fr(f.x), fr(f.y), r(f.z)),
+            fcvt::FMFS => format!("fmfs {}", r(f.x)),
+            fcvt::FMTS => format!("fmts {}", r(f.y)),
+            fcvt::FCLASS => format!("fclass {}, {}", r(f.x), fr(f.y)),
+            fcvt::FCONST => {
+                let names = ["0", "one", "pi", "e", "ln3", "log3e", "log3_10"];
+                format!("fconst {}, {}", fr(f.x), names.get(f.y as usize).filter(|_| f.y >= 0)?)
+            }
+            fcvt::FMOV => format!("fmov {}, {}", fr(f.x), fr(f.y)),
+            _ => return None,
+        },
+        op::FMEM | op::FMEMD => {
+            let (name, size) = match f.b {
+                fmem::FLDS => ("flds", 3),
+                fmem::FLDD => ("fldd", 9),
+                fmem::FSTS => ("fsts", 3),
+                fmem::FSTD => ("fstd", 9),
+                _ => return None,
+            };
+            if f.a == op::FMEM {
+                format!("{name} {}, {}", fr(f.x), addr(f.y, f.z * size))
+            } else {
+                let dot = if imm % size == 0 && (imm / size).abs() <= 13 { ".l" } else { "" };
+                format!("{name}{dot} {}, {}", fr(f.x), addr(f.y, imm))
+            }
+        }
+        op::FLI => {
+            let v = setun_real::Real::from_word27(imm);
+            let t = v.to_decimal(12);
+            let t = if t.contains(['.', 'e']) { t } else { format!("{t}.0") };
+            format!("fli {}, {t}", fr(f.x))
         }
         _ => return None,
     };
