@@ -14,6 +14,7 @@ fn session(disk: &[i16], lines: &[&str], max_steps: u64) -> (String, setun_core:
     let mut m = trinux::boot_trytes(disk, 729, 0, "");
     let mut out = String::new();
     let (mut next, mut steps, mut since_input) = (0, 0, 0);
+    let mut logged_in = false;
     while steps < max_steps && !m.powered_off {
         m.run(1_000_000);
         steps += 1_000_000;
@@ -22,7 +23,22 @@ fn session(disk: &[i16], lines: &[&str], max_steps: u64) -> (String, setun_core:
         if out.contains("Kernel panic") {
             break;
         }
-        let Some(line) = lines.get(next) else { continue };
+        // log in as root (password "root") at the first prompt
+        if !logged_in && out.ends_with("login: ") {
+            m.dev.serial_input("root\n");
+            continue;
+        }
+        if !logged_in && out.ends_with("Password: ") {
+            m.dev.serial_input("root\n");
+            logged_in = true;
+            continue;
+        }
+        let Some(line) = lines.get(next) else {
+            if out.contains("init: login session exited") && out.ends_with("login: ") {
+                break;
+            }
+            continue;
+        };
         if let Some(raw) = line.strip_prefix('~') {
             if since_input >= 5_000_000 {
                 m.dev.serial_input(raw);
@@ -208,9 +224,9 @@ fn k6_damaged_files_give_eio_and_the_system_carries_on() {
             "cat: /etc/badmode: Input/output error\n",
             "tfs: bad entry inode 5000",
             "cat: /etc/badent: Input/output error\n",
-            "$ ls /etc\nbadent\nbadmode\nmotd\n",
+            "$ ls /etc\nbadent\nbadmode\ngroup\nmotd\n",
             "$ echo still alive\nstill alive\n",
-            "init: /bin/sh exited with 0",
+            "init: login session exited with 0",
         ],
     );
 }
@@ -227,7 +243,7 @@ fn k6_proc_and_ps() {
     assert_has(
         &out,
         &[
-            "  PID  PPID  PGID S   TIME CMD\n    1     0     1 S   0:00 /sbin/init\n    2     1     2 S   0:00 sh\n    3     2     3 S   0:00 sleep 30\n",
+            "  PID  PPID  PGID S   TIME CMD\n    1     0     1 S   0:00 /sbin/init\n    2     1     2 S   0:00 -sh\n    3     2     3 S   0:00 sleep 30\n",
             " R   0:00 ps\n",
             "Name:\tsleep\nState:\tS (sleeping)\nPid:\t3\nPPid:\t2\nPGid:\t3\nSid:\t1\n",
             "$ cat /proc/3/cmdline; echo\nsleep\u{0}30\u{0}\n",

@@ -62,7 +62,18 @@ impl Default for Root {
 }
 
 /// Directories every tfs root gets (mount points and the like).
-pub const ROOT_DIRS: [&str; 6] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/etc"];
+pub const ROOT_DIRS: [&str; 8] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/etc", "/root", "/home/user"];
+
+/// Owners and modes that differ from the defaults (root:root, 0755 for
+/// programs and directories, 0644 for text): the password hashes are root's
+/// alone, su and passwd run set-user-ID root, and each user owns a home.
+pub const SPECIAL_MODES: [(&str, i64, i64, i64); 5] = [
+    ("/etc/shadow", 0o600, 0, 0),
+    ("/bin/su", 0o4755, 0, 0),
+    ("/bin/passwd", 0o4755, 0, 0),
+    ("/root", 0o700, 0, 0),
+    ("/home/user", 0o755, 1000, 1000),
+];
 
 /// The initramfs header sector (kernel/initramfs.tri); data follows it.
 pub const INITRAMFS_SECTOR: usize = 28;
@@ -123,15 +134,19 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     for prog in [
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
-        "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit",
+        "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
     // One multi-call program under many names (hard links on tfs).
     for applet in [
         "rmdir", "basename", "dirname", "env", "printenv", "uname", "date", "clear", "seq", "tee", "yes", "kill", "test", "[",
+        "id", "whoami", "groups", "chown", "chgrp",
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
+    }
+    for name in ["useradd", "userdel"] {
+        v.push((format!("/sbin/{name}"), u.join("bin/useradm.tri")));
     }
     // The text and file tools, likewise one program.
     for tool in ["sed", "tr", "cut", "od", "diff", "find", "xargs", "md5sum"] {
@@ -148,6 +163,9 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
     v.push(("/etc/motd".into(), u.join("etc/motd")));
     v.push(("/etc/pangrams".into(), u.join("etc/pangrams")));
+    for db in ["passwd", "group", "shadow"] {
+        v.push((format!("/etc/{db}"), u.join(format!("etc/{db}"))));
+    }
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));
     v
 }
@@ -220,6 +238,11 @@ pub fn build_tfs(files: &[(String, PathBuf)], blocks: usize, inodes: usize) -> R
         let perm = if src.extension().is_some_and(|e| e == "tri") { 0o755 } else { 0o644 };
         fs.write_file(name, &data, perm).map_err(|e| format!("{name}: {e}"))?;
         written.push((src, name.clone()));
+    }
+    for (path, perm, uid, gid) in SPECIAL_MODES {
+        if fs.lookup(path).is_ok() {
+            fs.set_owner_mode(path, perm, uid, gid)?;
+        }
     }
     Ok(fs)
 }

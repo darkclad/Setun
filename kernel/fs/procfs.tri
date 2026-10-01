@@ -230,6 +230,8 @@ fn proc_generate(i: int) -> int {
         ps("PPid:\t"); pi(t.ppid); pc('\n');
         ps("PGid:\t"); pi(t.pgid); pc('\n');
         ps("Sid:\t"); pi(t.sid); pc('\n');
+        ps("Uid:\t"); pi(t.uid); pc('\t'); pi(t.euid); pc('\t'); pi(t.suid); pc('\n');
+        ps("Gid:\t"); pi(t.gid); pc('\t'); pi(t.egid); pc('\t'); pi(t.sgid); pc('\n');
         ps("WChan:\t"); pi(t.state == TASK_SLEEPING ? t.wchan : 0); pc('\n');
         return 0;
     }

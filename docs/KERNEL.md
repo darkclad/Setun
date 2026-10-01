@@ -242,7 +242,7 @@ fmt_nl(f);
 2. **Languages:** there is no C compiler, so no `c99`; programs are written in Trine.
 3. **Formatted output:** there is no variadic `printf` unless Trine gains varargs (§10).
 4. **Threads:** no `pthread` in v1. `clone` exists only in its fork form.
-5. **Users:** single-user at first (root). The permission checks exist, but there are no login or `passwd` tools yet.
+5. **Users:** real users and groups with login, `su` and `passwd` (§22). Passwords use crypt-style `$id$salt$hash` strings with pluggable schemes; the only scheme so far is a single salted MD5, which is fast and therefore weak.
 
 ## 13. Milestones and review points
 
@@ -698,7 +698,7 @@ At boot the kernel mounts the tfs volume as `/`, and prints `VFS: Mounted root (
   | `clock_gettime` | 113: `CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the ticks |
   | `uname` | 160: six 65-character fields |
   | `umask` | 166: 022 at boot, applied when creating files and directories |
-  | `getuid`, `geteuid`, `getgid`, `getegid` | 174–177: always 0, since the system is single-user |
+  | `getuid`, `geteuid`, `getgid`, `getegid` | 174–177 (see §22 for the rest of the credential calls) |
 
 - **Close-on-exec:** `O_CLOEXEC` on `openat`, `pipe2` and `dup3`, and `FD_CLOEXEC`; `execve` closes the marked descriptors.
 - **Console:** a VT100 subset on the text screen: cursor position (`ESC[r;cH`), `ESC[J`/`2J`, `ESC[K`, cursor moves (`A`–`D`), and colours (`ESC[…m` with 0, 30–37, 40–47). The serial port passes escape sequences through unchanged.
@@ -881,3 +881,51 @@ The server keeps every window's pixels (server-side rendering), so clients never
   - tryte buffers inside structs need not be word-aligned, so the server decodes words arithmetically instead of casting pointers;
   - an unknown `ioctl` returned `EFAULT` instead of `ENOTTY`;
   - `lseek` was refused on `/dev/fb0`.
+
+## 22. Users and logins
+
+**Credentials** (`kernel/cred.tri`):
+- **What a task has:** real, effective and saved user and group IDs, plus up to 9 supplementary groups. `fork` copies them.
+- **Set-ID programs:** `execve` of a set-user-ID (04000) or set-group-ID (02000) file takes the file's owner or group as the effective ID.
+- **Calls,** with Linux's numbers and rules: `setuid` 146, `setgid` 144, `setreuid` 145, `setregid` 143, `setresuid`/`getresuid` 147/148, `setresgid`/`getresgid` 149/150, `getgroups`/`setgroups` 158/159 (setting needs root), `fchownat` 54 and `fchown` 55.
+
+**Ownership:** every inode has an owner and a group.
+- tfs keeps them in its on-disk inodes (words 2 and 3).
+- A new file belongs to its creator's effective IDs.
+- `stat` reports them, and `/proc/<pid>/status` shows `Uid:` and `Gid:` lines.
+
+**Permission checks:** by the owner, group (including supplementary groups) or other bits.
+- Root passes everything, except that it needs some execute bit to run a file.
+- **Paths:** search (x) on every directory walked through.
+- **open:** read and/or write by the access mode; `O_TRUNC` needs write. A file the call itself creates opens whatever its mode.
+- **Creating, removing, renaming, linking:** write and search on the directory. A sticky directory (01000, e.g. `/tmp`, which is mounted 01777) lets only the entry's owner, the directory's owner or root remove or rename an entry.
+- **chdir:** search. **execve:** execute.
+- **chmod:** owner or root.
+- **chown:** root may give anything. The owner may only change the group, to one of its own groups. A change by anyone else clears the set-ID bits.
+- **kill:** root, or a real/effective user ID equal to the target's real/saved one. `SIGCONT` also reaches the same session. Otherwise `EPERM`.
+- **mount, umount, reboot:** root only (`EPERM`).
+
+**Accounts:**
+- `/etc/passwd` (`name:x:uid:gid:gecos:home:shell`), `/etc/group` (`name:x:gid:members`) and `/etc/shadow` (`name:hash:…`, mode 0600).
+- `user/lib/pwd.tri` reads them: `getpwnam`, `getpwuid`, `getgrnam`, `getgrgid`, `getspnam`, `initgroups`. `user/lib/dbedit.tri` rewrites them through a temporary file and a rename.
+- The disk comes with `root` (password `root`), `user` (uid 1000, password `user`) and the group `wheel` holding both. `mkdisk` sets owners and modes from `SPECIAL_MODES`: `/etc/shadow` 0600, `su` and `passwd` set-user-ID root, `/root` 0700, `/home/user` owned by `user`.
+
+**Password hashing** (`user/lib/crypt.tri`), modular in the style of crypt(3):
+- **Format:** a stored hash reads `$id$salt$hash`; the id picks the scheme. Hashes from different schemes can live together, and an old one keeps working after the default changes.
+- **Adding a scheme:** write a function `(key, salt, out)` and register it in `crypt_init()`.
+- **The `md5` scheme:** the hex MD5 of salt and password, the only scheme so far. `crypt_new` makes a new 8-character salt from the clock, the pid, a counter and the previous salt.
+- **Entries that match nothing:** locked ones (`!`, `*`) and unknown schemes.
+
+**Programs:**
+- **init:** runs `/bin/login` on the console and starts it again whenever the session ends ("`init: login session exited with N`"). If login cannot run three times in a row, it falls back to a root shell.
+- **login:**
+  - asks for a name and a password, the password with the echo off, and allows three tries;
+  - hands `/dev/console`, `fb0`, `mouse` and `kbd` to the user, so they can run the window system;
+  - sets the groups, the group and the user;
+  - shows `/etc/motd`, then starts the shell as `-sh` in the home directory, with `HOME USER LOGNAME SHELL PATH TERM` set;
+  - `login -f user` (root only) skips the password.
+- **su [-] [user] [-c cmd]** (set-user-ID root): anyone but root must give the target's password.
+- **passwd [user]** (set-user-ID root): users change their own after giving the current password; root may change anyone's.
+- **useradd** `[-u uid] [-G groups] [-d home] [-s shell] [-c comment] name` gives the new user a private group (same number, from 1000 up), a home directory and a locked password. **userdel** `[-r] name` removes the user, its group and its memberships. Both are root only.
+- **id, whoami, groups, chown, chgrp** are applets of `misc`. **ls -l** shows owner and group names, and `s`/`t` for the set-ID and sticky bits.
+- **Tests:** they log in as root at the first prompt. `tests/users.rs` covers accounts, set-ID `passwd`, `su`, login failures and every permission refusal.

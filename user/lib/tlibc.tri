@@ -223,6 +223,20 @@ fn getuid() -> int { return syscall(174); }
 fn geteuid() -> int { return syscall(175); }
 fn getgid() -> int { return syscall(176); }
 fn getegid() -> int { return syscall(177); }
+fn setuid(u: int) -> int { return _ret(syscall(146, u)); }
+fn setgid(g: int) -> int { return _ret(syscall(144, g)); }
+fn setreuid(r: int, e: int) -> int { return _ret(syscall(145, r, e)); }
+fn setregid(r: int, e: int) -> int { return _ret(syscall(143, r, e)); }
+fn setresuid(r: int, e: int, s: int) -> int { return _ret(syscall(147, r, e, s)); }
+fn setresgid(r: int, e: int, s: int) -> int { return _ret(syscall(149, r, e, s)); }
+fn getresuid(r: *int, e: *int, s: *int) -> int { return _ret(syscall(148, r, e, s)); }
+fn getresgid(r: *int, e: *int, s: *int) -> int { return _ret(syscall(150, r, e, s)); }
+fn seteuid(e: int) -> int { return setresuid(-1, e, -1); }
+fn setegid(e: int) -> int { return setresgid(-1, e, -1); }
+fn getgroups(size: int, list: *int) -> int { return _ret(syscall(158, size, list)); }
+fn setgroups(n: int, list: *int) -> int { return _ret(syscall(159, n, list)); }
+fn chown(path: *char, u: int, g: int) -> int { return _ret(syscall(54, AT_FDCWD, path, u, g, 0)); }
+fn fchown(fd: int, u: int, g: int) -> int { return _ret(syscall(55, fd, u, g)); }
 fn umask(mask: int) -> int { return syscall(166, mask); }
 fn chmod(path: *char, mode: int) -> int { return _ret(syscall(53, AT_FDCWD, path, mode, 0)); }
 fn link(old: *char, new: *char) -> int { return _ret(syscall(37, AT_FDCWD, old, AT_FDCWD, new, 0)); }

@@ -26,6 +26,21 @@ fn with_init(test: &str, src: &str) -> Vec<(String, PathBuf)> {
 /// (no newline) 0.5 s of emulated time after the previous one, without
 /// waiting for a prompt: that is how ^C and ^Z arrive. Returns the console
 /// transcript.
+/// The first login: answer "login: " and "Password: " as root (password
+/// "root"). True if it typed something.
+fn auto_login(m: &mut setun_core::Machine, out: &str, logged_in: &mut bool) -> bool {
+    if out.ends_with("login: ") {
+        m.dev.serial_input("root\n");
+        return true;
+    }
+    if out.ends_with("Password: ") {
+        m.dev.serial_input("root\n");
+        *logged_in = true;
+        return true;
+    }
+    false
+}
+
 fn shell(lines: &[&str], max_steps: u64) -> String {
     let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot(&disk, 729, 0);
@@ -33,6 +48,7 @@ fn shell(lines: &[&str], max_steps: u64) -> String {
     let mut next = 0;
     let mut steps = 0;
     let mut since_input = 0;
+    let mut logged_in = false;
     while steps < max_steps {
         m.run(1_000_000);
         steps += 1_000_000;
@@ -41,7 +57,15 @@ fn shell(lines: &[&str], max_steps: u64) -> String {
         if out.contains("Kernel panic") {
             break;
         }
-        let Some(line) = lines.get(next) else { continue };
+        if !logged_in && auto_login(&mut m, &out, &mut logged_in) {
+            continue;
+        }
+        let Some(line) = lines.get(next) else {
+            if out.contains("init: login session exited") && out.ends_with("login: ") {
+                break; // the session ended and login asks again
+            }
+            continue;
+        };
         if let Some(raw) = line.strip_prefix('~') {
             if since_input >= 5_000_000 {
                 m.dev.serial_input(raw);
@@ -156,7 +180,7 @@ fn k3_k3test_forks_execs_and_waits() {
         "k3test: 5 fork/exec/wait cycles, no memory leaked",
         "k3test: heap ok, heap[999] = 42",
         "k3test: done",
-        "init: /bin/sh exited with 0",
+        "init: login session exited with 0",
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
@@ -166,10 +190,11 @@ fn k3_k3test_forks_execs_and_waits() {
 #[test]
 fn k4_shell_pipes_echo_into_cat() {
     let out = shell(&["echo hi | cat", "exit 5"], 150_000_000);
-    assert!(out.contains("init: pid 1, starting /bin/sh\n$ "), "{out}");
+    assert!(out.contains("init: pid 1, starting /bin/login\nlogin: root\nPassword: \n"), "{out}");
     assert!(out.contains("$ echo hi | cat\nhi\n$ exit 5\n"), "{out}");
-    assert!(out.contains("init: /bin/sh exited with 5"), "{out}");
-    assert!(out.contains("Attempted to kill init! exit status 1280"), "{out}");
+    // the session's end is reported, and login asks again (init lives on)
+    assert!(out.contains("init: login session exited with 5\nlogin: "), "{out}");
+    assert!(!out.contains("Attempted to kill init"), "{out}");
 }
 
 #[test]
@@ -197,14 +222,15 @@ fn k4_shell_files_dirs_and_status() {
         600_000_000,
     );
     for want in [
-        "$ pwd; cd /tmp; pwd\n/\n/tmp\n",
+        "$ pwd; cd /tmp; pwd\n/root\n/tmp\n",                     // a login starts at home
         "cat f\none\ntwo\n",
         "cat < f | cat | cat\none\ntwo\n",
         "&& ls\n/tmp/a/b\na\nf\n",
-        "$ ls /\nbin\ndev\netc\nhome\nmnt\nproc\nsbin\ntmp\n",
-        "-rwxr-xr-x 1 root root",
-        "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root root ",
-        "/etc:\n-rw-r--r-- 1 root root      65 motd\n",
+        "$ ls /\nbin\ndev\netc\nhome\nmnt\nproc\nroot\nsbin\ntmp\n",
+        "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root     root    ",
+        "/etc:\n-rw-r--r-- 1 root     root          44 group\n",
+        "-rw-r--r-- 1 root     root          65 motd\n",
+        "-rw------- 1 root     root         134 shadow\n",
         "Welcome to Trinux on Setun-386.\nEverything here is a power of 3.\n",
         "status 1\n",
         "or-ran\nand-ran\n",
@@ -215,7 +241,7 @@ fn k4_shell_files_dirs_and_status() {
         "/dev/null | cat\ncat: /nope: No such file or directory\n",
         "cat: f: No such file or directory\n",
         "$ cd /dev; ls\nconsole\nfb0\nkbd\nmouse\nnull\nptmx\npts\ntty\nttyS0\nzero\n",
-        "init: /bin/sh exited with 0",
+        "init: login session exited with 0",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
@@ -238,7 +264,7 @@ fn copy_dir(from: &Path, to: &Path) {
 fn k5_ctrl_c_interrupts_sleep() {
     let out = shell(&["sleep 100", "~\u{3}", "echo $?", "exit"], 100_000_000);
     assert!(out.contains("$ sleep 100\n^C\n$ echo $?\n130\n"), "{out}");
-    assert!(out.contains("init: /bin/sh exited with 0"), "{out}");
+    assert!(out.contains("init: login session exited with 0"), "{out}");
 }
 
 #[test]
@@ -312,7 +338,7 @@ fn k5_job_control() {
         "$ abc^C\n$ echo after\nafter\n",                       // ^C at the prompt drops the line
         "$ true\n[1]  Stopped                 cat\n",             // SIGTTIN for a background read
         "[1]  Killed                  cat\n",
-        "init: /bin/sh exited with 3",
+        "init: login session exited with 3",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }

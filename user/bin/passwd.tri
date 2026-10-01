@@ -1,0 +1,99 @@
+// passwd [user]: change a password.
+//
+// Installed set-user-ID root, since /etc/shadow is root's alone. A user
+// changes their own password and must give the current one; root may set
+// anyone's without it. The new hash uses crypt.tri's default scheme.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/pwd.tri";
+import "../lib/crypt.tri";
+import "../lib/dbedit.tri";
+
+fn ask_secret(p: *char, buf: *char, max: int) -> int {
+    fputs(STDERR_FILENO, p);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty) { tcsetattr(STDIN_FILENO, TCSANOW, &saved); fputs(STDERR_FILENO, "\n"); }
+    return got ? n : -1;
+}
+
+fn say(s: *char) -> int { fputs(STDERR_FILENO, s); return 1; }
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 2) { say("usage: passwd [user]\n"); return 2; }
+    if (geteuid() != 0) { return say("passwd: must be set-user-ID root\n"); }
+    var ruid: int = getuid();
+    var me: *passwd = getpwuid(ruid);
+    var name: [27]char;
+    if (argc == 2) {
+        strncpy(&name[0], argv[1], 26);
+    } else {
+        if (me == null) { return say("passwd: you do not exist in /etc/passwd\n"); }
+        strncpy(&name[0], me.pw_name, 26);
+    }
+    name[26] = 0;
+    var pw: *passwd = getpwnam(&name[0]);
+    if (pw == null) {
+        say("passwd: user '");
+        say(&name[0]);
+        return say("' does not exist\n");
+    }
+    if (ruid != 0 && pw.pw_uid != ruid) {
+        say("passwd: You may not change the password for ");
+        say(&name[0]);
+        return say(".\n");
+    }
+    say("Changing password for ");
+    say(&name[0]);
+    say(".\n");
+    if (ruid != 0) {
+        var stored: [243]char;
+        stored[0] = 0;
+        var sp: *spwd = getspnam(&name[0]);
+        if (sp != null) { strncpy(&stored[0], sp.sp_pwdp, 242); stored[242] = 0; }
+        if (stored[0] != 0) {
+            var old: [243]char;
+            if (ask_secret("Current password: ", &old[0], 243) < 0) { return 1; }
+            if (!crypt_verify(&old[0], &stored[0])) { return say("passwd: Authentication token manipulation error\n"); }
+        }
+    }
+    var a: [243]char;
+    var b: [243]char;
+    if (ask_secret("New password: ", &a[0], 243) < 0) { return 1; }
+    if (a[0] == 0) { return say("passwd: No password given; password unchanged\n"); }
+    if (ask_secret("Retype new password: ", &b[0], 243) < 0) { return 1; }
+    if (!streq(&a[0], &b[0])) { return say("Sorry, passwords do not match.\npasswd: password unchanged\n"); }
+    var hash: *char = crypt_new(&a[0]);
+    if (hash == null) { return say("passwd: cannot hash the password\n"); }
+    var line: [486]char;
+    strcpy(&line[0], &name[0]);
+    strcat(&line[0], ":");
+    strcat(&line[0], hash);
+    strcat(&line[0], ":0:0:99999:7:::");
+    if (db_replace("/etc/shadow", &name[0], &line[0], 1, 384) < 0) {   // 0600
+        perror2("passwd", "/etc/shadow");
+        return 1;
+    }
+    say("passwd: password updated successfully\n");
+    return 0;
+}

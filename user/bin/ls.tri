@@ -1,6 +1,7 @@
 // ls [-a] [-l] [path ...]: list directory contents, sorted by name.
 
 import "../lib/tlibc.tri";
+import "../lib/pwd.tri";
 
 var names: [243][27]char;
 var count: int;
@@ -35,16 +36,33 @@ fn type_char(m: int) -> *char {
     return "-";
 }
 
+// "-rwxr-xr-x", with s for set-user/group-ID and t for sticky in the
+// execute places (S and T when that execute bit is off).
 fn put_mode(m: int) {
     puts(type_char(m));
     var bits: *char = "rwxrwxrwx";
     var k: int = 0;
     var w: int = 256;
     while (k < 9) {
-        if (m / w % 2 != 0) { write(STDOUT_FILENO, &bits[k], 1); } else { puts("-"); }
+        var on: int = m / w % 2 != 0;
+        var special: int = (k == 2 && m / 2048 % 2 != 0) || (k == 5 && m / 1024 % 2 != 0) || (k == 8 && m / 512 % 2 != 0);
+        if (special) { puts(k == 8 ? (on ? "t" : "T") : (on ? "s" : "S")); }
+        else if (on) { write(STDOUT_FILENO, &bits[k], 1); } else { puts("-"); }
         w = w / 2;
         k += 1;
     }
+}
+
+// The names of owners and groups, looked up once each.
+var last_uid: int = -1;
+var last_user: [27]char;
+var last_gid: int = -1;
+var last_group: [27]char;
+
+fn put_name(s: *char) {
+    puts(s);
+    var n: int = strlen(s);
+    while (n < 8) { puts(" "); n += 1; }
 }
 
 fn put_padded(v: int, width: int) {
@@ -71,7 +89,13 @@ fn show(dir: *char, name: *char) {
             put_mode(st.st_mode);
             puts(" ");
             put_int(st.st_nlink);
-            puts(" root root ");
+            puts(" ");
+            if (st.st_uid != last_uid) { strncpy(&last_user[0], user_name(st.st_uid), 26); last_user[26] = 0; last_uid = st.st_uid; }
+            if (st.st_gid != last_gid) { strncpy(&last_group[0], group_name(st.st_gid), 26); last_group[26] = 0; last_gid = st.st_gid; }
+            put_name(&last_user[0]);
+            puts(" ");
+            put_name(&last_group[0]);
+            puts(" ");
             put_padded(st.st_size, 7);
             puts(" ");
         }

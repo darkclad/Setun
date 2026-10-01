@@ -251,8 +251,16 @@ mod tests {
                 return all;
             }
         }
-        panic!("no {want:?} in:
-{all}");
+        panic!("no {want:?} in:\n{all}");
+    }
+
+    /// Wait for the login prompt and sign in as root.
+    fn login() {
+        run_until("login: ", 80);
+        type_line("root\n");
+        run_until("Password: ", 20);
+        type_line("root\n");
+        run_until("$ ", 40);
     }
 
     fn type_line(s: &str) {
@@ -270,27 +278,21 @@ mod tests {
         setun_boot(KIND_TRINUX, 729, 1_790_000_000.0);
         assert_eq!(setun_kind(), KIND_TRINUX);
         assert_eq!(setun_disk_sectors(), 729);
-        run_until("$ ", 80);
-        type_line("echo hi from the web > /home/w; cat /home/w
-");
-        let out = run_until("hi from the web
-", 40);
+        login();
+        type_line("echo hi from the web > /home/w; cat /home/w\n");
+        let out = run_until("hi from the web\n", 40);
         assert!(out.contains("cat /home/w"), "{out}");
         // power-cycling keeps the disk: the file is still there
-        type_line("sync
-");
+        type_line("sync\n");
         run_until("$ ", 20);
         setun_power_cycle(1_790_000_100.0);
-        run_until("$ ", 80);
-        type_line("cat /home/w
-");
-        run_until("hi from the web
-", 40);
+        login();
+        type_line("cat /home/w\n");
+        run_until("hi from the web\n", 40);
         // a fresh disk does not have it
         setun_fresh_disk(1_790_000_200.0);
-        run_until("$ ", 80);
-        type_line("cat /home/w
-");
+        login();
+        type_line("cat /home/w\n");
         run_until("No such file or directory", 40);
     }
 

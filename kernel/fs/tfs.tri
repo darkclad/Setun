@@ -235,6 +235,8 @@ fn tfs_iload(i: int) -> int {
     inodes[i].nlink = p[DI_NLINK];
     inodes[i].size = p[DI_SIZE];
     inodes[i].mtime = p[DI_MTIME];
+    inodes[i].uid = p[DI_UID];
+    inodes[i].gid = p[DI_GID];
     if (inodes[i].size < 0 || inodes[i].nlink < 0) { return tfs_bad("size", inodes[i].size, ino); }
     return 0;
 }
@@ -247,6 +249,8 @@ fn tfs_isave(i: int) {
     dinode_set(ino, DI_SIZE, inodes[i].size);
     dinode_set(ino, DI_MTIME, inodes[i].mtime);
     dinode_set(ino, DI_CTIME, inodes[i].mtime);
+    dinode_set(ino, DI_UID, inodes[i].uid);
+    dinode_set(ino, DI_GID, inodes[i].gid);
 }
 
 fn add_blocks(ino: int, d: int) {

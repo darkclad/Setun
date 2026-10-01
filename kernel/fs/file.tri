@@ -222,11 +222,17 @@ fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     if (base < 0) { return base; }
     var i: int = path_lookup(&kpath[0], base);
     if (i >= 0 && has(flags, O_CREAT) && has(flags, O_EXCL)) { return -EEXIST; }
+    var created: int = 0;
     if (i == -ENOENT_ && has(flags, O_CREAT)) {
         i = vfs_create(&kpath[0], base, I_REG, apply_umask(mode % 512));
+        created = 1;                                  // a new file opens whatever its mode
     }
     if (i < 0) { return i; }
     var acc: int = flags % 4;
+    var want: int = acc == 0 ? MAY_READ : (acc == 1 ? MAY_WRITE : MAY_READ + MAY_WRITE);
+    if (acc == 0 && has(flags, O_TRUNC)) { want += MAY_WRITE; }
+    var p: int = inode_permission(i, want);
+    if (p < 0 && !created) { return p; }
     if (inodes[i].type == I_DIR && acc != 0) { return -EISDIR; }
     if (inodes[i].type != I_DIR && has(flags, O_DIRECTORY)) { return -ENOTDIR; }
     if (inodes[i].fs == FS_PROC && acc != 0) { return -EACCES; }
@@ -344,8 +350,8 @@ fn fill_stat(i: int, buf: int) -> int {
     st.st_ino = stat_ino(i);
     st.st_mode = st_mode(i);
     st.st_nlink = node.nlink;
-    st.st_uid = 0;
-    st.st_gid = 0;
+    st.st_uid = node.uid;
+    st.st_gid = node.gid;
     st.st_rdev = node.type == I_CHR ? node.rdev : 0;
     st.st_size = node.type == I_REG || node.type == I_DIR ? node.size : 0;
     st.st_blksize = PAGE;
@@ -447,6 +453,8 @@ fn sys_chdir(path: int) -> int {
     var i: int = path_lookup(&kpath[0], current_task().cwd);
     if (i < 0) { return i; }
     if (inodes[i].type != I_DIR) { return -ENOTDIR; }
+    var x: int = inode_permission(i, MAY_EXEC);
+    if (x < 0) { return x; }
     current_task().cwd = i;
     return 0;
 }
@@ -517,6 +525,7 @@ fn sys_statfs(path: int, buf: int) -> int {
 
 // mount(source, target, type, flags, data): ramfs/tmpfs and proc.
 fn sys_mount(source: int, target: int, type: int, flags: int, data: int) -> int {
+    if (!capable()) { return -EPERM_C; }
     var tname: [27]char;
     var src: [27]char;
     if (copy_user_string(type, &tname[0], 27) < 0) { return -EFAULT; }
@@ -538,6 +547,7 @@ fn sys_mount(source: int, target: int, type: int, flags: int, data: int) -> int 
 }
 
 fn sys_umount2(target: int, flags: int) -> int {
+    if (!capable()) { return -EPERM_C; }
     var r: int = get_path(target);
     if (r < 0) { return r; }
     var i: int = path_lookup(&kpath[0], current_task().cwd);
@@ -554,6 +564,7 @@ const REBOOT_CMD_HALT: int = 3454992675;
 
 fn sys_reboot(magic1: int, magic2: int, cmd: int) -> int {
     if (magic1 != REBOOT_MAGIC1 || magic2 != REBOOT_MAGIC2) { return -EINVAL; }
+    if (!capable()) { return -EPERM_C; }
     if (cmd != REBOOT_CMD_RESTART && cmd != REBOOT_CMD_POWER_OFF && cmd != REBOOT_CMD_HALT) { return -EINVAL; }
     if (tfs_shutdown() < 0) { printk("reboot: some buffers could not be written\n"); }
     if (cmd == REBOOT_CMD_RESTART) {

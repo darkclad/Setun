@@ -75,6 +75,7 @@ fn sys_fchmodat(dirfd: int, path: int, mode: int) -> int {
     var i: int = path_lookup(&kpath[0], base);
     if (i < 0) { return i; }
     if (inodes[i].fs == FS_PROC) { return -EPERM; }
+    if (!is_owner(i)) { return -EPERM; }
     inodes[i].mode = (mode % 4096 + 4096) % 4096;
     inodes[i].mtime = in(RTC_SECONDS);
     if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
@@ -98,6 +99,8 @@ fn sys_linkat(olddirfd: int, oldpath: int, newdirfd: int, newpath: int) -> int {
     var exists: int = fs_lookup(dir, &leaf[0], leaf_len);
     if (exists >= 0) { return -EEXIST; }
     if (exists != -ENOENT_) { return exists; }
+    var w: int = inode_permission(dir, MAY_WRITE + MAY_EXEC);
+    if (w < 0) { return w; }
     if (inodes[dir].mnt != inodes[src].mnt) { return -EXDEV; }
     if (inodes[src].fs != FS_TFS) { return -EPERM; }
     if (inodes[src].nlink >= 19683) { return -EMLINK; }
@@ -134,7 +137,6 @@ fn sys_fcntl(fd: int, cmd: int, arg: int) -> int {
     return -EINVAL;
 }
 
-fn sys_getuid() -> int { return 0; }       // single-user: everyone is root (KERNEL.md §12)
 
 // execve succeeded: close the descriptors marked close-on-exec.
 fn close_on_exec(t: *Task) {

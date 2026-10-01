@@ -159,39 +159,47 @@ fn send_signal_pgrp(pgrp: int, sig: int) -> int {
     return n;
 }
 
+// May the current task signal task i? Root may; others when their real or
+// effective user ID is the target's real or saved one (as on Linux). SIGCONT
+// also reaches anything in the same session.
+fn kill_ok(i: int, sig: int) -> int {
+    var t: *Task = current_task();
+    if (t.euid == 0) { return 1; }
+    var u: *Task = &tasks[i];
+    if (t.uid == u.uid || t.uid == u.suid || t.euid == u.uid || t.euid == u.suid) { return 1; }
+    return sig == SIGCONT && t.sid == u.sid;
+}
+
 // kill(2): pid > 0 one process, 0 our group, -1 everyone but init, < -1 group -pid.
+// EPERM when there were targets but none we may signal.
 fn sys_kill(pid: int, sig: int) -> int {
     if (sig < 0 || sig >= NSIG) { return -EINVAL; }
     var t: *Task = current_task();
     if (pid > 0) {
         var i: int = find_task(pid);
         if (i < 0 || tasks[i].state == TASK_ZOMBIE) { return -ESRCH; }
+        if (!kill_ok(i, sig)) { return -EPERM; }
         if (sig != 0) { send_signal(i, sig); }
         return 0;
     }
+    var found: int = 0;
     var n: int = 0;
-    if (pid == -1) {
-        var j: int = 1;
-        while (j < NTASKS) {
-            if (tasks[j].state != TASK_UNUSED && tasks[j].state != TASK_ZOMBIE && tasks[j].pid != 1 && j != current) {
+    var g: int = pid == 0 ? t.pgid : -pid;
+    var j: int = 1;
+    while (j < NTASKS) {
+        var live: int = tasks[j].state != TASK_UNUSED && tasks[j].state != TASK_ZOMBIE;
+        var target: int = pid == -1 ? live && tasks[j].pid != 1 && j != current : live && tasks[j].pgid == g;
+        if (target) {
+            found += 1;
+            if (kill_ok(j, sig)) {
                 if (sig != 0) { send_signal(j, sig); }
                 n += 1;
             }
-            j += 1;
         }
-    } else {
-        var g: int = pid == 0 ? t.pgid : -pid;
-        if (sig == 0) {
-            var k: int = 1;
-            while (k < NTASKS) {
-                if (tasks[k].state != TASK_UNUSED && tasks[k].state != TASK_ZOMBIE && tasks[k].pgid == g) { n += 1; }
-                k += 1;
-            }
-        } else {
-            n = send_signal_pgrp(g, sig);
-        }
+        j += 1;
     }
-    return n > 0 ? 0 : -ESRCH;
+    if (found == 0) { return -ESRCH; }
+    return n > 0 ? 0 : -EPERM;
 }
 
 // ---- system calls -------------------------------------------------------------------------

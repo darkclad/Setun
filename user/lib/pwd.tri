@@ -1,0 +1,207 @@
+// pwd: the user and group databases (pwd.h, grp.h, shadow.h).
+//
+//   /etc/passwd   name:x:uid:gid:gecos:home:shell
+//   /etc/group    name:x:gid:member,member,...
+//   /etc/shadow   name:hash:lastchange:min:max:warn:inactive:expire:   (root only)
+//
+// The lookups return a pointer to a static record, overwritten by the next
+// call (as in C); null when there is no such entry.
+
+import "tlibc.tri";
+import "string.tri";
+import "stdlib.tri";
+
+struct passwd {
+    pw_name: *char;
+    pw_passwd: *char;
+    pw_uid: int;
+    pw_gid: int;
+    pw_gecos: *char;
+    pw_dir: *char;
+    pw_shell: *char;
+}
+
+struct group {
+    gr_name: *char;
+    gr_passwd: *char;
+    gr_gid: int;
+    gr_mem: [27]*char;                // members, null-terminated
+}
+
+struct spwd {
+    sp_namp: *char;
+    sp_pwdp: *char;
+}
+
+const DB_MAX: int = 6561;
+
+var db_text: [6562]char;
+var db_line: [729]char;
+var db_fields: [10]*char;
+var pw_rec: passwd;
+var gr_rec: group;
+var sp_rec: spwd;
+
+// Read a whole database file into db_text. Its length, or -1.
+fn db_load(path: *char) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    var n: int = 0;
+    loop {
+        var r: int = read(fd, &db_text[n], DB_MAX - n);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        n += r;
+        if (n >= DB_MAX) { break; }
+    }
+    close(fd);
+    db_text[n] = 0;
+    return n;
+}
+
+// Line k of db_text, split at ':' into db_fields; the field count, or -1
+// past the last line. `at` is where to start; it moves to the next line.
+fn db_next(at: *int) -> int {
+    var i: int = at[0];
+    if (db_text[i] == 0) { return -1; }
+    var n: int = 0;
+    while (db_text[i] != 0 && db_text[i] != '\n' && n < 728) { db_line[n] = db_text[i]; n += 1; i += 1; }
+    if (db_text[i] == '\n') { i += 1; }
+    at[0] = i;
+    db_line[n] = 0;
+    var nf: int = 1;
+    db_fields[0] = &db_line[0];
+    var k: int = 0;
+    while (k < n) {
+        if (db_line[k] == ':') {
+            db_line[k] = 0;
+            if (nf < 10) { db_fields[nf] = &db_line[k + 1]; nf += 1; }
+        }
+        k += 1;
+    }
+    return nf;
+}
+
+fn db_int(s: *char) -> int {
+    var end: *char;
+    var v: int = strtol(s, &end, 10);
+    if (end == s || end[0] != 0) { return -1; }
+    return v;
+}
+
+fn pw_fill() -> *passwd {
+    pw_rec.pw_name = db_fields[0];
+    pw_rec.pw_passwd = db_fields[1];
+    pw_rec.pw_uid = db_int(db_fields[2]);
+    pw_rec.pw_gid = db_int(db_fields[3]);
+    pw_rec.pw_gecos = db_fields[4];
+    pw_rec.pw_dir = db_fields[5];
+    pw_rec.pw_shell = db_fields[6];
+    return &pw_rec;
+}
+
+// by name (uid < 0) or by uid
+fn pw_find(name: *char, uid: int) -> *passwd {
+    if (db_load("/etc/passwd") < 0) { return null; }
+    var at: int = 0;
+    loop {
+        var nf: int = db_next(&at);
+        if (nf < 0) { return null; }
+        if (nf < 7) { continue; }
+        if (name != null ? streq(db_fields[0], name) : db_int(db_fields[2]) == uid) { return pw_fill(); }
+    }
+}
+
+fn getpwnam(name: *char) -> *passwd { return pw_find(name, -1); }
+fn getpwuid(uid: int) -> *passwd { return pw_find(null, uid); }
+
+fn gr_find(name: *char, gid: int) -> *group {
+    if (db_load("/etc/group") < 0) { return null; }
+    var at: int = 0;
+    loop {
+        var nf: int = db_next(&at);
+        if (nf < 0) { return null; }
+        if (nf < 4) { continue; }
+        if (name != null ? !streq(db_fields[0], name) : db_int(db_fields[2]) != gid) { continue; }
+        gr_rec.gr_name = db_fields[0];
+        gr_rec.gr_passwd = db_fields[1];
+        gr_rec.gr_gid = db_int(db_fields[2]);
+        var m: int = 0;
+        var p: *char = db_fields[3];
+        while (p[0] != 0 && m < 26) {
+            gr_rec.gr_mem[m] = p;
+            m += 1;
+            var c: *char = strchr(p, ',');
+            if (c == null) { break; }
+            c[0] = 0;
+            p = &c[1];
+        }
+        gr_rec.gr_mem[m] = null;
+        return &gr_rec;
+    }
+}
+
+fn getgrnam(name: *char) -> *group { return gr_find(name, -1); }
+fn getgrgid(gid: int) -> *group { return gr_find(null, gid); }
+
+// The groups `user` belongs to: gid first, then every group listing it.
+// Their count (at most max).
+fn user_groups(user: *char, gid: int, out: *int, max: int) -> int {
+    var n: int = 0;
+    if (max > 0) { out[0] = gid; n = 1; }
+    if (db_load("/etc/group") < 0) { return n; }
+    var at: int = 0;
+    loop {
+        var nf: int = db_next(&at);
+        if (nf < 0) { break; }
+        if (nf < 4) { continue; }
+        var g: int = db_int(db_fields[2]);
+        if (g == gid) { continue; }
+        var p: *char = db_fields[3];
+        var member: int = 0;
+        while (p[0] != 0) {
+            var c: *char = strchr(p, ',');
+            var len: int = c == null ? strlen(p) : c as int - p as int;
+            if (len == strlen(user) && strncmp(p, user, len) == 0) { member = 1; }
+            if (c == null) { break; }
+            p = &c[1];
+        }
+        if (member && n < max) { out[n] = g; n += 1; }
+    }
+    return n;
+}
+
+// initgroups: set the supplementary groups for `user` (root only).
+fn initgroups(user: *char, gid: int) -> int {
+    var g: [9]int;
+    var n: int = user_groups(user, gid, &g[0], 9);
+    return setgroups(n, &g[0]);
+}
+
+fn getspnam(name: *char) -> *spwd {
+    if (db_load("/etc/shadow") < 0) { return null; }
+    var at: int = 0;
+    loop {
+        var nf: int = db_next(&at);
+        if (nf < 0) { return null; }
+        if (nf < 2 || !streq(db_fields[0], name)) { continue; }
+        sp_rec.sp_namp = db_fields[0];
+        sp_rec.sp_pwdp = db_fields[1];
+        return &sp_rec;
+    }
+}
+
+// The name of a user or group, or its number as text.
+var id_name_buf: [27]char;
+
+fn user_name(uid: int) -> *char {
+    var p: *passwd = getpwuid(uid);
+    if (p != null) { strncpy(&id_name_buf[0], p.pw_name, 26); id_name_buf[26] = 0; return &id_name_buf[0]; }
+    return itoa(uid, &id_name_buf[0]);
+}
+
+fn group_name(gid: int) -> *char {
+    var g: *group = getgrgid(gid);
+    if (g != null) { strncpy(&id_name_buf[0], g.gr_name, 26); id_name_buf[26] = 0; return &id_name_buf[0]; }
+    return itoa(gid, &id_name_buf[0]);
+}

@@ -100,7 +100,9 @@ fn start_kernel(disk: int, frames: int) {
     var point: int = path_lookup("/proc", root_ino);
     if (point < 0 || do_mount(FS_PROC, point, "proc", "/proc") < 0) { printk("VFS: cannot mount /proc\n"); }
     point = path_lookup("/tmp", root_ino);
-    if (point < 0 || do_mount(FS_RAM, point, "tmpfs", "/tmp") < 0) { printk("VFS: cannot mount /tmp\n"); }
+    var tm: int = point < 0 ? -1 : do_mount(FS_RAM, point, "tmpfs", "/tmp");
+    if (tm < 0) { printk("VFS: cannot mount /tmp\n"); }
+    else { inodes[mounts[tm].root].mode = 1023; }    // 01777: all may write; the sticky bit protects
     tty_init();
     input_init();
     printk("VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty\n");

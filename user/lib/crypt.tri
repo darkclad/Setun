@@ -1,0 +1,145 @@
+// crypt: password hashing with pluggable schemes, in the style of crypt(3).
+//
+// A stored password is "$id$salt$hash"; the id picks the scheme, so hashes
+// made by different schemes can live side by side and an old scheme keeps
+// working after a new one becomes the default. To add a scheme, write a
+// function fn(key, salt, out) -> int that puts the hash text into out
+// (returning 0, or -1 if it cannot) and register it in crypt_init().
+//
+//   crypt(key, setting)      setting "$id$salt" or a whole stored hash;
+//                            returns "$id$salt$hash" (static) or null
+//   crypt_verify(key, hash)  1 if key matches the stored hash
+//   crypt_new(key)           a fresh hash with a random salt, default scheme
+//
+// Schemes:
+//   md5   the hex MD5 digest of salt + key. Simple and fast, which also
+//         means fast to guess: kept as the first scheme, not the last.
+
+import "tlibc.tri";
+import "string.tri";
+import "md5.tri";
+
+const CRYPT_SALT_LEN: int = 8;
+const CRYPT_MAX: int = 243;
+
+var crypt_ids: [9]*char;
+var crypt_fns: [9]fn(*char, *char, *char) -> int;
+var ncrypt: int;
+var crypt_out: [243]char;
+
+// The scheme new passwords get.
+fn crypt_default() -> *char { return "md5"; }
+
+fn crypt_register(id: *char, f: fn(*char, *char, *char) -> int) {
+    if (ncrypt < 9) { crypt_ids[ncrypt] = id; crypt_fns[ncrypt] = f; ncrypt += 1; }
+}
+
+fn crypt_init() {
+    if (ncrypt > 0) { return; }
+    crypt_register("md5", &crypt_md5);
+}
+
+// md5: hex MD5 of salt followed by the key.
+fn crypt_md5(key: *char, salt: *char, out: *char) -> int {
+    md5_init();
+    var k: int = 0;
+    while (salt[k] != 0) { md5_put_char(salt[k]); k += 1; }
+    k = 0;
+    while (key[k] != 0) { md5_put_char(key[k]); k += 1; }
+    md5_digest_hex(out);
+    return 0;
+}
+
+fn crypt_salt_ok(c: int) -> int {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '/';
+}
+
+fn crypt(key: *char, setting: *char) -> *char {
+    crypt_init();
+    if (setting[0] != '$') { return null; }
+    var id: [27]char;
+    var salt: [27]char;
+    var i: int = 1;
+    var n: int = 0;
+    while (setting[i] != 0 && setting[i] != '$' && n < 26) { id[n] = setting[i]; n += 1; i += 1; }
+    id[n] = 0;
+    if (setting[i] != '$') { return null; }
+    i += 1;
+    n = 0;
+    while (setting[i] != 0 && setting[i] != '$' && n < 26) {
+        if (!crypt_salt_ok(setting[i])) { return null; }
+        salt[n] = setting[i];
+        n += 1;
+        i += 1;
+    }
+    salt[n] = 0;
+    if (n == 0) { return null; }
+    var s: int = 0;
+    while (s < ncrypt) {
+        if (streq(crypt_ids[s], &id[0])) {
+            var hash: [243]char;
+            var f: fn(*char, *char, *char) -> int = crypt_fns[s];
+            if (f(key, &salt[0], &hash[0]) < 0) { return null; }
+            strcpy(&crypt_out[0], "$");
+            strcat(&crypt_out[0], &id[0]);
+            strcat(&crypt_out[0], "$");
+            strcat(&crypt_out[0], &salt[0]);
+            strcat(&crypt_out[0], "$");
+            strcat(&crypt_out[0], &hash[0]);
+            return &crypt_out[0];
+        }
+        s += 1;
+    }
+    return null;                                        // an unknown scheme
+}
+
+// Does key match the stored hash? A locked ("!" or "*") or empty-scheme
+// entry matches nothing.
+fn crypt_verify(key: *char, stored: *char) -> int {
+    if (stored == null || stored[0] != '$' || strlen(stored) >= CRYPT_MAX) { return 0; }
+    var copy: [243]char;                                // stored may be crypt's own buffer
+    strcpy(&copy[0], stored);
+    var h: *char = crypt(key, &copy[0]);
+    return h != null && streq(h, &copy[0]);
+}
+
+var crypt_calls: int;
+var crypt_last_salt: [27]char;
+
+// A random salt: MD5 of the clock, pid, a call counter and the previous
+// salt (the clock moves only every tick, so two salts made in one tick
+// must still differ), mapped onto the salt alphabet.
+fn crypt_make_salt(out: *char) {
+    var ts: timespec;
+    clock_gettime(0, &ts);
+    crypt_calls += 1;
+    var seed: [81]char;
+    var b: [15]char;
+    strcpy(&seed[0], itoa(ts.tv_sec, &b[0]));
+    strcat(&seed[0], ".");
+    strcat(&seed[0], itoa(ts.tv_nsec, &b[0]));
+    strcat(&seed[0], ".");
+    strcat(&seed[0], itoa(getpid(), &b[0]));
+    strcat(&seed[0], ".");
+    strcat(&seed[0], itoa(crypt_calls, &b[0]));
+    strcat(&seed[0], &crypt_last_salt[0]);
+    var d: [16]int;
+    md5_init();
+    var k: int = 0;
+    while (seed[k] != 0) { md5_put_char(seed[k]); k += 1; }
+    md5_final(&d[0]);
+    var alphabet: *char = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    k = 0;
+    while (k < CRYPT_SALT_LEN) { out[k] = alphabet[d[k] % 64]; k += 1; }
+    out[CRYPT_SALT_LEN] = 0;
+    strcpy(&crypt_last_salt[0], out);
+}
+
+fn crypt_new(key: *char) -> *char {
+    var setting: [27]char;
+    strcpy(&setting[0], "$");
+    strcat(&setting[0], crypt_default());
+    strcat(&setting[0], "$");
+    crypt_make_salt(&setting[strlen(&setting[0])]);
+    return crypt(key, &setting[0]);
+}

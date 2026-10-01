@@ -11,6 +11,7 @@ fn session_m(lines: &[&str], max_steps: u64) -> (String, setun_core::Machine) {
     let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
     let mut out = String::new();
     let (mut next, mut steps, mut idle) = (0, 0, 0);
+    let mut logged_in = false;
     while steps < max_steps && !m.powered_off {
         m.run(1_000_000);
         steps += 1_000_000;
@@ -19,7 +20,22 @@ fn session_m(lines: &[&str], max_steps: u64) -> (String, setun_core::Machine) {
         if out.contains("Kernel panic") {
             break;
         }
-        let Some(line) = lines.get(next) else { continue };
+        // the first login is root's (password "root"); later ones are the test's
+        if !logged_in && out.ends_with("login: ") {
+            m.dev.serial_input("root\n");
+            continue;
+        }
+        if !logged_in && out.ends_with("Password: ") {
+            m.dev.serial_input("root\n");
+            logged_in = true;
+            continue;
+        }
+        let Some(line) = lines.get(next) else {
+            if out.contains("init: login session exited") && out.ends_with("login: ") {
+                break;
+            }
+            continue;
+        };
         if let Some(raw) = line.strip_prefix('~') {
             if idle >= 3_000_000 {
                 m.dev.serial_input(raw);
@@ -102,7 +118,7 @@ fn k7_shell_language() {
             "3 alpha\n<alpha>\n<beta gamma>\n<delta>\nbeta gamma\n",
             "sleep mv cp sort\n",
             "nomatch*\n",
-            "$ echo ~ ~/x\n/ //x\n",
+            "$ echo ~ ~/x\n/root /root/x\n",
             "FOO=prefix\nafter: []\n",
             "child sees exported\nchild sees []\n",
             "<Welcome to Trinux on Setun-386.>\n<Everything here is a power of 3.>\n",
@@ -176,7 +192,7 @@ fn k7_shell_errors() {
             "sh: for: bad variable name: 1v\n",
             "empty-case 0\n",
             "ok-after-errors\n",
-            "init: /bin/sh exited with 4",
+            "init: login session exited with 4",
         ],
     );
     // (the commands are echoed as typed, so the markers are split by quotes)
@@ -311,7 +327,7 @@ fn sh_functions_eval_heredocs_errors() {
             "unset-ok\n",
             "sh: undefined_var: boom\nstatus 1\n",
             "ok-after-errors\n",
-            "init: /bin/sh exited with 5",
+            "init: login session exited with 5",
         ],
     );
 }
@@ -395,7 +411,7 @@ fn sh_aliases_and_local_errors() {
             "sh: loop: not found\nstatus 127\n",
             "sh: self: not found\nstatus 127\n",
             "ok-after-errors\n",
-            "init: /bin/sh exited with 6",
+            "init: login session exited with 6",
         ],
     );
 }
@@ -705,9 +721,9 @@ fn k7_utilities() {
             "2:apple\n4:apple\n1\nCherry\nban",
             "date\nfound\nbanana\n",
             "banana\nf\n",
-            "-rw-r--r-- 2 root root      31 /home/f\n-rw------- 2 root root      31 /home/f2\n-rwxr--r-- 2 root root      31 /home/f\n",
+            "-rw-r--r-- 2 root     root          31 /home/f\n-rw------- 2 root     root          31 /home/f2\n-rwxr--r-- 2 root     root          31 /home/f\n",
             "file\ny\n/usr/lib\n.\n/\n",
-            "3\n4\n5\nA=1\nB=2\n/\nprintenv-status 1\n",
+            "3\n4\n5\nA=1\nB=2\n/root\nprintenv-status 1\n",
             "is-file\nis-dir\ncompound\n",
             "0\n1\n",
             "trit\ntrit\ntrit\n",

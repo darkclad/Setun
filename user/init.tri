@@ -1,30 +1,42 @@
-// /sbin/init: run /bin/sh on the console, reap orphans, and exit with the
-// shell's status when it exits (which the kernel reports as Linux does:
-// "Attempted to kill init!"). Runlevels and respawning come later.
+// /sbin/init: run /bin/login on the console, start it again whenever the
+// session ends, and reap orphans. If login cannot be run at all, fall back
+// to a root shell, so a broken disk can still be repaired.
 
 import "lib/tlibc.tri";
+
+fn spawn(path: *char, name: *char) -> int {
+    var pid: int = fork();
+    if (pid == 0) {
+        var args: [2]*char = { name, null };
+        execve(path, &args[0], environ);              // HOME=/ TERM=linux from the kernel
+        perror2("init", path);
+        _exit(127);
+    }
+    return pid;
+}
 
 fn main(argc: int, argv: **char) -> int {
     puts("init: pid ");
     put_int(getpid());
-    puts(", starting /bin/sh\n");
-    var pid: int = fork();
-    if (pid == 0) {
-        var args: [2]*char = { "sh", null };
-        execve("/bin/sh", &args[0], environ);           // HOME=/ TERM=linux from the kernel
-        perror2("init", "/bin/sh");
-        _exit(127);
-    }
+    puts(", starting /bin/login\n");
+    var pid: int = spawn("/bin/login", "login");
+    var quick_failures: int = 0;
     loop {
         var status: int = 0;
         var w: int = wait(&status);
         if (w < 0) { return 1; }
-        if (w == pid) {
-            var code: int = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
-            puts("init: /bin/sh exited with ");
-            put_int(code);
-            puts("\n");
-            return code;
+        if (w != pid) { continue; }                     // an orphan
+        var code: int = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        puts("init: login session exited with ");
+        put_int(code);
+        puts("\n");
+        if (code == 127) { quick_failures += 1; } else { quick_failures = 0; }
+        if (quick_failures >= 3) {
+            puts("init: /bin/login does not run; starting a root shell\n");
+            pid = spawn("/bin/sh", "sh");
+            quick_failures = 0;
+            continue;
         }
+        pid = spawn("/bin/login", "login");
     }
 }

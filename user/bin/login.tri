@@ -1,0 +1,160 @@
+// login: sign a user in on the terminal and start their shell.
+//
+//   login           ask for a name and a password (three tries)
+//   login -f user   no password (root only), e.g. for a scripted session
+//
+// The password is checked against /etc/shadow (crypt.tri) with the echo
+// off. Then the console devices (/dev/console, fb0, mouse, kbd) are handed
+// to the user, so they can run the window system; the supplementary groups,
+// group and user are set; and the shell starts in the home directory as a
+// login shell ("-sh") with HOME, USER, LOGNAME, SHELL, PATH and TERM.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/pwd.tri";
+import "../lib/crypt.tri";
+
+// Read a line from the terminal after printing p; echo off for passwords.
+// Its length, or -1 at the end of the input.
+fn ask(p: *char, buf: *char, max: int, echo: int) -> int {
+    fputs(STDOUT_FILENO, p);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty && !echo) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty && !echo) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+        fputs(STDOUT_FILENO, "\n");
+    }
+    return got ? n : -1;
+}
+
+fn wipe(s: *char, n: int) {
+    var k: int = 0;
+    while (k < n) { s[k] = 0; k += 1; }
+}
+
+var env_store: [1458]char;            // 6 strings of up to 243
+var env_vec: [7]*char;
+
+fn env_put(k: int, name: *char, value: *char) {
+    var e: *char = &env_store[243 * k];
+    strcpy(e, name);
+    strcat(e, "=");
+    strncat(e, value, 200);
+    env_vec[k] = e;
+}
+
+fn start_session(pw: *passwd) {
+    // copy what we need: the next database lookup overwrites the record
+    var name: [27]char;
+    var home: [243]char;
+    var shell: [243]char;
+    strncpy(&name[0], pw.pw_name, 26);
+    name[26] = 0;
+    strncpy(&home[0], pw.pw_dir, 242);
+    home[242] = 0;
+    strncpy(&shell[0], pw.pw_shell[0] != 0 ? pw.pw_shell : "/bin/sh", 242);
+    shell[242] = 0;
+    var uid: int = pw.pw_uid;
+    var gid: int = pw.pw_gid;
+    var devs: [4]*char = { "/dev/console", "/dev/fb0", "/dev/mouse", "/dev/kbd" };
+    var k: int = 0;
+    while (k < 4) { chown(devs[k], uid, gid); k += 1; }
+    if (initgroups(&name[0], gid) < 0 || setgid(gid) < 0 || setuid(uid) < 0) {
+        perror2("login", "cannot set the user and group");
+        _exit(1);
+    }
+    if (chdir(&home[0]) < 0) {
+        fputs(STDOUT_FILENO, "No directory, logging in with HOME=/\n");
+        strcpy(&home[0], "/");
+        chdir("/");
+    }
+    var term: *char = getenv("TERM");
+    env_put(0, "HOME", &home[0]);
+    env_put(1, "USER", &name[0]);
+    env_put(2, "LOGNAME", &name[0]);
+    env_put(3, "SHELL", &shell[0]);
+    env_put(4, "PATH", uid == 0 ? "/bin:/sbin" : "/bin");
+    env_put(5, "TERM", term == null ? "linux" : term);
+    env_vec[6] = null;
+    // the message of the day
+    var fd: int = open("/etc/motd", O_RDONLY, 0);
+    if (fd >= 0) {
+        var buf: [729]char;
+        loop {
+            var r: int = read(fd, &buf[0], 729);
+            if (r <= 0) { break; }
+            write(STDOUT_FILENO, &buf[0], r);
+        }
+        close(fd);
+    }
+    // a login shell: argv[0] is "-" and the program's name
+    var arg0: [243]char;
+    var base: *char = strrchr(&shell[0], '/');
+    strcpy(&arg0[0], "-");
+    strncat(&arg0[0], base == null ? &shell[0] : &base[1], 200);
+    var args: [2]*char = { &arg0[0], null };
+    execve(&shell[0], &args[0], &env_vec[0]);
+    perror2("login", &shell[0]);
+    _exit(127);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc == 3 && streq(argv[1], "-f")) {
+        if (getuid() != 0) { fputs(STDERR_FILENO, "login: -f: Permission denied\n"); return 1; }
+        var p: *passwd = getpwnam(argv[2]);
+        if (p == null) { fputs(STDERR_FILENO, "login: no such user\n"); return 1; }
+        start_session(p);
+    }
+    if (argc != 1) { fputs(STDERR_FILENO, "usage: login [-f user]\n"); return 2; }
+    if (geteuid() != 0) { fputs(STDERR_FILENO, "login: must be run by root\n"); return 1; }
+    var tries: int = 0;
+    while (tries < 3) {
+        var name: [81]char;
+        var n: int = ask("login: ", &name[0], 81, 1);
+        if (n < 0) { return 1; }
+        if (n == 0) { continue; }
+        var pass: [243]char;
+        var pw: *passwd = getpwnam(&name[0]);
+        var stored: [243]char;
+        stored[0] = 0;
+        if (pw != null) {
+            var sp: *spwd = getspnam(&name[0]);
+            strncpy(&stored[0], sp != null ? sp.sp_pwdp : pw.pw_passwd, 242);
+            stored[242] = 0;
+        }
+        var ok: int;
+        if (pw != null && stored[0] == 0) {
+            ok = 1;                                     // an empty password field: none needed
+        } else {
+            if (ask("Password: ", &pass[0], 243, 0) < 0) { return 1; }
+            ok = pw != null && crypt_verify(&pass[0], &stored[0]);
+            wipe(&pass[0], 243);
+        }
+        if (ok) {
+            pw = getpwnam(&name[0]);                    // the shadow lookup reused the buffer
+            start_session(pw);
+        }
+        fputs(STDOUT_FILENO, "Login incorrect\n");
+        tries += 1;
+    }
+    return 1;
+}

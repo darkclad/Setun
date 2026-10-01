@@ -56,7 +56,8 @@ fn exec_load() -> int {
     var file: int = path_lookup(&exec_path[0], exec_cwd);
     if (file < 0) { return file; }
     if (inodes[file].type != I_REG) { return -13; }                 // EACCES
-    if (inodes[file].mode / 64 % 2 == 0) { return -13; }            // no owner execute bit
+    var x: int = inode_permission(file, MAY_EXEC);
+    if (x < 0) { return x; }
     var fsize: int = inodes[file].size;
     if (fsize < 18) { return -ENOEXEC; }
     var r: int = vfs_read(file, 0, bytes(&exec_hdr[0]), 18);
@@ -128,6 +129,7 @@ fn exec_load() -> int {
     load_envp = envp;
     load_heap = bss;
     load_brk = bss + bss_size;
+    creds_exec(file);                                 // set-user-ID and set-group-ID programs
     return 0;
 }
 

@@ -66,8 +66,9 @@ sh web/build.sh                                # rebuild web/setun.wasm (BIOS + 
 python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```
 
-The browser page boots Trinux from the built-in disk (3^7 pages of RAM): type
-at the prompt, or press **Window system** for `trwm term clock colors paint`.
+The browser page boots Trinux from the built-in disk (3^7 pages of RAM). Log in
+as `user` (password `user`) or `root` (password `root`), then type at the
+prompt, or press **Window system** for `trwm term clock colors paint`.
 Power-cycle keeps the disk, so files written in the browser survive a reboot;
 **Fresh disk** restores it. The old demo ROM is still under **Boot**.
 

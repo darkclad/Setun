@@ -1,0 +1,241 @@
+// cred: users and groups, as on Linux.
+//
+// Every task has a real, effective and saved user ID (uid, euid, suid), the
+// same three for its group, and up to 9 supplementary groups. Root is euid
+// 0: it passes every permission check (but needs some execute bit to run a
+// file). Files carry an owner and group; inode_permission() checks the
+// owner, group or other bits of the mode against the task's euid, egid and
+// groups. execve of a set-user-ID (04000) or set-group-ID (02000) file
+// takes the file's owner or group as the effective ID.
+
+import "params.tri";
+
+const MAY_EXEC: int = 1;
+const MAY_WRITE: int = 2;
+const MAY_READ: int = 4;
+const NGROUPS_MAX: int = 9;
+const S_ISUID: int = 2048;
+const S_ISGID: int = 1024;
+const S_ISVTX: int = 512;
+const EPERM_C: int = 1;
+const EACCES_C: int = 13;
+const EINVAL_C: int = 22;
+const EFAULT_C: int = 14;
+
+fn cur_euid() -> int { return current_task().euid; }
+fn cur_egid() -> int { return current_task().egid; }
+fn capable() -> int { return current_task().euid == 0; }
+
+fn in_group_p(g: int) -> int {
+    var t: *Task = current_task();
+    if (t.egid == g) { return 1; }
+    var k: int = 0;
+    while (k < t.ngroups) { if (t.groups[k] == g) { return 1; } k += 1; }
+    return 0;
+}
+
+// May the current task read / write / execute (mask: MAY_*) inode i?
+// 0 or -EACCES.
+fn inode_permission(i: int, mask: int) -> int {
+    var t: *Task = current_task();
+    var m: int = inodes[i].mode;
+    if (t.euid == 0) {
+        if (mask % 2 != 0 && inodes[i].type != I_DIR && m / 64 % 2 == 0 && m / 8 % 2 == 0 && m % 2 == 0) { return -EACCES_C; }
+        return 0;
+    }
+    var bits: int;
+    if (inodes[i].uid == t.euid) { bits = m / 64 % 8; }
+    else if (in_group_p(inodes[i].gid)) { bits = m / 8 % 8; }
+    else { bits = m % 8; }
+    if (mask / 4 % 2 != 0 && bits / 4 % 2 == 0) { return -EACCES_C; }
+    if (mask / 2 % 2 != 0 && bits / 2 % 2 == 0) { return -EACCES_C; }
+    if (mask % 2 != 0 && bits % 2 == 0) { return -EACCES_C; }
+    return 0;
+}
+
+// Owner (or root): may change the mode, times and so on.
+fn is_owner(i: int) -> int { return capable() || inodes[i].uid == cur_euid(); }
+
+// A sticky directory (like /tmp) lets only the owner of an entry, the
+// owner of the directory or root remove or rename it.
+fn sticky_ok(dir: int, i: int) -> int {
+    if (inodes[dir].mode / S_ISVTX % 2 == 0) { return 1; }
+    return capable() || inodes[i].uid == cur_euid() || inodes[dir].uid == cur_euid();
+}
+
+fn creds_fork(parent: *Task, child: *Task) {
+    child.uid = parent.uid;
+    child.euid = parent.euid;
+    child.suid = parent.suid;
+    child.gid = parent.gid;
+    child.egid = parent.egid;
+    child.sgid = parent.sgid;
+    child.ngroups = parent.ngroups;
+    var k: int = 0;
+    while (k < NGROUPS_MAX) { child.groups[k] = parent.groups[k]; k += 1; }
+}
+
+// execve: set-ID bits of the new program's file.
+fn creds_exec(file: int) {
+    var t: *Task = current_task();
+    var m: int = inodes[file].mode;
+    if (m / S_ISUID % 2 != 0) { t.euid = inodes[file].uid; }
+    if (m / S_ISGID % 2 != 0) { t.egid = inodes[file].gid; }
+    t.suid = t.euid;
+    t.sgid = t.egid;
+}
+
+// ---- system calls ----
+
+fn sys_getuid() -> int { return current_task().uid; }
+fn sys_geteuid() -> int { return current_task().euid; }
+fn sys_getgid() -> int { return current_task().gid; }
+fn sys_getegid() -> int { return current_task().egid; }
+
+// setuid: root sets all three; others may only switch the effective ID to
+// their real or saved one.
+fn sys_setuid(u: int) -> int {
+    var t: *Task = current_task();
+    if (u < 0) { return -EINVAL_C; }
+    if (t.euid == 0) { t.uid = u; t.euid = u; t.suid = u; return 0; }
+    if (u == t.uid || u == t.suid) { t.euid = u; return 0; }
+    return -EPERM_C;
+}
+
+fn sys_setgid(g: int) -> int {
+    var t: *Task = current_task();
+    if (g < 0) { return -EINVAL_C; }
+    if (t.euid == 0) { t.gid = g; t.egid = g; t.sgid = g; return 0; }
+    if (g == t.gid || g == t.sgid) { t.egid = g; return 0; }
+    return -EPERM_C;
+}
+
+// One of the three IDs may become v (-1 leaves it) if root, or if v is
+// one of the current three.
+fn id_allowed(v: int, a: int, b: int, c: int) -> int {
+    return v == -1 || capable() || v == a || v == b || v == c;
+}
+
+fn sys_setresuid(r: int, e: int, s: int) -> int {
+    var t: *Task = current_task();
+    if (!id_allowed(r, t.uid, t.euid, t.suid) || !id_allowed(e, t.uid, t.euid, t.suid) || !id_allowed(s, t.uid, t.euid, t.suid)) {
+        return -EPERM_C;
+    }
+    if (r != -1) { t.uid = r; }
+    if (e != -1) { t.euid = e; }
+    if (s != -1) { t.suid = s; }
+    return 0;
+}
+
+fn sys_setresgid(r: int, e: int, s: int) -> int {
+    var t: *Task = current_task();
+    if (!id_allowed(r, t.gid, t.egid, t.sgid) || !id_allowed(e, t.gid, t.egid, t.sgid) || !id_allowed(s, t.gid, t.egid, t.sgid)) {
+        return -EPERM_C;
+    }
+    if (r != -1) { t.gid = r; }
+    if (e != -1) { t.egid = e; }
+    if (s != -1) { t.sgid = s; }
+    return 0;
+}
+
+// setreuid: as setresuid, and the saved ID follows the effective one when
+// the real ID is set or the effective one changes to something else.
+fn sys_setreuid(r: int, e: int) -> int {
+    var t: *Task = current_task();
+    var old: int = t.uid;
+    if (r != -1 && !capable() && r != t.uid && r != t.euid) { return -EPERM_C; }
+    if (!id_allowed(e, t.uid, t.euid, t.suid)) { return -EPERM_C; }
+    if (r != -1) { t.uid = r; }
+    if (e != -1) { t.euid = e; }
+    if (r != -1 || (e != -1 && e != old)) { t.suid = t.euid; }
+    return 0;
+}
+
+fn sys_setregid(r: int, e: int) -> int {
+    var t: *Task = current_task();
+    var old: int = t.gid;
+    if (r != -1 && !capable() && r != t.gid && r != t.egid) { return -EPERM_C; }
+    if (!id_allowed(e, t.gid, t.egid, t.sgid)) { return -EPERM_C; }
+    if (r != -1) { t.gid = r; }
+    if (e != -1) { t.egid = e; }
+    if (r != -1 || (e != -1 && e != old)) { t.sgid = t.egid; }
+    return 0;
+}
+
+fn put_user_int(p: int, v: int) -> int {
+    if (!user_range_ok(p - 1, 3)) { return -EFAULT_C; }
+    *(p as *int) = v;
+    return 0;
+}
+
+fn sys_getresuid(r: int, e: int, s: int) -> int {
+    var t: *Task = current_task();
+    if (put_user_int(r, t.uid) < 0 || put_user_int(e, t.euid) < 0 || put_user_int(s, t.suid) < 0) { return -EFAULT_C; }
+    return 0;
+}
+
+fn sys_getresgid(r: int, e: int, s: int) -> int {
+    var t: *Task = current_task();
+    if (put_user_int(r, t.gid) < 0 || put_user_int(e, t.egid) < 0 || put_user_int(s, t.sgid) < 0) { return -EFAULT_C; }
+    return 0;
+}
+
+// getgroups(size, list): with size 0, just the count.
+fn sys_getgroups(size: int, list: int) -> int {
+    var t: *Task = current_task();
+    if (size == 0) { return t.ngroups; }
+    if (size < t.ngroups) { return -EINVAL_C; }
+    if (!user_range_ok(list - 1, 3 * t.ngroups)) { return -EFAULT_C; }
+    var p: *int = list as *int;
+    var k: int = 0;
+    while (k < t.ngroups) { p[k] = t.groups[k]; k += 1; }
+    return t.ngroups;
+}
+
+fn sys_setgroups(n: int, list: int) -> int {
+    if (!capable()) { return -EPERM_C; }
+    if (n < 0 || n > NGROUPS_MAX) { return -EINVAL_C; }
+    if (n > 0 && !user_range_ok(list - 1, 3 * n)) { return -EFAULT_C; }
+    var t: *Task = current_task();
+    var p: *int = list as *int;
+    var k: int = 0;
+    while (k < n) { t.groups[k] = p[k]; k += 1; }
+    t.ngroups = n;
+    return 0;
+}
+
+// chown: root may give any owner and group; the owner may only change the
+// group, to one of its own. A change by anyone else but root clears the
+// set-ID bits.
+fn do_chown(i: int, u: int, g: int) -> int {
+    if (inodes[i].fs == FS_PROC) { return -EPERM_C; }
+    if (!capable()) {
+        if (inodes[i].uid != cur_euid()) { return -EPERM_C; }
+        if (u != -1 && u != inodes[i].uid) { return -EPERM_C; }
+        if (g != -1 && g != inodes[i].gid && !in_group_p(g)) { return -EPERM_C; }
+    }
+    if (u != -1) { inodes[i].uid = u; }
+    if (g != -1) { inodes[i].gid = g; }
+    if (!capable() && inodes[i].type == I_REG) {
+        if (inodes[i].mode / S_ISUID % 2 != 0) { inodes[i].mode -= S_ISUID; }
+        if (inodes[i].mode / S_ISGID % 2 != 0) { inodes[i].mode -= S_ISGID; }
+    }
+    if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
+    return 0;
+}
+
+fn sys_fchownat(dirfd: int, path: int, u: int, g: int, flags: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = path_lookup(&kpath[0], base);
+    if (i < 0) { return i; }
+    return do_chown(i, u, g);
+}
+
+fn sys_fchown(fd: int, u: int, g: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    return do_chown(files[f].ino, u, g);
+}

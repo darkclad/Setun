@@ -60,6 +60,8 @@ pub const SB_STATE: usize = 13; // 1 clean, 0 mounted (or not cleanly unmounted)
 // Inode words.
 pub const I_MODE: usize = 0;
 pub const I_NLINK: usize = 1;
+pub const I_UID: usize = 2;
+pub const I_GID: usize = 3;
 pub const I_SIZE: usize = 4;
 pub const I_MTIME: usize = 6;
 pub const I_BLOCKS: usize = 8;
@@ -468,6 +470,16 @@ impl Tfs {
         self.add_entry(d, name, ino)?;
         self.write_inode_data(ino, data)?;
         Ok(ino)
+    }
+
+    /// Set a file's permission bits (type kept), owner and group.
+    pub fn set_owner_mode(&mut self, path: &str, perm: i64, uid: i64, gid: i64) -> Result<(), String> {
+        let ino = self.lookup(path)?;
+        let mode = self.inode_word(ino, I_MODE);
+        self.set_inode_word(ino, I_MODE, mode / 4096 * 4096 + perm);
+        self.set_inode_word(ino, I_UID, uid);
+        self.set_inode_word(ino, I_GID, gid);
+        Ok(())
     }
 
     /// A second name for an existing file (a hard link).

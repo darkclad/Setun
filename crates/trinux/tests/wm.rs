@@ -30,8 +30,17 @@ struct Session {
 
 impl Session {
     fn boot() -> Session {
+        Session::boot_as("root", "root")
+    }
+
+    /// Boot and log in as `user` with `password`.
+    fn boot_as(user: &str, password: &str) -> Session {
         let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
         let mut s = Session { m: trinux::boot_trytes(&disk.trytes, 729, 0, ""), out: String::new(), mark: 0 };
+        s.wait_for("login: ", 60);
+        s.m.dev.serial_input(&format!("{user}\n"));
+        s.wait_for("Password: ", 30);
+        s.m.dev.serial_input(&format!("{password}\n"));
         s.wait_for("$ ", 60);
         s
     }
@@ -63,8 +72,7 @@ impl Session {
             }
             self.run(1);
         }
-        panic!("timed out waiting for {what:?}:
-{}", self.out);
+        panic!("timed out waiting for {what:?}:\n{}", self.out);
     }
 
     fn console(&mut self, line: &str) {
@@ -304,6 +312,20 @@ fn the_console_keyboard_has_a_russian_layout() {
 }
 
 #[test]
+fn a_normal_user_runs_the_window_system() {
+    // login hands the console devices to whoever logs in
+    let mut s = Session::boot_as("user", "user");
+    s.console("ls -l /dev/fb0 /dev/mouse /dev/kbd");
+    s.expect("crw-rw---- 1 user     user    ", 60);
+    s.console("trwm clock &");
+    s.wait_for("trwm: window 0 'Clock'", 200);
+    s.run(40);
+    assert_eq!(s.pixel(2, 2), PANEL, "the panel is drawn");
+    s.click(340, 8); // [Exit]
+    s.expect("trwm: exit", 60);
+}
+
+#[test]
 fn arrow_keys_edit_the_shell_line() {
     let mut s = Session::boot();
     // the console: Left goes through the kernel's keymap as ESC [ D
@@ -390,8 +412,7 @@ fn the_terminal_window_shows_cyrillic() {
 /// The pid trwm logged for the window titled `title`.
 fn window_pid(out: &str, title: &str) -> i64 {
     let tag = format!("'{title}' (pid ");
-    let at = out.rfind(&tag).unwrap_or_else(|| panic!("no window {title:?} in:
-{out}")) + tag.len();
+    let at = out.rfind(&tag).unwrap_or_else(|| panic!("no window {title:?} in:\n{out}")) + tag.len();
     out[at..].split(')').next().unwrap().parse().unwrap()
 }
 
@@ -421,8 +442,7 @@ fn k8_window_system_refusals() {
         "'Crash' (pid",
         "'Clock' (pid",
     ] {
-        assert!(s.out.contains(want), "missing {want:?} in:
-{}", s.out);
+        assert!(s.out.contains(want), "missing {want:?} in:\n{}", s.out);
     }
     // the crashing client dies of SIGSEGV after a second, and its window goes
     s.run(30);

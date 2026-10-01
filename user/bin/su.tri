@@ -1,0 +1,128 @@
+// su [-] [user] [-c command]: run a shell as another user (root by default).
+//
+// Installed set-user-ID root. Anyone but root must give the target user's
+// password. With "-" the shell is a login shell: a fresh environment and
+// the target's home directory. Otherwise the environment stays, with HOME,
+// SHELL, USER and LOGNAME set for the target.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/pwd.tri";
+import "../lib/crypt.tri";
+
+fn ask_secret(p: *char, buf: *char, max: int) -> int {
+    fputs(STDERR_FILENO, p);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty) { tcsetattr(STDIN_FILENO, TCSANOW, &saved); fputs(STDERR_FILENO, "\n"); }
+    return got ? n : -1;
+}
+
+var env_store: [1458]char;
+var env_vec: [7]*char;
+
+fn main(argc: int, argv: **char) -> int {
+    var login: int = 0;
+    var command: *char = null;
+    var target: *char = "root";
+    var i: int = 1;
+    while (i < argc) {
+        if (streq(argv[i], "-") || streq(argv[i], "-l")) { login = 1; }
+        else if (streq(argv[i], "-c")) {
+            if (i + 1 >= argc) { fputs(STDERR_FILENO, "usage: su [-] [user] [-c command]\n"); return 2; }
+            command = argv[i + 1];
+            i += 1;
+        } else if (argv[i][0] == '-') { fputs(STDERR_FILENO, "usage: su [-] [user] [-c command]\n"); return 2; }
+        else { target = argv[i]; }
+        i += 1;
+    }
+    if (geteuid() != 0) { fputs(STDERR_FILENO, "su: must be set-user-ID root\n"); return 1; }
+    var pw: *passwd = getpwnam(target);
+    if (pw == null) {
+        fputs(STDERR_FILENO, "su: user ");
+        fputs(STDERR_FILENO, target);
+        fputs(STDERR_FILENO, " does not exist\n");
+        return 1;
+    }
+    var name: [27]char;
+    var home: [243]char;
+    var shell: [243]char;
+    strncpy(&name[0], pw.pw_name, 26);
+    name[26] = 0;
+    strncpy(&home[0], pw.pw_dir, 242);
+    home[242] = 0;
+    strncpy(&shell[0], pw.pw_shell[0] != 0 ? pw.pw_shell : "/bin/sh", 242);
+    shell[242] = 0;
+    var uid: int = pw.pw_uid;
+    var gid: int = pw.pw_gid;
+    if (getuid() != 0) {
+        var stored: [243]char;
+        var sp: *spwd = getspnam(&name[0]);
+        stored[0] = 0;
+        if (sp != null) { strncpy(&stored[0], sp.sp_pwdp, 242); stored[242] = 0; }
+        if (stored[0] != 0) {
+            var pass: [243]char;
+            if (ask_secret("Password: ", &pass[0], 243) < 0) { return 1; }
+            var ok: int = crypt_verify(&pass[0], &stored[0]);
+            var k: int = 0;
+            while (k < 243) { pass[k] = 0; k += 1; }
+            if (!ok) { fputs(STDERR_FILENO, "su: Authentication failure\n"); return 1; }
+        }
+    }
+    if (initgroups(&name[0], gid) < 0 || setgid(gid) < 0 || setuid(uid) < 0) {
+        perror2("su", "cannot set the user and group");
+        return 1;
+    }
+    var e: **char = environ;
+    if (login) {
+        if (chdir(&home[0]) < 0) { perror2("su", &home[0]); }
+        var term: *char = getenv("TERM");
+        var names: [6]*char = { "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TERM" };
+        var values: [6]*char = { &home[0], &name[0], &name[0], &shell[0], uid == 0 ? "/bin:/sbin" : "/bin", term == null ? "linux" : term };
+        var k2: int = 0;
+        while (k2 < 6) {
+            var s: *char = &env_store[243 * k2];
+            strcpy(s, names[k2]);
+            strcat(s, "=");
+            strncat(s, values[k2], 200);
+            env_vec[k2] = s;
+            k2 += 1;
+        }
+        env_vec[6] = null;
+        e = &env_vec[0];
+    } else {
+        setenv("HOME", &home[0], 1);
+        setenv("SHELL", &shell[0], 1);
+        setenv("USER", &name[0], 1);
+        setenv("LOGNAME", &name[0], 1);
+        e = environ;
+    }
+    var arg0: [243]char;
+    var base: *char = strrchr(&shell[0], '/');
+    strcpy(&arg0[0], login ? "-" : "");
+    strncat(&arg0[0], base == null ? &shell[0] : &base[1], 200);
+    var args: [4]*char = { &arg0[0], null, null, null };
+    if (command != null) { args[1] = "-c"; args[2] = command; }
+    execve(&shell[0], &args[0], e);
+    perror2("su", &shell[0]);
+    return 127;
+}

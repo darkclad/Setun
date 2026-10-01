@@ -1,0 +1,201 @@
+// useradd and userdel (one program, chosen by argv[0]; root only).
+//
+//   useradd [-u uid] [-G group,...] [-d home] [-s shell] [-c comment] name
+//       A new user with its own group (same name and number, from 1000
+//       up), a home directory owned by it, and a locked password: set
+//       one with passwd before the user can log in.
+//   userdel [-r] name
+//       Remove the user, its own group and its group memberships; -r also
+//       removes the home directory.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/pwd.tri";
+import "../lib/dbedit.tri";
+
+var prog: *char;
+
+fn fail(a: *char, b: *char) -> int {
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, a);
+    if (b != null) { fputs(STDERR_FILENO, b); }
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}
+
+fn valid_user_name(s: *char) -> int {
+    if (!((s[0] >= 'a' && s[0] <= 'z') || s[0] == '_')) { return 0; }
+    var k: int = 0;
+    while (s[k] != 0) {
+        var c: char = s[k];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) { return 0; }
+        k += 1;
+    }
+    return k <= 26;
+}
+
+// The lowest free number >= 1000 not used as a uid or gid.
+fn next_id() -> int {
+    var id: int = 1000;
+    while (getpwuid(id) != null || getgrgid(id) != null) { id += 1; }
+    return id;
+}
+
+fn add_member(group: *char, user: *char) -> int {
+    var g: *group = getgrnam(group);
+    if (g == null) { return fail("no such group: ", group); }
+    var line: [729]char;
+    strcpy(&line[0], g.gr_name);
+    strcat(&line[0], ":x:");
+    var b: [15]char;
+    strcat(&line[0], itoa(g.gr_gid, &b[0]));
+    strcat(&line[0], ":");
+    var m: int = 0;
+    while (g.gr_mem[m] != null) {
+        if (streq(g.gr_mem[m], user)) { return 0; }
+        strcat(&line[0], g.gr_mem[m]);
+        strcat(&line[0], ",");
+        m += 1;
+    }
+    strcat(&line[0], user);
+    var name: [27]char;
+    strncpy(&name[0], g.gr_name, 26);
+    name[26] = 0;
+    if (db_replace("/etc/group", &name[0], &line[0], 0, 420) < 0) { perror2(prog, "/etc/group"); return 1; }
+    return 0;
+}
+
+fn do_useradd(argc: int, argv: **char) -> int {
+    var uid: int = -1;
+    var groups: *char = null;
+    var home: *char = null;
+    var shell: *char = "/bin/sh";
+    var comment: *char = "";
+    var c: int = getopt(argc, argv, "u:G:d:s:c:");
+    while (c != -1) {
+        if (c == 'u') {
+            var end: *char;
+            uid = strtol(optarg, &end, 10);
+            if (end == optarg || end[0] != 0 || uid < 0) { return fail("invalid user ID: ", optarg); }
+        } else if (c == 'G') { groups = optarg; }
+        else if (c == 'd') { home = optarg; }
+        else if (c == 's') { shell = optarg; }
+        else if (c == 'c') { comment = optarg; }
+        else { fputs(STDERR_FILENO, "usage: useradd [-u uid] [-G group,...] [-d home] [-s shell] [-c comment] name\n"); return 2; }
+        c = getopt(argc, argv, "u:G:d:s:c:");
+    }
+    if (optind != argc - 1) { fputs(STDERR_FILENO, "usage: useradd [-u uid] [-G group,...] [-d home] [-s shell] [-c comment] name\n"); return 2; }
+    var name: *char = argv[optind];
+    if (!valid_user_name(name)) { return fail("invalid user name: ", name); }
+    if (getpwnam(name) != null) { return fail("user already exists: ", name); }
+    if (getgrnam(name) != null) { return fail("group already exists: ", name); }
+    if (uid < 0) { uid = next_id(); }
+    else if (getpwuid(uid) != null) { return fail("user ID already in use", null); }
+    var homebuf: [243]char;
+    if (home == null) { strcpy(&homebuf[0], "/home/"); strcat(&homebuf[0], name); home = &homebuf[0]; }
+    if (strchr(comment, ':') != null || strchr(home, ':') != null || strchr(shell, ':') != null) { return fail("fields may not contain ':'", null); }
+    var b: [15]char;
+    var line: [729]char;
+    strcpy(&line[0], name);
+    strcat(&line[0], ":x:");
+    strcat(&line[0], itoa(uid, &b[0]));
+    strcat(&line[0], ":");
+    strcat(&line[0], itoa(uid, &b[0]));
+    strcat(&line[0], ":");
+    strcat(&line[0], comment);
+    strcat(&line[0], ":");
+    strcat(&line[0], home);
+    strcat(&line[0], ":");
+    strcat(&line[0], shell);
+    if (db_replace("/etc/passwd", name, &line[0], 1, 420) < 0) { perror2(prog, "/etc/passwd"); return 1; }
+    strcpy(&line[0], name);
+    strcat(&line[0], ":x:");
+    strcat(&line[0], itoa(uid, &b[0]));
+    strcat(&line[0], ":");
+    if (db_replace("/etc/group", name, &line[0], 1, 420) < 0) { perror2(prog, "/etc/group"); return 1; }
+    strcpy(&line[0], name);
+    strcat(&line[0], ":!:0:0:99999:7:::");                 // locked until passwd sets one
+    if (db_replace("/etc/shadow", name, &line[0], 1, 384) < 0) { perror2(prog, "/etc/shadow"); return 1; }
+    if (groups != null) {
+        var list: [243]char;
+        strncpy(&list[0], groups, 242);
+        list[242] = 0;
+        var p: *char = &list[0];
+        while (p[0] != 0) {
+            var comma: *char = strchr(p, ',');
+            if (comma != null) { comma[0] = 0; }
+            if (add_member(p, name) != 0) { return 1; }
+            if (comma == null) { break; }
+            p = &comma[1];
+        }
+    }
+    if (mkdir(home, 493) < 0 && errno != EEXIST) { perror2(prog, home); return 1; }
+    if (chown(home, uid, uid) < 0) { perror2(prog, home); return 1; }
+    return 0;
+}
+
+// Remove a directory tree (for userdel -r).
+fn remove_tree(path: *char) -> int {
+    var st: stat_t;
+    if (stat(path, &st) < 0) { return -1; }
+    if (!S_ISDIR(st.st_mode)) { return unlink(path); }
+    var d: *DIR = opendir(path);
+    if (d == null) { return -1; }
+    var names: **char = malloc(3 * 243) as **char;
+    var n: int = 0;
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        if (streq(&e.d_name[0], ".") || streq(&e.d_name[0], "..")) { continue; }
+        if (n < 243) { names[n] = strdup(&e.d_name[0]); n += 1; }
+    }
+    closedir(d);
+    var k: int = 0;
+    while (k < n) {
+        var child: [486]char;
+        strncpy(&child[0], path, 240);
+        child[240] = 0;
+        strcat(&child[0], "/");
+        strncat(&child[0], names[k], 240);
+        remove_tree(&child[0]);
+        free(names[k] as *tryte);
+        k += 1;
+    }
+    free(names as *tryte);
+    return rmdir(path);
+}
+
+fn do_userdel(argc: int, argv: **char) -> int {
+    var remove_home: int = 0;
+    var c: int = getopt(argc, argv, "r");
+    while (c != -1) {
+        if (c == 'r') { remove_home = 1; }
+        else { fputs(STDERR_FILENO, "usage: userdel [-r] name\n"); return 2; }
+        c = getopt(argc, argv, "r");
+    }
+    if (optind != argc - 1) { fputs(STDERR_FILENO, "usage: userdel [-r] name\n"); return 2; }
+    var name: *char = argv[optind];
+    var pw: *passwd = getpwnam(name);
+    if (pw == null) { return fail("user does not exist: ", name); }
+    if (pw.pw_uid == 0) { return fail("will not remove the superuser", null); }
+    var home: [243]char;
+    strncpy(&home[0], pw.pw_dir, 242);
+    home[242] = 0;
+    if (db_replace("/etc/passwd", name, null, 0, 420) < 0) { perror2(prog, "/etc/passwd"); return 1; }
+    if (db_replace("/etc/shadow", name, null, 0, 384) < 0) { perror2(prog, "/etc/shadow"); return 1; }
+    if (db_replace("/etc/group", name, null, 0, 420) < 0) { perror2(prog, "/etc/group"); return 1; }
+    if (db_drop_member(name) < 0) { perror2(prog, "/etc/group"); return 1; }
+    if (remove_home && remove_tree(&home[0]) < 0) { perror2(prog, &home[0]); return 1; }
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var s: *char = strrchr(argv[0], '/');
+    prog = s == null ? argv[0] : &s[1];
+    if (geteuid() != 0) { return fail("only root may add or remove users", null); }
+    if (streq(prog, "userdel")) { return do_userdel(argc, argv); }
+    return do_useradd(argc, argv);
+}

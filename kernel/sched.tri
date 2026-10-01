@@ -13,6 +13,7 @@ import "signal.tri";
 import "fs/tfs.tri";
 import "fs/procfs.tri";
 import "sys.tri";
+import "cred.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
@@ -75,6 +76,18 @@ const SYS_GETUID: int = 174;
 const SYS_GETEUID: int = 175;
 const SYS_GETGID: int = 176;
 const SYS_GETEGID: int = 177;
+const SYS_SETREGID: int = 143;
+const SYS_SETGID: int = 144;
+const SYS_SETREUID: int = 145;
+const SYS_SETUID: int = 146;
+const SYS_SETRESUID: int = 147;
+const SYS_GETRESUID: int = 148;
+const SYS_SETRESGID: int = 149;
+const SYS_GETRESGID: int = 150;
+const SYS_GETGROUPS: int = 158;
+const SYS_SETGROUPS: int = 159;
+const SYS_FCHOWNAT: int = 54;
+const SYS_FCHOWN: int = 55;
 const SYS_RENAMEAT: int = 38;
 const SYS_UMOUNT2: int = 39;
 const SYS_MOUNT: int = 40;
@@ -142,6 +155,14 @@ struct Task {
     fd_cloexec: [27]tryte;            // per descriptor: close on execve
     comm: [27]char;                   // the program's name (procfs)
     cmdline: [81]char;                // its arguments, NUL-separated
+    uid: int;                         // credentials (cred.tri): real, effective, saved
+    euid: int;
+    suid: int;
+    gid: int;
+    egid: int;
+    sgid: int;
+    ngroups: int;                     // supplementary groups
+    groups: [9]int;
 }
 
 var tasks: [27]Task;
@@ -320,6 +341,7 @@ fn do_fork(f: *int) -> int {
     while (k < 81) { child.cmdline[k] = parent.cmdline[k]; k += 1; }
     child.cmdline_len = parent.cmdline_len;
     child.umask = parent.umask;
+    creds_fork(parent, child);
     var c: int = 0;
     while (c < 27) { child.fd_cloexec[c] = parent.fd_cloexec[c]; c += 1; }
     child.pgid = parent.pgid;
@@ -648,7 +670,22 @@ fn do_syscall(f: *int, n: int) {
         case SYS_CLOCK_GETTIME: f[F_R1] = sys_clock_gettime(f[0], f[1]);
         case SYS_UNAME: f[F_R1] = sys_uname(f[0]);
         case SYS_UMASK: f[F_R1] = sys_umask(f[0]);
-        case SYS_GETUID, SYS_GETEUID, SYS_GETGID, SYS_GETEGID: f[F_R1] = sys_getuid();
+        case SYS_GETUID: f[F_R1] = sys_getuid();
+        case SYS_GETEUID: f[F_R1] = sys_geteuid();
+        case SYS_GETGID: f[F_R1] = sys_getgid();
+        case SYS_GETEGID: f[F_R1] = sys_getegid();
+        case SYS_SETUID: f[F_R1] = sys_setuid(f[0]);
+        case SYS_SETGID: f[F_R1] = sys_setgid(f[0]);
+        case SYS_SETREUID: f[F_R1] = sys_setreuid(f[0], f[1]);
+        case SYS_SETREGID: f[F_R1] = sys_setregid(f[0], f[1]);
+        case SYS_SETRESUID: f[F_R1] = sys_setresuid(f[0], f[1], f[2]);
+        case SYS_GETRESUID: f[F_R1] = sys_getresuid(f[0], f[1], f[2]);
+        case SYS_SETRESGID: f[F_R1] = sys_setresgid(f[0], f[1], f[2]);
+        case SYS_GETRESGID: f[F_R1] = sys_getresgid(f[0], f[1], f[2]);
+        case SYS_GETGROUPS: f[F_R1] = sys_getgroups(f[0], f[1]);
+        case SYS_SETGROUPS: f[F_R1] = sys_setgroups(f[0], f[1]);
+        case SYS_FCHOWNAT: f[F_R1] = sys_fchownat(f[0], f[1], f[2], f[3], f[4]);
+        case SYS_FCHOWN: f[F_R1] = sys_fchown(f[0], f[1], f[2]);
         case SYS_UMOUNT2: f[F_R1] = sys_umount2(f[0], f[1]);
         case SYS_MOUNT: f[F_R1] = sys_mount(f[0], f[1], f[2], f[3], f[4]);
         case SYS_STATFS: f[F_R1] = sys_statfs(f[0], f[1]);
