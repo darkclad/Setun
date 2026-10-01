@@ -109,7 +109,7 @@ fn put(c: char) {
     if (c == '\r') { cx = 0; row_dirty[cy] = 1; return; }
     if (c == 8) { if (cx > 0) { cx -= 1; } row_dirty[cy] = 1; return; }
     if (c == '\t') { cx = (cx / 8 + 1) * 8; if (cx >= COLS) { cx = COLS - 1; } return; }
-    if (c == 7 || c < 32) { return; }
+    if (c == 7 || (c < 32 && c > -33)) { return; }    // control; below -32 an overlined character
     if (cx >= COLS) { cx = 0; newline(); }
     *cell(cy, cx) = c;
     row_dirty[cy] = 1;

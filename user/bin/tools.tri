@@ -2,7 +2,7 @@
 //
 //   sed [-n] [-i] [-e script] ... [script] [file ...]
 //   tr [-cds] set1 [set2]          cut -c list | -f list [-d c] [-s] [file ...]
-//   od [-c|-d|-o|-x|-t] [file]     diff [-q] file1 file2
+//   od [-c|-d|-o|-x|-t|-3] [file]     diff [-q] file1 file2
 //   find [path ...] [expression]   xargs [-n max] [-I str] [command [arg ...]]
 //   md5sum [file ...]
 
@@ -731,7 +731,8 @@ fn do_cut(argc: int, argv: **char) -> int {
 //
 // A dump of trytes (the machine's bytes): offsets in octal, 8 trytes a line.
 // -o octal (the default), -d decimal, -x hex, -c characters, -t balanced
-// base 27 (three digits A..M = +1..+13, a..m = -1..-13 per tryte).
+// base 27 (three digits per tryte: 0-9 A-D, negative ones overlined), -3
+// balanced ternary (nine trits per tryte).
 
 fn od_offset(v: int) {
     var b: [8]char;
@@ -761,20 +762,22 @@ fn od_value(v: int, base: int, width: int) {
 }
 
 fn od_b27(v: int) {
-    var a: *char = "mlkjihgfedcba0ABCDEFGHIJKLM";
     var d: [4]char;
     var k: int = 3;
     while (k > 0) {
         k -= 1;
-        var r: int = v % 27;                            // balanced digit -13..13
-        if (r > 13) { r -= 27; }
-        if (r < -13) { r += 27; }
-        d[k] = a[r + 13];
-        v = (v - r) / 27;
+        d[k] = b27_digit(modr(v, 27));                  // balanced digit -13..13
+        v = divr(v, 27);
     }
     d[3] = 0;
     puts("  ");
     puts(&d[0]);
+}
+
+fn od_b3(v: int) {
+    var d: [10]char;
+    puts("  ");
+    puts(itoa3(v, 9, &d[0]));
 }
 
 fn od_char(v: int) {
@@ -795,13 +798,13 @@ fn od_char(v: int) {
 
 fn do_od(argc: int, argv: **char) -> int {
     var fmt: int = 'o';
-    var c: int = getopt(argc, argv, "cdoxt");
+    var c: int = getopt(argc, argv, "cdoxt3");
     while (c != -1) {
-        if (c == '?') { return usage("od [-c|-d|-o|-x|-t] [file]"); }
+        if (c == '?') { return usage("od [-c|-d|-o|-x|-t|-3] [file]"); }
         fmt = c;
-        c = getopt(argc, argv, "cdoxt");
+        c = getopt(argc, argv, "cdoxt3");
     }
-    if (argc - optind > 1) { return usage("od [-c|-d|-o|-x|-t] [file]"); }
+    if (argc - optind > 1) { return usage("od [-c|-d|-o|-x|-t|-3] [file]"); }
     var fd: int = 0;
     if (optind < argc) {
         fd = open(argv[optind], O_RDONLY, 0);
@@ -829,6 +832,7 @@ fn do_od(argc: int, argv: **char) -> int {
                     else if (fmt == 'd') { od_value(row[j], 10, 7); }
                     else if (fmt == 'x') { od_value(row[j], 16, 6); }
                     else if (fmt == 't') { od_b27(row[j]); }
+                    else if (fmt == '3') { od_b3(row[j]); }
                     else { od_value(row[j], 8, 7); }
                     j += 1;
                 }
@@ -846,6 +850,7 @@ fn do_od(argc: int, argv: **char) -> int {
             else if (fmt == 'd') { od_value(row[j2], 10, 7); }
             else if (fmt == 'x') { od_value(row[j2], 16, 6); }
             else if (fmt == 't') { od_b27(row[j2]); }
+            else if (fmt == '3') { od_b3(row[j2]); }
             else { od_value(row[j2], 8, 7); }
             j2 += 1;
         }

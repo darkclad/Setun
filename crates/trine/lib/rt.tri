@@ -45,17 +45,38 @@ fn itoa(v: int, buf: *char) -> *char {
     return buf;
 }
 
-// Base-27 text of `v` (9 digits: 0, A-M = +1..+13, a-m = -1..-13).
+// One balanced base-27 digit, -13..13, as a character: 0-9 and A-D for
+// 0..13, and for a negative digit the overlined one, which the machine's
+// character set writes as the negated code point (overlined 5 is -'5').
+fn b27_digit(d: int) -> char {
+    var a: int = d < 0 ? -d : d;
+    var c: int = a <= 9 ? '0' + a : 'A' + a - 10;
+    return (d < 0 ? -c : c) as char;
+}
+
+// Base-27 text of a word `v`: 9 digits (see b27_digit).
 fn itoa27(v: int, buf: *char) -> *char {
     var i: int = 8;
     while (i >= 0) {
         var d: int = modr(v, 27);
         v = divr(v, 27);
-        if (d > 0) { buf[i] = ('A' + d - 1) as char; }
-        else if (d < 0) { buf[i] = ('a' - d - 1) as char; }
-        else { buf[i] = '0'; }
+        buf[i] = b27_digit(d);
         i -= 1;
     }
     buf[9] = 0;
+    return buf;
+}
+
+// Base-3 text of the low `n` trits of `v` (n <= 27; buf holds n + 1):
+// 1, 0 and an overlined 1 (the code point -'1').
+fn itoa3(v: int, n: int, buf: *char) -> *char {
+    var i: int = n - 1;
+    while (i >= 0) {
+        var t: int = modr(v, 3);
+        v = divr(v, 3);
+        buf[i] = (t > 0 ? '1' : (t < 0 ? -'1' : '0')) as char;
+        i -= 1;
+    }
+    buf[n] = 0;
     return buf;
 }

@@ -3405,7 +3405,7 @@ fn edit_line_into_src(p: *char) -> int {
             while (w > 0 && ed_buf[w - 1] != ' ') { w -= 1; }
             ed_delete(w, ed_pos - w);
         } else if (c == '\t') { ed_tabs += 1; ed_complete(); }
-        else if (c >= 32 && c < K_UP) {
+        else if ((c >= 32 && c < K_UP) || c <= -33) {       // negative: an overlined character
             var ch: [1]char;
             ch[0] = c as char;
             ed_insert(&ch[0], 1);

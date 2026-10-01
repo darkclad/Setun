@@ -27,8 +27,10 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. Case matters.
 - **Integer literals**, the same forms as the assembler:
   - `42` and `1_000` (decimal)
-  - `0t+-0` (balanced ternary: `+` `0` `-`, most significant first) = 6
-  - `0zMMm` (base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13)
+  - `0t1T0` = `0t11̅0` = 6 (balanced ternary: `1`, `0`, and `T` or an overlined `1` for −1, most significant first)
+  - `0zDD5̅` (balanced base 27: `0`–`9` and `A`–`D` = 0…13 in either case; a negative digit is overlined with U+0305 COMBINING OVERLINE; see ISA §1.1)
+  - `0x1F` (hexadecimal, for values from binary systems; nothing wraps, so a sign is written with unary minus)
+  - A malformed literal is an error that says what is wrong (a bar on `0`, two bars, `E` as a digit, the old `+`/`-` base-3 digits…), and a constant must fit its type.
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
 - **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
@@ -240,7 +242,7 @@ Structs and arrays are passed as pointers. This is the same convention as the IS
 
 | Module | Contents |
 |---|---|
-| `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal, and base 27 via `itoa27`) |
+| `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal), `itoa27` (a word as 9 base-27 digits, negative ones overlined), `itoa3` (base 3), `b27_digit` |
 | `console.tri` | serial `putc`/`puts`/`getc`; a text-mode screen writer with cursor, colours and scrolling |
 | `ports.tri` | named constants for every device register in ISA §8 |
 | (generated) | startup code, see §9 |

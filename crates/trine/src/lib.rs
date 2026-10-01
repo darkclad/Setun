@@ -66,8 +66,8 @@ pub const BOOT_FRAME_START: i64 = 9_842;
 /// Entry point: the centre of frame 1.
 pub const BOOT_ENTRY: i64 = 19_683;
 /// Word at the end of the boot sector that marks it bootable.
-/// `0zCAFEBABE` in base 27.
-pub const BOOT_MAGIC: i64 = 31_857_270_899;
+/// `0zB007AB13` in base 27: BOOTABLE, with 7 = T, 1 = L and 3 = E.
+pub const BOOT_MAGIC: i64 = 115_067_810_199;
 pub const BOOT_MAGIC_ADDR: i64 = 29_523;
 
 impl Options {

@@ -12,7 +12,7 @@ import "../drivers/disk.tri";
 import "bcache.tri";
 import "vfs.tri";
 
-const TFS_MAGIC: int = 31857270904;
+const TFS_MAGIC: int = 0zB007AB18;
 const TFS_VERSION: int = 1;
 const TFS_NAME_MAX: int = 77;
 const INODE_WORDS: int = 27;

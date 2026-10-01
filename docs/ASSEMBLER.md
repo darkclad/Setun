@@ -21,8 +21,9 @@ NAME = expression                      ; constant (also: .equ NAME, expression)
 | Syntax | Meaning |
 |---|---|
 | `42`, `-7`, `1_000` | decimal |
-| `0t+-0` | balanced ternary (`+` `0` `-`, most significant first) = 6 |
-| `0zMMm` | base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13 |
+| `0t1T0`, `0t11̅0` | balanced ternary: `1`, `0`, and `T` or `1̅` for −1, most significant first = 6 |
+| `0zDD5̅` | balanced base 27: `0`–`9`, `A`–`D` = 0…13 (either case), negative digits overlined with U+0305 (ISA §1.1) |
+| `0x1F` | hexadecimal, for values from binary systems (no wrapping; use unary minus) |
 | `'A'`, `'Ж'`, `'\n'` | a Unicode character (escapes: `\n \t \r \0 \\ \' \"`) |
 | `$` | address of the current instruction |
 | `label`, `NAME` | a label's address or a constant |

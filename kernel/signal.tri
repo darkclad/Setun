@@ -57,7 +57,7 @@ const EINTR: int = 4;
 const ESRCH: int = 3;
 
 const SIGFRAME_WORDS: int = 30;       // trap frame (28), old mask, magic
-const SIGFRAME_MAGIC: int = 31857270903;
+const SIGFRAME_MAGIC: int = 0zB007AB17;
 const RED_ZONE: int = 81;             // trytes left untouched below the user sp
 
 // struct sigaction, one word per field (Linux generic order).

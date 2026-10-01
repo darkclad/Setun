@@ -59,18 +59,43 @@ Version history:
 
 ### 1.1 Notation
 
-- **Trits** are written `+ 0 -`.
-- **Base 27, "heptavigesimal"**: one digit = 3 trits.
-  - `0` is zero.
-  - **`A`…`M` are +1…+13.**
-  - **`a`…`m` are −1…−13.**
-  - **Negation swaps case.**
-- A tryte is 3 digits and a word is 9 digits.
+A negative digit is the positive one with a bar over it, as on the Setun. Negating a number toggles the bar on every digit.
+
+**Base 3, prefix `0t`:**
+- digits `1`, `0` and `1̅` (−1), most significant first; `0t11̅0` = 6;
+- `T` is an ASCII alias for `1̅`, so `0t1T0` is the same literal. The two may be mixed in one literal.
+
+**Base 27 ("heptavigesimal"), prefix `0z`:** one digit is 3 trits.
+
+| digit | `D̅` `C̅` `B̅` `A̅` `9̅` … `2̅` `1̅` | `0` | `1` `2` … `9` `A` `B` `C` `D` |
+|---|---|---|---|
+| value | −13 −12 −11 −10 −9 … −2 −1 | 0 | +1 +2 … +9 +10 +11 +12 +13 |
+
+- Letters may be written in either case (`0zabc` = `0zABC`). Case carries no sign; the bar does.
+- A tryte is 3 digits, from `0zD̅D̅D̅` to `0zDDD` (±9841). A word is 9 digits.
 - Examples:
-  - `00A` = 1
-  - `00a` = −1
-  - `MMM` = +9841, the largest tryte
-  - `0A0` = 27
+  - `001` = 1
+  - `001̅` = −1
+  - `010` = 27
+  - `1D̅` = 27 − 13 = 14
+  - `DDD` = +9841, the largest tryte
+  - `0zB007AB13` = 115 067 810 199, the boot signature ("BOOTABLE")
+
+**Writing the bar:**
+- **In host source files** (Trine, assembler, Rust tests): the digit followed by U+0305 COMBINING OVERLINE, in UTF-8. `_` and spaces may separate digits.
+- **In the machine:** an overlined character is the **negated code point**: overlined `1` is −49, overlined `D` is −68. So an overlined digit is still one tryte, one glyph and one screen cell, and "overline" is the same negation as on the number itself. Only code points below −32 are overlined characters; −1…−32 mean nothing.
+  - **Screen:** the glyph moved down one row, under a bar.
+  - **Serial port:** the character followed by U+0305, both ways.
+  - **Keyboard:** the dead key `` ` `` (US layout) and then the character.
+- **Refused in literals:**
+  - a bar on `0` (there is no −0), on `T`, on a letter beyond `D`, or on a separator;
+  - two bars on one digit, or a bar with no digit before it;
+  - the letters `E`–`Z` as digits, and the old `+`/`-` base-3 digits;
+  - a value that does not fit the target type.
+
+**Hexadecimal, prefix `0x`:** for values that come from binary systems. It is plain hexadecimal: a sign is written with unary minus, and nothing wraps.
+
+**Dumps** show `0z` digits per tryte (`od -t`), and base 3 on request (`od -3`).
 
 ## 2. Registers
 
@@ -563,13 +588,13 @@ Control values are ternary wherever that is natural.
   - Trits 1–3 are **R**, 4–6 are **G** and 7–9 are **B**. Each is a balanced −13..+13 value, giving **27 = 3³ levels per channel**.
   - The intensity is `(v+13)/26`, shown as `round(255·(v+13)/26)` in sRGB.
 - In base 27, **a pixel is its three colour digits**:
-  - `MMM` white
-  - `mmm` black
-  - `Mmm` red
-  - `mMm` green
-  - `mmM` blue
+  - `DDD` white
+  - `D̅D̅D̅` black
+  - `DD̅D̅` red
+  - `D̅DD̅` green
+  - `D̅D̅D` blue
   - `000` 50% grey (so a zeroed framebuffer is mid-grey)
-  - `MM0` yellow-ish
+  - `DD0` yellow-ish
   - Negating a pixel inverts its colour.
 - Pixel `(x, y)` is the tryte at `FB_BASE + y·PITCH + x`.
 - 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
@@ -601,7 +626,7 @@ One sector is 39 366 bytes.
    - set `ITB`;
    - read the RAM size from `SYSCTL`;
    - clear the text screen and run a self-test;
-   - load **disk sector 0 into frame 1**, check the boot signature `0zCAFEBABE` in its last word, then jump to its centre (physical 19 683 = 3^9) with `r1` = boot disk and `r2` = RAM frame count. This is the analogue of the PC's 0x7C00 boot sector. The full protocol is in [`BOOT.md`](BOOT.md).
+   - load **disk sector 0 into frame 1**, check the boot signature `0zB007AB13` in its last word, then jump to its centre (physical 19 683 = 3^9) with `r1` = boot disk and `r2` = RAM frame count. This is the analogue of the PC's 0x7C00 boot sector. The full protocol is in [`BOOT.md`](BOOT.md).
 3. **Boot sector / loader**: loads the kernel, builds page tables, sets `PTB`, turns on `PG`, and enters the kernel.
 
 ## 10. Notes for the compiler

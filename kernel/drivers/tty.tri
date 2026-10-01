@@ -264,7 +264,7 @@ fn tty_output(t: int, c: char) -> int {
 
 fn tty_echo(t: int, c: char) {
     if (!lflag(t, ECHO)) { return; }
-    if (c < 32 && c != '\n' && c != '\t') {      // control characters echo as ^X
+    if (c >= 0 && c < 32 && c != '\n' && c != '\t') {   // control characters echo as ^X
         tty_output(t, '^');
         tty_output(t, (c + 64) as char);
         return;

@@ -23,6 +23,57 @@ fn compile_err(src: &str) -> String {
 }
 
 #[test]
+fn ternary_literals() {
+    // base 3: 1, 0, and T or an overlined 1 (mixed is fine); base 27: 0-9, A-D,
+    // negative digits overlined, letters in either case; hex for interop
+    assert_eq!(exit("fn main() -> int { return 0t1T0; }"), 6);
+    assert_eq!(exit("fn main() -> int { return 0t11\u{305}0 - 0t1T0; }"), 0);
+    assert_eq!(exit("fn main() -> int { return 0tT11\u{305}; }"), -9 + 3 - 1);
+    assert_eq!(exit("fn main() -> int { return 0z1D\u{305}; }"), 27 - 13);
+    assert_eq!(exit("fn main() -> int { return 0zdd + 0zDD\u{305}; }"), 13 * 27 + 13 + 13 * 27 - 13);
+    assert_eq!(exit("fn main() -> int { var t: tryte = 0zD\u{305}D\u{305}D\u{305}; return t; }"), -9841);
+    assert_eq!(exit("fn main() -> int { return 0x1F + -0x10; }"), 15);
+    assert_eq!(exit("fn main() -> int { return 0zB007AB13 % 1000; }"), 199);
+    assert_eq!(exit("fn main() -> int { return 0t1-1; }"), 0, "0t1 minus 1, not a digit");
+}
+
+#[test]
+fn ternary_literals_refused() {
+    let e = compile_err("fn main() -> int { return 0t+-0; }");
+    assert!(e.contains("0t digits are 1, 0 and T (the old + and - are gone)"), "{e}");
+    let e = compile_err("fn main() -> int { return 0zMMm; }");
+    assert!(e.contains("bad 0z literal: invalid ternary digit 'M'"), "{e}");
+    let e = compile_err("fn main() -> int { return 0zE; }");
+    assert!(e.contains("invalid ternary digit 'E'"), "{e}");
+    let e = compile_err("fn main() -> int { return 0zE\u{305}; }");
+    assert!(e.contains("'E' cannot be overlined"), "{e}");
+    let e = compile_err("fn main() -> int { return 0z_\u{305}1; }");
+    assert!(e.contains("'_' cannot be overlined"), "{e}");
+    let e = compile_err("fn main() -> int { return 0z10\u{305}; }");
+    assert!(e.contains("'0' cannot be overlined"), "{e}");
+    let e = compile_err("fn main() -> int { return 0t1T\u{305}; }");
+    assert!(e.contains("'T' cannot be overlined"), "{e}");
+    let e = compile_err("fn main() -> int { return 0z1\u{305}\u{305}; }");
+    assert!(e.contains("'1' has two overlines"), "{e}");
+    let e = compile_err("fn main() -> int { return 0t2; }");
+    assert!(e.contains("invalid ternary digit '2'"), "{e}");
+    let e = compile_err("fn main() -> int { return 0xZ; }");
+    assert!(e.contains("invalid hexadecimal digit 'Z'"), "{e}");
+    let e = compile_err("fn main() -> int { return 0x5\u{305}; }");
+    assert!(e.contains("hexadecimal digits cannot be overlined"), "{e}");
+    // values that do not fit their type: constants are range-checked, and a
+    // variable of a narrower type will not take an int literal that is too big
+    let e = compile_err("const T: tryte = 0z1000;\nfn main() -> int { return T; }");
+    assert!(e.contains("19683 does not fit in tryte"), "{e}");
+    let e = compile_err("const T: trit = 0t1T;\nfn main() -> int { return T; }");
+    assert!(e.contains("2 does not fit in trit"), "{e}");
+    let e = compile_err("fn main() -> int { var t: tryte = 0z1000; return t; }");
+    assert!(e.contains("expected tryte, found int"), "{e}");
+    let e = compile_err("fn main() -> int { return 0z1000000000; }");
+    assert!(e.contains("does not fit in a word"), "{e}");
+}
+
+#[test]
 fn return_value() {
     assert_eq!(exit("fn main() -> int { return 42; }"), 42);
     assert_eq!(exit("fn main() -> int { return -7; }"), -7);
@@ -40,13 +91,13 @@ fn arithmetic_and_precedence() {
 
 #[test]
 fn tritwise_operators() {
-    // 0t+0- & 0t++0 = min per trit = 0t+0-   ;  | = max = 0t++0
-    assert_eq!(exit("fn main() -> int { var a: int = 0t+0-; return a & 0t-++; }"), {
-        // min(+,-)=-, min(0,+)=0, min(-,+)=- → 0t-0-
+    // 0t10T & 0t110 = min per trit = 0t10T   ;  | = max = 0t110
+    assert_eq!(exit("fn main() -> int { var a: int = 0t10T; return a & 0tT11; }"), {
+        // min(+,-)=-, min(0,+)=0, min(-,+)=- → 0tT0T
         -9 - 1
     });
-    assert_eq!(exit("fn main() -> int { var a: int = 0t+0-; return a | 0t-++; }"), 9 + 3 + 1);
-    assert_eq!(exit("fn main() -> int { return tmul(0t+-0, 0t--+); }"), -9 + 3);
+    assert_eq!(exit("fn main() -> int { var a: int = 0t10T; return a | 0tT11; }"), 9 + 3 + 1);
+    assert_eq!(exit("fn main() -> int { return tmul(0t1T0, 0tTT1); }"), -9 + 3);
 }
 
 #[test]
@@ -198,12 +249,17 @@ fn serial_console_and_stdlib() {
         putc('\\n');
         var buf: [10]char;
         puts(itoa27(9841, &buf[0]));
+        puts(itoa27(-9841 + 27 * 5, &buf[0]));
+        var b3: [10]char;
+        puts(itoa3(-5, 4, &b3[0]));
         var c: char = getc();
         return c;
     }";
     let (o, serial) = run_with(src, "Z");
     assert_eq!(o, Outcome::Exit('Z' as i64));
-    assert_eq!(serial, "Привет, -1234\n000000MMM");
+    // overlined digits are negative code points in the machine, and the
+    // character plus U+0305 on the host's side of the serial port
+    assert_eq!(serial, "Привет, -1234\n000000DDD000000D\u{305}8\u{305}D\u{305}01\u{305}11");
 }
 
 #[test]

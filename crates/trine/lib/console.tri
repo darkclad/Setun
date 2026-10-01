@@ -37,7 +37,7 @@ fn attr(fr: trit, fg: trit, fb: trit, br: trit, bg: trit, bb: trit) -> tryte {
 
 var screen_row: int = 0;
 var screen_col: int = 0;
-var screen_attr: tryte = 0t+++---000;     // white on black
+var screen_attr: tryte = 0t111TTT000;     // white on black
 
 fn cell(i: int) -> *tryte { return (FB_BASE + 3 * i) as *tryte; }
 

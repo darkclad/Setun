@@ -34,7 +34,7 @@ fn pr_b27(v: int) {
 
 // Stop the machine with a message. Never returns.
 fn panic(s: *char) {
-    screen_attr = 0t++++--000;          // white on red
+    screen_attr = 0t1111TT000;          // white on red
     printk("Kernel panic: ");
     pr(s);
     pr_nl();

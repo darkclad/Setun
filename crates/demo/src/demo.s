@@ -22,12 +22,12 @@ CLOCK_CELL  = 8*80 + 13
 
 ; Text attributes: foreground R G B, background R G B, style (one trit each:
 ; -1 = 0 %, 0 = 50 %, +1 = 100 %).
-A_TITLE     = 0t+++--+000       ; white on blue
-A_BODY      = 0t+++---000       ; white on black
-A_YELLOW    = 0t++----000
-A_CYAN      = 0t-++---000
-A_GREEN     = 0t-+----000
-A_FAULT     = 0t++++--000       ; white on red
+A_TITLE     = 0t111TT1000       ; white on blue
+A_BODY      = 0t111TTT000       ; white on black
+A_YELLOW    = 0t11TTTT000
+A_CYAN      = 0tT11TTT000
+A_GREEN     = 0tT1TTTT000
+A_FAULT     = 0t1111TT000       ; white on red
 
 ; USB HID usage codes
 KEY_ENTER = 40

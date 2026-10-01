@@ -285,7 +285,7 @@ fn prompt(q: *char, out: *char, max: int) -> int {
         if (c == '\n' || c == '\r') { out[n] = 0; return 1; }
         if (c == 3 || c == 27 || c == K_EOF) { out[n] = 0; return 0; }
         if ((c == 127 || c == 8) && n > 0) { n -= 1; }
-        else if (c >= 32 && c < K_UP && n < max - 1) { out[n] = c as char; n += 1; }
+        else if (((c >= 32 && c < K_UP) || c <= -33) && n < max - 1) { out[n] = c as char; n += 1; }
         out[n] = 0;
     }
 }
@@ -571,7 +571,7 @@ fn main(argc: int, argv: **char) -> int {
         else if (c == '\n' || c == '\r') { split_line(); }
         else if (c == 127 || c == 8) { backspace(); line_only = 1; }
         else if (c == K_DEL) { delete_char(); line_only = 1; }
-        else if (c == '\t' || (c >= 32 && c < K_UP)) { insert_char(c); line_only = 1; }
+        else if (c == '\t' || (c >= 32 && c < K_UP) || c <= -33) { insert_char(c); line_only = 1; }
         last_was_cut = was_cut;
         if (!quit) { refresh(line_only); }
     }

@@ -129,7 +129,7 @@ fn unassigned_major_opcodes_are_illegal() {
 
 #[test]
 fn mixed_branch_condition_is_illegal() {
-    let mixed = 9 - 1; // "+0-": S<0 or C>0 — reserved
+    let mixed = 9 - 1; // "10T": S<0 or C>0 — reserved
     assert_eq!(fault(&[isa::s6(op::BRQ, 0, mixed, 5)]), vector::ILLEGAL);
     assert_eq!(fault(&isa::wide(op::BR, 0, mixed, 0, 5)), vector::ILLEGAL);
     // `000` is "never": falls through, no fault.
@@ -592,11 +592,36 @@ fn input_devices_when_empty_or_disabled() {
     m.dev.mouse_buttons(true, false, false); // same as before
     m.dev.mouse_wheel(0);
     assert_eq!(m.dev.pending_vector(), None);
-    // Output of values that are not characters becomes U+FFFD.
-    for v in [-1, -9841, 0xD800] {
+    // Output of values that are not characters becomes U+FFFD: a surrogate,
+    // and negatives down to -32 (overlined control characters mean nothing),
+    // also -0xD800 (an overlined surrogate).
+    for v in [-1, -32, 0xD800, -0xD800] {
         out(&mut m, block::SERIAL, 0, v);
     }
-    assert_eq!(m.dev.serial.take_output(), "\u{FFFD}\u{FFFD}\u{FFFD}");
+    assert_eq!(m.dev.serial.take_output(), "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{305}");
+    // a negative code point below -32 is the character overlined
+    for v in [-('5' as i64), -9841, -33] {
+        out(&mut m, block::SERIAL, 0, v);
+    }
+    assert_eq!(m.dev.serial.take_output(), "5\u{305}\u{2671}\u{305}!\u{305}");
+}
+
+#[test]
+fn serial_input_folds_overlines() {
+    let mut m = machine();
+    out(&mut m, block::SERIAL, 3, 1); // receive interrupts on
+    // digit + U+0305 arrives as one negative code point; a lone or doubled
+    // overline, or one after a control character, changes nothing
+    m.dev.serial_input("0z1D\u{305}\u{305}x \u{305}\n\u{305}");
+    let mut got = Vec::new();
+    while inp(&mut m, block::SERIAL, 1) > 0 {
+        got.push(inp(&mut m, block::SERIAL, 0));
+    }
+    assert_eq!(got, vec!['0' as i64, 'z' as i64, '1' as i64, 'D' as i64, 'x' as i64, ' ' as i64, '\n' as i64]
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| if i == 3 { -c } else { c })
+        .collect::<Vec<_>>());
 }
 
 #[test]

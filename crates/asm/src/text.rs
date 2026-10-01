@@ -13,12 +13,14 @@
 //!         blt   loop               short (BRQ) when in range, else long (BR)
 //!         br3   less, more         3-way branch on S
 //!         call  func / ret / push r1 / pop r1 / mov r1, r2 / la r1, label
-//!         .word 1, label, -3       .tryte 1, 'A', 0t+-0     .string "Привет\n"
+//!         .word 1, label, -3       .tryte 1, 'A', 0t1T0     .string "Привет\n"
 //!         .zero 10                 10 zero words
 //! ```
 //!
-//! Literals: decimal, `0t+-0` (balanced ternary), `0zMMm` (base 27, A–M = +1..+13,
-//! a–m = −1..−13), `'c'` (a Unicode character). `$` is the current address.
+//! Literals: decimal; `0t1T0` (balanced ternary: `1`, `0`, and `T` or an
+//! overlined `1` for −1); `0zDD5̅` (balanced base 27: `0`–`9`, `A`–`D` = 0..13,
+//! a negative digit overlined with U+0305); `0x1F` (hexadecimal, for values
+//! from binary systems); `'c'` (a Unicode character). `$` is the current address.
 //! Registers: `r-13`..`r13`, `zero` = r0, `fp` = r11, `lr` = r12, `sp` = r13.
 
 use setun_core::isa::{self, alu, cond, cr, fld, mem, op, sys};
@@ -184,24 +186,22 @@ impl Lexer<'_> {
         }
         if c.is_ascii_digit() {
             let start = self.i;
-            if c == '0' && matches!(self.s.get(self.i + 1), Some('t' | 'z')) {
+            if c == '0' && matches!(self.s.get(self.i + 1), Some('t' | 'z' | 'x')) {
+                // the whole run of letters, digits, `_` and overlines is the literal
                 let base = self.s[self.i + 1];
                 self.i += 2;
                 let ds = self.i;
-                let ok = |c: char| if base == 't' { matches!(c, '+' | '0' | '-') } else { c == '0' || c.is_ascii_alphabetic() };
-                while self.peek().is_some_and(ok) {
+                while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ternary::OVERLINE) {
                     self.i += 1;
                 }
                 let digits: String = self.s[ds..self.i].iter().collect();
                 if digits.is_empty() {
+                    if base == 't' && matches!(self.peek(), Some('+' | '-')) {
+                        return Err("0t digits are 1, 0 and T (the old + and - are gone)".into());
+                    }
                     return Err(format!("empty 0{base} literal"));
                 }
-                let v = if base == 't' {
-                    digits.parse::<ternary::Tern<39>>().map_err(|e| e.to_string())?.value()
-                } else {
-                    ternary::Tern::<39>::from_b27(&digits).map_err(|e| e.to_string())?.value()
-                };
-                return Ok(Expr::Num(v));
+                return ternary::parse_prefixed(base, &digits).map(Expr::Num).map_err(|e| format!("bad 0{base} literal: {e}"));
             }
             while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
                 self.i += 1;
@@ -957,9 +957,13 @@ mod tests {
 
     #[test]
     fn literals_and_expressions() {
-        let w = asm1(".word 42, -7, 0t+-0, 0zMMM, 'Ж', 2*(3+4)-1, 10/3, -0t+");
+        let w = asm1(".word 42, -7, 0t1T0, 0zDDD, 'Ж', 2*(3+4)-1, 10/3, -0t1");
         let v: Vec<i64> = w.iter().map(|w| w.value()).collect();
         assert_eq!(v, vec![42, -7, 6, 9841, 'Ж' as i64, 13, 3, -1]);
+        // overlined digits, T as the ASCII -1, case-insensitive letters, hex
+        let w = asm1(".word 0z1D\u{305}, 0z5\u{305}0, 0t11\u{305}0, 0tT1, 0zabc, 0x1F, -0x10, 0zB007AB13");
+        let v: Vec<i64> = w.iter().map(|w| w.value()).collect();
+        assert_eq!(v, vec![27 - 13, -135, 9 - 3, -3 + 1, 10 * 729 + 11 * 27 + 12, 31, -16, 115_067_810_199]);
         let p = assemble("X = 5\n.equ Y, X*2\n.word Y+1").unwrap();
         assert_eq!(p.segments[0].words[0].value(), 11);
     }
@@ -1056,7 +1060,18 @@ mod tests {
         assert!(e(".org 1").msg.contains("word-aligned"));
         assert!(e("jalr r1, r2, 14").msg.contains("out of range"));
         assert!(e(".string \"unterminated").msg.contains("unterminated"));
-        assert!(e(".word 0t+x").msg.contains("unexpected"));
+        assert!(e(".word 0t1x").msg.contains("invalid ternary digit 'x'"));
+        // the new notation's refusals
+        assert!(e(".word 0t+-0").msg.contains("the old + and - are gone"));
+        assert!(e(".word 0zMMM").msg.contains("invalid ternary digit 'M'"), "the old letters are gone");
+        assert!(e(".word 0zE").msg.contains("invalid ternary digit 'E'"));
+        assert!(e(".word 0z10\u{305}").msg.contains("'0' cannot be overlined"));
+        assert!(e(".word 0zE\u{305}").msg.contains("'E' cannot be overlined"));
+        assert!(e(".word 0z1\u{305}\u{305}").msg.contains("two overlines"));
+        assert!(e(".word 0x1\u{305}").msg.contains("hexadecimal digits cannot be overlined"));
+        assert!(e(".word 0xG").msg.contains("invalid hexadecimal digit 'G'"));
+        assert!(e(".word 0z").msg.contains("empty 0z literal"));
+        assert!(e(".word 0z1DDDDDDDDDDDDDDDDDDDDDD").msg.contains("does not fit"));
         assert!(e("ext r1, r2, 20, 9").msg.contains("outside 1..27"));
         assert!(e("mfc r1, bogus").msg.contains("unknown control register"));
         assert!(e(".tryte 9842").msg.contains("out of range"));

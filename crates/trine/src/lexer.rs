@@ -86,23 +86,20 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
         }
         if c.is_ascii_digit() {
             let start = i;
-            if c == '0' && matches!(chars.get(i + 1), Some('t' | 'z')) {
+            if c == '0' && matches!(chars.get(i + 1), Some('t' | 'z' | 'x')) {
+                // the whole run of letters, digits, `_` and overlines is the literal
                 let base = chars[i + 1];
                 bump!();
                 bump!();
                 let ds = i;
-                while i < chars.len()
-                    && (if base == 't' { matches!(chars[i], '+' | '0' | '-') } else { chars[i] == '0' || chars[i].is_ascii_alphabetic() })
-                {
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == ternary::OVERLINE) {
                     bump!();
                 }
                 let digits: String = chars[ds..i].iter().collect();
-                let v = if base == 't' {
-                    digits.parse::<ternary::Tern<39>>().map(|t| t.value())
-                } else {
-                    ternary::Tern::<39>::from_b27(&digits).map(|t| t.value())
+                if digits.is_empty() && base == 't' && matches!(chars.get(i), Some('+' | '-')) {
+                    return Err(err("0t digits are 1, 0 and T (the old + and - are gone)".into()));
                 }
-                .map_err(|e| err(format!("bad 0{base} literal: {e}")))?;
+                let v = ternary::parse_prefixed(base, &digits).map_err(|e| err(format!("bad 0{base} literal: {e}")))?;
                 out.push(Token { tok: Tok::Int(v), pos });
                 continue;
             }

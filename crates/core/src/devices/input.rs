@@ -60,6 +60,8 @@ pub struct Mouse {
 
 /// Button changes the FIFO holds; older ones are dropped.
 const MOUSE_FIFO: usize = 27;
+/// U+0305 COMBINING OVERLINE, as a code point.
+const OVERLINE: i64 = 0x305;
 
 impl Mouse {
     pub fn moved(&mut self, dx: i64, dy: i64) -> bool {
@@ -132,17 +134,40 @@ pub struct Serial {
 }
 
 impl Serial {
+    /// A character from the host. The machine writes an overlined character
+    /// as its negated code point, the host as the character followed by
+    /// U+0305 COMBINING OVERLINE: an overline arriving after a printable
+    /// character still waiting in the queue negates it (otherwise it is
+    /// dropped).
     pub fn receive(&mut self, c: i64) -> bool {
+        if c == OVERLINE {
+            if let Some(last) = self.rx.back_mut() {
+                if *last >= 33 {
+                    *last = -*last;
+                }
+            }
+            return false;
+        }
         self.rx.push_back(c);
         self.irq_on
     }
 
-    /// Drain transmitted output as a host string.
+    /// Drain transmitted output as a host string: a negative code point
+    /// (an overlined character) becomes the character and U+0305.
     pub fn take_output(&mut self) -> String {
-        self.tx
-            .drain(..)
-            .map(|c| u32::try_from(c).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}'))
-            .collect()
+        let mut s = String::new();
+        for c in self.tx.drain(..) {
+            let ch = |v: i64| u32::try_from(v).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+            if c < -32 {
+                s.push(ch(-c));
+                s.push('\u{305}');
+            } else if c < 0 {
+                s.push('\u{FFFD}'); // an overlined control character means nothing
+            } else {
+                s.push(ch(c));
+            }
+        }
+        s
     }
 
     pub fn read(&mut self, r: i64) -> i64 {

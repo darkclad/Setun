@@ -187,10 +187,14 @@ pub fn trit_rgb(r: i64, g: i64, b: i64) -> u32 {
 }
 
 /// 8×8 glyph for a character tryte (a Unicode code point); bit 0 is the
-/// leftmost pixel. Unknown characters show as a hollow box.
+/// leftmost pixel. Unknown characters show as a hollow box. A negative
+/// tryte is the character overlined (see `font::overlined`).
 fn glyph(ch: i64) -> [u8; 8] {
     static TABLE: OnceLock<Vec<Option<[u8; 8]>>> = OnceLock::new();
     const BOX: [u8; 8] = [0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00];
+    if ch < -32 {
+        return super::overlined(glyph(-ch));
+    }
     if ch <= 32 {
         return [0; 8];
     }

@@ -121,8 +121,8 @@ mod tests {
         assert_eq!(m.dev.display.mode(), 0);
         let fb = m.mem.framebuffer();
         let px = |x: usize, y: usize| fb[y * 640 + x] as i64;
-        assert_eq!(Tryte::new(px(0, 0)).unwrap().to_b27(), "mmm", "top-left is black");
-        assert_eq!(Tryte::new(px(639, 479)).unwrap().to_b27(), "MMM", "bottom-right is white");
+        assert_eq!(Tryte::new(px(0, 0)).unwrap().to_b27(), "D\u{305}D\u{305}D\u{305}", "top-left is black");
+        assert_eq!(Tryte::new(px(639, 479)).unwrap().to_b27(), "DDD", "bottom-right is white");
         m.dev.key(44, true);
         m.run(200_000);
         assert_eq!(m.dev.display.mode(), -1);

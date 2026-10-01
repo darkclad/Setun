@@ -288,7 +288,10 @@ fn graphics_pixels_are_rgb_digits() {
     out(&mut m, block::DISPLAY, 0, 0); // 640×480
     let base = Display::fb_base();
     let px = |s: &str| Tryte::from_b27(s).unwrap();
-    for (x, c) in ["MMM", "mmm", "Mmm", "mMm", "mmM", "000"].iter().enumerate() {
+    // white, black, red, green, blue, grey: one digit per channel, D = +13
+    let n = "D\u{305}";
+    let pixels = ["DDD".to_string(), format!("{n}{n}{n}"), format!("D{n}{n}"), format!("{n}D{n}"), format!("{n}{n}D"), "000".into()];
+    for (x, c) in pixels.iter().enumerate() {
         m.mem.write_tryte(base + 640 * 2 + x as i64, px(c)).unwrap();
     }
     let mut buf = Vec::new();
@@ -304,7 +307,7 @@ fn text_mode_renders_glyphs_and_colours() {
     let base = Display::fb_base();
     // Cell (row 1, col 2): 'H', white on blue (fg +++, bg --+).
     let cell = base + 3 * (80 + 2);
-    let attr: Tryte = "+++--+000".parse().unwrap();
+    let attr: Tryte = "111TT1000".parse().unwrap();
     m.mem.write_tryte(cell, Tryte::new('H' as i64).unwrap()).unwrap();
     m.mem.write_tryte(cell + 1, attr).unwrap();
     m.dev.display.write(7, -1); // cursor off-screen
@@ -344,7 +347,7 @@ fn cell_glyph(buf: &[u32], row: usize, col: usize, fg: u32) -> [u8; 8] {
 fn text_mode_draws_cyrillic() {
     let mut m = machine();
     let base = Display::fb_base();
-    let attr: Tryte = "+++---000".parse().unwrap(); // white on black
+    let attr: Tryte = "111TTT000".parse().unwrap(); // white on black
     let text = "Съешь же ещё Ђ Ѡ";
     for (k, c) in text.chars().enumerate() {
         let cell = base + 3 * k as i64;
@@ -367,6 +370,32 @@ fn text_mode_draws_cyrillic() {
     }
     // ж (row 2 is ##.#.##.) really is drawn, not blank
     assert_eq!(cell_glyph(&buf, 0, 6, 0xFFFFFF)[2], 0b0110_1011);
+}
+
+#[test]
+fn text_mode_draws_overlined_characters() {
+    // the machine writes an overlined character as its negated code point
+    let mut m = machine();
+    let base = Display::fb_base();
+    let attr: Tryte = "111TTT000".parse().unwrap(); // white on black
+    let cells = [-('5' as i64), -('D' as i64), '5' as i64, -1, -32];
+    for (k, &c) in cells.iter().enumerate() {
+        m.mem.write_tryte(base + 3 * k as i64, Tryte::new(c).unwrap()).unwrap();
+        m.mem.write_tryte(base + 3 * k as i64 + 1, attr).unwrap();
+    }
+    m.dev.display.write(7, -1);
+    let mut buf = Vec::new();
+    m.dev.display.render(&m.mem, &mut buf);
+    let five = devices::glyph8x8('5' as u32).unwrap();
+    let over = devices::overlined(five);
+    assert_eq!(cell_glyph(&buf, 0, 0, 0xFFFFFF), over);
+    assert_eq!(over[0], 0x7F, "the bar");
+    assert_eq!(&over[1..], &five[..7], "the digit, one row lower");
+    assert_eq!(cell_glyph(&buf, 0, 1, 0xFFFFFF), devices::overlined(devices::glyph8x8('D' as u32).unwrap()));
+    assert_eq!(cell_glyph(&buf, 0, 2, 0xFFFFFF), five, "a plain 5 is untouched");
+    // overlined control characters (-1..-32) are blank, like the controls
+    assert_eq!(cell_glyph(&buf, 0, 3, 0xFFFFFF), [0; 8]);
+    assert_eq!(cell_glyph(&buf, 0, 4, 0xFFFFFF), [0; 8]);
 }
 
 #[test]

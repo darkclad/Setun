@@ -15,7 +15,7 @@ pub use disk::{BlockStore, Disk, MemDisk};
 #[cfg(not(target_arch = "wasm32"))]
 pub use disk::FileDisk;
 pub use display::{Display, FRAME_US};
-pub use font::{glyph8x8, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
+pub use font::{glyph8x8, overlined, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
 pub use input::{Keyboard, Mouse, Serial};
 pub use pic::Pic;
 pub use timer::{Rtc, Timer};

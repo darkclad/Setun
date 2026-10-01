@@ -11,7 +11,7 @@ import "mm.tri";
 import "vm.tri";
 import "fs/vfs.tri";
 
-const TEF_MAGIC: int = 31857270901;
+const TEF_MAGIC: int = 0zB007AB15;
 const MAX_ARGS: int = 81;             // argv and envp strings together
 const ARG_BYTES: int = 2187;
 

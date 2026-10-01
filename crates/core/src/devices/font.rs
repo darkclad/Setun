@@ -152,6 +152,17 @@ fn font8x8(c: char) -> Option<[u8; 8]> {
         .or_else(|| font8x8::MISC_FONTS.get(c))
 }
 
+/// An overlined character, which the machine's character set writes as the
+/// negated code point (a negative digit `1̅` is −'1'): the glyph moved down
+/// one row, with a bar across columns 0–6 on the freed top row. Digits and
+/// capitals stand on rows 0–6, so their bottom row was empty anyway.
+pub fn overlined(g: [u8; 8]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = 0x7F;
+    out[1..].copy_from_slice(&g[..7]);
+    out
+}
+
 /// The 8×8 glyph of a code point (bit 0 = leftmost pixel), or None when the
 /// font has none.
 pub fn glyph8x8(cp: u32) -> Option<[u8; 8]> {

@@ -22,7 +22,7 @@ memory layout:
 2. **Info screen.** It shows the results on the text screen and copies them to the serial console.
 3. **Boot.**
    - It reads **disk 0, sector 0** (one page, 3^9 trytes) by DMA into **frame 1**.
-   - It checks that the **last word of frame 1** (address 29 523) holds the **boot signature `0zCAFEBABE`** (31 857 270 899).
+   - It checks that the **last word of frame 1** (address 29 523) holds the **boot signature `0zB007AB13`** (115 067 810 199).
    - It **jumps to the centre of frame 1, address 19 683**, with:
      - `r1` = the boot disk number (0)
      - `r2` = the number of RAM pages

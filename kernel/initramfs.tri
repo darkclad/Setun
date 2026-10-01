@@ -13,7 +13,7 @@ import "drivers/disk.tri";
 import "fs/vfs.tri";
 
 const INITRAMFS_SECTOR: int = 28;
-const INITRAMFS_MAGIC: int = 31857270902;
+const INITRAMFS_MAGIC: int = 0zB007AB16;
 
 var ramfs_header: int;                // frame holding the header
 var ramfs_data: int;                  // first tryte of the file data

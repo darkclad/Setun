@@ -26,7 +26,7 @@ use setun_core::memory::word_to_trytes;
 use setun_core::PAGE;
 use ternary::Word;
 
-pub const MAGIC: i64 = 31_857_270_904;
+pub const MAGIC: i64 = 115_067_810_204;
 pub const VERSION: i64 = 1;
 pub const BLOCK: usize = PAGE as usize;
 pub const WORDS_PER_BLOCK: usize = BLOCK / 3;

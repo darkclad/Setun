@@ -21,28 +21,48 @@ fn checked_add_detects_overflow() {
     assert_eq!(Tryte::MIN.wrapping_sub(Tryte::new(1).unwrap()), Tryte::MAX);
 }
 
+const O: char = ternary::OVERLINE;
+
 #[test]
 fn trit_text_rejects_garbage() {
     assert_eq!("".parse::<Tryte>(), Err(ParseError::Empty));
     assert_eq!("  _ ".parse::<Tryte>(), Err(ParseError::Empty));
-    assert_eq!("+0x".parse::<Tryte>(), Err(ParseError::BadChar('x')));
+    assert_eq!("10x".parse::<Tryte>(), Err(ParseError::BadChar('x')));
     assert_eq!("2".parse::<Tryte>(), Err(ParseError::BadChar('2')));
-    assert_eq!("+-0+-0+-0+".parse::<Tryte>(), Err(ParseError::Overflow), "10 trits");
-    assert_eq!("++++".parse::<Tri>(), Err(ParseError::Overflow));
+    assert_eq!("1T01T01T01".parse::<Tryte>(), Err(ParseError::Overflow), "10 trits");
+    assert_eq!("1111".parse::<Tri>(), Err(ParseError::Overflow));
+    // the old + and - digits are gone
+    assert_eq!("+0-".parse::<Tryte>(), Err(ParseError::BadChar('+')));
+    assert_eq!("10-".parse::<Tryte>(), Err(ParseError::BadChar('-')));
+    // overlines: only on 1, once, after a digit
+    assert_eq!(format!("10{O}").parse::<Tryte>(), Err(ParseError::BadOverline('0')), "no -0");
+    assert_eq!(format!("1T{O}").parse::<Tryte>(), Err(ParseError::BadOverline('T')), "T is already negative");
+    assert_eq!(format!("11{O}{O}").parse::<Tryte>(), Err(ParseError::DoubleOverline('1')));
+    assert_eq!(format!("{O}1").parse::<Tryte>(), Err(ParseError::StrayOverline));
+    assert_eq!(format!("1_{O}0").parse::<Tryte>(), Err(ParseError::BadOverline('_')));
+    assert_eq!(format!("2{O}").parse::<Tryte>(), Err(ParseError::BadOverline('2')), "base 3 has no 2");
 }
 
 #[test]
 fn base27_rejects_garbage() {
     assert_eq!(Tryte::from_b27(""), Err(ParseError::Empty));
-    for bad in ['N', 'n', 'Z', 'z', '1', '-', '+', 'Ж'] {
+    // E..Z are not digits (only 0-9 and A-D are), and neither are the old letters
+    for bad in ['E', 'e', 'M', 'm', 'N', 'Z', 'z', 'T', '-', '+', 'Ж'] {
         assert_eq!(Tryte::from_b27(&format!("0{bad}0")), Err(ParseError::BadChar(bad)), "{bad}");
     }
-    assert_eq!(Tryte::from_b27("A000"), Err(ParseError::Overflow), "4 digits > 9 trits");
-    assert_eq!(Tri::from_b27("A0"), Err(ParseError::Overflow));
-    // A long run of digits must not overflow the parser itself.
-    assert_eq!(Word::from_b27(&"M".repeat(60)), Err(ParseError::Overflow));
-    // Leading zeros are fine.
-    assert_eq!(Tryte::from_b27("0000000A").unwrap().value(), 1);
+    assert_eq!(Tryte::from_b27("1000"), Err(ParseError::Overflow), "4 digits > 9 trits");
+    assert_eq!(Tri::from_b27("10"), Err(ParseError::Overflow));
+    // a long run of digits must not overflow the parser itself
+    assert_eq!(Word::from_b27(&"D".repeat(60)), Err(ParseError::Overflow));
+    // leading zeros are fine
+    assert_eq!(Tryte::from_b27("00000001").unwrap().value(), 1);
+    // overlines: on a nonzero digit, once, after it
+    assert_eq!(Tryte::from_b27(&format!("E{O}")), Err(ParseError::BadOverline('E')));
+    assert_eq!(Tryte::from_b27(&format!("_{O}1")), Err(ParseError::BadOverline('_')));
+    assert_eq!(Tryte::from_b27(&format!("10{O}")), Err(ParseError::BadOverline('0')), "no -0");
+    assert_eq!(Tryte::from_b27(&format!("1D{O}{O}")), Err(ParseError::DoubleOverline('D')));
+    assert_eq!(Tryte::from_b27(&format!("{O}D")), Err(ParseError::StrayOverline));
+    assert_eq!(Tryte::from_b27(&format!("1 {O}")), Err(ParseError::BadOverline(' ')));
 }
 
 #[test]
@@ -50,6 +70,9 @@ fn parse_errors_display() {
     assert_eq!(ParseError::Empty.to_string(), "empty ternary literal");
     assert!(ParseError::BadChar('q').to_string().contains("'q'"));
     assert_eq!(ParseError::Overflow.to_string(), "ternary literal does not fit");
+    assert_eq!(ParseError::BadOverline('0').to_string(), "'0' cannot be overlined");
+    assert_eq!(ParseError::DoubleOverline('D').to_string(), "'D' has two overlines");
+    assert_eq!(ParseError::StrayOverline.to_string(), "an overline with no digit before it");
 }
 
 #[test]
@@ -86,7 +109,7 @@ fn field_past_width_panics() {
 #[test]
 fn with_field_wraps_oversized_values() {
     // Only the low trits of the value land in the field.
-    let t = Tryte::ZERO.with_field(8..=9, 5); // 5 = +-- → low 2 trits "--" = −4
+    let t = Tryte::ZERO.with_field(8..=9, 5); // 5 = +-- → low 2 trits "TT" = −4
     assert_eq!(t.field(8..=9), -4);
     assert_eq!(t.field(1..=7), 0, "nothing leaks outside the field");
 }

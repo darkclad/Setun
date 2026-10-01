@@ -11,18 +11,18 @@ import "console.tri";
 
 const VERSION: *char = "1.0";
 
-const A_TITLE: tryte = 0t+++--+000;   // white on blue
-const A_TEXT:  tryte = 0t+++---000;   // white on black
-const A_LABEL: tryte = 0t-++---000;   // cyan
-const A_OK:    tryte = 0t-+----000;   // green
-const A_WARN:  tryte = 0t++----000;   // yellow
-const A_ERR:   tryte = 0t+-----000;   // red
+const A_TITLE: tryte = 0t111TT1000;   // white on blue
+const A_TEXT:  tryte = 0t111TTT000;   // white on black
+const A_LABEL: tryte = 0tT11TTT000;   // cyan
+const A_OK:    tryte = 0tT1TTTT000;   // green
+const A_WARN:  tryte = 0t11TTTT000;   // yellow
+const A_ERR:   tryte = 0t1TTTTT000;   // red
 
 // Boot protocol
 const BOOT_FRAME_START: int = 9842;   // first tryte of frame 1
 const BOOT_ENTRY: int = 19683;        // centre of frame 1
 const BOOT_MAGIC_ADDR: int = 29523;   // last word of frame 1
-const BOOT_MAGIC: int = 0zCAFEBABE;
+const BOOT_MAGIC: int = 0zB007AB13;
 
 var ram_frames: int;
 var boot_disk: int;
@@ -77,10 +77,10 @@ fn test_frame(f: int) -> int {
     while (k < 3) {
         var p: *tryte = (base + offsets[k]) as *tryte;
         var old: tryte = *p;
-        *p = 0t+-+-+-+-+;
-        if (*p != 0t+-+-+-+-+) { return 0; }
-        *p = 0t-+-+-+-+-;
-        if (*p != 0t-+-+-+-+-) { return 0; }
+        *p = 0t1T1T1T1T1;
+        if (*p != 0t1T1T1T1T1) { return 0; }
+        *p = 0tT1T1T1T1T;
+        if (*p != 0tT1T1T1T1T) { return 0; }
         *p = old;
         k += 1;
     }

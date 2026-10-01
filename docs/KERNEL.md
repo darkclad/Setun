@@ -434,6 +434,7 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
 - **Input:** the keyboard (USB HID codes with shift and ctrl) and the serial port, on IRQs 1 and 3. Keys become characters through `keymap.tri` (in the Trine standard library, shared with `trwm`):
   - two layouts, US and Russian ЙЦУКЕН (as on Windows: `ё` on the backquote key, `№;:?` on Shift+3/4/6/7, `.`/`,` on the slash key);
   - **Alt+Shift** switches layout, whichever key is pressed first. Caps Lock flips the case of letters in both layouts, and Ctrl+letter gives the control code of the key's position, so `^C` stays on the same key in Russian;
+  - in the US layout `` ` `` is a **dead key**. `` ` `` then a digit or letter types it overlined (the negated code point, ISA §1.1); `` ` `` then Space, or `` ` `` twice, types `` ` ``; anything else types the backquote and then itself;
   - the console and `trwm` each keep their own layout, and `trwm` shows its layout (`EN`/`RU`) at the right end of the panel. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
 - **Canonical mode:** erase (`^H`, DEL), kill (`^U`), EOF (`^D`), `ICRNL`, echo (control characters as `^X`). A read returns at most one line.
 - **Raw mode:** clear `ICANON` and characters pass straight through.
@@ -605,7 +606,7 @@ At boot the kernel mounts the tfs volume as `/`, and prints `VFS: Mounted root (
 
   | Block | Contents |
   |---|---|
-  | 0 | superblock: magic `31857270904`, version, block and inode counts, the block numbers of the maps, inode table and data, free counts, root inode (1), state (1 clean, 0 mounted) |
+  | 0 | superblock: magic `0zB007AB18` (115 067 810 204), version, block and inode counts, the block numbers of the maps, inode table and data, free counts, root inode (1), state (1 clean, 0 mounted) |
   | 1 | inode map, a tryte per inode |
   | 2… | block map, a tryte per block (0 free, 1 used, −1 bad) |
   | then | inode table: 243 inodes of 27 words per block |
@@ -770,7 +771,7 @@ There is still no `printf`; the typed writers replace it (§12).
 - the text and file tools, one multi-call program (`tools.tri`, hard-linked under each name):
   - `sed`: addresses `N`, `$`, `/re/`, ranges and `!`; commands `s` (with `g p N`, `&` and `\1`–`\9`), `y d p q = n a i c`; options `-n -e -i`;
   - `tr` (`-c -d -s`, ranges, `[:class:]`, so `tr а-я А-Я` works too) and `cut` (`-c`/`-f` lists, `-d`, `-s`);
-  - `od`: offsets in octal, values as `-o` (the default) `-d -x -c`, or `-t` for balanced base 27, three digits per tryte;
+  - `od`: offsets in octal, values as `-o` (the default) `-d -x -c`, `-t` for balanced base 27 (three digits per tryte, negative ones overlined) or `-3` for balanced base 3 (nine trits per tryte);
   - `diff` (normal format from the longest common subsequence, `-q`, status 0/1/2), `find` (`-name -type -maxdepth -mindepth -print -exec … ;` and `!`), `xargs` (`-n`, `-I`, status 123/126/127);
   - `md5sum`: text is hashed as UTF-8, so the digests match other systems'.
 - Shared libraries: `regex.tri` (BRE with groups and back-references), `fnmatch.tri` (wildcards, also used by `sh`), and `md5.tri`. Since `&` and `|` are ternary min/max, MD5's bit operations run one bit at a time, about 250k instructions per 64-byte block.

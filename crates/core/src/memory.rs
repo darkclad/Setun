@@ -187,11 +187,11 @@ mod tests {
     #[test]
     fn words_roundtrip_and_are_big_endian() {
         let mut m = Memory::new(1);
-        let w = Word::from_b27("ABCdefGHI").unwrap();
+        let w = Word::from_b27("ABC123D98").unwrap();
         m.write_word(300, w).unwrap();
         assert_eq!(m.read_word(300).unwrap(), w);
         assert_eq!(m.read_tryte(299).unwrap().to_b27(), "ABC");
-        assert_eq!(m.read_tryte(301).unwrap().to_b27(), "GHI");
+        assert_eq!(m.read_tryte(301).unwrap().to_b27(), "D98");
         for v in [Word::MAX, Word::MIN, Word::ZERO, Word::new(-1).unwrap()] {
             let t = word_to_trytes(v);
             m.write_word(0, v).unwrap();

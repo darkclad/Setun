@@ -51,6 +51,7 @@ canvas#screen:focus-visible { box-shadow: 0 0 0 2px var(--plus); }
 .lamps .lamp:nth-child(9n) { margin-right: 3px; }
 .readout { display: flex; justify-content: space-between; font: 13px var(--font-display); font-variant-numeric: tabular-nums; }
 .readout .b27 { color: var(--ink); letter-spacing: 0.08em; }
+.readout .b27 .neg { text-decoration: overline; text-decoration-thickness: 1.5px; }
 .readout .dec { color: var(--dim); }
 
 .status { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font: 13px var(--font-display); font-variant-numeric: tabular-nums; margin: 0; }
@@ -102,7 +103,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
         <div class="lamps" id="lamps-r1" aria-hidden="true"></div>
         <div class="readout"><span class="b27" id="r1-b27">000000000</span><span class="dec" id="r1-dec">0</span></div>
       </div>
-      <p class="legend"><span class="sw" style="background:var(--plus)"></span>+1 &nbsp; <span class="sw" style="background:var(--off)"></span>0 &nbsp; <span class="sw" style="background:var(--minus)"></span>−1 &nbsp;· base 27: A–M = +1…+13, a–m = −1…−13</p>
+      <p class="legend"><span class="sw" style="background:var(--plus)"></span>+1 &nbsp; <span class="sw" style="background:var(--off)"></span>0 &nbsp; <span class="sw" style="background:var(--minus)"></span>−1 &nbsp;· base 27: 0–9 A–D = 0…13, overlined = negative (<span style="text-decoration:overline">5</span> = −5)</p>
 
       <dl class="status">
         <dt>Speed</dt><dd id="st-mips">–</dd>
@@ -163,7 +164,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
 
   const $ = (id) => document.getElementById(id);
   const canvas = $("screen"), ctx = canvas.getContext("2d"), serialEl = $("serial");
-  const B27 = "mlkjihgfedcba0ABCDEFGHIJKLM";
+  const B27 = "0123456789ABCD";
 
   // Balanced-ternary trits (MSB first) of an integer that fits a double exactly.
   function trits(v, n) {
@@ -176,10 +177,16 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     }
     return t;
   }
-  function b27(t) {
-    let s = "";
-    for (let i = 0; i < t.length; i += 3) s += B27[t[i] * 9 + t[i + 1] * 3 + t[i + 2] + 13];
-    return s;
+  // Base-27 digits into el: 0-9 A-D, a negative digit overlined.
+  function showB27(el, t) {
+    el.textContent = "";
+    for (let i = 0; i < t.length; i += 3) {
+      const d = t[i] * 9 + t[i + 1] * 3 + t[i + 2];
+      const span = document.createElement("span");
+      span.textContent = B27[Math.abs(d)];
+      if (d < 0) span.className = "neg";
+      el.appendChild(span);
+    }
   }
   function makeLamps(el) {
     const out = [];
@@ -190,7 +197,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
   function showWord(name, v) {
     const t = trits(v, 27);
     lamps[name].forEach((d, i) => { d.className = t[i] > 0 ? "lamp p" : t[i] < 0 ? "lamp m" : "lamp"; });
-    $(name + "-b27").textContent = b27(t);
+    showB27($(name + "-b27"), t);
     $(name + "-dec").textContent = v.toLocaleString("en-US").replace(/,/g, " ");
   }
   function showError(msg) { const e = $("error"); e.textContent = msg; e.hidden = false; }

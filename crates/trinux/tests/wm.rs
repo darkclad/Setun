@@ -354,6 +354,30 @@ fn arrow_keys_edit_the_shell_line() {
 }
 
 #[test]
+fn the_dead_key_types_overlined_digits() {
+    const BACKQUOTE: i64 = 53;
+    let mut s = Session::boot();
+    s.mark = s.out.len();
+    s.type_text("echo 0z");
+    s.keys(&[BACKQUOTE, 30]); // ` 1: an overlined 1 (the code point -'1')
+    s.key(7, true, false); // D
+    s.keys(&[BACKQUOTE, 44]); // ` Space: a plain backquote
+    s.keys(&[BACKQUOTE, BACKQUOTE]); // ` `: a plain backquote too
+    s.keys(&[BACKQUOTE, 55]); // ` .: the backquote, then the dot
+    s.keys(&[BACKQUOTE, 80, 79]); // ` then an arrow: the backquote is dropped (Left, then Right back)
+    s.keys(&[BACKQUOTE, 7]); // ` d: letters work too
+    s.type_text("\n");
+    // the serial port shows an overlined character as itself plus U+0305
+    s.expect("\n0z1\u{305}D```.d\u{305}\n", 60);
+    // in the Russian layout the key is ё, not a dead key
+    s.switch_layout(ALT);
+    s.keys(&[BACKQUOTE]);
+    s.switch_layout(ALT);
+    s.type_text(" x\n");
+    s.expect("ё x\n", 60);
+}
+
+#[test]
 fn trwm_switches_layout_and_shows_it() {
     let mut s = Session::boot();
     s.console("trwm term &");

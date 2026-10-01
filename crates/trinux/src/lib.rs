@@ -77,9 +77,9 @@ pub const SPECIAL_MODES: [(&str, i64, i64, i64); 5] = [
 
 /// The initramfs header sector (kernel/initramfs.tri); data follows it.
 pub const INITRAMFS_SECTOR: usize = 28;
-pub const INITRAMFS_MAGIC: i64 = 31_857_270_902;
+pub const INITRAMFS_MAGIC: i64 = 115_067_810_202;
 /// TEF executable magic (kernel/exec.tri).
-pub const TEF_MAGIC: i64 = 31_857_270_901;
+pub const TEF_MAGIC: i64 = 115_067_810_201;
 
 /// The repository's `user/` directory.
 pub fn user_dir() -> PathBuf {

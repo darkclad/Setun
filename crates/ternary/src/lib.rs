@@ -8,9 +8,17 @@
 //! Conventions (see `docs/SETUN386_ISA.md` §1):
 //! * trit positions are **1-based and most-significant first**: in a tryte
 //!   `x[1:9]`, `x[1]` has weight 3^8 and `x[9]` has weight 3^0;
-//! * text form writes trits as `+`, `0`, `-` (e.g. `+-0` = 6);
-//! * base-27 form uses one digit per 3 trits: `0`, `A`..`M` = +1..+13,
-//!   `a`..`m` = −1..−13 (negation swaps case; e.g. `MMM` = 9841).
+//! * **base 3** writes trits as `1`, `0` and `1̅` (a `1` with U+0305
+//!   COMBINING OVERLINE), most significant first, e.g. `11̅0` = 6; `T` is
+//!   an ASCII alias for `1̅`;
+//! * **base 27** writes one digit per 3 trits: `0`–`9` and `A`–`D` (either
+//!   case) are 0..13, and a negative digit is the same digit overlined,
+//!   `1̅`…`9̅`, `A̅`…`D̅` = −1..−13. So `DDD` = 9841, `D̅D̅D̅` = −9841, and
+//!   negating a number toggles the overline on every digit.
+//!
+//! An overline belongs to the digit before it: `0` takes none, nor does
+//! anything that is not a digit, and a digit takes at most one. `_` and
+//! whitespace may separate digits.
 
 use std::fmt;
 use std::ops::{Neg, RangeInclusive};
@@ -40,20 +48,21 @@ impl Trit {
         }
     }
 
-    pub const fn to_char(self) -> char {
+    /// The canonical text: `1`, `0`, or `1` with an overline.
+    pub const fn to_str(self) -> &'static str {
         match self {
-            Trit::N => '-',
-            Trit::Z => '0',
-            Trit::P => '+',
+            Trit::N => "1\u{305}",
+            Trit::Z => "0",
+            Trit::P => "1",
         }
     }
 
-    pub fn from_char(c: char) -> Option<Trit> {
-        match c {
-            '-' | '−' | 'T' | 't' => Some(Trit::N),
-            '0' => Some(Trit::Z),
-            '+' | '1' => Some(Trit::P),
-            _ => None,
+    /// The ASCII text: `1`, `0` or `T`.
+    pub const fn to_ascii(self) -> char {
+        match self {
+            Trit::N => 'T',
+            Trit::Z => '0',
+            Trit::P => '1',
         }
     }
 }
@@ -305,34 +314,125 @@ impl<const N: usize> Tern<N> {
         self.trits().iter().take_while(|&&t| t == Trit::Z).count() as u32
     }
 
-    /// Base-27 text: one digit per 3 trits (`0`, `A`..`M` = +1..+13,
-    /// `a`..`m` = −1..−13). A width that is not a multiple of 3 gets implicit
-    /// leading zero trits.
-    pub fn to_b27(self) -> String {
+    /// The base-27 digits, −13..=13, most significant first: one per 3
+    /// trits (a width that is not a multiple of 3 gets implicit leading zero
+    /// trits).
+    pub fn b27_digits(self) -> Vec<i64> {
         let mut t: Vec<Trit> = self.trits().to_vec();
         while !t.len().is_multiple_of(3) {
             t.insert(0, Trit::Z);
         }
-        t.chunks(3)
-            .map(|d| b27_digit(d[0] as i64 * 9 + d[1] as i64 * 3 + d[2] as i64))
-            .collect()
+        t.chunks(3).map(|d| d[0] as i64 * 9 + d[1] as i64 * 3 + d[2] as i64).collect()
     }
 
-    /// Parse base-27 text (see [`Tern::to_b27`]). `_` and whitespace are ignored.
+    /// Base-27 text: `0`–`9`, `A`–`D` for 0..13, and those digits followed by
+    /// U+0305 COMBINING OVERLINE for −1..−13.
+    pub fn to_b27(self) -> String {
+        self.b27_digits().into_iter().map(b27_text).collect()
+    }
+
+    /// Parse base-27 text (see [`Tern::to_b27`]; letters in either case).
     pub fn from_b27(s: &str) -> Result<Self, ParseError> {
         let mut v: i128 = 0;
-        let mut digits = 0;
-        for c in s.chars().filter(|c| !c.is_whitespace() && *c != '_') {
-            v = v * 27 + b27_value(c).ok_or(ParseError::BadChar(c))? as i128;
-            digits += 1;
+        for (c, over) in digit_marks(s)? {
+            let d = b27_value(c).ok_or(if over { ParseError::BadOverline(c) } else { ParseError::BadChar(c) })?;
+            if over && d == 0 {
+                return Err(ParseError::BadOverline(c));
+            }
+            v = v * 27 + if over { -d } else { d } as i128;
             if v.abs() > Self::MAX.0 as i128 {
                 return Err(ParseError::Overflow);
             }
         }
-        if digits == 0 {
-            return Err(ParseError::Empty);
-        }
         Ok(Tern(v as i64))
+    }
+
+    /// The trits as ASCII text, with `T` for −1.
+    pub fn to_ascii(self) -> String {
+        self.trits().iter().map(|t| t.to_ascii()).collect()
+    }
+}
+
+/// U+0305 COMBINING OVERLINE: the mark of a negative digit.
+pub const OVERLINE: char = '\u{305}';
+
+/// The value of a prefixed literal's digits, as the assembler and the Trine
+/// compiler read them: `t` balanced ternary, `z` balanced base 27, `x` plain
+/// hexadecimal (for values from binary systems; a sign is written with unary
+/// minus, and nothing wraps). Range checks against a type are the caller's.
+pub fn parse_prefixed(base: char, digits: &str) -> Result<i64, String> {
+    match base {
+        't' => digits.parse::<Tern<39>>().map(|t| t.value()).map_err(|e| e.to_string()),
+        'z' => Tern::<39>::from_b27(digits).map(|t| t.value()).map_err(|e| e.to_string()),
+        'x' => {
+            if digits.contains(OVERLINE) {
+                return Err("hexadecimal digits cannot be overlined".into());
+            }
+            let h: String = digits.chars().filter(|&c| c != '_').collect();
+            if h.is_empty() {
+                return Err("empty hexadecimal literal".into());
+            }
+            if let Some(c) = h.chars().find(|c| !c.is_ascii_hexdigit()) {
+                return Err(format!("invalid hexadecimal digit {c:?}"));
+            }
+            i64::from_str_radix(&h, 16).map_err(|_| "hexadecimal literal does not fit".into())
+        }
+        _ => Err(format!("unknown literal prefix 0{base}")),
+    }
+}
+
+/// Split digit text into (character, overlined) pairs, skipping `_` and
+/// whitespace. An overline must follow a character that can take one; a
+/// second overline, or one with nothing before it, is an error.
+fn digit_marks(s: &str) -> Result<Vec<(char, bool)>, ParseError> {
+    let mut out = Vec::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == OVERLINE {
+            return Err(ParseError::StrayOverline);
+        }
+        let over = it.peek() == Some(&OVERLINE);
+        if over {
+            it.next();
+            if it.peek() == Some(&OVERLINE) {
+                return Err(ParseError::DoubleOverline(c));
+            }
+        }
+        if c.is_whitespace() || c == '_' {
+            if over {
+                return Err(ParseError::BadOverline(c));
+            }
+            continue;
+        }
+        out.push((c, over));
+    }
+    if out.is_empty() {
+        return Err(ParseError::Empty);
+    }
+    Ok(out)
+}
+
+fn b27_text(v: i64) -> String {
+    let d = b27_char(v.abs());
+    if v < 0 { format!("{d}{OVERLINE}") } else { d.to_string() }
+}
+
+/// The digit for 0..=13.
+fn b27_char(v: i64) -> char {
+    match v {
+        0..=9 => (b'0' + v as u8) as char,
+        10..=13 => (b'A' + (v - 10) as u8) as char,
+        _ => unreachable!("base-27 digit out of range: {v}"),
+    }
+}
+
+/// The value of an un-overlined base-27 digit, 0..=13.
+fn b27_value(c: char) -> Option<i64> {
+    match c {
+        '0'..='9' => Some(c as i64 - '0' as i64),
+        'A'..='D' => Some(c as i64 - 'A' as i64 + 10),
+        'a'..='d' => Some(c as i64 - 'a' as i64 + 10),
+        _ => None,
     }
 }
 
@@ -342,24 +442,6 @@ pub fn split_product<const N: usize>(p: i128) -> (Tern<N>, Tern<N>) {
     let lo = wrap_trits(p, N as u32);
     let hi = (p - lo) / pow3(N as u32);
     (Tern::<N>::wrap(hi), Tern::<N>(lo as i64))
-}
-
-fn b27_digit(v: i64) -> char {
-    match v {
-        0 => '0',
-        1..=13 => (b'A' + (v - 1) as u8) as char,
-        -13..=-1 => (b'a' + (-v - 1) as u8) as char,
-        _ => unreachable!("base-27 digit out of range: {v}"),
-    }
-}
-
-fn b27_value(c: char) -> Option<i64> {
-    match c {
-        '0' => Some(0),
-        'A'..='M' => Some(c as i64 - 'A' as i64 + 1),
-        'a'..='m' => Some(-(c as i64 - 'a' as i64 + 1)),
-        _ => None,
-    }
 }
 
 impl<const N: usize> Neg for Tern<N> {
@@ -372,7 +454,7 @@ impl<const N: usize> Neg for Tern<N> {
 
 impl<const N: usize> fmt::Display for Tern<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.trits().iter().try_for_each(|t| write!(f, "{}", t.to_char()))
+        self.trits().iter().try_for_each(|t| write!(f, "{}", t.to_str()))
     }
 }
 
@@ -387,6 +469,12 @@ pub enum ParseError {
     Empty,
     BadChar(char),
     Overflow,
+    /// An overline on something that cannot take one (`0`, `T`, a separator).
+    BadOverline(char),
+    /// Two overlines on one digit.
+    DoubleOverline(char),
+    /// An overline with no digit before it.
+    StrayOverline,
 }
 
 impl fmt::Display for ParseError {
@@ -395,6 +483,9 @@ impl fmt::Display for ParseError {
             ParseError::Empty => write!(f, "empty ternary literal"),
             ParseError::BadChar(c) => write!(f, "invalid ternary digit {c:?}"),
             ParseError::Overflow => write!(f, "ternary literal does not fit"),
+            ParseError::BadOverline(c) => write!(f, "{c:?} cannot be overlined"),
+            ParseError::DoubleOverline(c) => write!(f, "{c:?} has two overlines"),
+            ParseError::StrayOverline => write!(f, "an overline with no digit before it"),
         }
     }
 }
@@ -404,15 +495,20 @@ impl std::error::Error for ParseError {}
 impl<const N: usize> FromStr for Tern<N> {
     type Err = ParseError;
 
-    /// Parse trit text like `+-0` (MSB first). Up to `N` trits; shorter input
-    /// is zero-extended on the left. `_` and whitespace are ignored.
+    /// Parse base-3 text like `11̅0` or `1T0` (MSB first). Up to `N` trits;
+    /// shorter input is zero-extended on the left. `T` and an overlined `1`
+    /// are the same digit and may be mixed.
     fn from_str(s: &str) -> Result<Self, ParseError> {
         let mut trits = Vec::new();
-        for c in s.chars().filter(|c| !c.is_whitespace() && *c != '_') {
-            trits.push(Trit::from_char(c).ok_or(ParseError::BadChar(c))?);
-        }
-        if trits.is_empty() {
-            return Err(ParseError::Empty);
+        for (c, over) in digit_marks(s)? {
+            trits.push(match (c, over) {
+                ('1', false) => Trit::P,
+                ('1', true) | ('T' | 't', false) => Trit::N,
+                ('0', false) => Trit::Z,
+                ('0' | 'T' | 't', true) => return Err(ParseError::BadOverline(c)),
+                (_, true) => return Err(ParseError::BadOverline(c)),
+                _ => return Err(ParseError::BadChar(c)),
+            });
         }
         if trits.len() > N {
             return Err(ParseError::Overflow);
@@ -441,11 +537,20 @@ mod tests {
     #[test]
     fn brusentsov_examples() {
         // From Brusentsov & Ramil Alvarez (2006), section 3.
-        assert_eq!(t::<3>("+++").value(), 13);
-        assert_eq!(t::<3>("+-+").value(), 7);
-        assert_eq!(t::<3>("+-0").value(), 6);
-        assert_eq!(t::<3>("-+0").value(), -6);
-        assert_eq!((-t::<3>("+-+")).to_string(), "-+-");
+        assert_eq!(t::<3>("111").value(), 13);
+        assert_eq!(t::<3>("1T1").value(), 7);
+        assert_eq!(t::<3>("1T0").value(), 6);
+        assert_eq!(t::<3>("T10").value(), -6);
+        assert_eq!((-t::<3>("1T1")).to_ascii(), "T1T");
+        assert_eq!((-t::<3>("1T1")).to_string(), "1\u{305}11\u{305}", "canonical: overlined ones");
+    }
+
+    #[test]
+    fn base3_text_forms() {
+        // T and an overlined 1 are the same digit, alone or mixed
+        assert_eq!(t::<4>("1T0T").value(), t::<4>("11\u{305}01\u{305}").value());
+        assert_eq!(t::<4>("1t01\u{305}").value(), 27 - 9 - 1);
+        assert_eq!(t::<9>("1_T 0").value(), 6, "separators");
     }
 
     #[test]
@@ -461,18 +566,25 @@ mod tests {
 
     #[test]
     fn base27_notation() {
-        assert_eq!(Tryte::new(1).unwrap().to_b27(), "00A");
-        assert_eq!(Tryte::new(-1).unwrap().to_b27(), "00a");
-        assert_eq!(Tryte::new(27).unwrap().to_b27(), "0A0");
-        assert_eq!(Tryte::MAX.to_b27(), "MMM");
-        assert_eq!(Tryte::MIN.to_b27(), "mmm");
-        // Negation swaps case; a pixel's digits are R, G, B.
-        let red = Tryte::from_b27("Mmm").unwrap();
-        assert_eq!((-red).to_b27(), "mMM");
-        assert_eq!(Word::from_b27("MMMMMMMMM").unwrap(), Word::MAX);
-        assert_eq!(Tern::<4>::new(40).unwrap().to_b27(), "AM"); // 1·27 + 13
-        assert!(Tryte::from_b27("AMMM").is_err());
-        assert!(Tryte::from_b27("0N0").is_err());
+        let o = OVERLINE;
+        assert_eq!(Tryte::new(1).unwrap().to_b27(), "001");
+        assert_eq!(Tryte::new(-1).unwrap().to_b27(), format!("001{o}"));
+        assert_eq!(Tryte::new(13).unwrap().to_b27(), "00D");
+        assert_eq!(Tryte::new(10).unwrap().to_b27(), "00A");
+        assert_eq!(Tryte::new(27).unwrap().to_b27(), "010");
+        assert_eq!(Tryte::MAX.to_b27(), "DDD");
+        assert_eq!(Tryte::MIN.to_b27(), format!("D{o}D{o}D{o}"));
+        // negation toggles every overline; a pixel's digits are R, G, B
+        let red = Tryte::from_b27(&format!("DD{o}D{o}")).unwrap();
+        assert_eq!((-red).to_b27(), format!("D{o}DD"));
+        assert_eq!(Word::from_b27("DDDDDDDDD").unwrap(), Word::MAX);
+        assert_eq!(Tern::<4>::new(40).unwrap().to_b27(), "1D"); // 1·27 + 13
+        assert_eq!(Tryte::from_b27("abc").unwrap(), Tryte::from_b27("ABC").unwrap(), "letters in either case");
+        assert_eq!(Tryte::from_b27(&format!("d{o}")).unwrap().value(), -13);
+        assert_eq!(Tryte::new(5 * 27 - 9).unwrap().to_b27(), format!("059{o}"));
+        assert_eq!(Tryte::new(-9841).unwrap().b27_digits(), vec![-13, -13, -13]);
+        assert!(Tryte::from_b27("1DDD").is_err());
+        assert!(Tryte::from_b27("0E0").is_err());
     }
 
     #[test]
@@ -491,14 +603,14 @@ mod tests {
 
     #[test]
     fn fields_are_one_based_msb_first() {
-        let k = t::<9>("+-0+0-00+");
+        let k = t::<9>("1T010T001");
         assert_eq!(k.trit(1), Trit::P);
         assert_eq!(k.trit(6), Trit::N);
         assert_eq!(k.trit(9), Trit::P);
-        assert_eq!(k.field(1..=2), 2); // "+-"
-        assert_eq!(k.field(3..=6), t::<4>("0+0-").value());
+        assert_eq!(k.field(1..=2), 2); // "1T"
+        assert_eq!(k.field(3..=6), t::<4>("010T").value());
         let k2 = k.with_field(1..=2, 0);
-        assert_eq!(k2.to_string(), "000+0-00+");
+        assert_eq!(k2.to_ascii(), "00010T001");
         assert_eq!(k2.with_field(1..=2, 2), k);
     }
 
@@ -507,10 +619,10 @@ mod tests {
         // MAX + 1 wraps to MIN.
         assert_eq!(Tryte::MAX.wrapping_add(Tryte::new(1).unwrap()), Tryte::MIN);
         // Dropping low trits rounds to nearest.
-        assert_eq!(t::<6>("000+-").shift(-1).to_string(), "00000+"); // 2 -> 1
-        assert_eq!(t::<6>("0000+").shift(-1).value(), 0); // 1 -> 0
-        assert_eq!(t::<6>("0000-+").shift(-1).value(), -1); // -2 -> -1
-        assert_eq!(t::<6>("+00000").shift(1).value(), 0); // high trit falls off
+        assert_eq!(t::<6>("0001T").shift(-1).to_ascii(), "000001"); // 2 -> 1
+        assert_eq!(t::<6>("00001").shift(-1).value(), 0); // 1 -> 0
+        assert_eq!(t::<6>("0000T1").shift(-1).value(), -1); // -2 -> -1
+        assert_eq!(t::<6>("100000").shift(1).value(), 0); // high trit falls off
         for v in -9841..=9841i64 {
             let x = Tryte::new(v).unwrap();
             let r = x.shift(-2).value() as f64;
@@ -520,14 +632,14 @@ mod tests {
 
     #[test]
     fn tritwise_ops() {
-        let a = t::<6>("+0-+0-");
-        let b = t::<6>("++--00");
-        assert_eq!(a.tritwise_mul(b).to_string(), "+0+-00");
-        assert_eq!(a.tritwise_sat(b).to_string(), "++-00-");
-        assert_eq!(a.tritwise_min(b).to_string(), "+0--0-");
-        assert_eq!(a.tritwise_max(b).to_string(), "++-+00");
-        assert_eq!(a.tritwise_cons(b).to_string(), "+0-000");
-        assert_eq!(t::<9>("000+-0000").leading_zero_trits(), 3);
+        let a = t::<6>("10T10T");
+        let b = t::<6>("11TT00");
+        assert_eq!(a.tritwise_mul(b).to_ascii(), "101T00");
+        assert_eq!(a.tritwise_sat(b).to_ascii(), "11T00T");
+        assert_eq!(a.tritwise_min(b).to_ascii(), "10TT0T");
+        assert_eq!(a.tritwise_max(b).to_ascii(), "11T100");
+        assert_eq!(a.tritwise_cons(b).to_ascii(), "10T000");
+        assert_eq!(t::<9>("0001T0000").leading_zero_trits(), 3);
         assert_eq!(Tryte::ZERO.leading_zero_trits(), 9);
     }
 
