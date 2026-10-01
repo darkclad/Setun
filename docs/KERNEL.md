@@ -766,6 +766,7 @@ There is still no `printf`; the typed writers replace it (§12).
 - `grep` (basic regular expressions, `-i -v -c -n -q`, status 0/1/2);
 - `sort` (`-r -n -u`), `uniq` (`-c`);
 - `cp`, `ln`, `chmod` (octal and `ugoa±=rwx`);
+- `edit [file]`: a full-screen editor in the spirit of nano. Arrows, Home/End and PgUp/PgDn move; ^S saves, ^X exits (asking whether to save changes), ^K/^U cut and paste lines, ^W finds and ^G goes to a line. It uses the terminal size from `TIOCGWINSZ`, shows tabs as spaces to the next multiple of 8, and redraws only the cursor's line while typing;
 - the text and file tools, one multi-call program (`tools.tri`, hard-linked under each name):
   - `sed`: addresses `N`, `$`, `/re/`, ranges and `!`; commands `s` (with `g p N`, `&` and `\1`–`\9`), `y d p q = n a i c`; options `-n -e -i`;
   - `tr` (`-c -d -s`, ranges, `[:class:]`, so `tr а-я А-Я` works too) and `cut` (`-c`/`-f` lists, `-d`, `-s`);

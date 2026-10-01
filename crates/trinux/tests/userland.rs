@@ -2,22 +2,34 @@
 //! its error cases.
 
 /// Boot the default disk and type each line at a prompt ("$ " or the
-/// continuation prompt "> "). Returns the transcript and the machine.
+/// continuation prompt "> "). A line starting with `~` is sent as it is
+/// (no newline added) once the machine has had 3 M steps since the last
+/// input, for full-screen programs that print no prompt. Returns the
+/// transcript and the machine.
 fn session_m(lines: &[&str], max_steps: u64) -> (String, setun_core::Machine) {
     let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
     let mut out = String::new();
-    let (mut next, mut steps) = (0, 0);
+    let (mut next, mut steps, mut idle) = (0, 0, 0);
     while steps < max_steps && !m.powered_off {
         m.run(1_000_000);
         steps += 1_000_000;
+        idle += 1_000_000;
         out.push_str(&m.dev.serial.take_output());
         if out.contains("Kernel panic") {
             break;
         }
-        if next < lines.len() && (out.ends_with("$ ") || out.ends_with("> ")) {
-            m.dev.serial_input(&format!("{}\n", lines[next]));
+        let Some(line) = lines.get(next) else { continue };
+        if let Some(raw) = line.strip_prefix('~') {
+            if idle >= 3_000_000 {
+                m.dev.serial_input(raw);
+                next += 1;
+                idle = 0;
+            }
+        } else if out.ends_with("$ ") || out.ends_with("> ") {
+            m.dev.serial_input(&format!("{line}\n"));
             next += 1;
+            idle = 0;
         }
     }
     (out, m)
@@ -432,6 +444,86 @@ fn sh_line_editing() {
             "\nok\n",
             "\n/nonexist\n",
             "    1  echo hello\n    2  echo first\n    3  echo hi\n",
+        ],
+    );
+}
+
+#[test]
+fn the_editor() {
+    let out = session(
+        &[
+            "edit /tmp/e.txt",
+            "~one\rtwo\rthree",
+            "~\u{1b}[A\u{1b}[A",                          // up to "one"
+            "~\u{b}",                                      // ^K cuts it
+            "~\u{1b}[B",                                   // down to "three"
+            "~\u{15}",                                     // ^U pastes it above
+            "~\u{17}",                                     // ^W find
+            "~hre\r",
+            "~X",                                          // typed where "hre" starts
+            "~\u{7}",                                      // ^G go to line
+            "~9\r",                                        // past the end: refused
+            "~\u{7}",
+            "~3\r",
+            "~#",
+            "~\u{13}",                                     // ^S save
+            "~\u{18}",                                     // ^X exit
+            "cat /tmp/e.txt",
+            "edit /tmp/e.txt",
+            "~ZZZ\u{18}",                                  // changed, then ^X: asked
+            "~n\r",                                        // no: the file stays
+            "cat /tmp/e.txt; echo kept",
+            "edit /tmp/e.txt",
+            "~\u{1b}[F!\u{1b}[B\u{1b}[H\u{7f}",            // End, "!", down, Home, Backspace joins
+            "~\u{18}",
+            "~y\r",                                        // yes: saved
+            "cat /tmp/e.txt; echo saved",
+            "edit /tmp/new.txt",
+            "~привет\tмир\u{13}\u{18}",
+            "cat /tmp/new.txt",
+            "exit",
+        ],
+        700_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "[ New file ]",
+            "Invalid line number",
+            "Wrote 3 lines",
+            "$ cat /tmp/e.txt\ntwo\none\n#tXhree\n",
+            "Save the changes? (y/n) ",
+            "$ cat /tmp/e.txt; echo kept\ntwo\none\n#tXhree\nkept\n",
+            "$ cat /tmp/e.txt; echo saved\ntwo!one\n#tXhree\nsaved\n",
+            "$ cat /tmp/new.txt\nпривет\tмир\n",
+        ],
+    );
+}
+
+#[test]
+fn the_editor_errors() {
+    let out = session(
+        &[
+            "edit /tmp; echo st=$?",
+            "edit a b; echo st=$?",
+            "echo | edit /tmp/x; echo st=$?",
+            "edit /nope/file",
+            "~text\u{13}",                                 // ^S: cannot write there
+            "~\u{18}",
+            "~n\r",
+            "echo st=$?",
+            "exit",
+        ],
+        300_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "edit: /tmp: Is a directory\nst=1\n",
+            "usage: edit [file]\nst=2\n",
+            "edit: standard input is not a terminal\nst=1\n",
+            "Cannot write: No such file or directory",
+            "st=0\n",
         ],
     );
 }

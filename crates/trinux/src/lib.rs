@@ -123,7 +123,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     for prog in [
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
-        "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test",
+        "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }

@@ -455,6 +455,7 @@ struct winsize {
     ws_ypixel: int;
 }
 
+const ISIG: int = 1;
 const ICANON: int = 2;
 const ECHO: int = 8;
 const VMIN: int = 6;

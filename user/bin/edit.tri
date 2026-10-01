@@ -1,0 +1,582 @@
+// edit [file]: a small full-screen text editor, in the spirit of nano.
+//
+//   arrows, Home, End, PgUp, PgDn   move         Backspace, Delete   delete
+//   ^S save   ^X exit (asks if the text changed)  ^K cut the line   ^U paste
+//   ^W find (Enter again finds the next)          ^G go to a line number
+//
+// The screen: the text, a status line (file, position, messages) and a line
+// of shortcuts. Tabs show as spaces to the next multiple of 8. Lines can be
+// any length; the view scrolls sideways to follow the cursor.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+
+const MAX_LINES: int = 6561;
+
+var lines: [6561]*char;
+var lcap: [6561]int;                  // allocated size of each line
+var nlines: int;
+var cx: int;                          // cursor: index in the line
+var cy: int;                          // cursor: line
+var top: int;                         // first line on the screen
+var hoff: int;                        // first column on the screen
+var rows: int;
+var cols: int;
+var text_rows: int;
+var modified: int;
+var filename: [243]char;
+var message: [243]char;
+var cut: [243]*char;                  // the cut buffer: lines cut in a row
+var ncut: int;
+var last_was_cut: int;
+var find_text: [243]char;
+var full_redraw: int;
+
+// ---- output, buffered ----
+
+var obuf: [2187]char;
+var olen: int;
+
+fn oflush() {
+    var k: int = 0;
+    while (k < olen) {
+        var w: int = write(STDOUT_FILENO, &obuf[k], olen - k);
+        if (w <= 0) { break; }
+        k += w;
+    }
+    olen = 0;
+}
+
+fn oputc(c: int) {
+    if (olen == 2187) { oflush(); }
+    obuf[olen] = c as char;
+    olen += 1;
+}
+
+fn oputs(s: *char) {
+    var k: int = 0;
+    while (s[k] != 0) { oputc(s[k]); k += 1; }
+}
+
+fn oput_int(v: int) {
+    var b: [15]char;
+    oputs(itoa_e(v, &b[0]));
+}
+
+fn itoa_e(v: int, b: *char) -> *char {
+    var k: int = 14;
+    b[k] = 0;
+    var neg: int = v < 0;
+    if (neg) { v = -v; }
+    loop {
+        k -= 1;
+        b[k] = ('0' + v % 10) as char;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    if (neg) { k -= 1; b[k] = '-'; }
+    return &b[k];
+}
+
+fn goto_rc(r: int, c: int) {
+    oputs("\e[");
+    oput_int(r + 1);
+    oputs(";");
+    oput_int(c + 1);
+    oputs("H");
+}
+
+// ---- lines ----
+
+fn line_new(s: *char, n: int) -> *char {
+    var cap: int = n + 27;
+    var p: *char = malloc(cap) as *char;
+    var k: int = 0;
+    while (k < n) { p[k] = s[k]; k += 1; }
+    p[n] = 0;
+    return p;
+}
+
+fn insert_line(at: int, s: *char, n: int) -> int {
+    if (nlines == MAX_LINES) { set_message("Too many lines"); return 0; }
+    var k: int = nlines;
+    while (k > at) { lines[k] = lines[k - 1]; lcap[k] = lcap[k - 1]; k -= 1; }
+    lines[at] = line_new(s, n);
+    lcap[at] = n + 27;
+    nlines += 1;
+    return 1;
+}
+
+fn delete_line(at: int) {
+    free(lines[at] as *tryte);
+    var k: int = at;
+    while (k + 1 < nlines) { lines[k] = lines[k + 1]; lcap[k] = lcap[k + 1]; k += 1; }
+    nlines -= 1;
+    if (nlines == 0) { insert_line(0, "", 0); }
+}
+
+// Room for n more characters in line l.
+fn line_room(l: int, n: int) {
+    var len: int = strlen(lines[l]);
+    if (len + n + 1 <= lcap[l]) { return; }
+    var cap: int = (len + n + 1) * 2;
+    var p: *char = malloc(cap) as *char;
+    strcpy(p, lines[l]);
+    free(lines[l] as *tryte);
+    lines[l] = p;
+    lcap[l] = cap;
+}
+
+// The screen column of index i in line l (tabs to the next multiple of 8).
+fn render_col(l: int, i: int) -> int {
+    var col: int = 0;
+    var k: int = 0;
+    var s: *char = lines[l];
+    while (k < i && s[k] != 0) {
+        if (s[k] == '\t') { col = (col / 8 + 1) * 8; } else { col += 1; }
+        k += 1;
+    }
+    return col;
+}
+
+fn set_message(s: *char) {
+    strncpy(&message[0], s, 242);
+    message[242] = 0;
+}
+
+// ---- the screen ----
+
+fn draw_line(r: int) {
+    goto_rc(r, 0);
+    var l: int = top + r;
+    if (l < nlines) {
+        var s: *char = lines[l];
+        var col: int = 0;
+        var k: int = 0;
+        while (s[k] != 0 && col < hoff + cols) {
+            if (s[k] == '\t') {
+                var next: int = (col / 8 + 1) * 8;
+                while (col < next) {
+                    if (col >= hoff && col < hoff + cols) { oputc(' '); }
+                    col += 1;
+                }
+            } else {
+                if (col >= hoff) { oputc(s[k]); }
+                col += 1;
+            }
+            k += 1;
+        }
+    } else {
+        oputc('~');
+    }
+    oputs("\e[K");
+}
+
+fn draw_status() {
+    goto_rc(rows - 2, 0);
+    oputs("-- ");
+    oputs(filename[0] != 0 ? &filename[0] : "(new file)");
+    if (modified) { oputs(" [modified]"); }
+    oputs("  line ");
+    oput_int(cy + 1);
+    oputs("/");
+    oput_int(nlines);
+    oputs(", col ");
+    oput_int(render_col(cy, cx) + 1);
+    if (message[0] != 0) { oputs("  "); oputs(&message[0]); }
+    oputs("\e[K");
+    goto_rc(rows - 1, 0);
+    oputs("^S Save  ^X Exit  ^K Cut  ^U Paste  ^W Find  ^G Go to line\e[K");
+}
+
+// Keep the cursor on the screen; 1 if the view moved.
+fn scroll() -> int {
+    var moved: int = 0;
+    if (cy < top) { top = cy; moved = 1; }
+    if (cy >= top + text_rows) { top = cy - text_rows + 1; moved = 1; }
+    var col: int = render_col(cy, cx);
+    if (col < hoff) { hoff = col; moved = 1; }
+    if (col >= hoff + cols) { hoff = col - cols + 1; moved = 1; }
+    return moved;
+}
+
+// Redraw: everything, or only the cursor's line.
+fn refresh(line_only: int) {
+    if (scroll()) { full_redraw = 1; }
+    if (full_redraw) {
+        var r: int = 0;
+        while (r < text_rows) { draw_line(r); r += 1; }
+        full_redraw = 0;
+    } else if (line_only) {
+        draw_line(cy - top);
+    }
+    draw_status();
+    goto_rc(cy - top, render_col(cy, cx) - hoff);
+    oflush();
+}
+
+// ---- keys ----
+
+const K_UP: int = 100000;
+const K_DOWN: int = 100001;
+const K_RIGHT: int = 100002;
+const K_LEFT: int = 100003;
+const K_HOME: int = 100004;
+const K_END: int = 100005;
+const K_DEL: int = 100006;
+const K_PGUP: int = 100007;
+const K_PGDN: int = 100008;
+const K_NONE: int = 100009;
+const K_EOF: int = -2;
+
+fn getch() -> int {
+    var c: [1]char;
+    loop {
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { return K_EOF; }
+        return c[0];
+    }
+}
+
+fn key() -> int {
+    var c: int = getch();
+    if (c != 27) { return c; }
+    c = getch();
+    if (c != '[' && c != 'O') { return c == K_EOF ? K_EOF : K_NONE; }
+    var num: int = 0;
+    loop {
+        c = getch();
+        if (c >= '0' && c <= '9') { num = num * 10 + c - '0'; continue; }
+        if (c == ';') { continue; }
+        break;
+    }
+    switch (c) {
+        case 'A': return K_UP;
+        case 'B': return K_DOWN;
+        case 'C': return K_RIGHT;
+        case 'D': return K_LEFT;
+        case 'H': return K_HOME;
+        case 'F': return K_END;
+    }
+    if (c == '~') {
+        if (num == 1 || num == 7) { return K_HOME; }
+        if (num == 4 || num == 8) { return K_END; }
+        if (num == 3) { return K_DEL; }
+        if (num == 5) { return K_PGUP; }
+        if (num == 6) { return K_PGDN; }
+    }
+    return K_NONE;
+}
+
+// A one-line answer at the bottom (shown after the question q) into out;
+// 0 if cancelled with ^C or Escape.
+fn prompt(q: *char, out: *char, max: int) -> int {
+    var n: int = strlen(out);
+    loop {
+        goto_rc(rows - 1, 0);
+        oputs(q);
+        var k: int = 0;
+        while (k < n) { oputc(out[k]); k += 1; }
+        oputs("\e[K");
+        oflush();
+        var c: int = key();
+        if (c == '\n' || c == '\r') { out[n] = 0; return 1; }
+        if (c == 3 || c == 27 || c == K_EOF) { out[n] = 0; return 0; }
+        if ((c == 127 || c == 8) && n > 0) { n -= 1; }
+        else if (c >= 32 && c < K_UP && n < max - 1) { out[n] = c as char; n += 1; }
+        out[n] = 0;
+    }
+}
+
+// ---- files ----
+
+fn load(path: *char) -> int {
+    var st: stat_t;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) { errno = EISDIR; return -1; }
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        if (errno == ENOENT) { insert_line(0, "", 0); set_message("[ New file ]"); return 0; }
+        return -1;
+    }
+    var buf: [2187]char;
+    var line: *char = malloc(729) as *char;
+    var cap: int = 729;
+    var n: int = 0;
+    var ended: int = 1;
+    loop {
+        var r: int = read(fd, &buf[0], 2187);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        var k: int = 0;
+        while (k < r) {
+            var c: char = buf[k];
+            k += 1;
+            if (c == '\n') {
+                if (!insert_line(nlines, line, n)) { break; }
+                n = 0;
+                ended = 1;
+                continue;
+            }
+            if (n + 2 > cap) {
+                var bigger: *char = malloc(cap * 2) as *char;
+                var j: int = 0;
+                while (j < n) { bigger[j] = line[j]; j += 1; }
+                free(line as *tryte);
+                line = bigger;
+                cap = cap * 2;
+            }
+            line[n] = c;
+            n += 1;
+            ended = 0;
+        }
+    }
+    close(fd);
+    if (!ended || nlines == 0) { insert_line(nlines, line, n); }
+    free(line as *tryte);
+    var b: [15]char;
+    strcpy(&message[0], "Read ");
+    strcat(&message[0], itoa_e(nlines, &b[0]));
+    strcat(&message[0], nlines == 1 ? " line" : " lines");
+    return 0;
+}
+
+fn save() -> int {
+    if (filename[0] == 0) {
+        var name: [243]char;
+        name[0] = 0;
+        if (!prompt("File name to write: ", &name[0], 243) || name[0] == 0) { set_message("Cancelled"); return 0; }
+        strcpy(&filename[0], &name[0]);
+    }
+    var fd: int = open(&filename[0], O_WRONLY + O_CREAT + O_TRUNC, 438);
+    if (fd < 0) {
+        strcpy(&message[0], "Cannot write: ");
+        strncat(&message[0], strerror(errno), 200);
+        return 0;
+    }
+    var l: int = 0;
+    var ok: int = 1;
+    while (l < nlines && ok) {
+        var len: int = strlen(lines[l]);
+        if (len > 0 && write(fd, lines[l], len) != len) { ok = 0; }
+        if (write(fd, "\n", 1) != 1) { ok = 0; }
+        l += 1;
+    }
+    close(fd);
+    if (!ok) { set_message("Write failed"); return 0; }
+    modified = 0;
+    var b: [15]char;
+    strcpy(&message[0], "Wrote ");
+    strcat(&message[0], itoa_e(nlines, &b[0]));
+    strcat(&message[0], nlines == 1 ? " line" : " lines");
+    return 1;
+}
+
+// ---- editing ----
+
+fn insert_char(c: int) {
+    line_room(cy, 1);
+    var s: *char = lines[cy];
+    var len: int = strlen(s);
+    var k: int = len;
+    while (k >= cx) { s[k + 1] = s[k]; k -= 1; }
+    s[cx] = c as char;
+    cx += 1;
+    modified = 1;
+}
+
+fn split_line() {
+    var s: *char = lines[cy];
+    if (!insert_line(cy + 1, &s[cx], strlen(&s[cx]))) { return; }
+    lines[cy][cx] = 0;
+    cy += 1;
+    cx = 0;
+    modified = 1;
+    full_redraw = 1;
+}
+
+fn backspace() {
+    if (cx > 0) {
+        var s: *char = lines[cy];
+        var k: int = cx - 1;
+        while (s[k] != 0) { s[k] = s[k + 1]; k += 1; }
+        cx -= 1;
+        modified = 1;
+        return;
+    }
+    if (cy == 0) { return; }
+    // join with the line above
+    var prev: int = strlen(lines[cy - 1]);
+    line_room(cy - 1, strlen(lines[cy]));
+    strcat(lines[cy - 1], lines[cy]);
+    delete_line(cy);
+    cy -= 1;
+    cx = prev;
+    modified = 1;
+    full_redraw = 1;
+}
+
+fn delete_char() {
+    var s: *char = lines[cy];
+    if (s[cx] != 0) {
+        var k: int = cx;
+        while (s[k] != 0) { s[k] = s[k + 1]; k += 1; }
+        modified = 1;
+        return;
+    }
+    if (cy + 1 >= nlines) { return; }
+    line_room(cy, strlen(lines[cy + 1]));
+    strcat(lines[cy], lines[cy + 1]);
+    delete_line(cy + 1);
+    modified = 1;
+    full_redraw = 1;
+}
+
+fn cut_line() {
+    if (!last_was_cut) {
+        var k: int = 0;
+        while (k < ncut) { free(cut[k] as *tryte); k += 1; }
+        ncut = 0;
+    }
+    if (ncut < 243) { cut[ncut] = strdup(lines[cy]); ncut += 1; }
+    if (nlines == 1) { lines[0][0] = 0; }
+    else {
+        delete_line(cy);
+        if (cy >= nlines) { cy = nlines - 1; }
+    }
+    cx = 0;
+    modified = 1;
+    full_redraw = 1;
+}
+
+fn paste() {
+    var k: int = 0;
+    while (k < ncut) {
+        if (!insert_line(cy, cut[k], strlen(cut[k]))) { break; }
+        cy += 1;
+        k += 1;
+    }
+    cx = 0;
+    if (ncut > 0) { modified = 1; }
+    full_redraw = 1;
+}
+
+fn find() {
+    if (!prompt("Find: ", &find_text[0], 243) || find_text[0] == 0) { set_message("Cancelled"); full_redraw = 1; return; }
+    var l: int = cy;
+    var from: int = cx + 1;
+    var tries: int = 0;
+    while (tries <= nlines) {
+        var s: *char = lines[l];
+        if (from <= strlen(s)) {
+            var hit: *char = strstr(&s[from], &find_text[0]);
+            if (hit != null) {
+                cy = l;
+                cx = hit as int - s as int;
+                set_message("");
+                full_redraw = 1;
+                return;
+            }
+        }
+        l = (l + 1) % nlines;
+        from = 0;
+        tries += 1;
+    }
+    strcpy(&message[0], "Not found: ");
+    strncat(&message[0], &find_text[0], 200);
+    full_redraw = 1;
+}
+
+fn goto_line() {
+    var num: [27]char;
+    num[0] = 0;
+    if (!prompt("Go to line: ", &num[0], 27) || num[0] == 0) { set_message("Cancelled"); full_redraw = 1; return; }
+    var end: *char;
+    var n: int = strtol(&num[0], &end, 10);
+    if (end[0] != 0 || n < 1 || n > nlines) { set_message("Invalid line number"); full_redraw = 1; return; }
+    cy = n - 1;
+    cx = 0;
+    set_message("");
+    full_redraw = 1;
+}
+
+fn clamp_cx() {
+    var len: int = strlen(lines[cy]);
+    if (cx > len) { cx = len; }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 2) { fputs(STDERR_FILENO, "usage: edit [file]\n"); return 2; }
+    var saved: termios;
+    if (tcgetattr(STDIN_FILENO, &saved) < 0) { fputs(STDERR_FILENO, "edit: standard input is not a terminal\n"); return 1; }
+    filename[0] = 0;
+    if (argc == 2) {
+        strncpy(&filename[0], argv[1], 242);
+        filename[242] = 0;
+        if (load(argv[1]) < 0) { perror2("edit", argv[1]); return 1; }
+    } else {
+        insert_line(0, "", 0);
+    }
+    var ws: winsize;
+    rows = 24;
+    cols = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws as int) == 0 && ws.ws_row > 3 && ws.ws_col > 10) { rows = ws.ws_row; cols = ws.ws_col; }
+    text_rows = rows - 2;
+    var raw: termios;
+    tcgetattr(STDIN_FILENO, &raw);
+    var off: [3]int = { ICANON, ECHO, ISIG };
+    var k: int = 0;
+    while (k < 3) { if (raw.c_lflag / off[k] % 2 != 0) { raw.c_lflag -= off[k]; } k += 1; }
+    raw.c_cc[VMIN] = 1;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    oputs("\e[2J");
+    full_redraw = 1;
+    refresh(0);
+    var quit: int = 0;
+    while (!quit) {
+        var c: int = key();
+        var line_only: int = 0;
+        var was_cut: int = 0;
+        if (c != K_NONE) { message[0] = 0; }
+        if (c == K_EOF || c == 24) {                    // ^X
+            if (modified && c == 24) {
+                var ans: [3]char;
+                ans[0] = 0;
+                prompt("Save the changes? (y/n) ", &ans[0], 3);
+                if (ans[0] == 'y' || ans[0] == 'Y') { if (save()) { quit = 1; } }
+                else if (ans[0] == 'n' || ans[0] == 'N') { quit = 1; }
+                else { set_message("Cancelled"); }
+                full_redraw = 1;
+            } else {
+                quit = 1;
+            }
+        } else if (c == 19 || c == 15) { save(); }      // ^S, ^O
+        else if (c == 11) { cut_line(); was_cut = 1; }  // ^K
+        else if (c == 21) { paste(); }                   // ^U
+        else if (c == 23) { find(); }                    // ^W
+        else if (c == 7) { goto_line(); }                // ^G
+        else if (c == K_UP) { if (cy > 0) { cy -= 1; clamp_cx(); } }
+        else if (c == K_DOWN) { if (cy + 1 < nlines) { cy += 1; clamp_cx(); } }
+        else if (c == K_LEFT) {
+            if (cx > 0) { cx -= 1; }
+            else if (cy > 0) { cy -= 1; cx = strlen(lines[cy]); }
+        } else if (c == K_RIGHT) {
+            if (lines[cy][cx] != 0) { cx += 1; }
+            else if (cy + 1 < nlines) { cy += 1; cx = 0; }
+        } else if (c == K_HOME || c == 1) { cx = 0; }
+        else if (c == K_END || c == 5) { cx = strlen(lines[cy]); }
+        else if (c == K_PGUP) { cy -= text_rows; if (cy < 0) { cy = 0; } clamp_cx(); }
+        else if (c == K_PGDN) { cy += text_rows; if (cy >= nlines) { cy = nlines - 1; } clamp_cx(); }
+        else if (c == '\n' || c == '\r') { split_line(); }
+        else if (c == 127 || c == 8) { backspace(); line_only = 1; }
+        else if (c == K_DEL) { delete_char(); line_only = 1; }
+        else if (c == '\t' || (c >= 32 && c < K_UP)) { insert_char(c); line_only = 1; }
+        last_was_cut = was_cut;
+        if (!quit) { refresh(line_only); }
+    }
+    oputs("\e[2J\e[H");
+    oflush();
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    return 0;
+}
