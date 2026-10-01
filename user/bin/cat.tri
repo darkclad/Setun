@@ -1,0 +1,34 @@
+// cat [file ...]: copy files (or standard input, also for "-") to standard output.
+
+import "../lib/tlibc.tri";
+
+var buf: [2187]char;
+
+fn copy(fd: int, name: *char) -> int {
+    loop {
+        var n: int = read(fd, &buf[0], 2187);
+        if (n == 0) { return 0; }
+        if (n < 0) { perror2("cat", name); return 1; }
+        if (write(STDOUT_FILENO, &buf[0], n) != n) { perror2("cat", "write"); return 1; }
+    }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc < 2) { return copy(STDIN_FILENO, "-"); }
+    var status: int = 0;
+    var i: int = 1;
+    while (i < argc) {
+        if (streq(argv[i], "-")) {
+            status = status | copy(STDIN_FILENO, "-");
+        } else {
+            var fd: int = open(argv[i], O_RDONLY, 0);
+            if (fd < 0) { perror2("cat", argv[i]); status = 1; }
+            else {
+                if (copy(fd, argv[i]) != 0) { status = 1; }
+                close(fd);
+            }
+        }
+        i += 1;
+    }
+    return status;
+}

@@ -1,0 +1,33 @@
+// mkdir [-p] dir ...: make directories.
+
+import "../lib/tlibc.tri";
+
+// mkdir -p: make each missing directory along the path.
+fn make_parents(path: *char) -> int {
+    var buf: [243]char;
+    var i: int = 0;
+    while (path[i] != 0 && i < 242) {
+        buf[i] = path[i];
+        i += 1;
+        if ((path[i] == '/' || path[i] == 0) && i > 0) {
+            buf[i] = 0;
+            var st: stat_t;
+            if (stat(&buf[0], &st) < 0 && mkdir(&buf[0], 493) < 0) { return -1; }
+        }
+    }
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var i: int = 1;
+    var parents: int = 0;
+    if (argc > 1 && streq(argv[1], "-p")) { parents = 1; i = 2; }
+    if (i == argc) { fputs(STDERR_FILENO, "usage: mkdir [-p] dir ...\n"); return 2; }
+    var status: int = 0;
+    while (i < argc) {
+        var r: int = parents ? make_parents(argv[i]) : mkdir(argv[i], 493);
+        if (r < 0) { perror2("mkdir", argv[i]); status = 1; }
+        i += 1;
+    }
+    return status;
+}

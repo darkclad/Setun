@@ -1,5 +1,6 @@
 //! Trinux on the emulator: K1 (boot, paging, timer), K2 (user processes),
-//! K3 (fork, execve, wait4, copy on write, initramfs).
+//! K3 (fork, execve, wait4, copy on write, initramfs), K4 (VFS, tty, pipes,
+//! the shell).
 
 use setun_core::isa::{cr, mode};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,29 @@ fn with_init(test: &str, src: &str) -> Vec<(String, PathBuf)> {
     vec![("/sbin/init".into(), p), ("/bin/hello".into(), trinux::user_dir().join("hello.tri"))]
 }
 
+/// Boot the default disk and type each line at the shell prompt, waiting
+/// for "$ " before the next one. Returns the console transcript.
+fn shell(lines: &[&str], max_steps: u64) -> String {
+    let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
+    let mut m = trinux::boot(&disk, 729, 0);
+    let mut out = String::new();
+    let mut next = 0;
+    let mut steps = 0;
+    while steps < max_steps {
+        m.run(1_000_000);
+        steps += 1_000_000;
+        out.push_str(&m.dev.serial.take_output());
+        if out.contains("Kernel panic") {
+            break;
+        }
+        if out.ends_with("$ ") && next < lines.len() {
+            m.dev.serial_input(&format!("{}\n", lines[next]));
+            next += 1;
+        }
+    }
+    out
+}
+
 #[test]
 fn k1_kernel_boots_with_paging_and_timer() {
     let (out, m) = boot_log(&trinux::default_files(), 30_000_000);
@@ -28,10 +52,11 @@ fn k1_kernel_boots_with_paging_and_timer() {
         "Trinux version 0.1 (trine) on Setun-386, balanced ternary",
         "Booted from disk 0, RAM 729 pages",
         "Traps: 243 vectors",
-        "Memory: 689 pages free (frames 40..728), triddy orders 0..9",
+        "Memory: 671 pages free (frames 58..728), triddy orders 0..9",
         "mm: triddy self-test OK",
         "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 759 pages",
-        "initramfs: 3 files",
+        "VFS: ramfs root, devfs on /dev, console tty",
+        "initramfs: 13 files",
         "init: started /sbin/init as pid 1",
         "Timer: 100 Hz",
     ] {
@@ -40,27 +65,6 @@ fn k1_kernel_boots_with_paging_and_timer() {
     assert!(out.contains("[    0."), "printk uptime stamps: {out}");
     assert_eq!(m.cpu.mode(mode::PG), 1);
     assert!(m.cpu.cr(cr::PTB).value() % 59_049 == 0, "PTB is a multiple of 3^10");
-}
-
-#[test]
-fn k3_init_forks_execs_and_waits() {
-    let (out, _) = boot_log(&trinux::default_files(), 200_000_000);
-    for line in [
-        "init: pid 1, argv[0] = /sbin/init",
-        "hello: pid 2, parent 1, argc 3: [/bin/hello] [first] [ternary]",
-        "init: /bin/hello exited with 3",
-        "init: child saw 43, parent still has 100",              // copy on write (555 % 256 = 43)
-        "killed by signal 11",
-        "init: child killed by signal 11",
-        "init: ECHILD ok",
-        "init: 5 fork/exec/wait cycles, no memory leaked",
-        "init: heap ok, heap[999] = 42",
-        "init: done",
-        "Kernel panic - not syncing: Attempted to kill init! exit status 0",
-    ] {
-        assert!(out.contains(line), "missing {line:?} in:\n{out}");
-    }
-    assert!(!out.contains("LEAK"), "{out}");
 }
 
 #[test]
@@ -123,6 +127,84 @@ fn kernel_fault_panics_with_details() {
     assert!(out.contains("trap: misaligned access (vector -5)"), "{out}");
     assert!(out.contains("address 1"), "{out}");
     assert!(out.contains("Kernel panic: unhandled trap in the kernel"), "{out}");
+}
+
+#[test]
+fn k3_k3test_forks_execs_and_waits() {
+    let out = shell(&["k3test first", "exit"], 400_000_000);
+    for line in [
+        "hello: pid 4, parent 3, argc 3: [/bin/hello] [first] [ternary]",
+        "k3test: /bin/hello exited with 3",
+        "k3test: child saw 43, parent still has 100", // copy on write (555 % 256 = 43)
+        "killed by signal 11",
+        "k3test: child killed by signal 11",
+        "k3test: ECHILD ok",
+        "k3test: 5 fork/exec/wait cycles, no memory leaked",
+        "k3test: heap ok, heap[999] = 42",
+        "k3test: done",
+        "init: /bin/sh exited with 0",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
+    }
+    assert!(!out.contains("LEAK"), "{out}");
+}
+
+#[test]
+fn k4_shell_pipes_echo_into_cat() {
+    let out = shell(&["echo hi | cat", "exit 5"], 150_000_000);
+    assert!(out.contains("init: pid 1, starting /bin/sh\n$ "), "{out}");
+    assert!(out.contains("$ echo hi | cat\nhi\n$ exit 5\n"), "{out}");
+    assert!(out.contains("init: /bin/sh exited with 5"), "{out}");
+    assert!(out.contains("Attempted to kill init! exit status 1280"), "{out}");
+}
+
+#[test]
+fn k4_shell_files_dirs_and_status() {
+    let out = shell(
+        &[
+            "pwd; cd /tmp; pwd",
+            "echo one > f; echo two >> f; cat f",
+            "cat < f | cat | cat",
+            "mkdir -p a/b && cd a/b && pwd && cd ../.. && ls",
+            "ls /",
+            "ls -l /bin/true /etc",
+            "cat /etc/motd",
+            "false; echo status $?",
+            "false || echo or-ran && echo and-ran",
+            "true && false && echo never; echo $?",
+            r#"echo 'single  $?' "double $?" back\\slash"#,
+            "nosuch; echo $?",
+            "cat /nope",
+            "cat /nope 2>&1 >/dev/null | cat",
+            "rm f; cat f; rm -d a/b; ls a",
+            "cd /dev; ls",
+            "exit",
+        ],
+        600_000_000,
+    );
+    for want in [
+        "$ pwd; cd /tmp; pwd\n/\n/tmp\n",
+        "cat f\none\ntwo\n",
+        "cat < f | cat | cat\none\ntwo\n",
+        "&& ls\n/tmp/a/b\na\nf\n",
+        "$ ls /\nbin\ndev\netc\nsbin\ntmp\n",
+        "-rwxr-xr-x 1 root root",
+        "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root root ",
+        "/etc:\n-rwxr-xr-x 1 root root      65 motd\n",
+        "Welcome to Trinux on Setun-386.\nEverything here is a power of 3.\n",
+        "status 1\n",
+        "or-ran\nand-ran\n",
+        "echo never; echo $?\n1\n",
+        "single  $? double 0 back\\slash\n",
+        "sh: nosuch: not found\n127\n",
+        "cat: /nope: No such file or directory\n",
+        "/dev/null | cat\ncat: /nope: No such file or directory\n",
+        "cat: f: No such file or directory\n",
+        "$ cd /dev; ls\nconsole\nnull\ntty\nttyS0\nzero\n",
+        "init: /bin/sh exited with 0",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path) {

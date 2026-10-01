@@ -9,7 +9,7 @@ import "params.tri";
 import "printk.tri";
 import "mm.tri";
 import "vm.tri";
-import "initramfs.tri";
+import "fs/vfs.tri";
 
 const TEF_MAGIC: int = 31857270901;
 const MAX_ARGS: int = 32;
@@ -25,6 +25,7 @@ var exec_path: [81]char;
 var exec_buf: [2187]char;
 var exec_arg: [32]int;                // offsets into exec_buf
 var exec_argc: int;
+var exec_cwd: int;                    // where a relative path starts
 
 // Result of a successful load.
 var load_l1: int;
@@ -50,23 +51,30 @@ fn poke_word(l1: int, va: int, v: int) {
 // Load `exec_path` with the arguments in exec_buf/exec_arg into a fresh
 // address space. Returns 0 or -errno.
 fn exec_load() -> int {
-    var file: int = ramfs_lookup(&exec_path[0]);
-    if (file < 0) { return -ENOENT; }
-    var d: int = ramfs_data_at(file);
-    if (ramfs_size(file) < 18 || word_at(d, 0) != TEF_MAGIC) { return -ENOEXEC; }
+    var file: int = path_lookup(&exec_path[0], exec_cwd);
+    if (file < 0) { return file; }
+    if (inodes[file].type != I_REG) { return -13; }                 // EACCES
+    if (inodes[file].mode / 64 % 2 == 0) { return -13; }            // no owner execute bit
+    var d: int = inodes[file].data;
+    var fsize: int = inodes[file].size;
+    if (fsize < 18 || word_at(d, 0) != TEF_MAGIC) { return -ENOEXEC; }
     var entry: int = word_at(d, 1);
     var text: int = word_at(d, 2);
     var text_size: int = word_at(d, 3);
     var bss: int = word_at(d, 4);
     var bss_size: int = word_at(d, 5);
-    if (!is_user_address(text) || !is_user_address(text + text_size) || text_size + 18 > ramfs_size(file)) {
+    if (!is_user_address(text) || !is_user_address(text + text_size) || text_size + 18 > fsize) {
         return -ENOEXEC;
     }
     var l1: int = new_address_space();
     if (l1 < 0) { return -ENOMEM; }
 
-    // Text: map each page read-only + execute, then copy page by page.
-    var src: *tryte = (d + 18) as *tryte;
+    // Text: map each page read-only + execute, then copy a word at a time.
+    // The text and the file data both start on a word, and pages hold whole
+    // words, so no word straddles a page; a partial last word reads past the
+    // end of the text, into the file or its zero padding.
+    if ((text + 1) % 3 != 0) { free_address_space(l1); return -ENOEXEC; }
+    var src: *int = (d + 19) as *int;
     var i: int = 0;
     var page: int = divr(text, 19683) - 1;
     var phys: int = 0;
@@ -79,8 +87,8 @@ fn exec_load() -> int {
             page = p;
             phys = f * 19683 - p * 19683;          // phys = phys_base + va
         }
-        *((phys + va) as *tryte) = src[i];
-        i += 1;
+        *((phys + va + 1) as *int) = src[i / 3];
+        i += 3;
     }
 
     // Stack: the top page now, the rest on demand.

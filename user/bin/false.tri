@@ -1,0 +1,3 @@
+// false: fail.
+
+fn main(argc: int, argv: **char) -> int { return 1; }

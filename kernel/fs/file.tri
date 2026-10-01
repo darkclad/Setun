@@ -1,0 +1,425 @@
+// file: descriptors, open files and the file-system system calls.
+//
+// Each task has 27 descriptors; a descriptor names an entry in the global
+// open-file table (shared after fork and dup, as in Unix), which names an
+// inode. Reads and writes dispatch on the inode type: ramfs data, a
+// character device, or a pipe.
+
+import "../params.tri";
+import "../printk.tri";
+import "../mm.tri";
+import "../vm.tri";
+import "../exec.tri";
+import "vfs.tri";
+import "pipe.tri";
+import "devfs.tri";
+import "../drivers/tty.tri";
+import "../sched.tri";
+
+const NFDS: int = 27;
+const AT_FDCWD: int = -100;
+const AT_REMOVEDIR: int = 512;
+const O_EXCL: int = 128;
+const SEEK_SET: int = 0;
+const SEEK_CUR: int = 1;
+const SEEK_END: int = 2;
+
+const EACCES: int = 13;
+const EMFILE: int = 24;
+const ESPIPE: int = 29;
+const ERANGE: int = 34;
+
+// struct stat: one word per field (see tlibc).
+struct Stat {
+    st_dev: int;
+    st_ino: int;
+    st_mode: int;
+    st_nlink: int;
+    st_uid: int;
+    st_gid: int;
+    st_rdev: int;
+    st_size: int;
+    st_blksize: int;
+    st_blocks: int;
+    st_atime: int;
+    st_mtime: int;
+    st_ctime: int;
+}
+
+const DT_FIFO: int = 1;
+const DT_CHR: int = 2;
+const DT_DIR: int = 4;
+const DT_REG: int = 8;
+
+var kpath: [243]char;                 // a path copied in from user space
+
+// ---- open files ------------------------------------------------------------------
+
+fn file_close(f: int) {
+    files[f].refs -= 1;
+    if (files[f].refs > 0) { return; }
+    var i: int = files[f].ino;
+    if (inodes[i].type == I_FIFO) { pipe_close(inodes[i].rdev, writable(f)); }
+    inodes[i].opens -= 1;
+    if (inodes[i].opens == 0 && inodes[i].unlinked) { inode_free(i); }
+}
+
+fn file_read(f: int, buf: *tryte, n: int) -> int {
+    if (!readable(f)) { return -EBADF; }
+    var i: int = files[f].ino;
+    var node: *Inode = &inodes[i];
+    switch (node.type) {
+        case I_DIR: return -EISDIR;
+        case I_FIFO: return pipe_read(node.rdev, buf, n);
+        case I_CHR: return dev_read(node.rdev, buf, n);
+    }
+    var pos: int = files[f].pos;
+    if (pos >= node.size) { return 0; }
+    if (n > node.size - pos) { n = node.size - pos; }
+    memcpy(buf, (node.data + pos) as *tryte, n);
+    files[f].pos = pos + n;
+    return n;
+}
+
+fn file_write(f: int, buf: *tryte, n: int) -> int {
+    if (!writable(f)) { return -EBADF; }
+    var i: int = files[f].ino;
+    var node: *Inode = &inodes[i];
+    switch (node.type) {
+        case I_DIR: return -EISDIR;
+        case I_FIFO: return pipe_write(node.rdev, buf, n);
+        case I_CHR: return dev_write(node.rdev, buf, n);
+    }
+    if (has(files[f].flags, O_APPEND)) { files[f].pos = node.size; }
+    var pos: int = files[f].pos;
+    if (!reg_reserve(i, pos + n)) { return -ENOSPC; }
+    var d: *tryte = node.data as *tryte;
+    while (node.size < pos) { d[node.size] = 0; node.size += 1; }    // a hole reads as zeros
+    memcpy((node.data + pos) as *tryte, buf, n);
+    files[f].pos = pos + n;
+    if (pos + n > node.size) { node.size = pos + n; }
+    return n;
+}
+
+// ---- descriptors -------------------------------------------------------------------
+
+// The open file behind `fd`, or -EBADF.
+fn fd_file(fd: int) -> int {
+    if (fd < 0 || fd >= NFDS) { return -EBADF; }
+    var f: int = current_task().fds[fd] - 1;
+    if (f < 0) { return -EBADF; }
+    return f;
+}
+
+// Give file `f` the lowest free descriptor at or above `from`.
+fn fd_install(f: int, from: int) -> int {
+    var t: *Task = current_task();
+    var fd: int = from;
+    while (fd < NFDS) {
+        if (t.fds[fd] == 0) {
+            t.fds[fd] = f + 1;
+            return fd;
+        }
+        fd += 1;
+    }
+    return -EMFILE;
+}
+
+fn fs_fork(parent: *Task, child: *Task) {
+    var fd: int = 0;
+    while (fd < NFDS) {
+        child.fds[fd] = parent.fds[fd];
+        if (child.fds[fd] != 0) { files[child.fds[fd] - 1].refs += 1; }
+        fd += 1;
+    }
+    child.cwd = parent.cwd;
+}
+
+fn fs_exit(t: *Task) {
+    var fd: int = 0;
+    while (fd < NFDS) {
+        if (t.fds[fd] != 0) {
+            file_close(t.fds[fd] - 1);
+            t.fds[fd] = 0;
+        }
+        fd += 1;
+    }
+}
+
+// pid 1 starts with /dev/console on descriptors 0, 1 and 2.
+fn fs_init_task(t: *Task) {
+    t.cwd = root_ino;
+    var c: int = path_lookup("/dev/console", root_ino);
+    if (c < 0) { return; }
+    var f: int = file_alloc(c, O_RDWR);
+    if (f < 0) { return; }
+    files[f].refs = 3;
+    t.fds[0] = f + 1;
+    t.fds[1] = f + 1;
+    t.fds[2] = f + 1;
+}
+
+// ---- system calls ----------------------------------------------------------------------
+
+// Copy a user path into kpath. Returns 0 or -errno.
+fn get_path(p: int) -> int {
+    if (p == 0) { return -EFAULT; }
+    var n: int = copy_user_string(p, &kpath[0], 243);
+    if (n < 0) { return is_user_address(p) ? -ENAMETOOLONG : -EFAULT; }
+    if (n == 0) { return -ENOENT_; }
+    return 0;
+}
+
+// The directory a relative path starts from.
+fn dir_base(dirfd: int) -> int {
+    if (dirfd == AT_FDCWD || kpath[0] == '/') { return current_task().cwd; }
+    var f: int = fd_file(dirfd);
+    if (f < 0) { return f; }
+    if (inodes[files[f].ino].type != I_DIR) { return -ENOTDIR; }
+    return files[f].ino;
+}
+
+fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = path_lookup(&kpath[0], base);
+    if (i >= 0 && has(flags, O_CREAT) && has(flags, O_EXCL)) { return -EEXIST; }
+    if (i == -ENOENT_ && has(flags, O_CREAT)) {
+        i = vfs_create(&kpath[0], base, I_REG, (mode % 512 + 512) % 512);
+    }
+    if (i < 0) { return i; }
+    var acc: int = flags % 4;
+    if (inodes[i].type == I_DIR && acc != 0) { return -EISDIR; }
+    if (inodes[i].type != I_DIR && has(flags, O_DIRECTORY)) { return -ENOTDIR; }
+    if (inodes[i].type == I_REG && has(flags, O_TRUNC) && acc != 0) { reg_truncate(i); }
+    var f: int = file_alloc(i, flags);
+    if (f < 0) { return f; }
+    var fd: int = fd_install(f, 0);
+    if (fd < 0) { file_close(f); }
+    return fd;
+}
+
+fn sys_close(fd: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    current_task().fds[fd] = 0;
+    file_close(f);
+    return 0;
+}
+
+fn sys_read(fd: int, buf: int, n: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    if (!user_range_ok(buf, n)) { return -EFAULT; }
+    return file_read(f, buf as *tryte, n);
+}
+
+fn sys_write(fd: int, buf: int, n: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    if (!user_range_ok(buf, n)) { return -EFAULT; }
+    return file_write(f, buf as *tryte, n);
+}
+
+fn sys_lseek(fd: int, off: int, whence: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    var node: *Inode = &inodes[files[f].ino];
+    if (node.type == I_FIFO || node.type == I_CHR) { return -ESPIPE; }
+    var pos: int;
+    switch (whence) {
+        case SEEK_SET: pos = off;
+        case SEEK_CUR: pos = files[f].pos + off;
+        case SEEK_END: pos = node.size + off;
+        default: return -EINVAL;
+    }
+    if (pos < 0) { return -EINVAL; }
+    files[f].pos = pos;
+    return pos;
+}
+
+fn sys_dup(fd: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    var nfd: int = fd_install(f, 0);
+    if (nfd >= 0) { files[f].refs += 1; }
+    return nfd;
+}
+
+fn sys_dup3(fd: int, nfd: int, flags: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    if (nfd < 0 || nfd >= NFDS || nfd == fd) { return -EINVAL; }
+    var t: *Task = current_task();
+    if (t.fds[nfd] != 0) { file_close(t.fds[nfd] - 1); }
+    t.fds[nfd] = f + 1;
+    files[f].refs += 1;
+    return nfd;
+}
+
+fn sys_pipe2(fds: int, flags: int) -> int {
+    if (!user_range_ok(fds - 1, 6)) { return -EFAULT; }
+    var i: int = inode_alloc(I_FIFO, 384);              // 0600
+    if (i < 0) { return -ENFILE; }
+    inodes[i].unlinked = 1;                              // anonymous: freed on last close
+    var p: int = pipe_create();
+    if (p < 0) { inode_free(i); return -ENFILE; }
+    inodes[i].rdev = p;
+    var rf: int = file_alloc(i, 0);
+    var wf: int = file_alloc(i, O_WRONLY);
+    var rfd: int = rf < 0 ? -1 : fd_install(rf, 0);
+    var wfd: int = wf < 0 || rfd < 0 ? -1 : fd_install(wf, 0);
+    if (wfd < 0) {
+        if (rfd >= 0) { current_task().fds[rfd] = 0; }
+        if (rf >= 0) { file_close(rf); }
+        if (wf >= 0) { file_close(wf); }
+        return rf < 0 || wf < 0 ? -ENFILE : -EMFILE;
+    }
+    var out_fds: *int = fds as *int;
+    out_fds[0] = rfd;
+    out_fds[1] = wfd;
+    return 0;
+}
+
+fn fill_stat(i: int, buf: int) -> int {
+    if (!user_range_ok(buf - 1, sizeof(Stat))) { return -EFAULT; }
+    var st: *Stat = buf as *Stat;
+    var node: *Inode = &inodes[i];
+    st.st_dev = 0;
+    st.st_ino = i;
+    st.st_mode = st_mode(i);
+    st.st_nlink = node.type == I_DIR ? 2 : 1;
+    st.st_uid = 0;
+    st.st_gid = 0;
+    st.st_rdev = node.type == I_CHR ? node.rdev : 0;
+    st.st_size = node.type == I_REG ? node.size : 0;
+    st.st_blksize = PAGE;
+    st.st_blocks = node.block >= 0 ? node.cap / PAGE : 0;
+    st.st_atime = 0;
+    st.st_mtime = 0;
+    st.st_ctime = 0;
+    return 0;
+}
+
+fn sys_fstat(fd: int, buf: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    return fill_stat(files[f].ino, buf);
+}
+
+fn sys_newfstatat(dirfd: int, path: int, buf: int, flags: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = path_lookup(&kpath[0], base);
+    if (i < 0) { return i; }
+    return fill_stat(i, buf);
+}
+
+fn dirent_type(i: int) -> int {
+    switch (inodes[i].type) {
+        case I_DIR: return DT_DIR;
+        case I_CHR: return DT_CHR;
+        case I_FIFO: return DT_FIFO;
+    }
+    return DT_REG;
+}
+
+// One linux_dirent64 record: d_ino, d_off, d_reclen (words), d_type
+// (tryte), then the NUL-terminated name; records are whole words.
+fn put_dirent(at: int, ino: int, off: int, type: int, name: *char, room: int) -> int {
+    var len: int = strlen(name);
+    var reclen: int = (10 + len + 1 + 2) / 3 * 3;
+    if (reclen > room) { return 0; }
+    var w: *int = (at + 1) as *int;
+    w[0] = ino;
+    w[1] = off;
+    w[2] = reclen;
+    var t: *tryte = at as *tryte;
+    t[9] = type as tryte;
+    var k: int = 0;
+    while (k <= len) { t[10 + k] = name[k]; k += 1; }
+    return reclen;
+}
+
+// Entries: 0 = ".", 1 = "..", then the children in list order.
+fn sys_getdents64(fd: int, buf: int, n: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    var dir: int = files[f].ino;
+    if (inodes[dir].type != I_DIR) { return -ENOTDIR; }
+    if (!user_range_ok(buf, n)) { return -EFAULT; }
+    if ((buf + 1) % 3 != 0) { return -EINVAL; }          // must hold whole words
+    var used: int = 0;
+    loop {
+        var pos: int = files[f].pos;
+        var ino: int;
+        var name: *char;
+        if (pos == 0) { ino = dir; name = "."; }
+        else if (pos == 1) { ino = inodes[dir].parent; name = ".."; }
+        else {
+            ino = inodes[dir].child;
+            var k: int = 2;
+            while (ino != -1 && k < pos) { ino = inodes[ino].sibling; k += 1; }
+            if (ino == -1) { break; }
+            name = &inodes[ino].name[0];
+        }
+        var r: int = put_dirent(buf + used, ino, pos + 1, dirent_type(ino), name, n - used);
+        if (r == 0) {
+            if (used == 0) { return -EINVAL; }           // buffer too small for one entry
+            break;
+        }
+        used += r;
+        files[f].pos = pos + 1;
+    }
+    return used;
+}
+
+fn sys_mkdirat(dirfd: int, path: int, mode: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = vfs_create(&kpath[0], base, I_DIR, (mode % 512 + 512) % 512);
+    return i < 0 ? i : 0;
+}
+
+fn sys_unlinkat(dirfd: int, path: int, flags: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = path_lookup(&kpath[0], base);
+    if (i >= 0 && i == current_task().cwd && has(flags, AT_REMOVEDIR)) { return -16; }   // EBUSY
+    return vfs_unlink(&kpath[0], base, has(flags, AT_REMOVEDIR));
+}
+
+fn sys_chdir(path: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var i: int = path_lookup(&kpath[0], current_task().cwd);
+    if (i < 0) { return i; }
+    if (inodes[i].type != I_DIR) { return -ENOTDIR; }
+    current_task().cwd = i;
+    return 0;
+}
+
+fn sys_getcwd(buf: int, size: int) -> int {
+    var n: int = vfs_path_of(current_task().cwd, &kpath[0], 243);
+    if (size < n + 1) { return -ERANGE; }
+    if (!user_range_ok(buf, n + 1)) { return -EFAULT; }
+    memcpy(buf as *tryte, &kpath[0], n + 1);
+    return n + 1;
+}
+
+fn sys_ioctl(fd: int, cmd: int, arg: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    var i: int = files[f].ino;
+    if (inodes[i].type != I_CHR || !dev_is_tty(inodes[i].rdev)) { return -25; }   // ENOTTY
+    if (!user_range_ok(arg - 1, sizeof(Termios))) { return -EFAULT; }
+    return tty_ioctl(cmd, arg);
+}

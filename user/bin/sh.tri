@@ -1,0 +1,433 @@
+// /bin/sh: a small POSIX-style shell.
+//
+//   sh                  interactive on standard input (prompt "$ " on a tty)
+//   sh -c 'commands'    run one command string
+//   sh script           run a file
+//
+// Supported: pipelines (|), lists (; && ||), redirections (< > >> and
+// n> n>> n< n>&m), quoting ('...', "...", \), comments (#), $? and $$, and
+// the builtins cd, pwd, exit. Commands without a / are looked up in /bin.
+// Background jobs, signals and job control arrive with K5.
+
+import "../lib/tlibc.tri";
+
+const T_WORD: int = 0;
+const T_PIPE: int = 1;
+const T_SEMI: int = 2;
+const T_AND: int = 3;
+const T_OR: int = 4;
+const T_REDIR: int = 5;
+
+const R_IN: int = 0;                  // n<file
+const R_OUT: int = 1;                 // n>file
+const R_APPEND: int = 2;              // n>>file
+const R_DUP: int = 3;                 // n>&m
+
+const MAX_TOKENS: int = 243;
+const MAX_ARGS: int = 81;
+const MAX_CMDS: int = 27;
+const LINE_MAX: int = 729;
+
+// Markers the tokenizer leaves in words, expanded when a command runs, so
+// that `false; echo $?` sees the status of `false`.
+const VAR_STATUS: char = 1;
+const VAR_PID: char = 2;
+
+var tok_kind: [243]int;
+var tok_word: [243]*char;
+var tok_fd: [243]int;                 // T_REDIR: the descriptor redirected
+var tok_mode: [243]int;               // T_REDIR: R_*
+var ntok: int;
+var words: [2187]char;
+var wp: int;
+
+var expbuf: [2187]char;               // expanded words of the command being run
+var ep: int;
+
+var last_status: int;
+var interactive: int;
+var syntax_error: int;
+
+fn err(a: *char, b: *char) {
+    fputs(STDERR_FILENO, "sh: ");
+    fputs(STDERR_FILENO, a);
+    fputs(STDERR_FILENO, b);
+    fputs(STDERR_FILENO, "\n");
+}
+
+// ---- tokens -------------------------------------------------------------------------
+
+fn add_tok(kind: int) -> int {
+    if (ntok == MAX_TOKENS) { err("too many words", ""); syntax_error = 1; return 0; }
+    tok_kind[ntok] = kind;
+    tok_word[ntok] = null;
+    ntok += 1;
+    return 1;
+}
+
+fn put_char(c: char) {
+    if (wp < 2186) { words[wp] = c; wp += 1; }
+}
+
+fn is_digit(c: char) -> int { return c >= '0' && c <= '9'; }
+
+fn ends_word(c: char) -> int {
+    return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == '|' || c == '&' || c == ';' || c == '<' || c == '>';
+}
+
+// $? and $$ become markers; any other $ is literal.
+fn dollar(s: *char, i: int) -> int {
+    if (s[i + 1] == '?') { put_char(VAR_STATUS); return i + 2; }
+    if (s[i + 1] == '$') { put_char(VAR_PID); return i + 2; }
+    put_char('$');
+    return i + 1;
+}
+
+// Split a line into tokens. Returns 0 on a syntax error.
+fn tokenize(s: *char) -> int {
+    ntok = 0;
+    wp = 0;
+    syntax_error = 0;
+    var i: int = 0;
+    loop {
+        while (s[i] == ' ' || s[i] == '\t') { i += 1; }
+        var c: char = s[i];
+        if (c == 0 || c == '\n' || c == '#') { break; }
+        if (c == '|') {
+            if (s[i + 1] == '|') { add_tok(T_OR); i += 2; } else { add_tok(T_PIPE); i += 1; }
+        } else if (c == '&') {
+            if (s[i + 1] != '&') { err("background jobs (&) arrive with job control", ""); return 0; }
+            add_tok(T_AND);
+            i += 2;
+        } else if (c == ';') {
+            add_tok(T_SEMI);
+            i += 1;
+        } else if (c == '<' || c == '>' || (is_digit(c) && (s[i + 1] == '<' || s[i + 1] == '>'))) {
+            var fd: int = -1;
+            if (is_digit(c)) { fd = c - '0'; i += 1; }
+            if (!add_tok(T_REDIR)) { return 0; }
+            var t: int = ntok - 1;
+            if (s[i] == '<') {
+                tok_mode[t] = R_IN;
+                tok_fd[t] = fd < 0 ? 0 : fd;
+                i += 1;
+            } else {
+                tok_fd[t] = fd < 0 ? 1 : fd;
+                tok_mode[t] = R_OUT;
+                i += 1;
+                if (s[i] == '>') { tok_mode[t] = R_APPEND; i += 1; }
+                else if (s[i] == '&') { tok_mode[t] = R_DUP; i += 1; }
+            }
+        } else {
+            if (!add_tok(T_WORD)) { return 0; }
+            tok_word[ntok - 1] = &words[wp];
+            while (!ends_word(s[i])) {
+                if (s[i] == '\'') {
+                    i += 1;
+                    while (s[i] != '\'') {
+                        if (s[i] == 0) { err("unterminated quote", ""); return 0; }
+                        put_char(s[i]);
+                        i += 1;
+                    }
+                    i += 1;
+                } else if (s[i] == '"') {
+                    i += 1;
+                    while (s[i] != '"') {
+                        if (s[i] == 0) { err("unterminated quote", ""); return 0; }
+                        if (s[i] == '$') { i = dollar(s, i); continue; }
+                        if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\\' || s[i + 1] == '$')) { i += 1; }
+                        put_char(s[i]);
+                        i += 1;
+                    }
+                    i += 1;
+                } else if (s[i] == '\\') {
+                    i += 1;
+                    if (s[i] != 0 && s[i] != '\n') { put_char(s[i]); i += 1; }
+                } else if (s[i] == '$') {
+                    i = dollar(s, i);
+                } else {
+                    put_char(s[i]);
+                    i += 1;
+                }
+            }
+            put_char(0);
+        }
+        if (syntax_error) { return 0; }
+    }
+    return 1;
+}
+
+// A word with $? and $$ substituted (in expbuf when it changes).
+fn expand(w: *char) -> *char {
+    var k: int = 0;
+    var plain: int = 1;
+    while (w[k] != 0) {
+        if (w[k] == VAR_STATUS || w[k] == VAR_PID) { plain = 0; }
+        k += 1;
+    }
+    if (plain) { return w; }
+    var start: int = ep;
+    k = 0;
+    while (w[k] != 0) {
+        if (w[k] == VAR_STATUS || w[k] == VAR_PID) {
+            var num: [15]char;
+            var s: *char = itoa(w[k] == VAR_STATUS ? last_status : getpid(), &num[0]);
+            var j: int = 0;
+            while (s[j] != 0 && ep < 2186) { expbuf[ep] = s[j]; ep += 1; j += 1; }
+        } else if (ep < 2186) {
+            expbuf[ep] = w[k];
+            ep += 1;
+        }
+        k += 1;
+    }
+    expbuf[ep] = 0;
+    ep += 1;
+    return &expbuf[start];
+}
+
+// ---- running commands ----------------------------------------------------------------
+
+fn status_of(st: int) -> int {
+    if (WIFEXITED(st)) { return WEXITSTATUS(st); }
+    return 128 + WTERMSIG(st);
+}
+
+// Apply the redirections in tokens [a, b). Returns 0, or -1 after a message.
+fn redirect(a: int, b: int) -> int {
+    var t: int = a;
+    while (t < b) {
+        if (tok_kind[t] == T_REDIR) {
+            if (t + 1 >= b || tok_kind[t + 1] != T_WORD) { err("syntax error: redirection without a target", ""); return -1; }
+            var target: *char = expand(tok_word[t + 1]);
+            var fd: int;
+            switch (tok_mode[t]) {
+                case R_IN: fd = open(target, O_RDONLY, 0);
+                case R_OUT: fd = open(target, O_WRONLY + O_CREAT + O_TRUNC, 420);
+                case R_APPEND: fd = open(target, O_WRONLY + O_CREAT + O_APPEND, 420);
+                default: {
+                    if (!is_digit(target[0]) || target[1] != 0) { err("bad descriptor: ", target); return -1; }
+                    fd = dup(target[0] - '0');
+                }
+            }
+            if (fd < 0) {
+                perror2("sh", target);
+                return -1;
+            }
+            if (fd != tok_fd[t]) {
+                dup2(fd, tok_fd[t]);
+                close(fd);
+            }
+            t += 1;
+        }
+        t += 1;
+    }
+    return 0;
+}
+
+// The words of tokens [a, b), skipping redirections, as argv. Returns argc.
+fn collect_args(a: int, b: int, argv: **char) -> int {
+    var n: int = 0;
+    var t: int = a;
+    while (t < b) {
+        if (tok_kind[t] == T_REDIR) { t += 2; continue; }
+        if (n < MAX_ARGS - 1) { argv[n] = expand(tok_word[t]); n += 1; }
+        t += 1;
+    }
+    argv[n] = null;
+    return n;
+}
+
+fn is_builtin(name: *char) -> int { return streq(name, "cd") || streq(name, "pwd") || streq(name, "exit"); }
+
+fn builtin(argc: int, argv: **char) -> int {
+    if (streq(argv[0], "cd")) {
+        var dir: *char = argc > 1 ? argv[1] : "/";
+        if (chdir(dir) < 0) { perror2("sh: cd", dir); return 1; }
+        return 0;
+    }
+    if (streq(argv[0], "pwd")) {
+        var buf: [243]char;
+        if (getcwd(&buf[0], 243) == null) { perror2("sh", "pwd"); return 1; }
+        puts(&buf[0]);
+        puts("\n");
+        return 0;
+    }
+    // exit [n]
+    var code: int = last_status;
+    if (argc > 1) {
+        code = 0;
+        var k: int = 0;
+        while (is_digit(argv[1][k])) { code = code * 10 + argv[1][k] - '0'; k += 1; }
+    }
+    _exit(code);
+    return code;
+}
+
+// In a child: run the command, never return.
+fn exec_command(argc: int, argv: **char) {
+    if (is_builtin(argv[0])) { _exit(builtin(argc, argv)); }
+    var k: int = 0;
+    var has_slash: int = 0;
+    while (argv[0][k] != 0) { if (argv[0][k] == '/') { has_slash = 1; } k += 1; }
+    if (has_slash) {
+        execve(argv[0], argv, null);
+    } else {
+        var path: [243]char;
+        var p: *char = "/bin/";
+        var n: int = 0;
+        while (p[n] != 0) { path[n] = p[n]; n += 1; }
+        k = 0;
+        while (argv[0][k] != 0 && n < 242) { path[n] = argv[0][k]; n += 1; k += 1; }
+        path[n] = 0;
+        execve(&path[0], argv, null);
+    }
+    if (errno == ENOENT) {
+        err(argv[0], ": not found");
+        _exit(127);
+    }
+    perror2("sh", argv[0]);
+    _exit(126);
+}
+
+// A builtin in the shell itself, with its redirections undone afterwards.
+fn run_builtin_here(a: int, b: int, argc: int, argv: **char) -> int {
+    var saved: [3]int;
+    var fd: int = 0;
+    while (fd < 3) { saved[fd] = dup(fd); fd += 1; }
+    var status: int = 1;
+    if (redirect(a, b) == 0) { status = builtin(argc, argv); }
+    fd = 0;
+    while (fd < 3) {
+        if (saved[fd] >= 0) { dup2(saved[fd], fd); close(saved[fd]); }
+        fd += 1;
+    }
+    return status;
+}
+
+// Run the pipeline in tokens [a, b); returns its status.
+fn run_pipeline(a: int, b: int) -> int {
+    var starts: [27]int;
+    var ends: [27]int;
+    var n: int = 0;
+    var s: int = a;
+    var t: int = a;
+    while (t <= b) {
+        if (t == b || tok_kind[t] == T_PIPE) {
+            if (t == s || n == MAX_CMDS) { err("syntax error near |", ""); return 2; }
+            starts[n] = s;
+            ends[n] = t;
+            n += 1;
+            s = t + 1;
+        }
+        t += 1;
+    }
+    ep = 0;
+    var argv: [81]*char;
+    if (n == 1) {
+        var argc: int = collect_args(a, b, &argv[0]);
+        if (argc > 0 && is_builtin(argv[0])) { return run_builtin_here(a, b, argc, &argv[0]); }
+    }
+    var pids: [27]int;
+    var prev: int = -1;                          // read end of the previous pipe
+    var i: int = 0;
+    while (i < n) {
+        var p: [2]int;
+        if (i < n - 1 && pipe(&p[0]) < 0) { perror2("sh", "pipe"); return 1; }
+        var pid: int = fork();
+        if (pid < 0) { perror2("sh", "fork"); return 1; }
+        if (pid == 0) {
+            if (prev >= 0) { dup2(prev, 0); close(prev); }
+            if (i < n - 1) { close(p[0]); dup2(p[1], 1); close(p[1]); }
+            if (redirect(starts[i], ends[i]) < 0) { _exit(1); }
+            ep = 0;
+            var argc: int = collect_args(starts[i], ends[i], &argv[0]);
+            if (argc == 0) { _exit(0); }
+            exec_command(argc, &argv[0]);
+        }
+        pids[i] = pid;
+        if (prev >= 0) { close(prev); }
+        if (i < n - 1) { close(p[1]); prev = p[0]; }
+        i += 1;
+    }
+    var status: int = 0;
+    i = 0;
+    while (i < n) {
+        var st: int = 0;
+        waitpid(pids[i], &st, 0);
+        if (i == n - 1) { status = status_of(st); }
+        i += 1;
+    }
+    return status;
+}
+
+// Run a tokenized line: pipelines joined by ; && ||.
+fn run_list() -> int {
+    var status: int = last_status;
+    var op: int = T_SEMI;
+    var pos: int = 0;
+    while (pos < ntok) {
+        var end: int = pos;
+        while (end < ntok && tok_kind[end] != T_SEMI && tok_kind[end] != T_AND && tok_kind[end] != T_OR) { end += 1; }
+        if (end == pos && (end < ntok && tok_kind[end] != T_SEMI)) { err("syntax error near && or ||", ""); return 2; }
+        var go: int = op == T_SEMI || (op == T_AND && status == 0) || (op == T_OR && status != 0);
+        if (end > pos && go) {
+            status = run_pipeline(pos, end);
+            last_status = status;
+        }
+        if (end < ntok) { op = tok_kind[end]; end += 1; }
+        pos = end;
+    }
+    return status;
+}
+
+fn run_line(s: *char) {
+    if (!tokenize(s)) { last_status = 2; return; }
+    if (ntok > 0) { run_list(); }
+}
+
+// ---- input --------------------------------------------------------------------------
+
+var inbuf: [2187]char;
+var in_len: int;
+var in_pos: int;
+
+// The next line from fd into `line` (without the newline). 0 at end of file.
+fn read_line(fd: int, line: *char) -> int {
+    var n: int = 0;
+    loop {
+        if (in_pos == in_len) {
+            var r: int = read(fd, &inbuf[0], 2187);
+            if (r <= 0) {
+                line[n] = 0;
+                return n > 0;
+            }
+            in_len = r;
+            in_pos = 0;
+        }
+        var c: char = inbuf[in_pos];
+        in_pos += 1;
+        if (c == '\n') { line[n] = 0; return 1; }
+        if (n < LINE_MAX - 1) { line[n] = c; n += 1; }
+    }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 2 && streq(argv[1], "-c")) {
+        run_line(argv[2]);
+        return last_status;
+    }
+    var fd: int = STDIN_FILENO;
+    if (argc > 1) {
+        fd = open(argv[1], O_RDONLY, 0);
+        if (fd < 0) { perror2("sh", argv[1]); return 127; }
+    }
+    interactive = fd == STDIN_FILENO && isatty(STDIN_FILENO);
+    var line: [729]char;
+    loop {
+        if (interactive) { fputs(STDERR_FILENO, "$ "); }
+        if (!read_line(fd, &line[0])) { break; }
+        run_line(&line[0]);
+    }
+    if (interactive) { fputs(STDERR_FILENO, "exit\n"); }
+    return last_status;
+}

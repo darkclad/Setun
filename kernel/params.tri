@@ -9,8 +9,8 @@ const FRAME_LOADER: int = 1;          // the boot sector / loader
 const FRAME_KSTACK: int = 3;          // the kernel's boot stack
 const FRAME_KERNEL: int = 4;          // first frame of the kernel image
 const KERNEL_MAX_SECTORS: int = 27;   // frames 4..30
-const FRAME_KDATA: int = 31;          // kernel globals: frames 31..39
-const FRAME_FIRST_FREE: int = 40;     // the page allocator owns frames 40..
+const FRAME_KDATA: int = 31;          // kernel globals: frames 31..57
+const FRAME_FIRST_FREE: int = 58;     // the page allocator owns frames 58..
 
 // Loader handoff: mkdisk patches these words into the loader sector.
 const LOADER_KERNEL_SECTORS: int = 29520;

@@ -1,0 +1,95 @@
+// /bin/k3test: the K3 process scenarios (it was /sbin/init until the shell
+// arrived): fork, execve, wait4, copy on write, faults, ECHILD, memory
+// accounting and the heap.
+
+import "../lib/tlibc.tri";
+
+var shared: int = 100;                       // copy-on-write check
+
+fn free_ram() -> int {
+    var si: sysinfo_t;
+    sysinfo(&si);
+    return si.freeram / si.mem_unit;
+}
+
+// fork + exec /bin/hello + wait; returns the child's exit code.
+fn run_hello(tag: *char) -> int {
+    var pid: int = fork();
+    if (pid == 0) {
+        var argv: [4]*char = { "/bin/hello", tag, "ternary", null };
+        execve("/bin/hello", &argv[0], null);
+        puts("k3test: execve failed\n");
+        _exit(127);
+    }
+    var status: int = -1;
+    var w: int = waitpid(pid, &status, 0);
+    if (w != pid) { puts("k3test: waitpid returned the wrong pid\n"); return -1; }
+    return WEXITSTATUS(status);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    puts("k3test: pid ");
+    put_int(getpid());
+    puts(", argv[0] = ");
+    puts(argv[0]);
+    puts("\n");
+
+    // fork / execve / wait
+    var code: int = run_hello("first");
+    puts("k3test: /bin/hello exited with ");
+    put_int(code);
+    puts("\n");
+
+    // copy on write: the child's write must not show up here
+    var pid: int = fork();
+    if (pid == 0) {
+        shared = 555;
+        _exit(shared % 256);
+    }
+    var status: int;
+    waitpid(pid, &status, 0);
+    puts("k3test: child saw ");
+    put_int(WEXITSTATUS(status));
+    puts(", parent still has ");
+    put_int(shared);
+    puts("\n");
+
+    // a crashing child is reported as killed by SIGSEGV
+    pid = fork();
+    if (pid == 0) {
+        var p: *int = null;
+        return *p;
+    }
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        puts("k3test: child killed by signal ");
+        put_int(WTERMSIG(status));
+        puts("\n");
+    }
+
+    // nothing left to wait for
+    if (wait(&status) == -1 && errno == ECHILD) { puts("k3test: ECHILD ok\n"); }
+
+    // no memory leaks across fork/exec/exit/wait
+    var before: int = free_ram();
+    var i: int = 0;
+    while (i < 5) { run_hello("loop"); i += 1; }
+    var after: int = free_ram();
+    if (after == before) { puts("k3test: 5 fork/exec/wait cycles, no memory leaked\n"); }
+    else {
+        puts("k3test: LEAK: ");
+        put_int((before - after) / 19683);
+        puts(" pages\n");
+    }
+
+    // heap: brk grows it, pages arrive on demand
+    var base: int = sbrk(3 * 1000 + 6);
+    var heap: *int = (base / 3 * 3 + 3) as *int;      // the first word-aligned address
+    heap[999] = 42;
+    puts("k3test: heap ok, heap[999] = ");
+    put_int(heap[999]);
+    puts("\n");
+
+    puts("k3test: done\n");
+    return 0;
+}

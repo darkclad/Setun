@@ -6,6 +6,9 @@ import "mm.tri";
 import "arch.tri";
 import "vm.tri";
 import "exec.tri";
+import "fs/vfs.tri";
+import "fs/file.tri";
+import "drivers/tty.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
@@ -33,7 +36,22 @@ const SIGSEGV: int = 11;
 const SIGCHLD: int = 17;
 
 // Linux generic system-call numbers
+const SYS_GETCWD: int = 17;
+const SYS_DUP: int = 23;
+const SYS_DUP3: int = 24;
+const SYS_IOCTL: int = 29;
+const SYS_MKDIRAT: int = 34;
+const SYS_UNLINKAT: int = 35;
+const SYS_CHDIR: int = 49;
+const SYS_OPENAT: int = 56;
+const SYS_CLOSE: int = 57;
+const SYS_PIPE2: int = 59;
+const SYS_GETDENTS64: int = 61;
+const SYS_LSEEK: int = 62;
+const SYS_READ: int = 63;
 const SYS_WRITE: int = 64;
+const SYS_NEWFSTATAT: int = 79;
+const SYS_FSTAT: int = 80;
 const SYS_EXIT: int = 93;
 const SYS_EXIT_GROUP: int = 94;
 const SYS_SCHED_YIELD: int = 124;
@@ -59,6 +77,9 @@ struct Task {
     ticks: int;
     heap_start: int;                  // first tryte of the bss
     brk: int;                         // end of the heap
+    wchan: int;                       // what a SLEEPING task waits for
+    cwd: int;                         // inode of the working directory
+    fds: [27]int;                     // open file + 1 per descriptor; 0 = closed
 }
 
 var tasks: [27]Task;
@@ -148,11 +169,35 @@ fn scheduler_tick() {
     schedule();
 }
 
+// Block the current task until wake_up(chan). Callers re-check their
+// condition in a loop: a wake-up only means "look again".
+fn sleep_on(chan: int) {
+    var t: *Task = current_task();
+    t.wchan = chan;
+    t.state = TASK_SLEEPING;
+    schedule();
+}
+
+fn wake_up(chan: int) {
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state == TASK_SLEEPING && tasks[i].wchan == chan) {
+            tasks[i].state = TASK_RUNNABLE;
+            tasks[i].wchan = 0;
+        }
+        i += 1;
+    }
+}
+
+// A parent in wait4 sleeps on its own negated pid.
+fn child_chan(pid: int) -> int { return -pid; }
+
 // ---- process lifetime ---------------------------------------------------------
 
 // Start /sbin/init as pid 1.
 fn spawn_init(path: *char) -> int {
     set_kernel_exec(path);
+    exec_cwd = root_ino;
     var r: int = exec_load();
     if (r < 0) { return r; }
     var slot: int = alloc_task();
@@ -164,6 +209,7 @@ fn spawn_init(path: *char) -> int {
     t.ppid = 0;
     t.heap_start = load_heap;
     t.brk = load_brk;
+    fs_init_task(t);
     set_user_entry(task_frame(t), load_entry, load_sp, exec_argc, load_argv);
     prepare_stack(t);
     t.state = TASK_RUNNABLE;
@@ -188,6 +234,7 @@ fn do_fork(f: *int) -> int {
     child.status = 0;
     child.heap_start = parent.heap_start;
     child.brk = parent.brk;
+    fs_fork(parent, child);
     var cf: *int = task_frame(child);
     var i: int = 0;
     while (i < FRAME_WORDS) { cf[i] = f[i]; i += 1; }
@@ -201,6 +248,7 @@ fn do_fork(f: *int) -> int {
 fn do_execve(f: *int) -> int {
     var r: int = collect_exec_args(f[0], f[1]);
     if (r < 0) { return r; }
+    exec_cwd = current_task().cwd;
     r = exec_load();
     if (r < 0) { return r; }
     var t: *Task = current_task();
@@ -217,6 +265,7 @@ fn do_execve(f: *int) -> int {
 
 fn do_exit(status: int) {
     var t: *Task = current_task();
+    fs_exit(t);
     if (t.l1 != 0) {
         mtc(PTB, frame_centre(kernel_l1));
         free_address_space(t.l1);
@@ -239,8 +288,7 @@ fn do_exit(status: int) {
         if (tasks[i].state != TASK_UNUSED && tasks[i].ppid == t.pid) { tasks[i].ppid = 1; }
         i += 1;
     }
-    var p: int = find_task(t.ppid);
-    if (p >= 0 && tasks[p].state == TASK_SLEEPING) { tasks[p].state = TASK_RUNNABLE; }
+    wake_up(child_chan(t.ppid));
     schedule();                                       // never comes back
     panic("a zombie was scheduled");
 }
@@ -301,8 +349,7 @@ fn do_wait4(pid: int, status_ptr: int, options: int) -> int {
         }
         if (children == 0) { return -ECHILD; }
         if (options % 2 == WNOHANG) { return 0; }
-        current_task().state = TASK_SLEEPING;
-        schedule();
+        sleep_on(child_chan(me));
     }
 }
 
@@ -310,20 +357,6 @@ fn do_wait4(pid: int, status_ptr: int, options: int) -> int {
 
 fn user_range_ok(addr: int, n: int) -> int {
     return n >= 0 && is_user_address(addr) && is_user_address(addr + n - 1 + (n == 0));
-}
-
-fn sys_write(fd: int, buf: int, n: int) -> int {
-    if (fd != 1 && fd != 2) { return -EBADF; }
-    if (!user_range_ok(buf, n)) { return -EFAULT; }
-    var p: *tryte = buf as *tryte;
-    var i: int = 0;
-    while (i < n) {
-        var c: char = p[i];
-        putc(c);
-        screen_putc(c);
-        i += 1;
-    }
-    return n;
 }
 
 fn sys_brk(addr: int) -> int {
@@ -357,7 +390,22 @@ fn sys_sysinfo(info: int) -> int {
 // Arguments are r1..r6 in the frame; the result goes back in r1.
 fn do_syscall(f: *int, n: int) {
     switch (n) {
+        case SYS_READ: f[F_R1] = sys_read(f[0], f[1], f[2]);
         case SYS_WRITE: f[F_R1] = sys_write(f[0], f[1], f[2]);
+        case SYS_OPENAT: f[F_R1] = sys_openat(f[0], f[1], f[2], f[3]);
+        case SYS_CLOSE: f[F_R1] = sys_close(f[0]);
+        case SYS_LSEEK: f[F_R1] = sys_lseek(f[0], f[1], f[2]);
+        case SYS_DUP: f[F_R1] = sys_dup(f[0]);
+        case SYS_DUP3: f[F_R1] = sys_dup3(f[0], f[1], f[2]);
+        case SYS_PIPE2: f[F_R1] = sys_pipe2(f[0], f[1]);
+        case SYS_FSTAT: f[F_R1] = sys_fstat(f[0], f[1]);
+        case SYS_NEWFSTATAT: f[F_R1] = sys_newfstatat(f[0], f[1], f[2], f[3]);
+        case SYS_GETDENTS64: f[F_R1] = sys_getdents64(f[0], f[1], f[2]);
+        case SYS_MKDIRAT: f[F_R1] = sys_mkdirat(f[0], f[1], f[2]);
+        case SYS_UNLINKAT: f[F_R1] = sys_unlinkat(f[0], f[1], f[2]);
+        case SYS_CHDIR: f[F_R1] = sys_chdir(f[0]);
+        case SYS_GETCWD: f[F_R1] = sys_getcwd(f[0], f[1]);
+        case SYS_IOCTL: f[F_R1] = sys_ioctl(f[0], f[1], f[2]);
         case SYS_EXIT, SYS_EXIT_GROUP: do_exit((f[0] % 256 + 256) % 256 * 256);
         case SYS_GETPID: f[F_R1] = current_task().pid;
         case SYS_GETPPID: f[F_R1] = current_task().ppid;

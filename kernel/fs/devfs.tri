@@ -1,0 +1,43 @@
+// devfs: /dev and the character devices behind it.
+//
+// Device numbers follow Linux (major * 256 + minor). Every terminal node is
+// the one console tty in K4; virtual consoles come with the window system.
+
+import "vfs.tri";
+import "../drivers/tty.tri";
+
+const DEV_NULL: int = 259;            // 1,3
+const DEV_ZERO: int = 261;            // 1,5
+const DEV_TTYS0: int = 1088;          // 4,64
+const DEV_TTY: int = 1280;            // 5,0
+const DEV_CONSOLE: int = 1281;        // 5,1
+
+fn dev_is_tty(rdev: int) -> int { return rdev == DEV_TTY || rdev == DEV_CONSOLE || rdev == DEV_TTYS0; }
+
+fn dev_read(rdev: int, buf: *tryte, n: int) -> int {
+    if (rdev == DEV_NULL) { return 0; }
+    if (rdev == DEV_ZERO) {
+        memset(buf, 0, n);
+        return n;
+    }
+    return tty_read(buf, n);
+}
+
+fn dev_write(rdev: int, buf: *tryte, n: int) -> int {
+    if (rdev == DEV_NULL || rdev == DEV_ZERO) { return n; }
+    return tty_write(buf, n);
+}
+
+fn mknod(name: *char, rdev: int, mode: int) {
+    var i: int = vfs_create(name, root_ino, I_CHR, mode);
+    if (i >= 0) { inodes[i].rdev = rdev; }
+}
+
+fn devfs_init() {
+    vfs_mkdirs("/dev");
+    mknod("/dev/null", DEV_NULL, 438);          // 0666
+    mknod("/dev/zero", DEV_ZERO, 438);
+    mknod("/dev/tty", DEV_TTY, 438);
+    mknod("/dev/console", DEV_CONSOLE, 384);    // 0600
+    mknod("/dev/ttyS0", DEV_TTYS0, 432);        // 0660
+}

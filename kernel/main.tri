@@ -6,6 +6,9 @@ import "mm.tri";
 import "arch.tri";
 import "sched.tri";
 import "initramfs.tri";
+import "fs/vfs.tri";
+import "fs/devfs.tri";
+import "drivers/tty.tri";
 
 var boot_disk: int;
 
@@ -56,6 +59,11 @@ fn start_kernel(disk: int, frames: int) {
     if (!paging_enabled()) { panic("paging did not turn on"); }
 
     sched_init();
+    vfs_init();
+    devfs_init();
+    vfs_mkdirs("/tmp");
+    tty_init();
+    printk("VFS: ramfs root, devfs on /dev, console tty\n");
     if (initramfs_init()) {
         var pid: int = spawn_init("/sbin/init");
         if (pid < 0) {

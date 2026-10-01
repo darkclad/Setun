@@ -9,7 +9,7 @@ use trine::{Kind, Options};
 
 /// Kernel load address: the first word of frame 4.
 pub const KERNEL_ORG: i64 = 4 * PAGE - 9840;
-/// Kernel globals: frames 31..39.
+/// Kernel globals: frames 31..57.
 pub const KERNEL_DATA: i64 = 31 * PAGE - 9840;
 /// Kernel boot stack: the top word of frame 3.
 pub const KERNEL_STACK: i64 = 3 * PAGE + 9840;
@@ -47,11 +47,27 @@ pub fn user_dir() -> PathBuf {
 
 /// The default initramfs: (path in the file system, Trine source).
 pub fn default_files() -> Vec<(String, PathBuf)> {
-    vec![
-        ("/sbin/init".into(), user_dir().join("init.tri")),
-        ("/bin/hello".into(), user_dir().join("hello.tri")),
-        ("/bin/k2_hello".into(), user_dir().join("k2_hello.tri")),
-    ]
+    let u = user_dir();
+    let mut v: Vec<(String, PathBuf)> = vec![("/sbin/init".into(), u.join("init.tri"))];
+    for prog in ["sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "k3test"] {
+        v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
+    }
+    v.push(("/bin/hello".into(), u.join("hello.tri")));
+    v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
+    v.push(("/etc/motd".into(), u.join("etc/motd")));
+    v
+}
+
+/// The bytes of an initramfs file: `.tri` sources are compiled to TEF,
+/// anything else is copied as text (one code point per tryte).
+pub fn initramfs_file(src: &Path) -> Result<Vec<i16>, String> {
+    if src.extension().is_some_and(|e| e == "tri") {
+        return tef(src);
+    }
+    let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    text.chars()
+        .map(|c| i16::try_from(c as u32).ok().filter(|&t| t <= 9841).ok_or(format!("{}: {c:?} does not fit a tryte", src.display())))
+        .collect()
 }
 
 fn push_word(v: &mut Vec<i16>, w: i64) {
@@ -115,7 +131,7 @@ pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result
         if chars.len() > 26 {
             return Err(format!("initramfs path too long: {name}"));
         }
-        let file = tef(src)?;
+        let file = initramfs_file(src)?;
         let mut n: Vec<i16> = chars.iter().map(|&c| c as i16).collect();
         n.resize(27, 0);
         entries.extend_from_slice(&n);
@@ -143,10 +159,16 @@ pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result
 
 /// Boot a disk on a fresh machine with the BIOS; run `steps` instructions.
 pub fn boot(disk: &Disk, ram_frames: i64, steps: u64) -> setun_core::Machine {
+    boot_with_input(disk, ram_frames, steps, "")
+}
+
+/// Boot with `input` waiting on the serial console (the kernel's tty reads it).
+pub fn boot_with_input(disk: &Disk, ram_frames: i64, steps: u64, input: &str) -> setun_core::Machine {
     let bios = trine::bios_rom().expect("the BIOS compiles");
     let mut m = setun_core::Machine::new(ram_frames, 1_790_000_000);
     m.load_rom(&bios);
     m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
+    m.dev.serial_input(input);
     m.run(steps);
     m
 }

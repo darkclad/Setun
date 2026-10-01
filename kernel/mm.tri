@@ -116,13 +116,47 @@ fn mm_init(frames: int) {
     add_range(FRAME_FIRST_FREE, last);
 }
 
+// Word loops in assembly: the compiled `p[i] = 0` loop costs ~30
+// instructions a word, and zeroing page tables dominated fork and exec.
+extern fn zero_words(p: *int, n: int);
+extern fn copy_words(dst: *int, src: *int, n: int);
+
+fn _mm_asm() {
+    asm {
+        "        b     _mm_asm_end"
+        "zero_words:"
+        "        cmp   r2, 0"
+        "        ble   zero_words_done"
+        "zero_words_loop:"
+        "        stw   r0, [r1]"
+        "        add   r1, r1, 3"
+        "        sub   r2, r2, 1"
+        "        cmp   r2, 0"
+        "        bgt   zero_words_loop"
+        "zero_words_done:"
+        "        ret"
+        "copy_words:"
+        "        cmp   r3, 0"
+        "        ble   copy_words_done"
+        "copy_words_loop:"
+        "        ldw   r4, [r2]"
+        "        stw   r4, [r1]"
+        "        add   r1, r1, 3"
+        "        add   r2, r2, 3"
+        "        sub   r3, r3, 1"
+        "        cmp   r3, 0"
+        "        bgt   copy_words_loop"
+        "copy_words_done:"
+        "        ret"
+        "_mm_asm_end:"
+    }
+}
+
 // Allocate one zeroed frame.
 fn alloc_frame_zeroed() -> int {
     var f: int = alloc_pages(0);
     if (f < 0) { return -1; }
-    var p: *int = (frame_start(f) + 1) as *int;
-    var i: int = 0;
-    while (i < 6561) { p[i] = 0; i += 1; }
+    zero_words((frame_start(f) + 1) as *int, 6561);
     return f;
 }
 
@@ -130,9 +164,7 @@ fn alloc_frame_zeroed() -> int {
 fn alloc_table() -> int {
     var c: int = alloc_pages(1);
     if (c < 0) { return -1; }
-    var p: *int = (frame_start(c - 1) + 1) as *int;
-    var i: int = 0;
-    while (i < 3 * 6561) { p[i] = 0; i += 1; }
+    zero_words((frame_start(c - 1) + 1) as *int, 3 * 6561);
     return c;
 }
 
@@ -160,10 +192,7 @@ fn put_page(f: int) {
 
 // Copy a whole frame (6561 words).
 fn copy_frame(dst: int, src: int) {
-    var d: *int = (frame_start(dst) + 1) as *int;
-    var s: *int = (frame_start(src) + 1) as *int;
-    var i: int = 0;
-    while (i < 6561) { d[i] = s[i]; i += 1; }
+    copy_words((frame_start(dst) + 1) as *int, (frame_start(src) + 1) as *int, 6561);
 }
 
 // Allocate and free a mix of blocks; everything must come back.

@@ -1,0 +1,277 @@
+// tty: the console terminal, after Linux's n_tty line discipline.
+//
+// Input comes from the keyboard (USB HID usage codes) and the serial port.
+// Both raise IRQs; the timer tick and every read also poll them, so input
+// queued before the IRQs were enabled is not lost. In canonical mode
+// (ICANON) characters are collected into a line with erase (^H, DEL), kill
+// (^U) and end of file (^D); a read returns at most one line. With ICANON
+// off every character is passed through as it arrives. Output goes to the
+// serial port and the text screen. ^C and job control arrive in K5.
+
+import "../params.tri";
+import "../printk.tri";
+
+// termios, one word per flag field (Linux field order and bit values)
+struct Termios {
+    c_iflag: int;
+    c_oflag: int;
+    c_cflag: int;
+    c_lflag: int;
+    c_line: tryte;
+    c_cc: [19]tryte;
+}
+
+struct Winsize {
+    ws_row: int;
+    ws_col: int;
+    ws_xpixel: int;
+    ws_ypixel: int;
+}
+
+const ICRNL: int = 256;               // c_iflag
+const OPOST: int = 1;                 // c_oflag
+const ONLCR: int = 4;
+const ISIG: int = 1;                  // c_lflag
+const ICANON: int = 2;
+const ECHO: int = 8;
+const ECHOE: int = 16;
+const ECHOK: int = 32;
+
+const VINTR: int = 0;
+const VQUIT: int = 1;
+const VERASE: int = 2;
+const VKILL: int = 3;
+const VEOF: int = 4;
+const VTIME: int = 5;
+const VMIN: int = 6;
+
+const TCGETS: int = 21505;
+const TCSETS: int = 21506;
+const TCSETSW: int = 21507;
+const TCSETSF: int = 21508;
+const TIOCGWINSZ: int = 21523;
+
+const TTY_CHAN: int = 20000;          // wait channel for readers
+const TTY_BUF: int = 2187;
+const LINE_MAX: int = 243;
+const EOF_MARK: int = -1;             // in the ready queue: ^D on an empty line
+
+var termios: Termios;
+var ready: [2187]tryte;               // characters a read may take
+var ready_head: int;
+var ready_count: int;
+var line: [243]char;                  // the line being edited (canonical mode)
+var line_len: int;
+var kbd_shift: int;
+var kbd_ctrl: int;
+
+fn tty_init() {
+    termios.c_iflag = ICRNL;
+    termios.c_oflag = OPOST + ONLCR;
+    termios.c_cflag = 0;
+    termios.c_lflag = ISIG + ICANON + ECHO + ECHOE + ECHOK;
+    termios.c_cc[VINTR] = 3;
+    termios.c_cc[VQUIT] = 28;
+    termios.c_cc[VERASE] = 127;
+    termios.c_cc[VKILL] = 21;
+    termios.c_cc[VEOF] = 4;
+    termios.c_cc[VTIME] = 0;
+    termios.c_cc[VMIN] = 1;
+    out(KBD_CTRL, 1);
+    out(SERIAL_CTRL, 1);
+    out(TPIC_UNMASK, IRQ_KEYBOARD);
+    out(TPIC_UNMASK, IRQ_SERIAL);
+}
+
+fn lflag(bit: int) -> int { return termios.c_lflag / bit % 2 != 0; }
+
+fn tty_output(c: char) {
+    putc(c);
+    if (c == 8) {                                   // backspace: the screen cursor steps back
+        if (screen_col > 0) {
+            screen_col -= 1;
+            out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+        }
+        return;
+    }
+    screen_putc(c);
+}
+
+fn tty_echo(c: char) {
+    if (!lflag(ECHO)) { return; }
+    if (c < 32 && c != '\n' && c != '\t') {      // control characters echo as ^X
+        tty_output('^');
+        tty_output((c + 64) as char);
+        return;
+    }
+    tty_output(c);
+}
+
+fn erase_one() {
+    if (line_len == 0) { return; }
+    line_len -= 1;
+    if (lflag(ECHO) && lflag(ECHOE)) {
+        tty_output(8 as char);
+        tty_output(' ');
+        tty_output(8 as char);
+    }
+}
+
+fn ready_put(c: int) -> int {
+    if (ready_count == TTY_BUF) { return 0; }
+    ready[(ready_head + ready_count) % TTY_BUF] = c as tryte;
+    ready_count += 1;
+    return 1;
+}
+
+fn commit_line() {
+    var i: int = 0;
+    while (i < line_len) { ready_put(line[i]); i += 1; }
+    line_len = 0;
+    wake_up(TTY_CHAN);
+}
+
+// One character through the line discipline.
+fn tty_receive(c: char) {
+    if (c == '\r' && termios.c_iflag / ICRNL % 2 != 0) { c = '\n'; }
+    if (!lflag(ICANON)) {
+        if (ready_put(c)) { tty_echo(c); }
+        wake_up(TTY_CHAN);
+        return;
+    }
+    if (c == termios.c_cc[VERASE] || c == 8) { erase_one(); return; }
+    if (c == termios.c_cc[VKILL]) {
+        while (line_len > 0) { erase_one(); }
+        return;
+    }
+    if (c == termios.c_cc[VEOF]) {
+        if (line_len == 0) { ready_put(EOF_MARK); wake_up(TTY_CHAN); }
+        else { commit_line(); }
+        return;
+    }
+    if (c == '\n') {
+        tty_echo(c);
+        line[line_len] = c;
+        line_len += 1;
+        commit_line();
+        return;
+    }
+    if (line_len < LINE_MAX - 1) {
+        line[line_len] = c;
+        line_len += 1;
+        tty_echo(c);
+    }
+}
+
+// Keyboard: USB HID usage codes, +press / -release.
+fn hid_char(code: int) -> int {
+    var s: int = kbd_shift;
+    if (code >= 4 && code <= 29) {
+        if (kbd_ctrl) { return code - 3; }            // ^A = 1 ...
+        return (s ? 'A' : 'a') + code - 4;
+    }
+    if (code >= 30 && code <= 39) {
+        var digits: *char = s ? "!@#$%^&*()" : "1234567890";
+        return digits[code - 30];
+    }
+    switch (code) {
+        case 40: return '\n';
+        case 41: return 27;
+        case 42: return 127;
+        case 43: return '\t';
+        case 44: return ' ';
+        case 45: return s ? '_' : '-';
+        case 46: return s ? '+' : '=';
+        case 47: return s ? '{' : '[';
+        case 48: return s ? '}' : ']';
+        case 49: return s ? '|' : '\\';
+        case 51: return s ? ':' : ';';
+        case 52: return s ? '"' : '\'';
+        case 53: return s ? '~' : '`';
+        case 54: return s ? '<' : ',';
+        case 55: return s ? '>' : '.';
+        case 56: return s ? '?' : '/';
+    }
+    return 0;
+}
+
+fn kbd_event(ev: int) {
+    var code: int = ev < 0 ? -ev : ev;
+    var down: int = ev > 0;
+    if (code == 225 || code == 229) { kbd_shift = down; return; }
+    if (code == 224 || code == 228) { kbd_ctrl = down; return; }
+    if (!down) { return; }
+    var c: int = hid_char(code);
+    if (c != 0) { tty_receive(c as char); }
+}
+
+// Drain both input devices into the line discipline.
+fn tty_poll() {
+    while (in(KBD_COUNT) > 0) { kbd_event(in(KBD_DATA)); }
+    while (in(SERIAL_RX_COUNT) > 0) { tty_receive(in(SERIAL_DATA) as char); }
+}
+
+// Is there something a read can return now?
+fn tty_can_read() -> int {
+    tty_poll();
+    return ready_count > 0;
+}
+
+fn ready_take() -> int {
+    var c: int = ready[ready_head];
+    ready_head = (ready_head + 1) % TTY_BUF;
+    ready_count -= 1;
+    return c;
+}
+
+// Read into kernel-visible `buf`. Blocks until input is available.
+fn tty_read(buf: *tryte, n: int) -> int {
+    if (n == 0) { return 0; }
+    while (!tty_can_read()) { sleep_on(TTY_CHAN); }
+    var k: int = 0;
+    while (k < n && ready_count > 0) {
+        if (ready[ready_head] == EOF_MARK) {
+            if (k == 0) { ready_take(); }           // ^D: this read returns 0
+            break;
+        }
+        var c: int = ready_take();
+        buf[k] = c as tryte;
+        k += 1;
+        if (c == '\n' && lflag(ICANON)) { break; }   // one line per read
+    }
+    return k;
+}
+
+fn tty_write(buf: *tryte, n: int) -> int {
+    var i: int = 0;
+    while (i < n) {
+        tty_output(buf[i] as char);
+        i += 1;
+    }
+    return n;
+}
+
+// ioctl on the terminal; `arg` has been checked to be a user address.
+fn tty_ioctl(cmd: int, arg: int) -> int {
+    switch (cmd) {
+        case TCGETS: {
+            memcpy(bytes(arg as *Termios), bytes(&termios), sizeof(Termios));
+            return 0;
+        }
+        case TCSETS, TCSETSW, TCSETSF: {
+            memcpy(bytes(&termios), bytes(arg as *Termios), sizeof(Termios));
+            if (cmd == TCSETSF) { ready_count = 0; line_len = 0; }
+            if (!lflag(ICANON)) { commit_line(); }    // a half-typed line becomes input
+            return 0;
+        }
+        case TIOCGWINSZ: {
+            var w: *Winsize = arg as *Winsize;
+            w.ws_row = ROWS;
+            w.ws_col = COLS;
+            w.ws_xpixel = 640;
+            w.ws_ypixel = 480;
+            return 0;
+        }
+    }
+    return -25;                                         // ENOTTY
+}

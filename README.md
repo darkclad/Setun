@@ -22,7 +22,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
-- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1 running)
+- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K4 running: processes, VFS, tty, pipes, a shell)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 
@@ -55,7 +55,7 @@ cargo run --release -p trine -- run examples/hello.tri        # compile + run he
 cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
-cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux
+cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
 sh web/build.sh                                # rebuild web/setun.wasm
 python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```

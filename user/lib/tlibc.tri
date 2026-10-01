@@ -10,12 +10,52 @@ const STDOUT_FILENO: int = 1;
 const STDERR_FILENO: int = 2;
 
 // errno values (Linux)
+const EPERM: int = 1;
 const ENOENT: int = 2;
+const ENOEXEC: int = 8;
+const EBADF: int = 9;
 const ECHILD: int = 10;
+const ENOMEM: int = 12;
+const EACCES: int = 13;
 const EFAULT: int = 14;
+const EBUSY: int = 16;
+const EEXIST: int = 17;
+const ENOTDIR: int = 20;
+const EISDIR: int = 21;
+const EINVAL: int = 22;
+const EMFILE: int = 24;
+const ENOTTY: int = 25;
+const ENOSPC: int = 28;
+const ESPIPE: int = 29;
+const EPIPE: int = 32;
+const ERANGE: int = 34;
+const ENAMETOOLONG: int = 36;
+const ENOSYS: int = 38;
+const ENOTEMPTY: int = 39;
 
 const SIGCHLD: int = 17;
 const WNOHANG: int = 1;
+
+// fcntl.h
+const O_RDONLY: int = 0;
+const O_WRONLY: int = 1;
+const O_RDWR: int = 2;
+const O_CREAT: int = 64;
+const O_EXCL: int = 128;
+const O_TRUNC: int = 512;
+const O_APPEND: int = 1024;
+const O_DIRECTORY: int = 65536;
+const AT_FDCWD: int = -100;
+const AT_REMOVEDIR: int = 512;
+const SEEK_SET: int = 0;
+const SEEK_CUR: int = 1;
+const SEEK_END: int = 2;
+
+// sys/stat.h
+const S_IFIFO: int = 4096;
+const S_IFCHR: int = 8192;
+const S_IFDIR: int = 16384;
+const S_IFREG: int = 32768;
 
 var errno: int;
 
@@ -26,7 +66,23 @@ fn _ret(r: int) -> int {
 
 // ---- unistd.h ------------------------------------------------------------------
 
+fn read(fd: int, buf: *char, n: int) -> int { return _ret(syscall(63, fd, buf, n)); }
 fn write(fd: int, buf: *char, n: int) -> int { return _ret(syscall(64, fd, buf, n)); }
+fn close(fd: int) -> int { return _ret(syscall(57, fd)); }
+fn lseek(fd: int, off: int, whence: int) -> int { return _ret(syscall(62, fd, off, whence)); }
+fn dup(fd: int) -> int { return _ret(syscall(23, fd)); }
+fn dup2(fd: int, nfd: int) -> int {
+    if (fd == nfd) {                                   // dup3 refuses this; dup2 only checks fd
+        var st: stat_t;
+        if (fstat(fd, &st) < 0) { return -1; }
+        return nfd;
+    }
+    return _ret(syscall(24, fd, nfd, 0));
+}
+fn pipe(fds: *int) -> int { return _ret(syscall(59, fds, 0)); }
+fn chdir(path: *char) -> int { return _ret(syscall(49, path)); }
+fn rmdir(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, AT_REMOVEDIR)); }
+fn unlink(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, 0)); }
 fn getpid() -> int { return syscall(172); }
 fn getppid() -> int { return syscall(173); }
 fn sched_yield() -> int { return _ret(syscall(124)); }
@@ -35,12 +91,140 @@ fn fork() -> int { return _ret(syscall(220, SIGCHLD, 0, 0, 0, 0)); }
 fn execve(path: *char, argv: **char, envp: **char) -> int { return _ret(syscall(221, path, argv, envp)); }
 fn brk(addr: int) -> int { return syscall(214, addr); }
 
+// getcwd: the working directory into buf; returns buf, or null.
+fn getcwd(buf: *char, size: int) -> *char {
+    if (_ret(syscall(17, buf, size)) < 0) { return null; }
+    return buf;
+}
+
 // sbrk: grow the heap by n trytes; returns the old break, or -1.
 fn sbrk(n: int) -> int {
     var old: int = brk(0);
     if (n == 0) { return old; }
     if (brk(old + n) != old + n) { errno = 12; return -1; }
     return old;
+}
+
+// ---- fcntl.h, sys/stat.h ---------------------------------------------------------
+
+fn open(path: *char, flags: int, mode: int) -> int { return _ret(syscall(56, AT_FDCWD, path, flags, mode)); }
+fn creat(path: *char, mode: int) -> int { return open(path, O_WRONLY + O_CREAT + O_TRUNC, mode); }
+fn mkdir(path: *char, mode: int) -> int { return _ret(syscall(34, AT_FDCWD, path, mode)); }
+
+// One word per field (the kernel's layout, kernel/fs/file.tri).
+struct stat_t {
+    st_dev: int;
+    st_ino: int;
+    st_mode: int;
+    st_nlink: int;
+    st_uid: int;
+    st_gid: int;
+    st_rdev: int;
+    st_size: int;
+    st_blksize: int;
+    st_blocks: int;
+    st_atime: int;
+    st_mtime: int;
+    st_ctime: int;
+}
+
+fn stat(path: *char, st: *stat_t) -> int { return _ret(syscall(79, AT_FDCWD, path, st, 0)); }
+fn fstat(fd: int, st: *stat_t) -> int { return _ret(syscall(80, fd, st)); }
+fn S_IFMT_OF(m: int) -> int { return m / 4096 % 16 * 4096; }
+fn S_ISDIR(m: int) -> int { return S_IFMT_OF(m) == S_IFDIR; }
+fn S_ISREG(m: int) -> int { return S_IFMT_OF(m) == S_IFREG; }
+fn S_ISCHR(m: int) -> int { return S_IFMT_OF(m) == S_IFCHR; }
+fn S_ISFIFO(m: int) -> int { return S_IFMT_OF(m) == S_IFIFO; }
+
+// ---- dirent.h ----------------------------------------------------------------------
+//
+// getdents64 records: d_ino, d_off, d_reclen (words), d_type (tryte 9), the
+// NUL-terminated name from tryte 10; every record is a whole number of words.
+
+const DT_FIFO: int = 1;
+const DT_CHR: int = 2;
+const DT_DIR: int = 4;
+const DT_REG: int = 8;
+
+struct DIR {
+    fd: int;
+    pos: int;                          // next record, in trytes
+    len: int;                          // trytes in buf
+    buf: [2187]tryte;
+}
+
+struct dirent {
+    d_ino: int;
+    d_type: int;
+    d_name: [27]char;
+}
+
+var _dir: DIR;                         // one open directory at a time in v1
+var _dirent: dirent;
+
+fn getdents64(fd: int, buf: *tryte, n: int) -> int { return _ret(syscall(61, fd, buf, n)); }
+
+fn opendir(path: *char) -> *DIR {
+    var fd: int = open(path, O_RDONLY + O_DIRECTORY, 0);
+    if (fd < 0) { return null; }
+    _dir.fd = fd;
+    _dir.pos = 0;
+    _dir.len = 0;
+    return &_dir;
+}
+
+fn readdir(d: *DIR) -> *dirent {
+    if (d.pos >= d.len) {
+        var n: int = getdents64(d.fd, &d.buf[0], 2187);
+        if (n <= 0) { return null; }
+        d.len = n;
+        d.pos = 0;
+    }
+    var rec: *tryte = &d.buf[d.pos];
+    var w: *int = ((rec as int) + 1) as *int;          // the record's words
+    _dirent.d_ino = w[0];
+    _dirent.d_type = rec[9];
+    var k: int = 0;
+    while (rec[10 + k] != 0 && k < 26) { _dirent.d_name[k] = rec[10 + k]; k += 1; }
+    _dirent.d_name[k] = 0;
+    d.pos += w[2];
+    return &_dirent;
+}
+
+fn closedir(d: *DIR) -> int { return close(d.fd); }
+
+// ---- termios.h, sys/ioctl.h ----------------------------------------------------------
+
+struct termios {
+    c_iflag: int;
+    c_oflag: int;
+    c_cflag: int;
+    c_lflag: int;
+    c_line: tryte;
+    c_cc: [19]tryte;
+}
+
+struct winsize {
+    ws_row: int;
+    ws_col: int;
+    ws_xpixel: int;
+    ws_ypixel: int;
+}
+
+const ICANON: int = 2;
+const ECHO: int = 8;
+const VMIN: int = 6;
+const TCSANOW: int = 0;
+const TCGETS: int = 21505;
+const TCSETS: int = 21506;
+const TIOCGWINSZ: int = 21523;
+
+fn ioctl(fd: int, cmd: int, arg: int) -> int { return _ret(syscall(29, fd, cmd, arg)); }
+fn tcgetattr(fd: int, t: *termios) -> int { return ioctl(fd, TCGETS, t as int); }
+fn tcsetattr(fd: int, when: int, t: *termios) -> int { return ioctl(fd, TCSETS + when, t as int); }
+fn isatty(fd: int) -> int {
+    var t: termios;
+    return tcgetattr(fd, &t) == 0;
 }
 
 // ---- sys/wait.h ----------------------------------------------------------------
@@ -77,7 +261,41 @@ struct sysinfo_t {
 
 fn sysinfo(info: *sysinfo_t) -> int { return _ret(syscall(179, info)); }
 
+// ---- string.h -------------------------------------------------------------------
+
+fn streq(a: *char, b: *char) -> int { return strcmp(a, b) == 0; }
+
+fn strerror(e: int) -> *char {
+    switch (e) {
+        case EPERM: return "Operation not permitted";
+        case ENOENT: return "No such file or directory";
+        case ENOEXEC: return "Exec format error";
+        case EBADF: return "Bad file descriptor";
+        case ECHILD: return "No child processes";
+        case ENOMEM: return "Out of memory";
+        case EACCES: return "Permission denied";
+        case EFAULT: return "Bad address";
+        case EBUSY: return "Device or resource busy";
+        case EEXIST: return "File exists";
+        case ENOTDIR: return "Not a directory";
+        case EISDIR: return "Is a directory";
+        case EINVAL: return "Invalid argument";
+        case EMFILE: return "Too many open files";
+        case ENOTTY: return "Not a tty";
+        case ENOSPC: return "No space left on device";
+        case ESPIPE: return "Illegal seek";
+        case EPIPE: return "Broken pipe";
+        case ERANGE: return "Result out of range";
+        case ENAMETOOLONG: return "File name too long";
+        case ENOSYS: return "Function not implemented";
+        case ENOTEMPTY: return "Directory not empty";
+    }
+    return "Unknown error";
+}
+
 // ---- small stdio helpers (no varargs printf: see KERNEL.md §10) -----------------
+
+fn fputs(fd: int, s: *char) -> int { return write(fd, s, strlen(s)); }
 
 fn puts(s: *char) -> int {
     var n: int = strlen(s);
@@ -88,4 +306,14 @@ fn puts(s: *char) -> int {
 fn put_int(v: int) {
     var buf: [15]char;
     puts(itoa(v, &buf[0]));
+}
+
+// "prog: what: <strerror(errno)>" on stderr, like perror.
+fn perror2(prog: *char, what: *char) {
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, what);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, strerror(errno));
+    fputs(STDERR_FILENO, "\n");
 }

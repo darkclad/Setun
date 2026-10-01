@@ -1,0 +1,18 @@
+// rm [-d] file ...: remove files (-d: also empty directories).
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var i: int = 1;
+    var dirs: int = 0;
+    if (argc > 1 && streq(argv[1], "-d")) { dirs = 1; i = 2; }
+    if (i == argc) { fputs(STDERR_FILENO, "usage: rm [-d] file ...\n"); return 2; }
+    var status: int = 0;
+    while (i < argc) {
+        var r: int = unlink(argv[i]);
+        if (r < 0 && errno == EISDIR && dirs) { r = rmdir(argv[i]); }
+        if (r < 0) { perror2("rm", argv[i]); status = 1; }
+        i += 1;
+    }
+    return status;
+}

@@ -253,7 +253,7 @@ fmt_nl(f);
 | K1 ✅ | loader, `start_kernel`, paging on, `printk`, frame allocator, timer interrupt | the kernel boots from a disk image and prints its banner |
 | K2 ✅ | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
 | K3 ✅ | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
-| K4 | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
+| K4 ✅ | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
 | K5 | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
 | K6 | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
 | K7 | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
@@ -286,8 +286,8 @@ BIOS → disk 0 sector 0 (kernel/boot/loader.tri)
 | 2 | loader stack |
 | 3 | kernel boot stack |
 | 4…30 | kernel image (≤ 27 sectors) |
-| 31…39 | kernel globals |
-| 40… | the triddy allocator |
+| 31…57 | kernel globals (31…39 until K4) |
+| 58… | the triddy allocator (40… until K4) |
 
 **Files:**
 
@@ -392,10 +392,104 @@ Kernel-mode faults on user addresses go through the same path, so system calls c
 | `execve` | 221 |
 | `wait4` | 260 |
 
-**Verified on the emulator by `/sbin/init`** ([`user/init.tri`](../user/init.tri)):
+**Verified on the emulator by `/sbin/init`**, which became [`/bin/k3test`](../user/bin/k3test.tri) in K4:
 - fork + exec + wait with `argv`;
 - COW isolation;
 - `SIGSEGV` reporting;
 - `ECHILD`;
 - no leaked pages across 5 fork/exec/wait cycles (checked with `sysinfo.freeram`);
 - the heap via `sbrk`.
+
+## 17. K4 as built
+
+**Boot to a shell:** `start_kernel` builds the VFS, `/dev` and `/tmp`, starts the tty, and unpacks the initramfs into ramfs. `/sbin/init` ([`user/init.tri`](../user/init.tri)) starts `/bin/sh` on `/dev/console` (descriptors 0, 1, 2), reaps orphans, and exits with the shell's status.
+
+**VFS** ([`kernel/fs/vfs.tri`](../kernel/fs/vfs.tri)): a simplified version of Linux's objects.
+
+| Object | As built |
+|---|---|
+| inode | a table of 243: type (regular, directory, character device, FIFO), mode, size, data, device number, open count. Freed on its last close once unlinked. |
+| dentry | merged into the inode: one name per inode (no hard links yet); a directory keeps its children on a sibling list |
+| file | a table of 243 open files: references, inode, position, `O_*` flags. Shared after `fork` and `dup`, as in Unix. |
+| descriptors | 27 per task (`Task.fds`), plus `Task.cwd` |
+| superblock | not yet: ramfs is the only file system until `tfs` (K6) |
+
+- Path lookup handles absolute and relative paths, `.`, `..`, repeated slashes and `ENAMETOOLONG` (26-character names).
+- **ramfs data:** a regular file's contents live in one triddy block that grows by powers of 3. An initramfs file points straight into the archive until its first write copies it out.
+- `exec` now looks programs up through the VFS (relative to the cwd) and needs the owner-execute bit.
+
+**devfs** ([`kernel/fs/devfs.tri`](../kernel/fs/devfs.tri)): Linux device numbers.
+
+| Node | Device | Number |
+|---|---|---|
+| `/dev/null` | discards writes, reads EOF | 1,3 |
+| `/dev/zero` | reads zeros | 1,5 |
+| `/dev/tty` | the console tty | 5,0 |
+| `/dev/console` | the console tty | 5,1 |
+| `/dev/ttyS0` | the console tty | 4,64 |
+
+Every terminal node is the same tty in K4; separate virtual consoles come with the window system.
+
+**tty** ([`kernel/drivers/tty.tri`](../kernel/drivers/tty.tri)), after Linux's `n_tty`:
+- **Input:** the keyboard (USB HID codes with shift and ctrl) and the serial port, on IRQs 1 and 3. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
+- **Canonical mode:** erase (`^H`, DEL), kill (`^U`), EOF (`^D`), `ICRNL`, echo (control characters as `^X`). A read returns at most one line.
+- **Raw mode:** clear `ICANON` and characters pass straight through.
+- **ioctl:** `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF` and `TIOCGWINSZ` (80×30, 640×480). `termios` has one word per flag field, then `c_line` and `c_cc[19]` as trytes; Linux bit values.
+- **Output:** the serial port and the text screen.
+
+**Pipes** ([`kernel/fs/pipe.tri`](../kernel/fs/pipe.tri)): 27 pipes, each a 3^9-tryte ring buffer in one frame. Reads block while the pipe is empty and a writer is left; after that they return EOF. Writes block while it is full; writing with no reader returns `EPIPE` (`SIGPIPE` comes in K5).
+
+**Sleeping:** `sleep_on(chan)` and `wake_up(chan)` with a per-task `wchan`. Pipes, the tty and `wait4` all use them, and sleepers re-check their condition in a loop.
+
+**System calls** (in addition to K3's):
+
+| Call | Number |
+|---|---|
+| `getcwd` | 17 |
+| `dup` / `dup3` | 23 / 24 |
+| `ioctl` | 29 |
+| `mkdirat` / `unlinkat` | 34 / 35 (`AT_REMOVEDIR`) |
+| `chdir` | 49 |
+| `openat` | 56 (`AT_FDCWD`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`) |
+| `close` | 57 |
+| `pipe2` | 59 |
+| `getdents64` | 61 |
+| `lseek` | 62 |
+| `read` / `write` | 63 / 64 |
+| `newfstatat` / `fstat` | 79 / 80 |
+
+- `struct stat` has one word per field: dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks, atime, mtime, ctime.
+- A `linux_dirent64` record is `d_ino`, `d_off`, `d_reclen` (words), `d_type` (tryte 9), then the NUL-terminated name, padded to whole words.
+
+**User space:**
+- **tlibc** gained the file, directory (`opendir`/`readdir`), termios, `stat` and `strerror` APIs.
+- **`/bin/sh`** ([`user/bin/sh.tri`](../user/bin/sh.tri)) supports:
+  - pipelines, and lists with `;`, `&&` and `||`;
+  - redirections `<`, `>`, `>>`, `n>`, `n>&m`;
+  - quoting with `'…'`, `"…"` and `\`;
+  - `#` comments, `$?` and `$$`;
+  - the builtins `cd`, `pwd` and `exit`;
+  - `sh -c` and `sh script`.
+
+  Commands without a `/` are looked up in `/bin`.
+- **Utilities:**
+  - `echo [-n]`;
+  - `cat`;
+  - `ls [-al]`, sorted;
+  - `mkdir [-p]`;
+  - `rm [-d]`;
+  - `true`, `false`;
+  - `k3test`, `hello`, `k2_hello`.
+- `mkdisk` compiles `.tri` files to TEF and copies anything else as text, for example `/etc/motd`.
+
+**Performance:** fork + exec + exit + wait fell from about 17M instructions to 1.5M.
+- Each page table records its lowest and highest used entries (two trytes per table frame), so address-space walks skip the empty parts.
+- Zeroing and copying frames are 5-instruction assembly loops.
+- `exec` copies the text a word at a time.
+
+**Verified on the emulator** (`crates/trinux/tests/boot.rs`, typing at the prompt over the serial port):
+- `echo hi | cat` and `exit 5`;
+- redirection and append, `cat < f | cat | cat`, `mkdir -p` with `cd`/`pwd`, and `ls` / `ls -l`;
+- `$?` after `false` and after a missing command (127), the `&&`/`||` chains and quoting;
+- error messages through `2>&1 >/dev/null | cat`, and `rm`;
+- `/bin/k3test` run from the shell.

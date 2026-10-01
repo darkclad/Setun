@@ -29,10 +29,27 @@ fn pte_frame(p: int) -> int { return ext(p, 1, 18); }
 
 fn is_user_address(va: int) -> int { return va >= USER_BASE - 9841 && va <= USER_LIMIT; }
 
+// The range of entries in use per page table (indexed by its centre frame),
+// so walking an address space touches only the live part of each table.
+// Indices are -9841..9841: one tryte each.
+var tbl_lo: [59049]tryte;
+var tbl_hi: [59049]tryte;
+
+fn table_reset(t: int) {
+    tbl_lo[t] = 9841;
+    tbl_hi[t] = -9841;
+}
+
+fn table_used(t: int, i: int) {
+    if (i < tbl_lo[t]) { tbl_lo[t] = i as tryte; }
+    if (i > tbl_hi[t]) { tbl_hi[t] = i as tryte; }
+}
+
 // A new address space: an L1 table sharing the kernel's slots 0 and +1.
 fn new_address_space() -> int {
     var l1: int = alloc_table();
     if (l1 < 0) { return -1; }
+    table_reset(l1);                        // the kernel slots are never walked
     *table_entry(l1, 0) = *table_entry(kernel_l1, 0);
     *table_entry(l1, 1) = *table_entry(kernel_l1, 1);
     return l1;
@@ -49,10 +66,13 @@ fn pte_slot(l1: int, va: int, create: int) -> *int {
         if (!create) { return null; }
         l2 = alloc_table();
         if (l2 < 0) { return null; }
+        table_reset(l2);
+        table_used(l1, i1);
         *e1 = l2 * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
     } else {
         l2 = pte_frame(*e1);
     }
+    if (create) { table_used(l2, i2); }
     return table_entry(l2, i2);
 }
 
@@ -73,13 +93,13 @@ fn uva_to_phys(l1: int, va: int) -> int {
 
 // Release every user page and table, then the L1 table.
 fn free_address_space(l1: int) {
-    var i1: int = -9841;
-    while (i1 <= -1) {
+    var i1: int = tbl_lo[l1];
+    while (i1 <= tbl_hi[l1] && i1 <= -1) {
         var e1: int = *table_entry(l1, i1);
         if (e1 != 0) {
             var l2: int = pte_frame(e1);
-            var i2: int = -9841;
-            while (i2 <= 9841) {
+            var i2: int = tbl_lo[l2];
+            while (i2 <= tbl_hi[l2]) {
                 var p: int = *table_entry(l2, i2);
                 if (p != 0) { put_page(pte_frame(p)); }
                 i2 += 1;
@@ -96,16 +116,19 @@ fn free_address_space(l1: int) {
 fn copy_address_space(parent: int) -> int {
     var child: int = new_address_space();
     if (child < 0) { return -1; }
-    var i1: int = -9841;
-    while (i1 <= -1) {
+    var i1: int = tbl_lo[parent];
+    while (i1 <= tbl_hi[parent] && i1 <= -1) {
         var e1: int = *table_entry(parent, i1);
         if (e1 != 0) {
             var pl2: int = pte_frame(e1);
             var cl2: int = alloc_table();
             if (cl2 < 0) { free_address_space(child); return -1; }
+            table_used(child, i1);
+            tbl_lo[cl2] = tbl_lo[pl2];
+            tbl_hi[cl2] = tbl_hi[pl2];
             *table_entry(child, i1) = cl2 * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
-            var i2: int = -9841;
-            while (i2 <= 9841) {
+            var i2: int = tbl_lo[pl2];
+            while (i2 <= tbl_hi[pl2]) {
                 var p: int = *table_entry(pl2, i2);
                 if (p != 0) {
                     if (trit(p, 19) == 1) {                    // writable: share copy-on-write

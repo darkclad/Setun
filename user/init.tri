@@ -1,95 +1,30 @@
-// /sbin/init (K3): exercises fork, execve, wait4, copy on write, faults,
-// ECHILD and memory accounting, then exits (which the kernel reports as
-// Linux does: "Attempted to kill init!"). A real init arrives with the shell.
+// /sbin/init: run /bin/sh on the console, reap orphans, and exit with the
+// shell's status when it exits (which the kernel reports as Linux does:
+// "Attempted to kill init!"). Runlevels and respawning come later.
 
 import "lib/tlibc.tri";
-
-var shared: int = 100;                       // copy-on-write check
-
-fn free_ram() -> int {
-    var si: sysinfo_t;
-    sysinfo(&si);
-    return si.freeram / si.mem_unit;
-}
-
-// fork + exec /bin/hello + wait; returns the child's exit code.
-fn run_hello(tag: *char) -> int {
-    var pid: int = fork();
-    if (pid == 0) {
-        var argv: [4]*char = { "/bin/hello", tag, "ternary", null };
-        execve("/bin/hello", &argv[0], null);
-        puts("init: execve failed\n");
-        _exit(127);
-    }
-    var status: int = -1;
-    var w: int = waitpid(pid, &status, 0);
-    if (w != pid) { puts("init: waitpid returned the wrong pid\n"); return -1; }
-    return WEXITSTATUS(status);
-}
 
 fn main(argc: int, argv: **char) -> int {
     puts("init: pid ");
     put_int(getpid());
-    puts(", argv[0] = ");
-    puts(argv[0]);
-    puts("\n");
-
-    // fork / execve / wait
-    var code: int = run_hello("first");
-    puts("init: /bin/hello exited with ");
-    put_int(code);
-    puts("\n");
-
-    // copy on write: the child's write must not show up here
+    puts(", starting /bin/sh\n");
     var pid: int = fork();
     if (pid == 0) {
-        shared = 555;
-        _exit(shared % 256);
+        var args: [2]*char = { "sh", null };
+        execve("/bin/sh", &args[0], null);
+        perror2("init", "/bin/sh");
+        _exit(127);
     }
-    var status: int;
-    waitpid(pid, &status, 0);
-    puts("init: child saw ");
-    put_int(WEXITSTATUS(status));
-    puts(", parent still has ");
-    put_int(shared);
-    puts("\n");
-
-    // a crashing child is reported as killed by SIGSEGV
-    pid = fork();
-    if (pid == 0) {
-        var p: *int = null;
-        return *p;
+    loop {
+        var status: int = 0;
+        var w: int = wait(&status);
+        if (w < 0) { return 1; }
+        if (w == pid) {
+            var code: int = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+            puts("init: /bin/sh exited with ");
+            put_int(code);
+            puts("\n");
+            return code;
+        }
     }
-    waitpid(pid, &status, 0);
-    if (WIFSIGNALED(status)) {
-        puts("init: child killed by signal ");
-        put_int(WTERMSIG(status));
-        puts("\n");
-    }
-
-    // nothing left to wait for
-    if (wait(&status) == -1 && errno == ECHILD) { puts("init: ECHILD ok\n"); }
-
-    // no memory leaks across fork/exec/exit/wait
-    var before: int = free_ram();
-    var i: int = 0;
-    while (i < 5) { run_hello("loop"); i += 1; }
-    var after: int = free_ram();
-    if (after == before) { puts("init: 5 fork/exec/wait cycles, no memory leaked\n"); }
-    else {
-        puts("init: LEAK: ");
-        put_int((before - after) / 19683);
-        puts(" pages\n");
-    }
-
-    // heap: brk grows it, pages arrive on demand
-    var base: int = sbrk(3 * 1000 + 6);
-    var heap: *int = (base / 3 * 3 + 3) as *int;      // the first word-aligned address
-    heap[999] = 42;
-    puts("init: heap ok, heap[999] = ");
-    put_int(heap[999]);
-    puts("\n");
-
-    puts("init: done\n");
-    return 0;
 }
