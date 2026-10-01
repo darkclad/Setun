@@ -21,6 +21,6 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
 5. **Assembler and disassembler** ✅: text syntax with form selection and branch relaxation, round-trip-safe disassembler, `setun-asm` CLI; the demo ROM is now `demo.s`
 6. **Compiler** for **Trine** ✅ ([`LANGUAGE.md`](LANGUAGE.md) v0.2): `trine build/run`, stdlib (ports, rt, console), 19 end-to-end tests; `examples/mandel.tri` renders the Mandelbrot set
 7. **BIOS** ✅ ([`bios/bios.tri`](../bios/bios.tri), [`BOOT.md`](BOOT.md)): machine check, RTC date, disk boot with signature, monitor shell; `setun` boots it by default; `trine build --boot` makes boot disks
-8. **Kernel: Trinux**, modelled on Linux with POSIX interfaces ([`KERNEL.md`](KERNEL.md)): K1 ✅ (loader, start_kernel, printk, traps, paging, triddy allocator, timer); K2-K7 next
+8. **Kernel: Trinux**, modelled on Linux with POSIX interfaces ([`KERNEL.md`](KERNEL.md)): K1 ✅ boot, paging, triddy allocator, timer; K2 ✅ preemptive user processes, write/exit/getpid; K3-K7 next
 9. **Window system**: framebuffer compositor, mouse cursor, windows, a terminal app
 10. Later: a "Setun-387" floating-point unit, and a Setun-70 emulator as a user program

@@ -4,6 +4,8 @@ import "params.tri";
 import "printk.tri";
 import "mm.tri";
 import "arch.tri";
+import "sched.tri";
+import "module.tri";
 
 var boot_disk: int;
 
@@ -53,18 +55,25 @@ fn start_kernel(disk: int, frames: int) {
     paging_init();
     if (!paging_enabled()) { panic("paging did not turn on"); }
 
+    sched_init();
+    load_modules();
     time_init();
-    local_irq_enable();
 
-    var reported: int = 0;
+    // The idle task: schedule user tasks, sleep until the next interrupt.
+    var announced: int = 0;
     loop {
-        hlt();                                // idle until the next interrupt
-        if (!reported && jiffies >= 10) {
-            printk("K1 OK: ");
+        local_irq_disable();
+        schedule();
+        local_irq_enable();
+        if (user_tasks_alive == 0 && !announced) {
+            printk("Idle: no user processes left (");
             pr_int(jiffies);
-            pr(" timer ticks, idle\n");
-            reported = 1;
+            pr(" ticks, ");
+            pr_int(free_frames);
+            pr(" pages free)\n");
+            announced = 1;
         }
+        hlt();
     }
 }
 

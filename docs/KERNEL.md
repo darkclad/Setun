@@ -1,6 +1,6 @@
 # Trinux: the Setun-386 kernel
 
-**Status: v0.1, accepted. Milestone K1 is implemented** (`kernel/`, built by `mkdisk`).
+**Status: v0.1, accepted. Milestones K1 and K2 are implemented** (`kernel/`, built by `mkdisk`).
 Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
 
 Trinux is a Unix kernel for Setun-386, **modelled on Linux** and providing
@@ -251,7 +251,7 @@ fmt_nl(f);
 | # | Milestone | Done when |
 |---|---|---|
 | K1 ✅ | loader, `start_kernel`, paging on, `printk`, frame allocator, timer interrupt | the kernel boots from a disk image and prints its banner |
-| K2 | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
+| K2 ✅ | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
 | K3 | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
 | K4 | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
 | K5 | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
@@ -300,3 +300,43 @@ BIOS → disk 0 sector 0 (kernel/boot/loader.tri)
 | `kernel/main.tri` | `start_kernel`: banner, traps, mm, paging, 100 Hz timer, idle in `hlt` |
 
 `cargo run -p trinux --bin mkdisk -- -o trinux.disk` builds the disk, and `setun --disk trinux.disk` boots it. `crates/trinux/tests/boot.rs` boots it on the emulator.
+
+## 15. K2 as built
+
+**Trap path:**
+- `trap_stub` (assembly in `kernel/arch.tri`) saves every register, plus `EPC`, `EMODE` and `KSP`, as a 28-word frame on the current kernel stack.
+- It calls `trap_handler(frame)`, then restores the frame and runs `IRET`.
+- System calls read `r1`–`r6` from the frame and write the result back into the frame's `r1`.
+
+**Context switch:**
+- `switch_to(prev, next)` pushes `lr` and `fp`, saves `sp` in `prev`'s first field, loads `next`'s, pops and returns.
+- A new task's kernel stack is pre-built (a frame with `EPC` = entry, `EMODE` = ring −1 + IE + PG, `KSP` = user stack, under a fake switch frame whose `lr` is `trap_return`). So its first switch "returns" into user mode.
+- Kernel code runs with interrupts off (as in early single-CPU Linux). The idle task, task 0 (the `start_kernel` loop), schedules with interrupts off, then sleeps in `hlt` with them on.
+
+**Address spaces:** each process has its own L1 table, sharing the kernel's slots 0 and +1. User pages are ring −1.
+
+| Region | Address | Pages |
+|---|---|---|
+| code | from `USER_BASE` = −3^25 | up to 9 |
+| globals | 9 pages up | 3 |
+| stack | top at −3^18 − 3 | 3 |
+
+**Boot modules** (the precursor of the initramfs):
+- `mkdisk` writes a table at sector 28: magic, count, then (first sector, sector count, first page) for each program.
+- Each program follows as page images, compiled with `trine`'s user kind (unprivileged startup code that ends in `exit`).
+- The kernel loads each program into fresh frames and creates a process for it.
+
+**System calls:**
+
+| Call | Number |
+|---|---|
+| `write` | 64 (fd 1 and 2: the console) |
+| `exit` / `exit_group` | 93 / 94 |
+| `sched_yield` | 124 |
+| `getpid` | 172 |
+
+Anything else returns `−ENOSYS`.
+- Pointers are checked against the user range (`−EFAULT`), and bad descriptors get `−EBADF`.
+- A fault in user mode kills the process and prints the cause; the kernel carries on.
+
+**Known limits until K3:** exited processes stay zombies and keep their memory (there is no `wait` yet), and pages are mapped read/write/execute.

@@ -1,0 +1,20 @@
+// K2 test program: prints a few lines with busy work in between, so the
+// timer interleaves several copies. Exit code = 10 * pid.
+
+import "lib/tlibc.tri";
+
+fn main() -> int {
+    var pid: int = getpid();
+    var i: int = 0;
+    while (i < 5) {
+        puts("pid ");
+        put_int(pid);
+        puts(": step ");
+        put_int(i);
+        puts("\n");
+        var spin: int = 0;
+        while (spin < 15000) { spin += 1; }
+        i += 1;
+    }
+    return 10 * pid;
+}

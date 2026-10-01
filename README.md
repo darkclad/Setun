@@ -40,6 +40,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | `examples/` | Trine programs, e.g. `mandel.tri` |
 | `bios/` | the BIOS (`bios.tri`, built into `setun`) and a sample boot sector |
 | `kernel/` | Trinux, the kernel (Trine) |
+| `user/` | Trinux user programs and `tlibc` |
 | `crates/trinux` | `mkdisk`: builds bootable Trinux disks; boot tests |
 
 ## Build and run

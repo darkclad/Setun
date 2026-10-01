@@ -1,0 +1,47 @@
+// vm: user address spaces.
+
+import "params.tri";
+import "mm.tri";
+import "arch.tri";
+
+// PTE for a user page (ring -1, read/write/execute for now).
+fn user_pte(frame: int) -> int {
+    return frame * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
+}
+
+// A new address space: an L1 table sharing the kernel's slots 0 and +1.
+fn new_address_space() -> int {
+    var l1: int = alloc_table();
+    if (l1 < 0) { return -1; }
+    *table_entry(l1, 0) = *table_entry(kernel_l1, 0);
+    *table_entry(l1, 1) = *table_entry(kernel_l1, 1);
+    return l1;
+}
+
+// Map virtual page `page` (VA page*PAGE ± 9841) to physical frame `frame`.
+fn map_user_page(l1: int, page: int, frame: int) -> int {
+    var i1: int = divr(page, 19683);
+    var i2: int = page - i1 * 19683;
+    var e1: *int = table_entry(l1, i1);
+    var l2: int;
+    if (*e1 == 0) {
+        l2 = alloc_table();
+        if (l2 < 0) { return 0; }
+        *e1 = l2 * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
+    } else {
+        l2 = ext(*e1, 1, 18);
+    }
+    *table_entry(l2, i2) = user_pte(frame);
+    return 1;
+}
+
+// Map `count` fresh zeroed pages from `page` upward.
+fn map_zeroed(l1: int, page: int, count: int) -> int {
+    var k: int = 0;
+    while (k < count) {
+        var f: int = alloc_frame_zeroed();
+        if (f < 0 || !map_user_page(l1, page + k, f)) { return 0; }
+        k += 1;
+    }
+    return 1;
+}

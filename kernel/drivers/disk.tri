@@ -1,0 +1,17 @@
+// disk: block reads from disk 0 by DMA into physical frames.
+
+import "../params.tri";
+
+// Read `count` sectors starting at `lba` into frames first_frame, +1, ...
+// Returns 0 on success or the controller's error code.
+fn disk_read(lba: int, count: int, first_frame: int) -> int {
+    out(DISK_LBA, lba);
+    out(DISK_COUNT, count);
+    out(DISK_DMA, frame_start(first_frame));
+    out(DISK_CMD, -1);
+    while (in(DISK_STATUS) == 1) {}
+    if (in(DISK_STATUS) != 0) { return in(DISK_ERROR); }
+    return 0;
+}
+
+fn disk_sectors() -> int { return in(DISK_SECTORS); }

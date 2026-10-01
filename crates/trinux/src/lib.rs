@@ -31,10 +31,45 @@ pub struct Disk {
     /// T1B2 trytes, whole sectors.
     pub trytes: Vec<i16>,
     pub kernel_sectors: usize,
+    pub programs: usize,
 }
 
-/// Compile the loader and the kernel and lay out the disk.
+/// Sector holding the boot-module table (kernel/module.tri).
+pub const MODULE_TABLE_SECTOR: usize = 28;
+pub const MODULE_MAGIC: i64 = 31_857_270_900;
+
+/// The repository's `user/` directory.
+pub fn user_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../user")
+}
+
+/// The user programs a default disk starts (K2: two copies of the demo).
+pub fn default_programs() -> Vec<PathBuf> {
+    vec![user_dir().join("k2_hello.tri"), user_dir().join("k2_hello.tri")]
+}
+
+/// A user program as page images: page `first_page` onward, laid out so the
+/// image starts at `USER_BASE − 1`.
+fn program_pages(path: &Path) -> Result<Vec<i16>, String> {
+    let image = trine::build_file(path, &Options::user())?.image;
+    let page = PAGE as usize;
+    let lead = (trine::USER_BASE - 1 - (trine::USER_BASE / PAGE * PAGE - 9841)) as usize; // 9840
+    let mut pages = vec![0i16; lead];
+    pages.extend_from_slice(&image);
+    let n = pages.len().div_ceil(page);
+    if n > 9 {
+        return Err(format!("{}: {n} pages of code; at most 9 fit below the globals", path.display()));
+    }
+    pages.resize(n * page, 0);
+    Ok(pages)
+}
+
+/// Compile the loader, the kernel and `programs`, and lay out the disk.
 pub fn build_disk(kernel_dir: &Path) -> Result<Disk, String> {
+    build_disk_with(kernel_dir, &default_programs())
+}
+
+pub fn build_disk_with(kernel_dir: &Path, programs: &[PathBuf]) -> Result<Disk, String> {
     let loader = trine::build_file(&kernel_dir.join("boot/loader.tri"), &Options::boot())?.image;
     let kernel = trine::build_file(&kernel_dir.join("main.tri"), &kernel_options())?.image;
     let page = PAGE as usize;
@@ -55,7 +90,27 @@ pub fn build_disk(kernel_dir: &Path) -> Result<Disk, String> {
     let mut trytes = sector0;
     trytes.extend_from_slice(&kernel);
     trytes.resize((1 + sectors) * page, 0);
-    Ok(Disk { trytes, kernel_sectors: sectors })
+
+    // Boot modules: the table at sector 28, programs from sector 29.
+    trytes.resize((MODULE_TABLE_SECTOR + 1) * page, 0);
+    let first_page = trine::USER_BASE / PAGE;
+    let mut table = vec![MODULE_MAGIC, programs.len() as i64];
+    for p in programs {
+        let pages = program_pages(p)?;
+        let start = trytes.len() / page;
+        table.extend([start as i64, (pages.len() / page) as i64, first_page]);
+        trytes.extend_from_slice(&pages);
+    }
+    if table.len() * 3 > page {
+        return Err("too many boot programs for one table sector".into());
+    }
+    let t0 = MODULE_TABLE_SECTOR * page;
+    for (j, &w) in table.iter().enumerate() {
+        for (i, t) in word_to_trytes(Word::new(w).unwrap()).iter().enumerate() {
+            trytes[t0 + 3 * j + i] = t.value() as i16;
+        }
+    }
+    Ok(Disk { trytes, kernel_sectors: sectors, programs: programs.len() })
 }
 
 /// Boot a disk on a fresh machine with the BIOS; run `steps` instructions.

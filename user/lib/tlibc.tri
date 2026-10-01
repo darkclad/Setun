@@ -1,0 +1,35 @@
+// tlibc: the Trinux C library, in Trine (docs/KERNEL.md §10). K2 subset.
+//
+// System calls use the Linux generic numbers and return -errno on failure;
+// these wrappers set `errno` and return -1, as POSIX specifies.
+
+import "rt.tri";
+
+const STDIN_FILENO: int = 0;
+const STDOUT_FILENO: int = 1;
+const STDERR_FILENO: int = 2;
+
+var errno: int;
+
+fn _ret(r: int) -> int {
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+
+fn write(fd: int, buf: *char, n: int) -> int { return _ret(syscall(64, fd, buf, n)); }
+fn getpid() -> int { return syscall(172); }
+fn sched_yield() -> int { return _ret(syscall(124)); }
+fn _exit(code: int) { syscall(93, code); }
+
+// ---- small stdio helpers (no varargs printf: see KERNEL.md §10) -----------
+
+fn puts(s: *char) -> int {
+    var n: int = strlen(s);
+    if (write(STDOUT_FILENO, s, n) < 0) { return -1; }
+    return n;
+}
+
+fn put_int(v: int) {
+    var buf: [15]char;
+    puts(itoa(v, &buf[0]));
+}

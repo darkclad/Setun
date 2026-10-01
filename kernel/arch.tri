@@ -1,8 +1,115 @@
-// arch: traps, interrupts and the kernel page tables.
+// arch: the trap entry stub, context switching and the kernel page tables.
 
 import "params.tri";
 import "printk.tri";
 import "mm.tri";
+import "sched.tri";
+
+// ---- trap frame ---------------------------------------------------------------
+//
+// trap_stub saves every register on the current kernel stack, as words at
+// frame + 3*i:   0..11 = r1..r12   12..24 = r-1..r-13   25 = EPC
+//                26 = EMODE        27 = KSP (the other stack pointer)
+// When a trap comes from user mode the CPU has already swapped r13 and KSP,
+// so r13 is the task's kernel stack and KSP holds the user stack pointer.
+
+const FRAME_WORDS: int = 28;
+const F_R1: int = 0;
+const F_EPC: int = 25;
+const F_EMODE: int = 26;
+const F_KSP: int = 27;
+
+extern fn trap_stub();
+extern fn trap_return();
+extern fn switch_to(prev: *Task, next: *Task);
+
+// The assembly lives inside a function that is never called; the code
+// jumps over it.
+fn _arch_asm() {
+    asm {
+        "        b     _arch_asm_end"
+        "trap_stub:"
+        "        sub   sp, sp, 84"
+        "        stw   r1, [sp]"
+        "        stw   r2, [sp+3]"
+        "        stw   r3, [sp+6]"
+        "        stw   r4, [sp+9]"
+        "        stw   r5, [sp+12]"
+        "        stw   r6, [sp+15]"
+        "        stw   r7, [sp+18]"
+        "        stw   r8, [sp+21]"
+        "        stw   r9, [sp+24]"
+        "        stw   r10, [sp+27]"
+        "        stw   r11, [sp+30]"
+        "        stw   r12, [sp+33]"
+        "        stw   r-1, [sp+36]"
+        "        stw   r-2, [sp+39]"
+        "        stw   r-3, [sp+42]"
+        "        stw   r-4, [sp+45]"
+        "        stw   r-5, [sp+48]"
+        "        stw   r-6, [sp+51]"
+        "        stw   r-7, [sp+54]"
+        "        stw   r-8, [sp+57]"
+        "        stw   r-9, [sp+60]"
+        "        stw   r-10, [sp+63]"
+        "        stw   r-11, [sp+66]"
+        "        stw   r-12, [sp+69]"
+        "        stw   r-13, [sp+72]"
+        "        mfc   r1, epc"
+        "        stw   r1, [sp+75]"
+        "        mfc   r1, emode"
+        "        stw   r1, [sp+78]"
+        "        mfc   r1, ksp"
+        "        stw   r1, [sp+81]"
+        "        mov   r1, sp"
+        "        call  trap_handler"
+        "trap_return:"
+        "        ldw   r1, [sp+81]"
+        "        mtc   ksp, r1"
+        "        ldw   r1, [sp+78]"
+        "        mtc   emode, r1"
+        "        ldw   r1, [sp+75]"
+        "        mtc   epc, r1"
+        "        ldw   r2, [sp+3]"
+        "        ldw   r3, [sp+6]"
+        "        ldw   r4, [sp+9]"
+        "        ldw   r5, [sp+12]"
+        "        ldw   r6, [sp+15]"
+        "        ldw   r7, [sp+18]"
+        "        ldw   r8, [sp+21]"
+        "        ldw   r9, [sp+24]"
+        "        ldw   r10, [sp+27]"
+        "        ldw   r11, [sp+30]"
+        "        ldw   r12, [sp+33]"
+        "        ldw   r-1, [sp+36]"
+        "        ldw   r-2, [sp+39]"
+        "        ldw   r-3, [sp+42]"
+        "        ldw   r-4, [sp+45]"
+        "        ldw   r-5, [sp+48]"
+        "        ldw   r-6, [sp+51]"
+        "        ldw   r-7, [sp+54]"
+        "        ldw   r-8, [sp+57]"
+        "        ldw   r-9, [sp+60]"
+        "        ldw   r-10, [sp+63]"
+        "        ldw   r-11, [sp+66]"
+        "        ldw   r-12, [sp+69]"
+        "        ldw   r-13, [sp+72]"
+        "        ldw   r1, [sp]"
+        "        add   sp, sp, 84"
+        "        iret"
+        // switch_to(prev, next): save prev's kernel stack, resume next's.
+        // A Task's first field is its saved kernel sp.
+        "switch_to:"
+        "        push  lr"
+        "        push  fp"
+        "        stw   sp, [r1]"
+        "        ldw   sp, [r2]"
+        "        pop   fp"
+        "        pop   lr"
+        "        ret"
+        "_arch_asm_end:"
+    }
+}
 
 // ---- traps and interrupts ----------------------------------------------------
 
@@ -28,22 +135,45 @@ fn fault_name(v: int) -> *char {
     return "unknown trap";
 }
 
-fn timer_interrupt() {
-    jiffies += 1;
+fn traps_init() {
+    var i: int = 0;
+    while (i < 243) { idt[i] = &trap_stub as int; i += 1; }
+    mtc(ITB, &idt[121] as int);
 }
 
-// Every vector enters here. Faults in the kernel are fatal (for now);
-// hardware interrupts are claimed from the TPIC and dispatched.
-interrupt fn trap_entry() {
+fn irqs_enabled() -> int { return trit(mfc(MODE), 26) == 1; }
+
+fn local_irq_enable() {
+    if (!irqs_enabled()) { mtc(MODE, mfc(MODE) + MODE_IE); }
+}
+
+fn local_irq_disable() {
+    if (irqs_enabled()) { mtc(MODE, mfc(MODE) - MODE_IE); }
+}
+
+// Called by trap_stub with the saved frame, interrupts off.
+fn trap_handler(f: *int) {
     var cause: int = mfc(FCAUSE);
     var v: int = ext(cause, 23, 5);
+    if (v == 0) {
+        do_syscall(f, ext(cause, 1, 18));
+        return;
+    }
     if (v >= 1) {
         var irq: int = in(TPIC_CLAIM);
         if (irq >= 0) {
             irq_count[irq] += 1;
-            if (irq == IRQ_TIMER) { timer_interrupt(); }
             out(TPIC_EOI, irq);
+            if (irq == IRQ_TIMER) {
+                jiffies += 1;
+                scheduler_tick();
+            }
         }
+        return;
+    }
+    var from_user: int = trit(f[F_EMODE], 27) == -1;
+    if (from_user) {
+        user_fault(v, f[F_EPC], mfc(FADDR), fault_name(v));
         return;
     }
     printk("trap: ");
@@ -51,26 +181,16 @@ interrupt fn trap_entry() {
     pr(" (vector ");
     pr_int(v);
     pr(") at ");
-    pr_int(mfc(EPC));
+    pr_int(f[F_EPC]);
     pr(", address ");
     pr_int(mfc(FADDR));
     pr_nl();
     panic("unhandled trap in the kernel");
 }
 
-fn traps_init() {
-    var i: int = 0;
-    while (i < 243) { idt[i] = &trap_entry as int; i += 1; }
-    mtc(ITB, &idt[121] as int);
-}
+// ---- kernel page tables -----------------------------------------------------------
 
-fn local_irq_enable() {
-    if (trit(mfc(MODE), 26) != 1) { mtc(MODE, mfc(MODE) + MODE_IE); }
-}
-
-// ---- paging -----------------------------------------------------------------------
-
-var kernel_l1: int;                   // centre frame of the L1 table
+var kernel_l1: int;                   // centre frame of the kernel's L1 table
 var kernel_l2: [2]int;                // centre frames of the L2 tables for slots 0, +1
 
 fn table_entry(table_centre_frame: int, i: int) -> *int {
