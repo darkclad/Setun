@@ -127,21 +127,35 @@ fn scroll_rect(s: *Surface, x: int, y: int, w: int, h: int, dy: int, fill: int) 
 
 // ---- text ---------------------------------------------------------------------------------
 
-var font: [2048]tryte;                // 256 glyphs x 8 rows, bit 0 = leftmost pixel
+// The font file: glyphs for code points 0..255, then the Cyrillic block
+// U+0400..U+045F as glyphs 256..351; 8 rows each, bit 0 = leftmost pixel.
+const FONT_GLYPHS: int = 352;
+const FONT_TRYTES: int = 2816;
+const CYRILLIC_FIRST: int = 1024;
+const CYRILLIC_LAST: int = 1119;
+
+var font: [2816]tryte;
 var font_ok: int;
 
 fn font_load(path: *char) -> int {
     var fd: int = open(path, O_RDONLY, 0);
     if (fd < 0) { return -1; }
-    var n: int = read(fd, &font[0] as *char, 2048);
+    var n: int = read(fd, &font[0] as *char, FONT_TRYTES);
     close(fd);
-    font_ok = n == 2048;
+    font_ok = n == FONT_TRYTES;
     return font_ok ? 0 : -1;
+}
+
+// The glyph for code point c ('?' when the font has none).
+fn font_glyph(c: int) -> int {
+    if (c >= 0 && c <= 255) { return c; }
+    if (c >= CYRILLIC_FIRST && c <= CYRILLIC_LAST) { return 256 + c - CYRILLIC_FIRST; }
+    return '?';
 }
 
 // One character with its top-left at (x, y), each font pixel scale x scale.
 fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) {
-    if (c < 0 || c > 255) { c = '?'; }
+    c = font_glyph(c);
     if (scale == 1 && x >= 0 && y >= 0 && x + 8 <= s.w && y + 8 <= s.h) {
         // the common case: whole and unscaled, so no clipping per pixel
         var r: int = 0;

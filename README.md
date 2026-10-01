@@ -21,6 +21,8 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 
 *Trinux on the emulator: `trwm term clock colors paint`. The Colors window shows every one of the 3^9 pixel colours once.*
 
+The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` runs on the text console: ([screenshot](docs/screenshots/cyrillic-console.png))
+
 ## Docs
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)

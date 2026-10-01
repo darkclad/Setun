@@ -318,6 +318,83 @@ fn text_mode_renders_glyphs_and_colours() {
     assert_eq!(line, vec![w, w, b, b, w, w, b, b]);
 }
 
+/// The 8×16 text cell at (row, col) as eight glyph rows (bit 0 = leftmost
+/// pixel lit in `fg`), checking that each glyph row fills two scanlines.
+fn cell_glyph(buf: &[u32], row: usize, col: usize, fg: u32) -> [u8; 8] {
+    let mut g = [0u8; 8];
+    for (r, gr) in g.iter_mut().enumerate() {
+        for dy in 0..2 {
+            let y = row * 16 + 2 * r + dy;
+            let mut bits = 0u8;
+            for x in 0..8 {
+                if buf[y * 640 + col * 8 + x] == fg {
+                    bits |= 1 << x;
+                }
+            }
+            if dy == 1 {
+                assert_eq!(bits, *gr, "glyph row {r} is doubled");
+            }
+            *gr = bits;
+        }
+    }
+    g
+}
+
+#[test]
+fn text_mode_draws_cyrillic() {
+    let mut m = machine();
+    let base = Display::fb_base();
+    let attr: Tryte = "+++---000".parse().unwrap(); // white on black
+    let text = "Съешь же ещё Ђ Ѡ";
+    for (k, c) in text.chars().enumerate() {
+        let cell = base + 3 * k as i64;
+        m.mem.write_tryte(cell, Tryte::new(c as i64).unwrap()).unwrap();
+        m.mem.write_tryte(cell + 1, attr).unwrap();
+    }
+    m.dev.display.write(7, -1);
+    let mut buf = Vec::new();
+    m.dev.display.render(&m.mem, &mut buf);
+    const BOX: [u8; 8] = [0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00];
+    for (k, c) in text.chars().enumerate() {
+        let want = if c == ' ' {
+            [0; 8]
+        } else if c == 'Ѡ' {
+            BOX // U+0460 is past the Cyrillic the font covers
+        } else {
+            devices::glyph8x8(c as u32).unwrap()
+        };
+        assert_eq!(cell_glyph(&buf, 0, k, 0xFFFFFF), want, "cell {k} ({c})");
+    }
+    // ж (row 2 is ##.#.##.) really is drawn, not blank
+    assert_eq!(cell_glyph(&buf, 0, 6, 0xFFFFFF)[2], 0b0110_1011);
+}
+
+#[test]
+fn the_cyrillic_glyphs() {
+    use devices::{glyph8x8, CYRILLIC_FIRST, CYRILLIC_LAST};
+    // every code point of U+0400..U+045F has a visible glyph
+    for cp in CYRILLIC_FIRST..=CYRILLIC_LAST {
+        let g = glyph8x8(cp).unwrap_or_else(|| panic!("U+{cp:04X} has no glyph"));
+        assert!(g.iter().any(|&r| r != 0), "U+{cp:04X} is blank");
+    }
+    // the 66 letters of Russian are told apart
+    let russian: Vec<char> = ('А'..='я').chain(['Ё', 'ё']).collect();
+    assert_eq!(russian.len(), 66);
+    for (i, a) in russian.iter().enumerate() {
+        for b in &russian[i + 1..] {
+            assert_ne!(glyph8x8(*a as u32), glyph8x8(*b as u32), "{a} and {b} look the same");
+        }
+    }
+    // letters shaped like Latin ones share the Latin glyph
+    for (cyr, lat) in [('А', 'A'), ('О', 'O'), ('р', 'p'), ('у', 'y'), ('Ё', 'Ë'), ('ј', 'j')] {
+        assert_eq!(glyph8x8(cyr as u32), glyph8x8(lat as u32), "{cyr} vs {lat}");
+    }
+    // past the block, and in gaps, there is nothing
+    assert_eq!(glyph8x8(CYRILLIC_LAST + 1), None);
+    assert_eq!(glyph8x8(0x0500), None);
+    assert_eq!(glyph8x8(0xD800), None); // not a character at all
+}
+
 #[test]
 fn rom_boots_prints_and_powers_off() {
     // A BIOS at the reset vector: print "OK" on serial, then SYSCTL POWER −1.

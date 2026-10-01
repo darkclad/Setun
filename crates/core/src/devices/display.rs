@@ -194,21 +194,7 @@ fn glyph(ch: i64) -> [u8; 8] {
     if ch <= 32 {
         return [0; 8];
     }
-    let table = TABLE.get_or_init(|| {
-        use font8x8::UnicodeFonts;
-        (0..=9841u32)
-            .map(|cp| {
-                let c = char::from_u32(cp)?;
-                font8x8::BASIC_FONTS
-                    .get(c)
-                    .or_else(|| font8x8::LATIN_FONTS.get(c))
-                    .or_else(|| font8x8::GREEK_FONTS.get(c))
-                    .or_else(|| font8x8::BOX_FONTS.get(c))
-                    .or_else(|| font8x8::BLOCK_FONTS.get(c))
-                    .or_else(|| font8x8::MISC_FONTS.get(c))
-            })
-            .collect()
-    });
+    let table = TABLE.get_or_init(|| (0..=9841u32).map(super::glyph8x8).collect());
     table[ch as usize].unwrap_or(BOX)
 }
 

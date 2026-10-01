@@ -841,7 +841,7 @@ The server keeps every window's pixels (server-side rendering), so clients never
 | `colors` | every one of the 3^9 = 19683 pixel colours, once each |
 | `paint` | draws with the mouse, with a colour strip |
 
-`mkdisk` generates `/usr/share/font8x8` (256 glyphs) from the same font crate the emulator's text mode uses.
+`mkdisk` generates `/usr/share/font8x8` from the same font the emulator's text mode uses: 352 glyphs, namely code points 0..255 followed by the Cyrillic block U+0400..U+045F as glyphs 256..351. `gfx.tri` maps a code point to its glyph (`font_glyph`) and draws `?` for anything else.
 
 **Pixels and gfx:** a pixel is one tryte: red, green and blue are 3 trits each, so there are 27 levels per channel. `lib/gfx.tri` has surfaces, clipped fill, blit, scroll and text (scaled or not), and a fast path for whole unscaled characters.
 

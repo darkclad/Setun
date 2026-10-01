@@ -672,7 +672,6 @@ dependencies = [
 name = "trinux"
 version = "0.1.0"
 dependencies = [
- "font8x8",
  "setun-core",
  "ternary",
  "trine",

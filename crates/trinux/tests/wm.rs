@@ -124,6 +124,8 @@ impl Session {
     }
 
     /// The terminal window's text, recognised from the screen (`rows` rows).
+    /// Letters drawn alike (Latin A, Cyrillic А) read as the first in
+    /// `glyph_order`; compare with `canonical`.
     fn term_text(&self, rows: usize) -> Vec<String> {
         let font = trinux::font8x8_table();
         (0..rows)
@@ -134,7 +136,7 @@ impl Session {
                         let cell: Vec<i16> = (0..8)
                             .map(|y| (0..8).map(|x| (self.pixel(x0 + x, y0 + y) == WHITE) as i16 * (1 << x)).sum())
                             .collect();
-                        (32u8..127).find(|&ch| font[ch as usize * 8..ch as usize * 8 + 8] == cell[..]).map(|ch| ch as char).unwrap_or('?')
+                        glyph_order().find(|&i| font[i * 8..i * 8 + 8] == cell[..]).map(trinux::font_char).unwrap_or('?')
                     })
                     .collect::<String>()
                     .trim_end()
@@ -142,6 +144,27 @@ impl Session {
             })
             .collect()
     }
+}
+
+/// Font glyphs in the order the screen reader tries them: ASCII, Latin-1,
+/// then Cyrillic.
+fn glyph_order() -> impl Iterator<Item = usize> {
+    (32..127).chain(161..256).chain(256..trinux::FONT_GLYPHS)
+}
+
+/// How `term_text` reads `s` back: each character as the first glyph that
+/// looks the same, and characters past the font as '?'.
+fn canonical(s: &str) -> String {
+    let font = trinux::font8x8_table();
+    s.chars()
+        .map(|c| match trinux::font_index(c as u32) {
+            Some(i) => {
+                let g = &font[i * 8..i * 8 + 8];
+                glyph_order().find(|&j| &font[j * 8..j * 8 + 8] == g).map(trinux::font_char).unwrap_or('?')
+            }
+            None => '?',
+        })
+        .collect()
 }
 
 /// USB HID usage code for a character, and whether it needs shift.
@@ -220,6 +243,28 @@ fn k8_window_system_end_to_end() {
     assert_eq!(s.m.dev.display.mode(), -1, "the console is back in text mode");
     s.console("echo console-ok");
     s.expect("console-ok\n", 60);
+}
+
+#[test]
+fn the_terminal_window_shows_cyrillic() {
+    let mut s = Session::boot();
+    s.console("trwm term &");
+    s.wait_for("trwm: window 0 'Terminal'", 200);
+    s.run(40);
+    s.click(TERM_X + 500, TERM_Y - 8);
+    s.type_text("cat /etc/pangrams\n");
+    s.run(120);
+    let text = s.term_text(7);
+    let file = std::fs::read_to_string(trinux::user_dir().join("etc/pangrams")).unwrap();
+    for line in file.lines() {
+        let want = canonical(line);
+        assert!(text.contains(&want), "missing {want:?} in the terminal: {text:#?}");
+    }
+    // the letters only Cyrillic has really are read back as Cyrillic
+    assert!(text.iter().any(|l| l.contains("Съешь") || l.contains("Cъeшь")), "{text:#?}");
+    assert!(text.iter().any(|l| l.contains('Ж') && l.contains('Щ') && l.contains('Ю') && l.contains('Я')), "{text:#?}");
+    // characters past the font are drawn as '?'
+    assert!(text.iter().any(|l| l.starts_with("? ? are past the font.")), "{text:#?}");
 }
 
 /// The pid trwm logged for the window titled `title`.

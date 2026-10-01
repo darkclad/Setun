@@ -14,4 +14,3 @@ path = "src/main.rs"
 setun-core = { path = "../core" }
 trine = { path = "../trine" }
 ternary = { path = "../ternary" }
-font8x8 = "0.3.1"

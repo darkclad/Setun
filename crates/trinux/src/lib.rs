@@ -78,15 +78,34 @@ pub fn user_dir() -> PathBuf {
 /// A generated file rather than a source: the 8x8 font for the window system.
 pub const FONT_SOURCE: &str = "<font8x8>";
 
-/// Glyphs 0..255, eight rows each, one tryte per row (bit 0 = leftmost
-/// pixel), from the same `font8x8` crate the emulator's text mode uses.
+/// Glyphs in the font file: code points 0..255, then the Cyrillic block
+/// U+0400..U+045F as glyphs 256..351.
+pub const FONT_GLYPHS: usize = 352;
+
+/// The font file's glyph for a code point, if it has one.
+pub fn font_index(cp: u32) -> Option<usize> {
+    use setun_core::devices::{CYRILLIC_FIRST, CYRILLIC_LAST};
+    match cp {
+        0..=255 => Some(cp as usize),
+        CYRILLIC_FIRST..=CYRILLIC_LAST => Some(256 + (cp - CYRILLIC_FIRST) as usize),
+        _ => None,
+    }
+}
+
+/// The code point of font file glyph `i` (the inverse of `font_index`).
+pub fn font_char(i: usize) -> char {
+    let cp = if i < 256 { i as u32 } else { setun_core::devices::CYRILLIC_FIRST + (i - 256) as u32 };
+    char::from_u32(cp).unwrap_or('?')
+}
+
+/// The window system's font: FONT_GLYPHS glyphs, eight rows each, one tryte
+/// per row (bit 0 = leftmost pixel), from the same font as the emulator's
+/// text mode.
 pub fn font8x8_table() -> Vec<i16> {
-    use font8x8::UnicodeFonts;
-    let mut v = Vec::with_capacity(256 * 8);
-    for cp in 0u32..256 {
-        let g = char::from_u32(cp)
-            .and_then(|c| font8x8::BASIC_FONTS.get(c).or_else(|| font8x8::LATIN_FONTS.get(c)))
-            .unwrap_or([0; 8]);
+    let mut v = Vec::with_capacity(FONT_GLYPHS * 8);
+    for i in 0..FONT_GLYPHS {
+        let cp = font_char(i) as u32;
+        let g = setun_core::devices::glyph8x8(cp).unwrap_or([0; 8]);
         v.extend(g.iter().map(|&b| b as i16));
     }
     v
@@ -119,6 +138,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v.push(("/bin/hello".into(), u.join("hello.tri")));
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
     v.push(("/etc/motd".into(), u.join("etc/motd")));
+    v.push(("/etc/pangrams".into(), u.join("etc/pangrams")));
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));
     v
 }
