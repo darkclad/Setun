@@ -1,0 +1,158 @@
+// md5: the MD5 message digest (RFC 1321).
+//
+// The machine has no binary AND/OR/XOR (Trine's & and | are tritwise min
+// and max), so 32-bit words are plain integers 0..2^32-1 and the boolean
+// functions run a bit at a time. Text is hashed as UTF-8, so a file's digest
+// matches md5sum elsewhere; a negative tryte v (not text) is hashed as the
+// code point v + 3^9, which no positive tryte can be.
+//
+//   md5_init(); md5_put_char(c) ...; md5_final(&digest[0]);   16 bytes
+//   md5_hex(s, n, &hex[0]);                                    32 hex digits
+
+const TWO32: int = 4294967296;
+
+var md5_k: [64]int = {
+    3614090360, 3905402710, 606105819, 3250441966, 4118548399, 1200080426, 2821735955, 4249261313,
+    1770035416, 2336552879, 4294925233, 2304563134, 1804603682, 4254626195, 2792965006, 1236535329,
+    4129170786, 3225465664, 643717713, 3921069994, 3593408605, 38016083, 3634488961, 3889429448,
+    568446438, 3275163606, 4107603335, 1163531501, 2850285829, 4243563512, 1735328473, 2368359562,
+    4294588738, 2272392833, 1839030562, 4259657740, 2763975236, 1272893353, 4139469664, 3200236656,
+    681279174, 3936430074, 3572445317, 76029189, 3654602809, 3873151461, 530742520, 3299628645,
+    4096336452, 1126891415, 2878612391, 4237533241, 1700485571, 2399980690, 4293915773, 2240044497,
+    1873313359, 4264355552, 2734768916, 1309151649, 4149444226, 3174756917, 718787259, 3951481745
+};
+var md5_shift: [16]int = { 7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21 };
+
+var md5_state: [4]int;
+var md5_block: [64]int;               // bytes waiting for a full block
+var md5_fill: int;
+var md5_bytes: int;                   // message length so far
+
+fn md5_init() {
+    md5_state[0] = 1732584193;
+    md5_state[1] = 4023233417;
+    md5_state[2] = 2562383102;
+    md5_state[3] = 271733878;
+    md5_fill = 0;
+    md5_bytes = 0;
+}
+
+fn pow2(n: int) -> int {
+    var v: int = 1;
+    while (n > 0) { v *= 2; n -= 1; }
+    return v;
+}
+
+// Round r's boolean function of x, y, z (0 F, 1 G, 2 H, 3 I), bit by bit.
+fn md5_fun(r: int, x: int, y: int, z: int) -> int {
+    var out: int = 0;
+    var bit: int = 1;
+    var k: int = 0;
+    while (k < 32) {
+        var a: int = x % 2;
+        var b: int = y % 2;
+        var c: int = z % 2;
+        x = x / 2;
+        y = y / 2;
+        z = z / 2;
+        var v: int;
+        if (r == 0) { v = a != 0 ? b : c; }                 // (x and y) or (not x and z)
+        else if (r == 1) { v = c != 0 ? a : b; }            // (x and z) or (y and not z)
+        else if (r == 2) { v = (a + b + c) % 2; }           // x xor y xor z
+        else { v = (b + (a != 0 || c == 0 ? 1 : 0)) % 2; }  // y xor (x or not z)
+        out += v * bit;
+        bit *= 2;
+        k += 1;
+    }
+    return out;
+}
+
+fn rotl32(x: int, s: int) -> int {
+    var m: int = pow2(32 - s);
+    return x % m * pow2(s) + x / m;
+}
+
+fn md5_transform() {
+    var w: [16]int;
+    var i: int = 0;
+    while (i < 16) {
+        w[i] = md5_block[4 * i] + 256 * (md5_block[4 * i + 1] + 256 * (md5_block[4 * i + 2] + 256 * md5_block[4 * i + 3]));
+        i += 1;
+    }
+    var a: int = md5_state[0];
+    var b: int = md5_state[1];
+    var c: int = md5_state[2];
+    var d: int = md5_state[3];
+    i = 0;
+    while (i < 64) {
+        var r: int = i / 16;
+        var g: int;
+        if (r == 0) { g = i; }
+        else if (r == 1) { g = (5 * i + 1) % 16; }
+        else if (r == 2) { g = (3 * i + 5) % 16; }
+        else { g = 7 * i % 16; }
+        var f: int = (md5_fun(r, b, c, d) + a + md5_k[i] + w[g]) % TWO32;
+        a = d;
+        d = c;
+        c = b;
+        b = (b + rotl32(f, md5_shift[4 * r + i % 4])) % TWO32;
+        i += 1;
+    }
+    md5_state[0] = (md5_state[0] + a) % TWO32;
+    md5_state[1] = (md5_state[1] + b) % TWO32;
+    md5_state[2] = (md5_state[2] + c) % TWO32;
+    md5_state[3] = (md5_state[3] + d) % TWO32;
+}
+
+fn md5_put_byte(v: int) {
+    md5_block[md5_fill] = v;
+    md5_fill += 1;
+    md5_bytes += 1;
+    if (md5_fill == 64) { md5_transform(); md5_fill = 0; }
+}
+
+// One character, as UTF-8.
+fn md5_put_char(c: int) {
+    if (c < 0) { c += 19683; }
+    if (c < 128) { md5_put_byte(c); }
+    else if (c < 2048) { md5_put_byte(192 + c / 64); md5_put_byte(128 + c % 64); }
+    else { md5_put_byte(224 + c / 4096); md5_put_byte(128 + c / 64 % 64); md5_put_byte(128 + c % 64); }
+}
+
+// Finish: the 16 digest bytes into out.
+fn md5_final(out: *int) {
+    var bits: int = md5_bytes * 8;
+    md5_put_byte(128);
+    while (md5_fill != 56) { md5_put_byte(0); }
+    var k: int = 0;
+    while (k < 8) { md5_put_byte(bits % 256); bits = bits / 256; k += 1; }
+    var i: int = 0;
+    while (i < 4) {
+        var v: int = md5_state[i];
+        k = 0;
+        while (k < 4) { out[4 * i + k] = v % 256; v = v / 256; k += 1; }
+        i += 1;
+    }
+}
+
+// The digest as 32 lowercase hex digits (out holds 33).
+fn md5_digest_hex(out: *char) {
+    var d: [16]int;
+    md5_final(&d[0]);
+    var hex: *char = "0123456789abcdef";
+    var i: int = 0;
+    while (i < 16) {
+        out[2 * i] = hex[d[i] / 16];
+        out[2 * i + 1] = hex[d[i] % 16];
+        i += 1;
+    }
+    out[32] = 0;
+}
+
+// MD5 of the n characters at s, as hex.
+fn md5_hex(s: *char, n: int, out: *char) {
+    md5_init();
+    var i: int = 0;
+    while (i < n) { md5_put_char(s[i]); i += 1; }
+    md5_digest_hex(out);
+}

@@ -1,0 +1,180 @@
+// regex: POSIX basic regular expressions (a subset), as sed uses them.
+//
+//   c        the character c          .        any character
+//   [set]    one of set (a-z ranges)  [^set]   any character not in set
+//   e*       e repeated, greedily     ^  $     the start / end (at the ends only)
+//   \( \)    a group (up to 9)        \1..\9   what group k matched
+//   \n \t    newline, tab             \c       the character c
+//
+// re_compile(p) checks p (0 and re_error on a bad one); re_search(p, s,
+// from) finds the leftmost match in s at or after index from, returning its
+// start (or -1); re_so/re_eo is its span and re_gs[k]/re_ge[k] group k's
+// (-1 when the group took no part).
+
+import "ctype.tri";
+
+const RE_MAX: int = 729;
+
+var re_p: *char;
+var re_s: *char;
+var re_gnum: [729]int;                // group number at each \( and \)
+var re_ngroups: int;
+var re_gs: [10]int;
+var re_ge: [10]int;
+var re_so: int;
+var re_eo: int;
+var re_error: *char;
+
+// Length of the [...] class at p (brackets included), or 0 if unclosed.
+fn re_class_len(p: *char) -> int {
+    var k: int = 1;
+    if (p[k] == '^') { k += 1; }
+    if (p[k] == ']') { k += 1; }
+    while (p[k] != 0 && p[k] != ']') { k += 1; }
+    return p[k] == ']' ? k + 1 : 0;
+}
+
+fn re_class_match(p: *char, c: int) -> int {
+    var k: int = 1;
+    var neg: int = p[1] == '^';
+    if (neg) { k = 2; }
+    var hit: int = 0;
+    var first: int = 1;
+    while (p[k] != ']' || first) {
+        if (p[k + 1] == '-' && p[k + 2] != ']') {
+            if (c >= p[k] && c <= p[k + 2]) { hit = 1; }
+            k += 3;
+        } else {
+            if (c == p[k]) { hit = 1; }
+            k += 1;
+        }
+        first = 0;
+    }
+    return hit != neg;
+}
+
+fn re_escaped(c: int) -> int {
+    if (c == 'n') { return '\n'; }
+    if (c == 't') { return '\t'; }
+    return c;
+}
+
+// Pattern length of the single-character element at re_p[i].
+fn re_elem_len(i: int) -> int {
+    if (re_p[i] == '\\' && re_p[i + 1] != 0) { return 2; }
+    if (re_p[i] == '[') { return re_class_len(&re_p[i]); }
+    return 1;
+}
+
+fn re_elem_match(i: int, c: int) -> int {
+    if (c == 0) { return 0; }
+    var p: char = re_p[i];
+    if (p == '.') { return 1; }
+    if (p == '[') { return re_class_match(&re_p[i], c); }
+    if (p == '\\') { return re_escaped(re_p[i + 1]) == c; }
+    return p == c;
+}
+
+// Check p and number its groups. 1 = fine.
+fn re_compile(p: *char) -> int {
+    re_p = p;
+    re_ngroups = 0;
+    var open: [10]int;
+    var depth: int = 0;
+    var i: int = 0;
+    while (p[i] != 0) {
+        if (i >= RE_MAX - 2) { re_error = "regular expression too long"; return 0; }
+        if (p[i] == '\\' && p[i + 1] == '(') {
+            if (re_ngroups == 9) { re_error = "too many groups"; return 0; }
+            re_ngroups += 1;
+            re_gnum[i] = re_ngroups;
+            open[depth] = re_ngroups;
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (p[i] == '\\' && p[i + 1] == ')') {
+            if (depth == 0) { re_error = "unmatched \\)"; return 0; }
+            depth -= 1;
+            re_gnum[i] = open[depth];
+            i += 2;
+            continue;
+        }
+        if (p[i] == '\\' && p[i + 1] >= '1' && p[i + 1] <= '9') {
+            if (p[i + 1] - '0' > re_ngroups) { re_error = "invalid back reference"; return 0; }
+            i += 2;
+            continue;
+        }
+        if (p[i] == '\\' && p[i + 1] == 0) { re_error = "trailing backslash"; return 0; }
+        if (p[i] == '[' && re_class_len(&p[i]) == 0) { re_error = "unterminated ["; return 0; }
+        i += re_elem_len(i);
+    }
+    if (depth != 0) { re_error = "unmatched \\("; return 0; }
+    return 1;
+}
+
+fn re_match_here(i: int, si: int) -> int {
+    loop {
+        var c: char = re_p[i];
+        if (c == 0) { re_eo = si; return 1; }
+        if (c == '$' && re_p[i + 1] == 0) {
+            if (re_s[si] == 0) { re_eo = si; return 1; }
+            return 0;
+        }
+        if (c == '\\' && (re_p[i + 1] == '(' || re_p[i + 1] == ')')) {
+            var g: int = re_gnum[i];
+            var opening: int = re_p[i + 1] == '(';
+            var old: int = opening ? re_gs[g] : re_ge[g];
+            if (opening) { re_gs[g] = si; } else { re_ge[g] = si; }
+            if (re_match_here(i + 2, si)) { return 1; }
+            if (opening) { re_gs[g] = old; } else { re_ge[g] = old; }
+            return 0;
+        }
+        if (c == '\\' && re_p[i + 1] >= '1' && re_p[i + 1] <= '9') {
+            var k: int = re_p[i + 1] - '0';
+            if (re_gs[k] < 0 || re_ge[k] < 0) { return 0; }
+            var n: int = 0;
+            while (n < re_ge[k] - re_gs[k]) {
+                if (re_s[si + n] != re_s[re_gs[k] + n]) { return 0; }
+                n += 1;
+            }
+            si += n;
+            i += 2;
+            continue;
+        }
+        var el: int = re_elem_len(i);
+        if (re_p[i + el] == '*') {
+            var m: int = 0;
+            while (re_elem_match(i, re_s[si + m])) { m += 1; }
+            while (m >= 0) {
+                if (re_match_here(i + el + 1, si + m)) { return 1; }
+                m -= 1;
+            }
+            return 0;
+        }
+        if (!re_elem_match(i, re_s[si])) { return 0; }
+        i += el;
+        si += 1;
+    }
+}
+
+fn re_search(p: *char, s: *char, from: int) -> int {
+    if (!re_compile(p)) { return -1; }
+    re_s = s;
+    var anchored: int = p[0] == '^';
+    if (anchored && from > 0) { return -1; }            // ^ is the start of the line only
+    var start: int = anchored ? 1 : 0;
+    var i: int = from;
+    loop {
+        var k: int = 0;
+        while (k < 10) { re_gs[k] = -1; re_ge[k] = -1; k += 1; }
+        if (re_match_here(start, i)) {
+            re_so = i;
+            re_gs[0] = i;
+            re_ge[0] = re_eo;
+            return i;
+        }
+        if (anchored || s[i] == 0) { return -1; }
+        i += 1;
+    }
+}

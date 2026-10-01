@@ -26,6 +26,7 @@ import "../lib/string.tri";
 import "../lib/ctype.tri";
 import "../lib/stdlib.tri";
 import "../lib/testexpr.tri";
+import "../lib/fnmatch.tri";
 
 // ---- tokens ---------------------------------------------------------------------------
 
@@ -1406,60 +1407,6 @@ fn expand_one(t: int, from: int) -> *char {
 }
 
 // ---- globbing ---------------------------------------------------------------------------------------
-
-// fnmatch: * ? [abc] [a-z] [!x] and \ escapes.
-fn fnmatch(p: *char, s: *char) -> int {
-    loop {
-        var c: char = p[0];
-        if (c == 0) { return s[0] == 0; }
-        if (c == '*') {
-            while (p[0] == '*') { p = &p[1]; }
-            if (p[0] == 0) { return 1; }
-            loop {
-                if (fnmatch(p, s)) { return 1; }
-                if (s[0] == 0) { return 0; }
-                s = &s[1];
-            }
-        }
-        if (s[0] == 0) { return 0; }
-        if (c == '?') {
-            p = &p[1];
-            s = &s[1];
-            continue;
-        }
-        if (c == '[') {
-            var k: int = 1;
-            var neg: int = p[1] == '!' || p[1] == '^';
-            if (neg) { k = 2; }
-            var hit: int = 0;
-            var first: int = 1;
-            while (p[k] != 0 && (p[k] != ']' || first)) {
-                if (p[k + 1] == '-' && p[k + 2] != ']' && p[k + 2] != 0) {
-                    if (s[0] >= p[k] && s[0] <= p[k + 2]) { hit = 1; }
-                    k += 3;
-                } else {
-                    if (s[0] == p[k]) { hit = 1; }
-                    k += 1;
-                }
-                first = 0;
-            }
-            if (p[k] != ']') {                              // no closing bracket: a literal [
-                if (s[0] != '[') { return 0; }
-                p = &p[1];
-                s = &s[1];
-                continue;
-            }
-            if (hit == neg) { return 0; }
-            p = &p[k + 1];
-            s = &s[1];
-            continue;
-        }
-        if (c == '\\' && p[1] != 0) { p = &p[1]; c = p[0]; }
-        if (c != s[0]) { return 0; }
-        p = &p[1];
-        s = &s[1];
-    }
-}
 
 fn cmp_fields(a: int, b: int) -> int { return strcmp(a as *char, b as *char); }
 

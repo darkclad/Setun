@@ -1,0 +1,1263 @@
+// A multi-call program, chosen by argv[0]: the text and file tools.
+//
+//   sed [-n] [-i] [-e script] ... [script] [file ...]
+//   tr [-cds] set1 [set2]          cut -c list | -f list [-d c] [-s] [file ...]
+//   od [-c|-d|-o|-x|-t] [file]     diff [-q] file1 file2
+//   find [path ...] [expression]   xargs [-n max] [-I str] [command [arg ...]]
+//   md5sum [file ...]
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/ctype.tri";
+import "../lib/stdlib.tri";
+import "../lib/stdio.tri";
+import "../lib/getopt.tri";
+import "../lib/regex.tri";
+import "../lib/fnmatch.tri";
+import "../lib/md5.tri";
+
+const LINE_MAX: int = 2187;
+
+var prog: *char;
+
+fn name_of(p: *char) -> *char {
+    var s: *char = strrchr(p, '/');
+    return s == null ? p : &s[1];
+}
+
+fn fail(a: *char, b: *char) -> int {
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, a);
+    if (b != null) { fputs(STDERR_FILENO, b); }
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}
+
+fn usage(s: *char) -> int {
+    fputs(STDERR_FILENO, "usage: ");
+    fputs(STDERR_FILENO, s);
+    fputs(STDERR_FILENO, "\n");
+    return 2;
+}
+
+// One line from f into buf (without its newline): its length, or -1 at the
+// end of the input. *had_nl says whether it ended with a newline.
+fn read_line(f: *FILE, buf: *char, max: int, had_nl: *int) -> int {
+    var n: int = 0;
+    had_nl[0] = 0;
+    loop {
+        var c: int = fgetc(f);
+        if (c == EOF) { break; }
+        if (c == '\n') { had_nl[0] = 1; break; }
+        if (n < max - 1) { buf[n] = c as char; n += 1; }
+    }
+    buf[n] = 0;
+    if (n == 0 && !had_nl[0]) { return -1; }
+    return n;
+}
+
+fn open_in(name: *char) -> *FILE {
+    if (streq(name, "-")) { return stdin(); }
+    var f: *FILE = fopen(name, "r");
+    if (f == null) { perror2(prog, name); }
+    return f;
+}
+
+fn close_in(f: *FILE) { if (f != stdin()) { fclose(f); } }
+
+// ---- sed --------------------------------------------------------------------------------------
+//
+// Addresses: N, $, /re/ (and \cREc), addr1,addr2, with ! to negate.
+// Commands: s/re/repl/[gpN]  y/abc/xyz/  d p q = n  a i c text  (; or a
+// newline between commands). An empty regex means the last one used.
+
+const SED_MAX: int = 81;
+const A_NONE: int = 0;
+const A_LINE: int = 1;
+const A_LAST: int = 2;
+const A_RE: int = 3;
+
+var sc_cmd: [81]int;
+var sc_a1: [81]int;
+var sc_n1: [81]int;
+var sc_r1: [81]*char;
+var sc_a2: [81]int;
+var sc_n2: [81]int;
+var sc_r2: [81]*char;
+var sc_neg: [81]int;
+var sc_active: [81]int;
+var sc_re: [81]*char;                 // s: the regex; y: the source set
+var sc_text: [81]*char;               // s: the replacement; y: the target set; a i c: the text
+var sc_global: [81]int;
+var sc_print: [81]int;
+var sc_nth: [81]int;
+var nsc: int;
+
+var sed_quiet: int;
+var sed_src: *char;
+var sed_pos: int;
+var sed_last_re: *char;
+var sed_line: int;
+var sed_is_last: int;
+var sed_out: *FILE;
+
+fn sed_error(msg: *char) -> int {
+    fputs(STDERR_FILENO, "sed: -e expression, char ");
+    put_int_fd(STDERR_FILENO, sed_pos + 1);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, msg);
+    fputs(STDERR_FILENO, "\n");
+    return -1;
+}
+
+fn put_int_fd(fd: int, v: int) {
+    var b: [15]char;
+    var k: int = 14;
+    b[k] = 0;
+    var neg: int = v < 0;
+    if (neg) { v = -v; }
+    loop {
+        k -= 1;
+        b[k] = ('0' + v % 10) as char;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    if (neg) { k -= 1; b[k] = '-'; }
+    fputs(fd, &b[k]);
+}
+
+fn sed_skip_blanks() { while (sed_src[sed_pos] == ' ' || sed_src[sed_pos] == '\t') { sed_pos += 1; } }
+
+// The text up to the next unescaped delimiter d (\d becomes d; other
+// escapes stay for the regex or replacement), malloc'd; null if unclosed.
+fn sed_delimited(d: char) -> *char {
+    var buf: [729]char;
+    var n: int = 0;
+    loop {
+        var c: char = sed_src[sed_pos];
+        if (c == 0 || c == '\n') { return null; }
+        if (c == d) { sed_pos += 1; break; }
+        if (c == '\\' && sed_src[sed_pos + 1] == d) { c = d; sed_pos += 1; }
+        else if (c == '\\' && sed_src[sed_pos + 1] != 0) {
+            if (n < 727) { buf[n] = c; n += 1; }
+            sed_pos += 1;
+            c = sed_src[sed_pos];
+        }
+        if (n < 727) { buf[n] = c; n += 1; }
+        sed_pos += 1;
+    }
+    buf[n] = 0;
+    return strdup(&buf[0]);
+}
+
+// An address at sed_pos: its kind (A_NONE if there is none).
+fn sed_address(num: *int, re: **char) -> int {
+    var c: char = sed_src[sed_pos];
+    if (isdigit(c)) {
+        var v: int = 0;
+        while (isdigit(sed_src[sed_pos])) { v = v * 10 + sed_src[sed_pos] - '0'; sed_pos += 1; }
+        num[0] = v;
+        return A_LINE;
+    }
+    if (c == '$') { sed_pos += 1; return A_LAST; }
+    if (c == '/' || c == '\\') {
+        var d: char = '/';
+        if (c == '\\') { sed_pos += 1; d = sed_src[sed_pos]; }
+        sed_pos += 1;
+        var r: *char = sed_delimited(d);
+        if (r == null) { sed_error("unterminated address regex"); return -1; }
+        if (r[0] != 0 && !re_compile(r)) { sed_error(re_error); return -1; }
+        re[0] = r;
+        return A_RE;
+    }
+    return A_NONE;
+}
+
+// Text for a, i, c: "a\" newline text, or "a text"; to the end of the line.
+fn sed_text() -> *char {
+    sed_skip_blanks();
+    if (sed_src[sed_pos] == '\\') {
+        sed_pos += 1;
+        if (sed_src[sed_pos] == '\n') { sed_pos += 1; }
+    }
+    var buf: [729]char;
+    var n: int = 0;
+    while (sed_src[sed_pos] != 0 && sed_src[sed_pos] != '\n') {
+        var c: char = sed_src[sed_pos];
+        if (c == '\\' && sed_src[sed_pos + 1] != 0) { sed_pos += 1; c = sed_src[sed_pos]; }
+        if (n < 727) { buf[n] = c; n += 1; }
+        sed_pos += 1;
+    }
+    buf[n] = 0;
+    return strdup(&buf[0]);
+}
+
+fn sed_parse(script: *char) -> int {
+    sed_src = script;
+    sed_pos = 0;
+    loop {
+        while (sed_src[sed_pos] == ' ' || sed_src[sed_pos] == '\t' || sed_src[sed_pos] == '\n' || sed_src[sed_pos] == ';') {
+            sed_pos += 1;
+        }
+        if (sed_src[sed_pos] == 0) { return 0; }
+        if (nsc == SED_MAX) { return sed_error("too many commands"); }
+        var k: int = nsc;
+        sc_a1[k] = sed_address(&sc_n1[k], &sc_r1[k]);
+        if (sc_a1[k] < 0) { return -1; }
+        sc_a2[k] = A_NONE;
+        if (sc_a1[k] != A_NONE && sed_src[sed_pos] == ',') {
+            sed_pos += 1;
+            sc_a2[k] = sed_address(&sc_n2[k], &sc_r2[k]);
+            if (sc_a2[k] < 0) { return -1; }
+            if (sc_a2[k] == A_NONE) { return sed_error("unexpected `,'"); }
+        }
+        sed_skip_blanks();
+        sc_neg[k] = 0;
+        if (sed_src[sed_pos] == '!') { sc_neg[k] = 1; sed_pos += 1; sed_skip_blanks(); }
+        var c: char = sed_src[sed_pos];
+        if (c == 0) { return sed_error("missing command"); }
+        sed_pos += 1;
+        sc_cmd[k] = c;
+        sc_active[k] = 0;
+        if (c == 's') {
+            var d: char = sed_src[sed_pos];
+            if (d == 0 || d == '\n' || d == '\\') { return sed_error("unterminated `s' command"); }
+            sed_pos += 1;
+            sc_re[k] = sed_delimited(d);
+            if (sc_re[k] == null) { return sed_error("unterminated `s' command"); }
+            sc_text[k] = sed_delimited(d);
+            if (sc_text[k] == null) { return sed_error("unterminated `s' command"); }
+            if (sc_re[k][0] != 0 && !re_compile(sc_re[k])) { return sed_error(re_error); }
+            sc_global[k] = 0;
+            sc_print[k] = 0;
+            sc_nth[k] = 1;
+            loop {
+                var f: char = sed_src[sed_pos];
+                if (f == 'g') { sc_global[k] = 1; sed_pos += 1; }
+                else if (f == 'p') { sc_print[k] = 1; sed_pos += 1; }
+                else if (isdigit(f)) {
+                    var v: int = 0;
+                    while (isdigit(sed_src[sed_pos])) { v = v * 10 + sed_src[sed_pos] - '0'; sed_pos += 1; }
+                    if (v == 0) { return sed_error("number option to `s' command may not be zero"); }
+                    sc_nth[k] = v;
+                } else { break; }
+            }
+        } else if (c == 'y') {
+            var d2: char = sed_src[sed_pos];
+            sed_pos += 1;
+            sc_re[k] = sed_delimited(d2);
+            sc_text[k] = sc_re[k] == null ? null : sed_delimited(d2);
+            if (sc_text[k] == null) { return sed_error("unterminated `y' command"); }
+            if (strlen(sc_re[k]) != strlen(sc_text[k])) { return sed_error("strings for `y' command are different lengths"); }
+        } else if (c == 'a' || c == 'i' || c == 'c') {
+            sc_text[k] = sed_text();
+        } else if (c != 'd' && c != 'p' && c != 'q' && c != '=' && c != 'n') {
+            sed_pos -= 1;
+            return sed_error("unknown command");
+        }
+        nsc += 1;
+        sed_skip_blanks();
+        var e: char = sed_src[sed_pos];
+        if (e != 0 && e != ';' && e != '\n' && c != 'a' && c != 'i' && c != 'c') {
+            return sed_error("extra characters after command");
+        }
+    }
+}
+
+fn sed_re(r: *char) -> *char {
+    if (r[0] != 0) { sed_last_re = r; }
+    return sed_last_re;
+}
+
+fn sed_addr_match(kind: int, num: int, re: *char, ps: *char) -> int {
+    if (kind == A_LINE) { return sed_line == num; }
+    if (kind == A_LAST) { return sed_is_last; }
+    var r: *char = sed_re(re);
+    if (r == null) { return 0; }
+    return re_search(r, ps, 0) >= 0;
+}
+
+fn sed_selected(k: int, ps: *char) -> int {
+    var hit: int;
+    if (sc_a1[k] == A_NONE) {
+        hit = 1;
+    } else if (sc_a2[k] == A_NONE) {
+        hit = sed_addr_match(sc_a1[k], sc_n1[k], sc_r1[k], ps);
+    } else if (sc_active[k]) {
+        hit = 1;
+        if (sc_a2[k] == A_LINE ? sed_line >= sc_n2[k] : sed_addr_match(sc_a2[k], sc_n2[k], sc_r2[k], ps)) { sc_active[k] = 0; }
+    } else {
+        hit = sed_addr_match(sc_a1[k], sc_n1[k], sc_r1[k], ps);
+        if (hit) {
+            sc_active[k] = 1;
+            if (sc_a2[k] == A_LINE && sc_n2[k] <= sed_line) { sc_active[k] = 0; }
+            if (sc_a2[k] == A_LAST && sed_is_last) { sc_active[k] = 0; }
+        }
+    }
+    return hit != sc_neg[k];
+}
+
+fn sed_put(s: *char) { fputs_f(s, sed_out); fputc('\n', sed_out); }
+
+// s///: rewrite ps in place; 1 if something was replaced.
+fn sed_subst(k: int, ps: *char) -> int {
+    var r: *char = sed_re(sc_re[k]);
+    if (r == null) { fail("no previous regular expression", null); return 0; }
+    var out: [6561]char;
+    var n: int = 0;
+    var pos: int = 0;
+    var count: int = 0;
+    var done: int = 0;
+    var len: int = strlen(ps);
+    var last_end: int = -1;                             // where the last non-empty match ended
+    while (pos <= len) {
+        var m: int = re_search(r, ps, pos);
+        if (m < 0) { break; }
+        var e: int = re_eo;
+        if (e == m && m == last_end) {                  // no empty match right after a match
+            if (ps[m] == 0) { break; }
+            if (n < 6560) { out[n] = ps[m]; n += 1; }
+            pos = m + 1;
+            continue;
+        }
+        if (e > m) { last_end = e; }
+        count += 1;
+        var take: int = sc_global[k] ? count >= sc_nth[k] : count == sc_nth[k];
+        var j: int = pos;
+        while (j < m && n < 6560) { out[n] = ps[j]; n += 1; j += 1; }
+        if (take) {
+            done = 1;
+            var t: *char = sc_text[k];
+            var q: int = 0;
+            while (t[q] != 0) {
+                var c: char = t[q];
+                if (c == '&') {
+                    j = m;
+                    while (j < e && n < 6560) { out[n] = ps[j]; n += 1; j += 1; }
+                } else if (c == '\\' && t[q + 1] >= '1' && t[q + 1] <= '9') {
+                    var g: int = t[q + 1] - '0';
+                    q += 1;
+                    if (g <= re_ngroups && re_gs[g] >= 0 && re_ge[g] >= 0) {
+                        j = re_gs[g];
+                        while (j < re_ge[g] && n < 6560) { out[n] = ps[j]; n += 1; j += 1; }
+                    }
+                } else {
+                    if (c == '\\' && t[q + 1] != 0) { q += 1; c = re_escaped(t[q]) as char; }
+                    if (n < 6560) { out[n] = c; n += 1; }
+                }
+                q += 1;
+            }
+        } else {
+            j = m;
+            while (j < e && n < 6560) { out[n] = ps[j]; n += 1; j += 1; }
+        }
+        if (e == m) {                                   // an empty match: step past one character
+            if (ps[m] == 0) { pos = len + 1; break; }
+            if (n < 6560) { out[n] = ps[m]; n += 1; }
+            pos = m + 1;
+        } else {
+            pos = e;
+        }
+        if (done && !sc_global[k]) { break; }
+    }
+    if (!done) { return 0; }
+    while (pos < len && n < 6560) { out[n] = ps[pos]; n += 1; pos += 1; }
+    if (n > LINE_MAX - 1) { n = LINE_MAX - 1; }
+    out[n] = 0;
+    strcpy(ps, &out[0]);
+    return 1;
+}
+
+fn sed_y(k: int, ps: *char) {
+    var i: int = 0;
+    while (ps[i] != 0) {
+        var p: *char = strchr(sc_re[k], ps[i]);
+        if (p != null) { ps[i] = sc_text[k][p as int - sc_re[k] as int]; }
+        i += 1;
+    }
+}
+
+var sed_next: [2187]char;             // the line after the current one
+var sed_have_next: int;
+var sed_in: *FILE;
+var sed_files: **char;
+var sed_nfiles: int;
+var sed_file_i: int;
+
+// The next input line into sed_next, across the files.
+fn sed_fetch() {
+    var nl: int;
+    loop {
+        if (sed_in == null) {
+            if (sed_file_i >= sed_nfiles) { sed_have_next = 0; return; }
+            sed_in = open_in(sed_files[sed_file_i]);
+            sed_file_i += 1;
+            if (sed_in == null) { continue; }
+        }
+        if (read_line(sed_in, &sed_next[0], LINE_MAX, &nl) >= 0) { sed_have_next = 1; return; }
+        close_in(sed_in);
+        sed_in = null;
+    }
+}
+
+fn sed_take(ps: *char) -> int {
+    if (!sed_have_next) { return 0; }
+    strcpy(ps, &sed_next[0]);
+    sed_line += 1;
+    sed_fetch();
+    sed_is_last = !sed_have_next;
+    return 1;
+}
+
+// Run the script over the files (or stdin); 1 = quit early.
+fn sed_run() -> int {
+    var ps: [2187]char;
+    var appended: [27]*char;
+    sed_fetch();
+    while (sed_take(&ps[0])) {
+        var napp: int = 0;
+        var deleted: int = 0;
+        var quit: int = 0;
+        var k: int = 0;
+        while (k < nsc && !deleted && !quit) {
+            if (!sed_selected(k, &ps[0])) { k += 1; continue; }
+            var c: int = sc_cmd[k];
+            if (c == 's') {
+                if (sed_subst(k, &ps[0]) && sc_print[k]) { sed_put(&ps[0]); }
+            } else if (c == 'y') { sed_y(k, &ps[0]); }
+            else if (c == 'd') { deleted = 1; }
+            else if (c == 'p') { sed_put(&ps[0]); }
+            else if (c == '=') { fput_int(sed_line, sed_out); fputc('\n', sed_out); }
+            else if (c == 'q') { quit = 1; }
+            else if (c == 'a') { if (napp < 27) { appended[napp] = sc_text[k]; napp += 1; } }
+            else if (c == 'i') { sed_put(sc_text[k]); }
+            else if (c == 'c') {
+                if (sc_a2[k] == A_NONE || !sc_active[k]) { sed_put(sc_text[k]); }
+                deleted = 1;
+            } else if (c == 'n') {
+                if (!sed_quiet) { sed_put(&ps[0]); }
+                if (!sed_take(&ps[0])) { deleted = 1; quit = 1; }
+            }
+            k += 1;
+        }
+        if (!deleted && !sed_quiet) { sed_put(&ps[0]); }
+        var a: int = 0;
+        while (a < napp) { sed_put(appended[a]); a += 1; }
+        if (quit) { return 1; }
+    }
+    return 0;
+}
+
+fn do_sed(argc: int, argv: **char) -> int {
+    var script: [2187]char;
+    script[0] = 0;
+    var have: int = 0;
+    var in_place: int = 0;
+    var c: int = getopt(argc, argv, "ne:i");
+    while (c != -1) {
+        if (c == 'n') { sed_quiet = 1; }
+        else if (c == 'i') { in_place = 1; }
+        else if (c == 'e') {
+            if (strlen(&script[0]) + strlen(optarg) + 2 >= 2187) { return fail("script too long", null); }
+            if (have) { strcat(&script[0], "\n"); }
+            strcat(&script[0], optarg);
+            have = 1;
+        } else { return usage("sed [-n] [-i] [-e script] ... [script] [file ...]"); }
+        c = getopt(argc, argv, "ne:i");
+    }
+    if (!have) {
+        if (optind >= argc) { return usage("sed [-n] [-i] [-e script] ... [script] [file ...]"); }
+        strncpy(&script[0], argv[optind], 2186);
+        script[2186] = 0;
+        optind += 1;
+    }
+    if (sed_parse(&script[0]) < 0) { return 1; }
+    var dash: [2]*char = { "-", null };
+    if (in_place) {
+        if (optind >= argc) { return fail("no input files", null); }
+        var status: int = 0;
+        var i: int = optind;
+        while (i < argc) {
+            var tmp: [243]char;
+            strncpy(&tmp[0], argv[i], 230);
+            tmp[230] = 0;
+            strcat(&tmp[0], ".sed~");
+            var outf: *FILE = fopen(&tmp[0], "w");
+            if (outf == null) { perror2("sed", &tmp[0]); status = 1; i += 1; continue; }
+            sed_out = outf;
+            sed_files = &argv[i];
+            sed_nfiles = 1;
+            sed_file_i = 0;
+            sed_in = null;
+            sed_line = 0;
+            var k: int = 0;
+            while (k < nsc) { sc_active[k] = 0; k += 1; }
+            sed_run();
+            fclose(outf);
+            if (rename(&tmp[0], argv[i]) < 0) { perror2("sed", argv[i]); unlink(&tmp[0]); status = 1; }
+            i += 1;
+        }
+        return status;
+    }
+    sed_out = stdout();
+    if (optind >= argc) { sed_files = &dash[0]; sed_nfiles = 1; }
+    else { sed_files = &argv[optind]; sed_nfiles = argc - optind; }
+    sed_run();
+    fflush(stdout());
+    return 0;
+}
+
+// ---- tr ---------------------------------------------------------------------------------------
+
+// Expand a tr set (ranges a-z, \n \t \\ \NNN octal, [:class:]) into out;
+// its length, or -1.
+fn tr_set(s: *char, out: *int, max: int) -> int {
+    var n: int = 0;
+    var i: int = 0;
+    while (s[i] != 0) {
+        if (s[i] == '[' && s[i + 1] == ':') {
+            var e: *char = strstr(&s[i], ":]");
+            if (e == null) { return -1; }
+            var name: [15]char;
+            var len: int = e as int - (&s[i + 2]) as int;
+            if (len > 14) { return -1; }
+            strncpy(&name[0], &s[i + 2], len);
+            name[len] = 0;
+            var c: int = 0;
+            var known: int = 0;
+            while (c < 128) {
+                var hit: int;
+                if (streq(&name[0], "lower")) { hit = islower(c); known = 1; }
+                else if (streq(&name[0], "upper")) { hit = isupper(c); known = 1; }
+                else if (streq(&name[0], "digit")) { hit = isdigit(c); known = 1; }
+                else if (streq(&name[0], "alpha")) { hit = isalpha(c); known = 1; }
+                else if (streq(&name[0], "alnum")) { hit = isalnum(c); known = 1; }
+                else if (streq(&name[0], "space")) { hit = isspace(c); known = 1; }
+                else if (streq(&name[0], "punct")) { hit = ispunct(c); known = 1; }
+                else { break; }
+                if (hit && n < max) { out[n] = c; n += 1; }
+                c += 1;
+            }
+            if (!known) { fail("invalid character class: ", &name[0]); return -1; }
+            i = e as int - s as int + 2;
+            continue;
+        }
+        var a: int = s[i];
+        if (a == '\\' && s[i + 1] != 0) {
+            i += 1;
+            a = s[i];
+            if (a == 'n') { a = '\n'; }
+            else if (a == 't') { a = '\t'; }
+            else if (a >= '0' && a <= '7') {
+                a = 0;
+                var d: int = 0;
+                while (d < 3 && s[i] >= '0' && s[i] <= '7') { a = a * 8 + s[i] - '0'; i += 1; d += 1; }
+                i -= 1;
+            }
+        }
+        if (s[i + 1] == '-' && s[i + 2] != 0) {
+            var b: int = s[i + 2];
+            if (b < a) { fail("range-endpoints are in reverse collating sequence order", null); return -1; }
+            while (a <= b) { if (n < max) { out[n] = a; n += 1; } a += 1; }
+            i += 3;
+            continue;
+        }
+        if (n < max) { out[n] = a; n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+fn in_set(set: *int, n: int, c: int) -> int {
+    var k: int = 0;
+    while (k < n) { if (set[k] == c) { return k; } k += 1; }
+    return -1;
+}
+
+fn do_tr(argc: int, argv: **char) -> int {
+    var del: int = 0;
+    var squeeze: int = 0;
+    var comp: int = 0;
+    var c: int = getopt(argc, argv, "cds");
+    while (c != -1) {
+        if (c == 'd') { del = 1; } else if (c == 's') { squeeze = 1; } else if (c == 'c') { comp = 1; }
+        else { return usage("tr [-cds] set1 [set2]"); }
+        c = getopt(argc, argv, "cds");
+    }
+    var nargs: int = argc - optind;
+    if (nargs < 1 || nargs > 2 || (!del && !squeeze && nargs != 2) || (del && !squeeze && nargs != 1)) {
+        return usage("tr [-cds] set1 [set2]");
+    }
+    var s1: [2187]int;
+    var s2: [2187]int;
+    var n1: int = tr_set(argv[optind], &s1[0], 2187);
+    var n2: int = 0;
+    if (n1 < 0) { return 1; }
+    if (nargs == 2) {
+        n2 = tr_set(argv[optind + 1], &s2[0], 2187);
+        if (n2 < 0) { return 1; }
+        if (n2 == 0 && !del) { return fail("when not truncating set1, string2 must be non-empty", null); }
+    }
+    var translate: int = nargs == 2 && !del;
+    var last: int = -1;
+    var f: *FILE = stdin();
+    var out: *FILE = stdout();
+    loop {
+        var ch: int = fgetc(f);
+        if (ch == EOF) { break; }
+        var k: int = in_set(&s1[0], n1, ch);
+        var member: int = comp ? k < 0 : k >= 0;
+        if (del && member) { continue; }
+        if (translate && member && !comp) { ch = s2[k < n2 ? k : n2 - 1]; }
+        var sq: *int = translate || del ? &s2[0] : &s1[0];
+        var sqn: int = translate || del ? n2 : n1;
+        if (squeeze && ch == last && (comp && !translate && !del ? in_set(sq, sqn, ch) < 0 : in_set(sq, sqn, ch) >= 0)) { continue; }
+        fputc(ch, out);
+        last = ch;
+    }
+    fflush(out);
+    return 0;
+}
+
+// ---- cut --------------------------------------------------------------------------------------
+
+var cut_lo: [81]int;
+var cut_hi: [81]int;
+var ncut: int;
+
+// "N,N-M,N-,-M" into ranges; 0 = bad.
+fn cut_list(s: *char) -> int {
+    var i: int = 0;
+    ncut = 0;
+    while (s[i] != 0) {
+        if (ncut == 81) { return 0; }
+        var lo: int = 1;
+        var hi: int = 1000000;
+        if (isdigit(s[i])) {
+            lo = 0;
+            while (isdigit(s[i])) { lo = lo * 10 + s[i] - '0'; i += 1; }
+            hi = lo;
+        }
+        if (s[i] == '-') {
+            i += 1;
+            hi = 1000000;
+            if (isdigit(s[i])) {
+                hi = 0;
+                while (isdigit(s[i])) { hi = hi * 10 + s[i] - '0'; i += 1; }
+            }
+        } else if (i == 0 || !isdigit(s[i - 1])) { return 0; }
+        if (lo < 1 || hi < lo) { return 0; }
+        cut_lo[ncut] = lo;
+        cut_hi[ncut] = hi;
+        ncut += 1;
+        if (s[i] == ',') { i += 1; if (s[i] == 0) { return 0; } }
+        else if (s[i] != 0) { return 0; }
+    }
+    return ncut > 0;
+}
+
+fn cut_has(n: int) -> int {
+    var k: int = 0;
+    while (k < ncut) { if (n >= cut_lo[k] && n <= cut_hi[k]) { return 1; } k += 1; }
+    return 0;
+}
+
+fn do_cut(argc: int, argv: **char) -> int {
+    var mode: int = 0;                                  // 'c' or 'f'
+    var delim: char = '\t';
+    var only: int = 0;
+    var c: int = getopt(argc, argv, "c:f:d:s");
+    while (c != -1) {
+        if (c == 'c' || c == 'f') {
+            if (mode != 0) { return fail("only one type of list may be specified", null); }
+            mode = c;
+            if (!cut_list(optarg)) { return fail("invalid list: ", optarg); }
+        } else if (c == 'd') {
+            if (strlen(optarg) != 1) { return fail("the delimiter must be a single character", null); }
+            delim = optarg[0];
+        } else if (c == 's') { only = 1; }
+        else { return usage("cut -c list | -f list [-d c] [-s] [file ...]"); }
+        c = getopt(argc, argv, "c:f:d:s");
+    }
+    if (mode == 0) { return usage("cut -c list | -f list [-d c] [-s] [file ...]"); }
+    var dash: [2]*char = { "-", null };
+    var files: **char = optind < argc ? &argv[optind] : &dash[0];
+    var nfiles: int = optind < argc ? argc - optind : 1;
+    var status: int = 0;
+    var out: *FILE = stdout();
+    var i: int = 0;
+    while (i < nfiles) {
+        var f: *FILE = open_in(files[i]);
+        i += 1;
+        if (f == null) { status = 1; continue; }
+        var line: [2187]char;
+        var nl: int;
+        while (read_line(f, &line[0], LINE_MAX, &nl) >= 0) {
+            if (mode == 'c') {
+                var k: int = 0;
+                while (line[k] != 0) { if (cut_has(k + 1)) { fputc(line[k], out); } k += 1; }
+            } else {
+                if (strchr(&line[0], delim) == null) {
+                    if (!only) { fputs_f(&line[0], out); fputc('\n', out); }
+                    continue;
+                }
+                var field: int = 1;
+                var first: int = 1;
+                var k2: int = 0;
+                loop {
+                    var start: int = k2;
+                    while (line[k2] != 0 && line[k2] != delim) { k2 += 1; }
+                    if (cut_has(field)) {
+                        if (!first) { fputc(delim, out); }
+                        var j: int = start;
+                        while (j < k2) { fputc(line[j], out); j += 1; }
+                        first = 0;
+                    }
+                    if (line[k2] == 0) { break; }
+                    k2 += 1;
+                    field += 1;
+                }
+            }
+            fputc('\n', out);
+        }
+        close_in(f);
+    }
+    fflush(out);
+    return status;
+}
+
+// ---- od ---------------------------------------------------------------------------------------
+//
+// A dump of trytes (the machine's bytes): offsets in octal, 8 trytes a line.
+// -o octal (the default), -d decimal, -x hex, -c characters, -t balanced
+// base 27 (three digits A..M = +1..+13, a..m = -1..-13 per tryte).
+
+fn od_offset(v: int) {
+    var b: [8]char;
+    var k: int = 7;
+    while (k > 0) { k -= 1; b[k] = ('0' + v % 8) as char; v = v / 8; }
+    b[7] = 0;
+    puts(&b[0]);
+}
+
+fn od_value(v: int, base: int, width: int) {
+    var b: [20]char;
+    var k: int = 19;
+    b[k] = 0;
+    var neg: int = v < 0;
+    if (neg) { v = -v; }
+    var digits: *char = "0123456789abcdef";
+    loop {
+        k -= 1;
+        b[k] = digits[v % base];
+        v = v / base;
+        if (v == 0) { break; }
+    }
+    if (neg) { k -= 1; b[k] = '-'; }
+    var pad: int = width - (19 - k);
+    while (pad > 0) { puts(" "); pad -= 1; }
+    puts(&b[k]);
+}
+
+fn od_b27(v: int) {
+    var a: *char = "mlkjihgfedcba0ABCDEFGHIJKLM";
+    var d: [4]char;
+    var k: int = 3;
+    while (k > 0) {
+        k -= 1;
+        var r: int = v % 27;                            // balanced digit -13..13
+        if (r > 13) { r -= 27; }
+        if (r < -13) { r += 27; }
+        d[k] = a[r + 13];
+        v = (v - r) / 27;
+    }
+    d[3] = 0;
+    puts("  ");
+    puts(&d[0]);
+}
+
+fn od_char(v: int) {
+    if (v == '\n') { puts("  \\n"); return; }
+    if (v == '\t') { puts("  \\t"); return; }
+    if (v == 0) { puts("  \\0"); return; }
+    if (v == '\\') { puts("  \\\\"); return; }
+    if (v >= 32 && v != 127) {
+        var c: [2]char;
+        c[0] = v as char;
+        c[1] = 0;
+        puts("   ");
+        puts(&c[0]);
+        return;
+    }
+    od_value(v, 8, 4);
+}
+
+fn do_od(argc: int, argv: **char) -> int {
+    var fmt: int = 'o';
+    var c: int = getopt(argc, argv, "cdoxt");
+    while (c != -1) {
+        if (c == '?') { return usage("od [-c|-d|-o|-x|-t] [file]"); }
+        fmt = c;
+        c = getopt(argc, argv, "cdoxt");
+    }
+    if (argc - optind > 1) { return usage("od [-c|-d|-o|-x|-t] [file]"); }
+    var fd: int = 0;
+    if (optind < argc) {
+        fd = open(argv[optind], O_RDONLY, 0);
+        if (fd < 0) { perror2("od", argv[optind]); return 1; }
+    }
+    var buf: [729]char;
+    var row: [8]int;
+    var nrow: int = 0;
+    var off: int = 0;
+    loop {
+        var r: int = read(fd, &buf[0], 729);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        var k: int = 0;
+        while (k < r) {
+            row[nrow] = buf[k];
+            nrow += 1;
+            k += 1;
+            if (nrow == 8 || k == r) {
+                if (nrow < 8 && k == r) { break; }      // a partial row waits for more input
+                od_offset(off);
+                var j: int = 0;
+                while (j < nrow) {
+                    if (fmt == 'c') { od_char(row[j]); }
+                    else if (fmt == 'd') { od_value(row[j], 10, 7); }
+                    else if (fmt == 'x') { od_value(row[j], 16, 6); }
+                    else if (fmt == 't') { od_b27(row[j]); }
+                    else { od_value(row[j], 8, 7); }
+                    j += 1;
+                }
+                puts("\n");
+                off += nrow;
+                nrow = 0;
+            }
+        }
+    }
+    if (nrow > 0) {
+        od_offset(off);
+        var j2: int = 0;
+        while (j2 < nrow) {
+            if (fmt == 'c') { od_char(row[j2]); }
+            else if (fmt == 'd') { od_value(row[j2], 10, 7); }
+            else if (fmt == 'x') { od_value(row[j2], 16, 6); }
+            else if (fmt == 't') { od_b27(row[j2]); }
+            else { od_value(row[j2], 8, 7); }
+            j2 += 1;
+        }
+        puts("\n");
+        off += nrow;
+    }
+    od_offset(off);
+    puts("\n");
+    if (fd != 0) { close(fd); }
+    return 0;
+}
+
+// ---- diff -------------------------------------------------------------------------------------
+//
+// Normal-format differences between two files, from a longest common
+// subsequence of their lines. Status 0 same, 1 different, 2 trouble.
+
+const DIFF_LINES: int = 729;
+
+fn read_lines(name: *char, out: **char) -> int {
+    var f: *FILE = streq(name, "-") ? stdin() : fopen(name, "r");
+    if (f == null) { perror2("diff", name); return -1; }
+    var n: int = 0;
+    var line: [2187]char;
+    var nl: int;
+    while (read_line(f, &line[0], LINE_MAX, &nl) >= 0) {
+        if (n == DIFF_LINES) { close_in(f); fail(name, ": too many lines"); return -1; }
+        out[n] = strdup(&line[0]);
+        n += 1;
+    }
+    close_in(f);
+    return n;
+}
+
+fn diff_range(a: int, b: int) {
+    put_int(a);
+    if (b != a) { puts(","); put_int(b); }
+}
+
+fn do_diff(argc: int, argv: **char) -> int {
+    var brief: int = 0;
+    var c: int = getopt(argc, argv, "q");
+    while (c != -1) {
+        if (c == 'q') { brief = 1; } else { usage("diff [-q] file1 file2"); return 2; }
+        c = getopt(argc, argv, "q");
+    }
+    if (argc - optind != 2) { usage("diff [-q] file1 file2"); return 2; }
+    var a: [729]*char;
+    var b: [729]*char;
+    var n: int = read_lines(argv[optind], &a[0]);
+    if (n < 0) { return 2; }
+    var m: int = read_lines(argv[optind + 1], &b[0]);
+    if (m < 0) { return 2; }
+    // L[i][j]: the LCS length of a[i..] and b[j..]
+    var w: int = m + 1;
+    var L: *int = malloc(3 * (n + 1) * w) as *int;
+    if (L == null) { fail("out of memory", null); return 2; }
+    var i: int = n;
+    while (i >= 0) {
+        var j: int = m;
+        while (j >= 0) {
+            if (i == n || j == m) { L[i * w + j] = 0; }
+            else if (streq(a[i], b[j])) { L[i * w + j] = L[(i + 1) * w + j + 1] + 1; }
+            else {
+                var x: int = L[(i + 1) * w + j];
+                var y: int = L[i * w + j + 1];
+                L[i * w + j] = x > y ? x : y;
+            }
+            j -= 1;
+        }
+        i -= 1;
+    }
+    var differ: int = L[0] != n || L[0] != m;
+    if (brief) {
+        if (differ) { puts("Files "); puts(argv[optind]); puts(" and "); puts(argv[optind + 1]); puts(" differ\n"); }
+        return differ;
+    }
+    i = 0;
+    var j2: int = 0;
+    while (i < n || j2 < m) {
+        if (i < n && j2 < m && streq(a[i], b[j2])) { i += 1; j2 += 1; continue; }
+        var i0: int = i;
+        var j0: int = j2;
+        while ((i < n || j2 < m) && !(i < n && j2 < m && streq(a[i], b[j2]))) {
+            if (j2 >= m || (i < n && L[(i + 1) * w + j2] >= L[i * w + j2 + 1])) { i += 1; } else { j2 += 1; }
+        }
+        if (i0 == i) { put_int(i0); puts("a"); diff_range(j0 + 1, j2); }
+        else if (j0 == j2) { diff_range(i0 + 1, i); puts("d"); put_int(j0); }
+        else { diff_range(i0 + 1, i); puts("c"); diff_range(j0 + 1, j2); }
+        puts("\n");
+        var k: int = i0;
+        while (k < i) { puts("< "); puts(a[k]); puts("\n"); k += 1; }
+        if (i0 < i && j0 < j2) { puts("---\n"); }
+        k = j0;
+        while (k < j2) { puts("> "); puts(b[k]); puts("\n"); k += 1; }
+    }
+    return differ;
+}
+
+// ---- find -------------------------------------------------------------------------------------
+//
+// find [path ...] [-name pat] [-type f|d|c|p] [-maxdepth n] [-mindepth n]
+//      [-print] [-exec cmd ... ;] with ! before a test to negate it; tests
+// are all ANDed, and with no -print or -exec, matches are printed.
+
+const F_NAME: int = 1;
+const F_TYPE: int = 2;
+const F_PRINT: int = 3;
+const F_EXEC: int = 4;
+
+var ft_kind: [27]int;
+var ft_neg: [27]int;
+var ft_arg: [27]*char;
+var ft_exec: [27]int;                 // -exec: index of its command in argv
+var ft_exec_n: [27]int;               // and its word count
+var nft: int;
+var find_argv: **char;
+var find_action: int;
+var find_maxdepth: int;
+var find_mindepth: int;
+var find_status: int;
+
+fn find_run(k: int, path: *char) -> int {
+    var args: [81]*char;
+    var n: int = 0;
+    var j: int = 0;
+    while (j < ft_exec_n[k] && n < 80) {
+        var w: *char = find_argv[ft_exec[k] + j];
+        args[n] = streq(w, "{}") ? path : w;
+        n += 1;
+        j += 1;
+    }
+    args[n] = null;
+    var pid: int = fork();
+    if (pid < 0) { perror2("find", "fork"); return 0; }
+    if (pid == 0) {
+        execvp(args[0], &args[0]);
+        perror2("find", args[0]);
+        _exit(127);
+    }
+    var st: int = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+fn find_visit(path: *char, depth: int) {
+    var st: stat_t;
+    if (stat(path, &st) < 0) { perror2("find", path); find_status = 1; return; }
+    if (depth >= find_mindepth) {
+        var base: *char = strrchr(path, '/');
+        base = base == null || base[1] == 0 ? path : &base[1];
+        var ok: int = 1;
+        var k: int = 0;
+        while (k < nft && ok) {
+            var hit: int = 1;
+            if (ft_kind[k] == F_NAME) { hit = fnmatch(ft_arg[k], base); }
+            else if (ft_kind[k] == F_TYPE) {
+                var t: char = ft_arg[k][0];
+                hit = (t == 'f' && S_ISREG(st.st_mode)) || (t == 'd' && S_ISDIR(st.st_mode))
+                    || (t == 'c' && S_ISCHR(st.st_mode)) || (t == 'p' && S_ISFIFO(st.st_mode));
+            } else if (ft_kind[k] == F_PRINT) { puts(path); puts("\n"); }
+            else if (ft_kind[k] == F_EXEC) { hit = find_run(k, path); }
+            if (ft_neg[k]) { hit = !hit; }
+            ok = hit;
+            k += 1;
+        }
+        if (ok && !find_action) { puts(path); puts("\n"); }
+    }
+    if (!S_ISDIR(st.st_mode) || (find_maxdepth >= 0 && depth >= find_maxdepth)) { return; }
+    var d: *DIR = opendir(path);
+    if (d == null) { perror2("find", path); find_status = 1; return; }
+    var names: **char = malloc(3 * 729) as **char;
+    var nn: int = 0;
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        if (streq(&e.d_name[0], ".") || streq(&e.d_name[0], "..")) { continue; }
+        if (nn < 729) { names[nn] = strdup(&e.d_name[0]); nn += 1; }
+    }
+    closedir(d);
+    var i: int = 0;
+    while (i < nn) {
+        var child: [729]char;
+        strncpy(&child[0], path, 600);
+        child[600] = 0;
+        var l: int = strlen(&child[0]);
+        if (l > 0 && child[l - 1] != '/') { child[l] = '/'; child[l + 1] = 0; }
+        strncat(&child[0], names[i], 120);
+        find_visit(&child[0], depth + 1);
+        free(names[i] as *tryte);
+        i += 1;
+    }
+    free(names as *tryte);
+}
+
+fn do_find(argc: int, argv: **char) -> int {
+    find_argv = argv;
+    find_maxdepth = -1;
+    var i: int = 1;
+    while (i < argc && argv[i][0] != '-' && !streq(argv[i], "!")) { i += 1; }
+    var npaths: int = i - 1;
+    while (i < argc) {
+        if (nft == 27) { return fail("too many tests", null); }
+        var neg: int = 0;
+        if (streq(argv[i], "!")) { neg = 1; i += 1; if (i >= argc) { return fail("expected a test after !", null); } }
+        var a: *char = argv[i];
+        ft_neg[nft] = neg;
+        if (streq(a, "-name") || streq(a, "-type")) {
+            if (i + 1 >= argc) { return fail("missing argument to ", a); }
+            ft_kind[nft] = streq(a, "-name") ? F_NAME : F_TYPE;
+            ft_arg[nft] = argv[i + 1];
+            if (ft_kind[nft] == F_TYPE && (strlen(argv[i + 1]) != 1 || strchr("fdcp", argv[i + 1][0]) == null)) {
+                return fail("unknown argument to -type: ", argv[i + 1]);
+            }
+            nft += 1;
+            i += 2;
+        } else if (streq(a, "-maxdepth") || streq(a, "-mindepth")) {
+            if (i + 1 >= argc || !isdigit(argv[i + 1][0])) { return fail("expected a number after ", a); }
+            if (streq(a, "-maxdepth")) { find_maxdepth = atoi(argv[i + 1]); } else { find_mindepth = atoi(argv[i + 1]); }
+            i += 2;
+        } else if (streq(a, "-print")) {
+            ft_kind[nft] = F_PRINT;
+            nft += 1;
+            find_action = 1;
+            i += 1;
+        } else if (streq(a, "-exec")) {
+            var j: int = i + 1;
+            while (j < argc && !streq(argv[j], ";")) { j += 1; }
+            if (j >= argc || j == i + 1) { return fail("missing argument to -exec", null); }
+            ft_kind[nft] = F_EXEC;
+            ft_exec[nft] = i + 1;
+            ft_exec_n[nft] = j - i - 1;
+            nft += 1;
+            find_action = 1;
+            i = j + 1;
+        } else {
+            return fail("unknown predicate: ", a);
+        }
+    }
+    if (npaths == 0) { find_visit(".", 0); }
+    else {
+        var p: int = 1;
+        while (p <= npaths) { find_visit(argv[p], 0); p += 1; }
+    }
+    return find_status;
+}
+
+// ---- xargs ------------------------------------------------------------------------------------
+
+var xa_cmd: **char;
+var xa_ncmd: int;
+var xa_status: int;
+
+// -I: arg with every occurrence of str replaced by item (malloc'd).
+fn xargs_subst(arg: *char, str: *char, item: *char) -> *char {
+    var sl: int = strlen(str);
+    var count: int = 0;
+    var p: *char = strstr(arg, str);
+    while (p != null && sl > 0) { count += 1; p = strstr(&p[sl], str); }
+    if (count == 0) { return arg; }
+    var out: *char = malloc(strlen(arg) + count * strlen(item) + 1) as *char;
+    var n: int = 0;
+    var i: int = 0;
+    while (arg[i] != 0) {
+        if (strncmp(&arg[i], str, sl) == 0) {
+            strcpy(&out[n], item);
+            n += strlen(item);
+            i += sl;
+        } else {
+            out[n] = arg[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    out[n] = 0;
+    return out;
+}
+
+fn xargs_run(items: **char, n: int, replace: *char) -> int {
+    var args: [729]*char;
+    var k: int = 0;
+    var j: int = 0;
+    while (j < xa_ncmd && k < 727) {
+        args[k] = replace != null ? xargs_subst(xa_cmd[j], replace, n > 0 ? items[0] : "") : xa_cmd[j];
+        k += 1;
+        j += 1;
+    }
+    if (replace == null) {
+        j = 0;
+        while (j < n && k < 727) { args[k] = items[j]; k += 1; j += 1; }
+    }
+    args[k] = null;
+    var pid: int = fork();
+    if (pid < 0) { perror2("xargs", "fork"); return 1; }
+    if (pid == 0) {
+        execvp(args[0], &args[0]);
+        perror2("xargs", args[0]);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    var st: int = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st) && (WEXITSTATUS(st) == 127 || WEXITSTATUS(st) == 126)) { xa_status = WEXITSTATUS(st); return 1; }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { xa_status = 123; }
+    return 0;
+}
+
+fn do_xargs(argc: int, argv: **char) -> int {
+    var max: int = 0;
+    var replace: *char = null;
+    var c: int = getopt(argc, argv, "n:I:");
+    while (c != -1) {
+        if (c == 'n') {
+            max = atoi(optarg);
+            if (max < 1) { return fail("invalid number for -n: ", optarg); }
+        } else if (c == 'I') { replace = optarg; max = 1; }
+        else { return usage("xargs [-n max] [-I str] [command [arg ...]]"); }
+        c = getopt(argc, argv, "n:I:");
+    }
+    var echo: [2]*char = { "echo", null };
+    if (optind < argc) { xa_cmd = &argv[optind]; xa_ncmd = argc - optind; }
+    else { xa_cmd = &echo[0]; xa_ncmd = 1; }
+    var items: [729]*char;
+    var n: int = 0;
+    var any: int = 0;
+    var word: [729]char;
+    var wl: int = 0;
+    var quote: int = 0;
+    var f: *FILE = stdin();
+    loop {
+        var ch: int = fgetc(f);
+        var end: int = ch == EOF;
+        if (!end && quote != 0) {
+            if (ch == quote) { quote = 0; } else if (wl < 728) { word[wl] = ch as char; wl += 1; }
+            continue;
+        }
+        if (!end && (ch == '\'' || ch == '"')) { quote = ch; any = 1; continue; }
+        if (!end && ch == '\\') { ch = fgetc(f); if (ch == EOF) { end = 1; } else { if (wl < 728) { word[wl] = ch as char; wl += 1; } any = 1; continue; } }
+        var blank: int = end || ch == ' ' || ch == '\t' || ch == '\n';
+        if (!blank) { if (wl < 728) { word[wl] = ch as char; wl += 1; } any = 1; continue; }
+        if (replace != null && !end && ch != '\n') { if (wl > 0 || any) { if (wl < 728) { word[wl] = ch as char; wl += 1; } } continue; }
+        if (wl > 0 || any) {
+            word[wl] = 0;
+            items[n] = strdup(&word[0]);
+            n += 1;
+            wl = 0;
+            any = 0;
+            if ((max > 0 && n == max) || n == 729) {
+                if (xargs_run(&items[0], n, replace)) { return xa_status; }
+                n = 0;
+            }
+        }
+        if (end) { break; }
+    }
+    if (quote != 0) { return fail("unmatched quote", null); }
+    if (n > 0 && xargs_run(&items[0], n, replace)) { return xa_status; }
+    return xa_status;
+}
+
+// ---- md5sum -----------------------------------------------------------------------------------
+
+fn md5_fd(fd: int, out: *char) -> int {
+    md5_init();
+    var buf: [729]char;
+    loop {
+        var r: int = read(fd, &buf[0], 729);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r < 0) { return -1; }
+        if (r == 0) { break; }
+        var k: int = 0;
+        while (k < r) { md5_put_char(buf[k]); k += 1; }
+    }
+    md5_digest_hex(out);
+    return 0;
+}
+
+fn do_md5sum(argc: int, argv: **char) -> int {
+    var hex: [33]char;
+    if (argc < 2) {
+        if (md5_fd(0, &hex[0]) < 0) { perror2("md5sum", "-"); return 1; }
+        puts(&hex[0]);
+        puts("  -\n");
+        return 0;
+    }
+    var status: int = 0;
+    var i: int = 1;
+    while (i < argc) {
+        var fd: int = streq(argv[i], "-") ? 0 : open(argv[i], O_RDONLY, 0);
+        if (fd < 0 || md5_fd(fd, &hex[0]) < 0) { perror2("md5sum", argv[i]); status = 1; }
+        else {
+            puts(&hex[0]);
+            puts("  ");
+            puts(argv[i]);
+            puts("\n");
+        }
+        if (fd > 0) { close(fd); }
+        i += 1;
+    }
+    return status;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    prog = name_of(argv[0]);
+    if (streq(prog, "sed")) { return do_sed(argc, argv); }
+    if (streq(prog, "tr")) { return do_tr(argc, argv); }
+    if (streq(prog, "cut")) { return do_cut(argc, argv); }
+    if (streq(prog, "od")) { return do_od(argc, argv); }
+    if (streq(prog, "diff")) { return do_diff(argc, argv); }
+    if (streq(prog, "find")) { return do_find(argc, argv); }
+    if (streq(prog, "xargs")) { return do_xargs(argc, argv); }
+    if (streq(prog, "md5sum")) { return do_md5sum(argc, argv); }
+    fputs(STDERR_FILENO, "tools: unknown name: ");
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}

@@ -133,6 +133,10 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }
+    // The text and file tools, likewise one program.
+    for tool in ["sed", "tr", "cut", "od", "diff", "find", "xargs", "md5sum"] {
+        v.push((format!("/bin/{tool}"), u.join("bin/tools.tri")));
+    }
     // One test client under several names; the name picks how it misbehaves.
     for name in ["nocreate", "unknown", "huge", "crash", "bigwin"] {
         v.push((format!("/usr/lib/trwtest/{name}"), u.join("bin/badclient.tri")));

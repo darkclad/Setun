@@ -759,7 +759,14 @@ There is still no `printf`; the typed writers replace it (§12).
 - `head`, `tail`, `wc`;
 - `grep` (basic regular expressions, `-i -v -c -n -q`, status 0/1/2);
 - `sort` (`-r -n -u`), `uniq` (`-c`);
-- `cp`, `ln`, `chmod` (octal and `ugoa±=rwx`).
+- `cp`, `ln`, `chmod` (octal and `ugoa±=rwx`);
+- the text and file tools, one multi-call program (`tools.tri`, hard-linked under each name):
+  - `sed`: addresses `N`, `$`, `/re/`, ranges and `!`; commands `s` (with `g p N`, `&` and `\1`–`\9`), `y d p q = n a i c`; options `-n -e -i`;
+  - `tr` (`-c -d -s`, ranges, `[:class:]`, so `tr а-я А-Я` works too) and `cut` (`-c`/`-f` lists, `-d`, `-s`);
+  - `od`: offsets in octal, values as `-o` (the default) `-d -x -c`, or `-t` for balanced base 27, three digits per tryte;
+  - `diff` (normal format from the longest common subsequence, `-q`, status 0/1/2), `find` (`-name -type -maxdepth -mindepth -print -exec … ;` and `!`), `xargs` (`-n`, `-I`, status 123/126/127);
+  - `md5sum`: text is hashed as UTF-8, so the digests match other systems'.
+- Shared libraries: `regex.tri` (BRE with groups and back-references), `fnmatch.tri` (wildcards, also used by `sh`), and `md5.tri`. Since `&` and `|` are ternary min/max, MD5's bit operations run one bit at a time, about 250k instructions per 64-byte block.
 
 A busybox-style multi-call program, stored once with hard links, provides `rmdir basename dirname env printenv uname date clear seq tee yes kill test [`. `mkdisk` makes a hard link for each source file that appears under several names.
 
