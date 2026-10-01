@@ -75,6 +75,23 @@ pub fn user_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../user")
 }
 
+/// A generated file rather than a source: the 8x8 font for the window system.
+pub const FONT_SOURCE: &str = "<font8x8>";
+
+/// Glyphs 0..255, eight rows each, one tryte per row (bit 0 = leftmost
+/// pixel), from the same `font8x8` crate the emulator's text mode uses.
+pub fn font8x8_table() -> Vec<i16> {
+    use font8x8::UnicodeFonts;
+    let mut v = Vec::with_capacity(256 * 8);
+    for cp in 0u32..256 {
+        let g = char::from_u32(cp)
+            .and_then(|c| font8x8::BASIC_FONTS.get(c).or_else(|| font8x8::LATIN_FONTS.get(c)))
+            .unwrap_or([0; 8]);
+        v.extend(g.iter().map(|&b| b as i16));
+    }
+    v
+}
+
 /// The default root file system: (path in the file system, source).
 pub fn default_files() -> Vec<(String, PathBuf)> {
     let u = user_dir();
@@ -82,7 +99,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     for prog in [
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
-        "fdcheck",
+        "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -92,18 +109,26 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }
+    // One test client under several names; the name picks how it misbehaves.
+    for name in ["nocreate", "unknown", "huge", "crash", "bigwin"] {
+        v.push((format!("/usr/lib/trwtest/{name}"), u.join("bin/badclient.tri")));
+    }
     for name in ["reboot", "poweroff", "halt"] {
         v.push((format!("/sbin/{name}"), u.join("bin/reboot.tri")));
     }
     v.push(("/bin/hello".into(), u.join("hello.tri")));
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
     v.push(("/etc/motd".into(), u.join("etc/motd")));
+    v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));
     v
 }
 
 /// The bytes of an initramfs file: `.tri` sources are compiled to TEF,
 /// anything else is copied as text (one code point per tryte).
 pub fn initramfs_file(src: &Path) -> Result<Vec<i16>, String> {
+    if src == Path::new(FONT_SOURCE) {
+        return Ok(font8x8_table());
+    }
     if src.extension().is_some_and(|e| e == "tri") {
         return tef(src);
     }

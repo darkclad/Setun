@@ -124,7 +124,11 @@ fn k6_fstest_passes_and_leaves_a_clean_volume() {
 
 #[test]
 fn k6_full_volume_gives_enospc_and_recovers() {
-    let files = trinux::default_files();
+    // A small volume holding only what the test runs.
+    let files: Vec<_> = trinux::default_files()
+        .into_iter()
+        .filter(|(p, _)| ["/sbin/init", "/sbin/poweroff", "/bin/sh", "/bin/fstest"].contains(&p.as_str()))
+        .collect();
     let disk = trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Tfs { blocks: 81, inodes: 243 })
         .unwrap_or_else(|e| panic!("{e}"))
         .trytes;

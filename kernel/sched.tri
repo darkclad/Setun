@@ -63,6 +63,9 @@ const SYS_SCHED_YIELD: int = 124;
 const SYS_GETPID: int = 172;
 const SYS_GETPPID: int = 173;
 const SYS_FCNTL: int = 25;
+const SYS_PPOLL: int = 73;
+const SYS_MMAP: int = 222;
+const SYS_MUNMAP: int = 215;
 const SYS_LINKAT: int = 37;
 const SYS_FCHMODAT: int = 53;
 const SYS_CLOCK_GETTIME: int = 113;
@@ -100,6 +103,7 @@ const WNOHANG: int = 1;
 const WUNTRACED: int = 2;
 const EPERM_: int = 1;
 const TIMER_CHAN: int = 40000;        // woken on every tick
+const POLL_CHAN: int = 40001;         // tasks in poll(): woken by any wake_up
 const HEAP_MAX: int = 243 * 19683;    // brk may grow 243 pages past the bss
 
 struct Task {
@@ -242,10 +246,11 @@ fn sleep_on(chan: int) -> int {
     return signal_pending(t);
 }
 
+// Every wake-up also wakes the tasks in poll(), which then look again.
 fn wake_up(chan: int) {
     var i: int = 1;
     while (i < NTASKS) {
-        if (tasks[i].state == TASK_SLEEPING && tasks[i].wchan == chan) {
+        if (tasks[i].state == TASK_SLEEPING && (tasks[i].wchan == chan || tasks[i].wchan == POLL_CHAN)) {
             tasks[i].state = TASK_RUNNABLE;
             tasks[i].wchan = 0;
         }
@@ -635,6 +640,9 @@ fn do_syscall(f: *int, n: int) {
         case SYS_NANOSLEEP: f[F_R1] = sys_nanosleep(f[0], f[1]);
         case SYS_RENAMEAT: f[F_R1] = sys_renameat(f[0], f[1], f[2], f[3]);
         case SYS_FCNTL: f[F_R1] = sys_fcntl(f[0], f[1], f[2]);
+        case SYS_PPOLL: f[F_R1] = sys_ppoll(f[0], f[1], f[2], f[3]);
+        case SYS_MMAP: f[F_R1] = sys_mmap(f[0], f[1], f[2], f[3], f[4], f[5]);
+        case SYS_MUNMAP: f[F_R1] = sys_munmap(f[0], f[1]);
         case SYS_LINKAT: f[F_R1] = sys_linkat(f[0], f[1], f[2], f[3]);
         case SYS_FCHMODAT: f[F_R1] = sys_fchmodat(f[0], f[1], f[2]);
         case SYS_CLOCK_GETTIME: f[F_R1] = sys_clock_gettime(f[0], f[1]);

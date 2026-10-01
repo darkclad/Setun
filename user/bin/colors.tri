@@ -1,0 +1,39 @@
+// colors: every one of the 3^9 = 19683 pixel colours, once each.
+//
+// 81 rows x 243 columns, drawn 2x: red runs down the rows in thirds of
+// green; across each row green steps every 27 columns and blue every one.
+
+import "../lib/tlibc.tri";
+import "../lib/gfx.tri";
+import "../lib/trw.tri";
+
+fn colour_at(col: int, row: int) -> int {
+    var r: int = row / 3 - 13;                       // 27 reds
+    var g: int = (row % 3) * 9 + col / 27 - 13;      // 27 greens
+    var b: int = col % 27 - 13;                      // 27 blues
+    return rgb(r, g, b);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    trw_create(486, 162, "Colors: all 3^9");
+    var line: [486]int;
+    var row: int = 0;
+    while (row < 81) {
+        var col: int = 0;
+        while (col < 243) {
+            var c: int = colour_at(col, row);
+            line[2 * col] = c;
+            line[2 * col + 1] = c;
+            col += 1;
+        }
+        trw_pixels(0, 2 * row, 486, 1, &line[0]);
+        trw_pixels(0, 2 * row + 1, 486, 1, &line[0]);
+        row += 1;
+    }
+    trw_flush();
+    var ev: trw_event;
+    loop {
+        var r: int = trw_wait(&ev, -1, -1);
+        if (r < 0 || (r == 1 && ev.type == TRW_CLOSE)) { return 0; }
+    }
+}

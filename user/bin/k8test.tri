@@ -1,0 +1,229 @@
+// /bin/k8test: the K8 kernel interfaces (framebuffer, input, poll, ptys),
+// one line per check, most of them failure paths.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+
+var failures: int;
+var got_usr1: int;
+
+fn ok(what: *char, cond: int) {
+    puts("k8test: ");
+    puts(what);
+    if (cond) { puts(" ok\n"); } else { puts(" FAILED\n"); failures += 1; }
+}
+
+fn fails(r: int, e: int) -> int { return r == -1 && errno == e; }
+fn on_usr1(sig: int) { got_usr1 = 1; }
+
+fn framebuffer() {
+    var fd: int = open("/dev/fb0", O_RDWR, 0);
+    ok("open /dev/fb0", fd >= 0);
+    ok("EBUSY: a second open of /dev/fb0", fails(open("/dev/fb0", O_RDWR, 0), EBUSY));
+    var info: fb_info;
+    ok("text mode to start with", ioctl(fd, FBIOGET_VSCREENINFO, &info as int) == 0 && info.mode == -1 && info.xres == 80);
+    info.mode = 5;
+    ok("EINVAL: an unknown mode", fails(ioctl(fd, FBIOPUT_VSCREENINFO, &info as int), EINVAL));
+    info.mode = 0;
+    ioctl(fd, FBIOPUT_VSCREENINFO, &info as int);
+    ioctl(fd, FBIOGET_VSCREENINFO, &info as int);
+    ok("640x480", info.mode == 0 && info.xres == 640 && info.yres == 480 && info.pitch == 640);
+    ok("ENOTTY: an unknown ioctl", fails(ioctl(fd, 12345, 0), ENOTTY));
+    var size: int = 640 * 480;
+    ok("EINVAL: mmap of length 0", mmap(0, 0, PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EINVAL);
+    ok("EINVAL: mmap at an offset", mmap(0, size, PROT_WRITE, MAP_SHARED, fd, 9) == MAP_FAILED && errno == EINVAL);
+    ok("EINVAL: MAP_PRIVATE", mmap(0, size, PROT_WRITE, 2, fd, 0) == MAP_FAILED && errno == EINVAL);
+    ok("EINVAL: more than the framebuffer", mmap(0, size + 1, PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EINVAL);
+    ok("EBADF: mmap of a closed descriptor", mmap(0, size, PROT_WRITE, MAP_SHARED, 25, 0) == MAP_FAILED && errno == EBADF);
+    var f: int = open("/etc/motd", O_RDONLY, 0);
+    ok("ENODEV: mmap of a regular file", mmap(0, 100, PROT_READ, MAP_SHARED, f, 0) == MAP_FAILED && errno == ENODEV);
+    close(f);
+    var addr: int = mmap(0, size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0);
+    ok("mmap the framebuffer", addr != MAP_FAILED);
+    var px: *tryte = addr as *tryte;
+    px[10 * 640 + 10] = 1234;
+    var back: [1]char;
+    lseek(fd, 10 * 640 + 10, SEEK_SET);
+    read(fd, &back[0], 1);
+    ok("a mapped write is read back by read()", back[0] == 1234);
+    var pid: int = fork();
+    if (pid == 0) { px[20] = -777; _exit(0); }
+    var st: int;
+    waitpid(pid, &st, 0);
+    ok("the mapping is shared after fork (no copy on write)", px[20] == -777);
+    ok("EINVAL: munmap of another address", fails(munmap(addr + 3, size), EINVAL));
+    ok("munmap", munmap(addr, size) == 0);
+    close(fd);
+    fd = open("/dev/fb0", O_RDWR, 0);
+    ioctl(fd, FBIOGET_VSCREENINFO, &info as int);
+    ok("closing gives the console its text mode back", fd >= 0 && info.mode == -1);
+    close(fd);
+}
+
+fn input() {
+    var k: int = open("/dev/kbd", O_RDONLY + O_NONBLOCK, 0);
+    ok("open /dev/kbd", k >= 0);
+    ok("EBUSY: a second open of /dev/kbd", fails(open("/dev/kbd", O_RDONLY, 0), EBUSY));
+    var ev: [6]int;
+    ok("EAGAIN: no key waiting", fails(read(k, bytes(&ev[0]) as *char, 3), EAGAIN));
+    ok("EINVAL: a read smaller than an event", fails(read(k, bytes(&ev[0]) as *char, 2), EINVAL));
+    ok("EBADF: writing to a read-only descriptor", fails(write(k, "x", 1), EBADF));
+    close(k);
+    k = open("/dev/kbd", O_RDWR, 0);
+    ok("EINVAL: writing to the keyboard", fails(write(k, "x", 1), EINVAL));
+    close(k);
+    var m: int = open("/dev/mouse", O_RDONLY + O_NONBLOCK, 0);
+    ok("open /dev/mouse", m >= 0);
+    ok("EBUSY: a second open of /dev/mouse", fails(open("/dev/mouse", O_RDONLY, 0), EBUSY));
+    ok("EINVAL: a read smaller than a mouse event", fails(read(m, bytes(&ev[0]) as *char, 9), EINVAL));
+    ok("EAGAIN: no motion waiting", fails(read(m, bytes(&ev[0]) as *char, 18), EAGAIN));
+    close(m);
+    ok("both can be opened again after close", (k = open("/dev/kbd", O_RDONLY, 0)) >= 0);
+    close(k);
+}
+
+fn polling() {
+    var p: [2]int;
+    pipe(&p[0]);
+    var pf: [3]pollfd;
+    pf[0].fd = p[0];
+    pf[0].events = POLLIN;
+    ok("poll: an empty pipe times out", poll(&pf[0], 1, 0) == 0 && pf[0].revents == 0);
+    write(p[1], "x", 1);
+    ok("poll: data makes it readable", poll(&pf[0], 1, 0) == 1 && pf[0].revents == POLLIN);
+    pf[1].fd = p[1];
+    pf[1].events = POLLOUT;
+    pf[2].fd = -1;
+    pf[2].events = POLLIN;
+    ok("poll: the write end is writable; fd -1 is skipped", poll(&pf[0], 3, 0) == 2 && pf[1].revents == POLLOUT && pf[2].revents == 0);
+    var c: [1]char;
+    read(p[0], &c[0], 1);
+    close(p[1]);
+    ok("poll: POLLHUP when the writer is gone", poll(&pf[0], 1, 0) == 1 && pf[0].revents == POLLHUP);
+    pf[1].fd = 20;
+    ok("poll: POLLNVAL for a closed descriptor", poll(&pf[1], 1, 0) == 1 && pf[1].revents == POLLNVAL);
+    close(p[0]);
+    ok("EINVAL: too many descriptors", fails(poll(&pf[0], 100, 0), EINVAL));
+    ok("EFAULT: a bad pointer", fails(poll(1000 as *pollfd, 1, 0), EFAULT));
+    pipe(&p[0]);
+    pf[0].fd = p[0];
+    pf[0].events = POLLIN;
+    var t0: timespec;
+    var t1: timespec;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    var r: int = poll(&pf[0], 1, 200);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    var ms: int = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    ok("poll: a 200 ms timeout waits about 200 ms", r == 0 && ms >= 190 && ms <= 260);
+    signal(SIGUSR1, &on_usr1 as int);
+    var parent: int = getpid();
+    var pid: int = fork();
+    if (pid == 0) {
+        var t: timespec;
+        t.tv_sec = 0;
+        t.tv_nsec = 50000000;
+        nanosleep(&t, null);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    ok("EINTR: a signal ends an endless poll", fails(poll(&pf[0], 1, -1), EINTR) && got_usr1);
+    var st: int;
+    waitpid(pid, &st, 0);
+    close(p[0]);
+    close(p[1]);
+}
+
+fn ptys() {
+    var m: int = posix_openpt(O_RDWR);
+    ok("posix_openpt", m >= 0 && unlockpt(m) == 0);
+    var name: [27]char;
+    ok("ptsname", ptsname_r(m, &name[0], 27) == 0 && strncmp(&name[0], "/dev/pts/", 9) == 0);
+    var buf: [81]char;
+    ok("EAGAIN: the master has nothing to read yet", fcntl(m, F_SETFL, O_NONBLOCK) == 0 && fails(read(m, &buf[0], 81), EAGAIN));
+    fcntl(m, F_SETFL, 0);
+    var s: int = open(&name[0], O_RDWR, 0);
+    ok("open the slave", s >= 0 && isatty(s));
+    write(m, "hi\n", 3);
+    var n: int = read(s, &buf[0], 81);
+    ok("the master types into the slave (one line)", n == 3 && buf[0] == 'h' && buf[2] == '\n');
+    n = read(m, &buf[0], 81);
+    ok("the slave echoes back to the master", n == 3 && buf[1] == 'i');
+    write(s, "out", 3);
+    n = read(m, &buf[0], 81);
+    ok("slave output is read from the master", n == 3 && buf[0] == 'o');
+    var ws: winsize;
+    ws.ws_row = 33;
+    ws.ws_col = 99;
+    ioctl(m, TIOCSWINSZ, &ws as int);
+    var ws2: winsize;
+    ioctl(s, TIOCGWINSZ, &ws2 as int);
+    ok("the window size set on the master shows on the slave", ws2.ws_row == 33 && ws2.ws_col == 99);
+    // ^C through the master reaches the slave's foreground group
+    var pid: int = fork();
+    if (pid == 0) {
+        close(m);
+        setsid();
+        var cs: int = open(&name[0], O_RDWR, 0);
+        tcsetpgrp(cs, getpid());
+        write(cs, "R", 1);
+        loop { pause(); }
+    }
+    close(s);
+    buf[0] = 0;
+    while (buf[0] != 'R') { read(m, &buf[0], 1); }   // the child is ready
+    var ctrl_c: [1]char;
+    ctrl_c[0] = 3 as char;
+    write(m, &ctrl_c[0], 1);
+    var st: int;
+    waitpid(pid, &st, 0);
+    ok("^C on the pty sends SIGINT to its foreground group", WIFSIGNALED(st) && WTERMSIG(st) == SIGINT);
+    // hanging up: closing the master sends SIGHUP
+    pid = fork();
+    if (pid == 0) {
+        close(m);                                    // the master must be the parent's alone
+        setsid();
+        var cs2: int = open(&name[0], O_RDWR, 0);
+        tcsetpgrp(cs2, getpid());
+        write(cs2, "R", 1);
+        loop { pause(); }
+    }
+    buf[0] = 0;
+    while (buf[0] != 'R') { read(m, &buf[0], 1); }   // past the "^C" echo of the last check
+    close(m);
+    waitpid(pid, &st, 0);
+    ok("closing the master hangs up the slave (SIGHUP)", WIFSIGNALED(st) && WTERMSIG(st) == SIGHUP);
+    ok("ENOENT: the pty is gone with both sides", fails(open(&name[0], O_RDWR, 0), ENOENT));
+    ok("ENOENT: a pty that was never made", fails(open("/dev/pts/7", O_RDWR, 0), ENOENT));
+    // the slave side closing: the master reads EIO
+    m = posix_openpt(O_RDWR);
+    ptsname_r(m, &name[0], 27);
+    s = open(&name[0], O_RDWR, 0);
+    close(s);
+    ok("EIO: the master after the slave has closed", fails(read(m, &buf[0], 81), EIO));
+    close(m);
+    // there are nine
+    var all: [10]int;
+    var k: int = 0;
+    while (k < 10) { all[k] = posix_openpt(O_RDWR); k += 1; }
+    ok("nine ptys, then EAGAIN", all[8] >= 0 && all[9] == -1 && errno == EAGAIN);
+    k = 0;
+    while (k < 9) { close(all[k]); k += 1; }
+    var d: *DIR = opendir("/dev/pts");
+    var left: int = 0;
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        if (e.d_name[0] != '.') { left += 1; }
+    }
+    closedir(d);
+    ok("closed ptys leave /dev/pts", left == 0);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    framebuffer();
+    input();
+    polling();
+    ptys();
+    puts(failures == 0 ? "k8test: all passed\n" : "k8test: some checks FAILED\n");
+    return failures != 0;
+}

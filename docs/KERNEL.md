@@ -257,7 +257,7 @@ fmt_nl(f);
 | K5 ✅ | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
 | K6 ✅ | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
 | K7 ✅ | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
-| K8 | (then) the window system on the framebuffer | – |
+| K8 ✅ | the window system on the framebuffer | a terminal window runs the shell, with the mouse and keyboard |
 
 **Decisions for review:**
 1. **The name "Trinux".**
@@ -772,3 +772,87 @@ A busybox-style multi-call program, stored once with hard links, provides `rmdir
   - `chmod` combined permission bits with `|`, which in Trine is tritwise max, not binary OR;
   - `malloc` returned the first tryte instead of a word-aligned address;
   - init passed an empty environment to the shell.
+
+## 21. K8 as built
+
+**The design, as on Linux:** a user-space display server, `trwm`, owns the framebuffer and the input devices. Each client owns one window and talks to the server over a pipe pair. A terminal window runs the shell on a pseudo-terminal.
+
+**Kernel devices:**
+
+| Node | Number | What it does |
+|---|---|---|
+| `/dev/fb0` | 29,0 | One process may hold it (`EBUSY` otherwise). |
+| `/dev/mouse` | 13,63 | Six-word events: x, y (absolute), buttons, wheel, dx, dy. |
+| `/dev/kbd` | 13,64 | Raw keyboard events, one word each (±HID code). While it is open the console gets no keys. |
+| `/dev/ptmx` | 5,2 | Each open makes a pseudo-terminal pair; the slave appears as `/dev/pts/N`. |
+
+- **`/dev/fb0` details:**
+  - `FBIOGET_VSCREENINFO` and `FBIOPUT_VSCREENINFO` (`{xres, yres, pitch, mode}`; mode −1 text, 0 = 640×480, 1 = 800×600);
+  - `FBIO_CURSOR` drives the hardware cursor;
+  - `read`, `write` and `lseek` work over the pixels;
+  - `mmap` (`MAP_SHARED`, offset 0) maps its device frames at a fixed user address (page −3^15). The PTE's SW trit is −1 there, so the pages are never copy-on-write or reference-counted;
+  - while a graphics mode is on, console output still reaches the serial port but not the screen;
+  - when the owner closes it, or dies, the text console comes back.
+- **`/dev/mouse` and `/dev/kbd`:** each can be open once (like a grabbed evdev device). Reads return whole events, and `O_NONBLOCK` gives `EAGAIN`.
+- **Pseudo-terminals:**
+  - The tty driver has ten instances: tty 0 is the console, ttys 1–9 are ptys. All share the line discipline, `termios`, job-control signals and `SIGTTIN`.
+  - The master gives `TIOCGPTN` and accepts `TIOCSPTLCK`. What it writes is typed into the slave; the slave's output, echo included, is read from the master.
+  - `TIOCSWINSZ` sets the window size.
+  - Closing the master sends `SIGHUP` and `SIGCONT` to the slave's foreground group, and slave reads then see end of file.
+  - The master reads `EIO` once the slave has closed. `/dev/pts/N` disappears when both sides are gone, and there are nine ptys (`EAGAIN` after that).
+- **`ppoll` (73):**
+  - `struct pollfd` is one word per field;
+  - readiness is supported for pipes, terminals, pty masters, the input devices and files; `POLLNVAL` is returned for bad descriptors;
+  - the timeout is in ticks;
+  - a signal gives `EINTR`;
+  - every `wake_up` also wakes the pollers, which then check again.
+- **Also:** `O_NONBLOCK` for pipes, terminals and the input devices; `mmap` (222) and `munmap` (215) for the framebuffer; and a `WChan:` line in `/proc/<pid>/status`.
+- **ioctl order:** an unknown command is `ENOTTY` before the argument is checked, as on Linux.
+
+**The protocol** ([`user/lib/trw.tri`](../user/lib/trw.tri)): the server starts each client with requests on fd 3 and events on fd 4. A message is words: the op, the argument count, then the arguments (strings one character per word).
+
+| Direction | Messages |
+|---|---|
+| Requests | `CREATE w h title`, `FILL x y w h colour`, `TEXT x y fg bg scale text`, `PIXELS x y w h …`, `SCROLL x y w h dy fill`, `FLUSH`, `TITLE text`, `SPAWN path` |
+| Events | `KEY char`, `BUTTON x y buttons`, `MOTION x y buttons`, `CLOSE`, `FOCUS in` |
+
+The server keeps every window's pixels (server-side rendering), so clients never redraw on exposure.
+
+**`trwm`** ([`user/bin/trwm.tri`](../user/bin/trwm.tri)):
+- **Desktop:** a panel with launchers (Terminal, Clock, Colors, Paint) and [Exit].
+- **Windows:** framed, with a title bar and a close box. Click to raise, drag the title bar to move; keys go to the window in front, and mouse events go to the window under the pointer while a button is held.
+- **Drawing:** damage is collected into one rectangle, drawn into a scratch buffer of its size, then copied to the mapped framebuffer. The inner loops are assembly (`lib/gfx.tri`).
+- **Clients:** it reaps clients and closes a window when its client exits or is killed. A client that breaks the protocol is logged ("client N: bad request (…)"), sent `SIGTERM`, and cut off. Events go out non-blocking, so a slow client cannot stall the server.
+
+**Clients:**
+
+| Client | What it does |
+|---|---|
+| `term` | runs `/bin/sh` on a pty in a new session, so job control and `^C` work in the window; a VT100 subset on a 76×24 grid; `SCROLL` moves the server's pixels |
+| `clock` | the time, once a second (`poll` with a timeout) |
+| `colors` | every one of the 3^9 = 19683 pixel colours, once each |
+| `paint` | draws with the mouse, with a colour strip |
+
+`mkdisk` generates `/usr/share/font8x8` (256 glyphs) from the same font crate the emulator's text mode uses.
+
+**Pixels and gfx:** a pixel is one tryte: red, green and blue are 3 trits each, so there are 27 levels per channel. `lib/gfx.tri` has surfaces, clipped fill, blit, scroll and text (scaled or not), and a fast path for whole unscaled characters.
+
+**Verified** (`crates/trinux/tests/wm.rs`, `user/bin/k8test.tri`):
+- **End to end**, driving the machine's mouse and keyboard and reading the framebuffer back:
+  - the panel, the desktop and the focus colours;
+  - a paint drag leaves red dots exactly where the pointer went;
+  - raising the terminal by its title bar, then typing a command and a pipeline into it: the window's text is read back by matching 8×8 glyphs against the font, and the console sees the file the window's shell wrote;
+  - `^C` in the window interrupts `sleep 100`;
+  - dragging a window uncovers the one beneath, with its pixels intact;
+  - the close box closes Paint, and [Exit] gives the console back in text mode.
+- **Refusals:**
+  - a second server (`EBUSY` on `/dev/fb0`);
+  - clients that draw before `CREATE`, send an unknown op, send an impossible length, or ask for a window bigger than the screen are each cut off with their own message;
+  - a missing program is reported;
+  - a client that crashes, or is killed with `kill -9`, loses its window while the server carries on.
+- **k8test (48 checks):** framebuffer ioctls and `mmap` (including `EBUSY`, `EINVAL`, `EBADF`, `ENODEV`, `ENOTTY`, sharing after fork, and the console coming back); input devices (`EBUSY`, `EAGAIN`, `EINVAL`, `EBADF`); `poll` (timeouts, `POLLHUP`, `POLLNVAL`, `EINVAL`, `EFAULT`, `EINTR`); ptys (line discipline and echo, window size, `^C` to the foreground group, hang-up `SIGHUP`, `EIO`, `ENOENT`, nine then `EAGAIN`).
+- **Bugs found on the way:**
+  - `mmap`'s result is a negative address here, which the wrapper took for an error; only −1…−4095 are errors, as on Linux;
+  - tryte buffers inside structs need not be word-aligned, so the server decodes words arithmetically instead of casting pointers;
+  - an unknown `ioctl` returned `EFAULT` instead of `ENOTTY`;
+  - `lseek` was refused on `/dev/fb0`.

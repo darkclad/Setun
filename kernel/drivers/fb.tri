@@ -1,0 +1,115 @@
+// fb: /dev/fb0, the framebuffer device (after Linux's fbdev).
+//
+// One process may have it open (EBUSY otherwise): the display server.
+//   ioctl FBIOGET_VSCREENINFO  { xres, yres, pitch, mode }  (one word each)
+//   ioctl FBIOPUT_VSCREENINFO  set `mode`: -1 text, 0 = 640x480, 1 = 800x600
+//   ioctl FBIO_CURSOR          { x, y, enable }: the hardware mouse cursor
+//   read/write                 pixels at the file position (tryte = pixel)
+//   mmap                       the pixels, shared (see sys_mmap)
+// While a graphics mode is on, console output still reaches the serial
+// port but not the screen. When the owner closes it (or dies), the text
+// console comes back.
+
+import "../params.tri";
+import "../printk.tri";
+import "tty.tri";
+
+const FBIOGET_VSCREENINFO: int = 17920;
+const FBIOPUT_VSCREENINFO: int = 17921;
+const FBIO_CURSOR: int = 17928;
+const FB_FIRST_FRAME: int = -81;      // FB_BASE is the first tryte of frame -81
+const FB_MAX_FRAMES: int = 25;        // 800 x 600 trytes fit in 25 frames
+const EBUSY_FB: int = 16;
+const EINVAL_FB: int = 22;
+const ENOTTY_FB: int = 25;
+
+struct FbInfo {
+    xres: int;
+    yres: int;
+    pitch: int;
+    mode: int;
+}
+
+struct FbCursor {
+    x: int;
+    y: int;
+    enable: int;
+}
+
+var fb_open: int;
+
+fn fb_mode() -> int { return in(DISPLAY_MODE); }
+
+// Bytes the framebuffer has in the current mode.
+fn fb_size() -> int {
+    if (fb_mode() == -1) { return COLS * ROWS * 3; }
+    return in(DISPLAY_PITCH) * in(DISPLAY_HEIGHT);
+}
+
+fn fb_set_mode(m: int) {
+    out(DISPLAY_MODE, m);
+    if (m == -1) {
+        out(DISPLAY_HWC_ON, 0);
+        screen_owned_by_fb = 0;
+        screen_clear();                               // the console starts on a fresh screen
+    } else {
+        screen_owned_by_fb = 1;
+        var p: *tryte = FB_BASE as *tryte;
+        zero_trytes(p, fb_size());                    // black
+    }
+}
+
+fn fb_dev_open() -> int {
+    if (fb_open) { return -EBUSY_FB; }
+    fb_open = 1;
+    return 0;
+}
+
+fn fb_dev_close() {
+    fb_open = 0;
+    if (fb_mode() != -1) { fb_set_mode(-1); }
+}
+
+fn fb_dev_ioctl(cmd: int, arg: int) -> int {
+    switch (cmd) {
+        case FBIOGET_VSCREENINFO: {
+            var i: *FbInfo = arg as *FbInfo;
+            var m: int = fb_mode();
+            i.mode = m;
+            i.xres = m == -1 ? COLS : in(DISPLAY_WIDTH);
+            i.yres = m == -1 ? ROWS : in(DISPLAY_HEIGHT);
+            i.pitch = in(DISPLAY_PITCH);
+            return 0;
+        }
+        case FBIOPUT_VSCREENINFO: {
+            var j: *FbInfo = arg as *FbInfo;
+            if (j.mode < -1 || j.mode > 1) { return -EINVAL_FB; }
+            if (j.mode != fb_mode()) { fb_set_mode(j.mode); }
+            return 0;
+        }
+        case FBIO_CURSOR: {
+            var c: *FbCursor = arg as *FbCursor;
+            out(DISPLAY_HWC_X, c.x);
+            out(DISPLAY_HWC_Y, c.y);
+            out(DISPLAY_HWC_ON, c.enable != 0);
+            return 0;
+        }
+    }
+    return -ENOTTY_FB;
+}
+
+fn fb_dev_read(pos: int, buf: *tryte, n: int) -> int {
+    var size: int = fb_size();
+    if (pos >= size) { return 0; }
+    if (n > size - pos) { n = size - pos; }
+    copy_trytes(buf, (FB_BASE + pos) as *tryte, n);
+    return n;
+}
+
+fn fb_dev_write(pos: int, buf: *tryte, n: int) -> int {
+    var size: int = fb_size();
+    if (pos >= size) { return -28; }                  // ENOSPC, as Linux's fbdev
+    if (n > size - pos) { n = size - pos; }
+    copy_trytes((FB_BASE + pos) as *tryte, buf, n);
+    return n;
+}

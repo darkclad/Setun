@@ -1,0 +1,27 @@
+// clock: the time (UTC), redrawn every second.
+
+import "../lib/tlibc.tri";
+import "../lib/gfx.tri";
+import "../lib/trw.tri";
+import "../lib/time.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var w: int = 8 * 2 * 8 + 16;
+    trw_create(w, 44, "Clock");
+    var ev: trw_event;
+    loop {
+        var t: tm;
+        gmtime_r(time(null), &t);
+        var hms: [27]char;
+        var date: [27]char;
+        strftime(&hms[0], 27, "%H:%M:%S", &t);
+        strftime(&date[0], 27, "%Y-%m-%d UTC", &t);
+        trw_fill(0, 0, w, 44, rgb(-12, -12, -6));
+        trw_text(8, 6, rgb(13, 13, 2), rgb(-12, -12, -6), 2, &hms[0]);
+        trw_text(16, 30, rgb(6, 6, 13), rgb(-12, -12, -6), 1, &date[0]);
+        trw_flush();
+        var r: int = trw_wait(&ev, -1, 1000);
+        if (r < 0) { return 0; }
+        if (r == 1 && ev.type == TRW_CLOSE) { return 0; }
+    }
+}

@@ -61,9 +61,10 @@ fn pipe_close(p: int, writer: int) {
     pipe_maybe_free(p);
 }
 
-fn pipe_read(p: int, buf: *tryte, n: int) -> int {
+fn pipe_read(p: int, buf: *tryte, n: int, nonblock: int) -> int {
     while (pipes[p].count == 0) {
         if (pipes[p].writers == 0) { return 0; }          // EOF
+        if (nonblock) { return -11; }                     // EAGAIN
         if (sleep_on(pipe_chan(p))) { return -ERESTARTSYS; }
     }
     var b: *tryte = pipe_buf(p);
@@ -78,7 +79,7 @@ fn pipe_read(p: int, buf: *tryte, n: int) -> int {
     return k;
 }
 
-fn pipe_write(p: int, buf: *tryte, n: int) -> int {
+fn pipe_write(p: int, buf: *tryte, n: int, nonblock: int) -> int {
     var k: int = 0;
     while (k < n) {
         if (pipes[p].readers == 0) {
@@ -87,6 +88,7 @@ fn pipe_write(p: int, buf: *tryte, n: int) -> int {
             return -EPIPE;
         }
         if (pipes[p].count == PIPE_SIZE) {
+            if (nonblock) { return k > 0 ? k : -11; }
             wake_up(pipe_chan(p));
             if (sleep_on(pipe_chan(p))) { return k > 0 ? k : -ERESTARTSYS; }
             continue;

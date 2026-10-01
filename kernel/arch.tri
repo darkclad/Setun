@@ -6,6 +6,7 @@ import "mm.tri";
 import "sched.tri";
 import "vm.tri";
 import "drivers/tty.tri";
+import "drivers/input.tri";
 
 // ---- trap frame ---------------------------------------------------------------
 //
@@ -169,6 +170,7 @@ fn trap_handler(f: *int) {
             irq_count[irq] += 1;
             out(TPIC_EOI, irq);
             if (irq == IRQ_KEYBOARD || irq == IRQ_SERIAL) { tty_poll(); }
+            if (irq == IRQ_MOUSE) { mouse_poll(); }
             if (irq == IRQ_TIMER) {
                 jiffies += 1;
                 tty_poll();

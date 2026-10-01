@@ -1,0 +1,206 @@
+// term: a terminal window. It runs /bin/sh on a pseudo-terminal, so the
+// shell has job control and ^C works; output goes through a small VT100
+// subset (CR, LF, BS, TAB, ESC [ H J K A-D m) onto a 76 x 24 grid.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/gfx.tri";
+import "../lib/trw.tri";
+
+const COLS: int = 76;
+const ROWS: int = 24;
+const CW: int = 8;
+const CH: int = 9;                    // a pixel of leading between rows
+
+var grid: [1824]char;                 // ROWS x COLS
+var row_dirty: [24]int;
+var cx: int;
+var cy: int;
+var esc: int;                         // 0 text, 1 after ESC, 2 in ESC [
+var par: [9]int;
+var npar: int;
+var master: int = -1;
+var child: int;
+const FG: int = 9841;
+const BG: int = -9841;
+
+fn cell(r: int, c: int) -> *char { return &grid[r * COLS + c]; }
+
+fn clear_rows(from: int, to: int) {
+    var r: int = from;
+    while (r < to) {
+        var c: int = 0;
+        while (c < COLS) { *cell(r, c) = ' '; c += 1; }
+        row_dirty[r] = 1;
+        r += 1;
+    }
+}
+
+fn scroll_up() {
+    var r: int = 0;
+    while (r < ROWS - 1) {
+        var c: int = 0;
+        while (c < COLS) { *cell(r, c) = *cell(r + 1, c); c += 1; }
+        r += 1;
+    }
+    var k: int = 0;
+    while (k < COLS) { *cell(ROWS - 1, k) = ' '; k += 1; }
+    trw_scroll(0, 0, COLS * CW, ROWS * CH, CH, BG);      // the server moves the pixels
+    row_dirty[ROWS - 1] = 1;
+    if (cy > 0) { row_dirty[cy - 1] = 1; }
+}
+
+fn newline() {
+    row_dirty[cy] = 1;
+    cy += 1;
+    if (cy == ROWS) { scroll_up(); cy = ROWS - 1; }
+    row_dirty[cy] = 1;
+}
+
+fn csi(f: char) {
+    var n: int = par[0] == 0 ? 1 : par[0];
+    row_dirty[cy] = 1;
+    switch (f) {
+        case 'H', 'f': {
+            cy = n - 1;
+            cx = (npar > 1 && par[1] > 0 ? par[1] : 1) - 1;
+        }
+        case 'A': cy -= n;
+        case 'B': cy += n;
+        case 'C': cx += n;
+        case 'D': cx -= n;
+        case 'J': {
+            if (par[0] == 2) { clear_rows(0, ROWS); }
+            else {
+                var c: int = cx;
+                while (c < COLS) { *cell(cy, c) = ' '; c += 1; }
+                clear_rows(cy + 1, ROWS);
+            }
+        }
+        case 'K': {
+            var c2: int = cx;
+            while (c2 < COLS) { *cell(cy, c2) = ' '; c2 += 1; }
+        }
+    }
+    if (cy < 0) { cy = 0; }
+    if (cy >= ROWS) { cy = ROWS - 1; }
+    if (cx < 0) { cx = 0; }
+    if (cx >= COLS) { cx = COLS - 1; }
+    row_dirty[cy] = 1;
+}
+
+fn put(c: char) {
+    if (esc == 1) {
+        esc = c == '[' ? 2 : 0;
+        npar = 1;
+        par[0] = 0;
+        return;
+    }
+    if (esc == 2) {
+        if (c >= '0' && c <= '9') { par[npar - 1] = par[npar - 1] * 10 + c - '0'; return; }
+        if (c == ';') { if (npar < 9) { par[npar] = 0; npar += 1; } return; }
+        esc = 0;
+        csi(c);
+        return;
+    }
+    if (c == 27) { esc = 1; return; }
+    if (c == '\n') { newline(); cx = 0; return; }            // no ONLCR on our ptys: LF is a new line
+    if (c == '\r') { cx = 0; row_dirty[cy] = 1; return; }
+    if (c == 8) { if (cx > 0) { cx -= 1; } row_dirty[cy] = 1; return; }
+    if (c == '\t') { cx = (cx / 8 + 1) * 8; if (cx >= COLS) { cx = COLS - 1; } return; }
+    if (c == 7 || c < 32) { return; }
+    if (cx >= COLS) { cx = 0; newline(); }
+    *cell(cy, cx) = c;
+    row_dirty[cy] = 1;
+    cx += 1;
+}
+
+// Send the rows that changed (and the cursor), then show them.
+fn redraw() {
+    var r: int = 0;
+    var any: int = 0;
+    while (r < ROWS) {
+        if (row_dirty[r]) {
+            var line: [77]char;
+            var c: int = 0;
+            while (c < COLS) { line[c] = *cell(r, c); c += 1; }
+            line[COLS] = 0;
+            trw_fill(0, r * CH, COLS * CW, CH, BG);
+            trw_text(0, r * CH, FG, BG, 1, &line[0]);
+            row_dirty[r] = 0;
+            any = 1;
+        }
+        r += 1;
+    }
+    if (any) {
+        var x: int = cx < COLS ? cx : COLS - 1;
+        trw_fill(x * CW, cy * CH + CH - 2, CW, 2, rgb(13, 13, 0));     // the cursor, an underline
+        row_dirty[cy] = 1;                          // redrawn next time, wherever the cursor goes
+        trw_flush();
+    }
+}
+
+fn start_shell() -> int {
+    master = posix_openpt(O_RDWR);
+    if (master < 0) { perror2("term", "/dev/ptmx"); return -1; }
+    unlockpt(master);
+    var name: [27]char;
+    if (ptsname_r(master, &name[0], 27) < 0) { perror2("term", "ptsname"); return -1; }
+    var ws: winsize;
+    ws.ws_row = ROWS;
+    ws.ws_col = COLS;
+    ioctl(master, TIOCSWINSZ, &ws as int);
+    child = fork();
+    if (child < 0) { perror2("term", "fork"); return -1; }
+    if (child == 0) {
+        setsid();
+        var slave: int = open(&name[0], O_RDWR, 0);
+        if (slave < 0) { perror2("term", &name[0]); _exit(127); }
+        dup2(slave, 0);
+        dup2(slave, 1);
+        dup2(slave, 2);
+        var fd: int = 3;
+        while (fd < 27) { close(fd); fd += 1; }
+        setenv("TERM", "trinux", 1);
+        var argv: [2]*char = { "sh", null };
+        execv("/bin/sh", &argv[0]);
+        _exit(127);
+    }
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    trw_create(COLS * CW, ROWS * CH, "Terminal");
+    trw_fill(0, 0, COLS * CW, ROWS * CH, BG);
+    clear_rows(0, ROWS);
+    if (start_shell() < 0) { return 1; }
+    redraw();
+    var ev: trw_event;
+    var buf: [729]char;
+    loop {
+        var r: int = trw_wait(&ev, master, -1);
+        if (r < 0) { break; }                        // the window system has gone
+        if (r == 2) {
+            var n: int = read(master, &buf[0], 729);
+            if (n <= 0) { break; }                   // the shell has exited
+            var k: int = 0;
+            while (k < n) { put(buf[k]); k += 1; }
+            redraw();
+            continue;
+        }
+        if (ev.type == TRW_KEY) {
+            var ch: [1]char;
+            ch[0] = ev.a as char;
+            write(master, &ch[0], 1);
+        } else if (ev.type == TRW_CLOSE) {
+            kill(-child, SIGHUP);
+            break;
+        }
+    }
+    close(master);
+    kill(child, SIGHUP);
+    var st: int;
+    waitpid(child, &st, 0);
+    return 0;
+}

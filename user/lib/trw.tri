@@ -1,0 +1,183 @@
+// trw: the client side of the Trinux window system protocol.
+//
+// trwm starts each client with two pipes: requests go out on fd 3, events
+// come in on fd 4. A message is words: op, the number of argument words,
+// then the arguments (strings are one character per word). A client owns
+// one window, server-side: the server keeps its pixels and draws them.
+//
+// Requests: CREATE w h title...      (first)    FILL x y w h colour
+//           TEXT x y fg bg scale text...         PIXELS x y w h pixels...
+//           SCROLL x y w h dy fill               FLUSH (show the changes)
+//           TITLE text...                        SPAWN path...
+// Events:   KEY char   BUTTON x y buttons   MOTION x y buttons   CLOSE
+//           FOCUS in
+
+import "tlibc.tri";
+
+const TRW_CREATE: int = 1;
+const TRW_FILL: int = 2;
+const TRW_TEXT: int = 3;
+const TRW_PIXELS: int = 4;
+const TRW_SCROLL: int = 5;
+const TRW_FLUSH: int = 6;
+const TRW_TITLE: int = 7;
+const TRW_SPAWN: int = 8;
+
+const TRW_KEY: int = 101;
+const TRW_BUTTON: int = 102;
+const TRW_MOTION: int = 103;
+const TRW_CLOSE: int = 104;
+const TRW_FOCUS: int = 105;
+
+const TRW_MAX_MSG: int = 2187;        // words, header included
+const TRW_REQ_FD: int = 3;
+const TRW_EV_FD: int = 4;
+
+struct trw_event {
+    type: int;
+    a: int;
+    b: int;
+    c: int;
+}
+
+// A word from three trytes (big-endian, as the hardware stores it). Tryte
+// buffers need not start on a word boundary, so no pointer casting.
+fn word_of(p: *tryte) -> int { return p[0] * 387420489 + p[1] * 19683 + p[2]; }
+
+var trw_out: [2187]int;               // requests waiting to be sent
+var trw_out_n: int;
+var trw_in: [729]int;                 // event words received
+var trw_in_n: int;
+var trw_in_part: [3]tryte;            // trytes of a word not yet complete
+var trw_in_partn: int;
+var trw_dead: int;
+
+fn trw_send_now() -> int {
+    if (trw_out_n == 0) { return 0; }
+    var r: int = write(TRW_REQ_FD, bytes(&trw_out[0]) as *char, 3 * trw_out_n);
+    trw_out_n = 0;
+    if (r < 0) { trw_dead = 1; return -1; }
+    return 0;
+}
+
+// Queue one message (op + args); sent when the buffer fills or on flush.
+fn trw_msg(op: int, args: *int, n: int, text: *char) -> int {
+    var tl: int = text == null ? 0 : strlen(text);
+    var total: int = 2 + n + tl;
+    if (total > TRW_MAX_MSG) { return -1; }
+    if (trw_out_n + total > TRW_MAX_MSG) { trw_send_now(); }
+    trw_out[trw_out_n] = op;
+    trw_out[trw_out_n + 1] = n + tl;
+    var k: int = 0;
+    while (k < n) { trw_out[trw_out_n + 2 + k] = args[k]; k += 1; }
+    k = 0;
+    while (k < tl) { trw_out[trw_out_n + 2 + n + k] = text[k]; k += 1; }
+    trw_out_n += total;
+    return 0;
+}
+
+fn trw_create(w: int, h: int, title: *char) -> int {
+    var a: [2]int = { w, h };
+    return trw_msg(TRW_CREATE, &a[0], 2, title);
+}
+
+fn trw_fill(x: int, y: int, w: int, h: int, colour: int) {
+    var a: [5]int = { x, y, w, h, colour };
+    trw_msg(TRW_FILL, &a[0], 5, null);
+}
+
+fn trw_text(x: int, y: int, fg: int, bg: int, scale: int, text: *char) {
+    var a: [5]int = { x, y, fg, bg, scale };
+    trw_msg(TRW_TEXT, &a[0], 5, text);
+}
+
+// A block of pixels (w * h at most 2181), written straight into the queue.
+fn trw_pixels(x: int, y: int, w: int, h: int, px: *int) -> int {
+    var n: int = w * h;
+    if (n + 6 > TRW_MAX_MSG || w <= 0 || h <= 0) { return -1; }
+    if (trw_out_n + n + 6 > TRW_MAX_MSG) { trw_send_now(); }
+    var m: *int = &trw_out[trw_out_n];
+    m[0] = TRW_PIXELS;
+    m[1] = 4 + n;
+    m[2] = x;
+    m[3] = y;
+    m[4] = w;
+    m[5] = h;
+    var k: int = 0;
+    while (k < n) { m[6 + k] = px[k]; k += 1; }
+    trw_out_n += n + 6;
+    return 0;
+}
+
+fn trw_scroll(x: int, y: int, w: int, h: int, dy: int, fill: int) {
+    var a: [6]int = { x, y, w, h, dy, fill };
+    trw_msg(TRW_SCROLL, &a[0], 6, null);
+}
+
+fn trw_title(text: *char) { trw_msg(TRW_TITLE, null, 0, text); }
+fn trw_spawn(path: *char) { trw_msg(TRW_SPAWN, null, 0, path); }
+
+fn trw_flush() -> int {
+    trw_msg(TRW_FLUSH, null, 0, null);
+    return trw_send_now();
+}
+
+// Pull what the server has sent (without waiting).
+fn trw_fill_input() {
+    var buf: [729]tryte;
+    var n: int = read(TRW_EV_FD, &buf[0] as *char, 729);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { trw_dead = 1; return; }
+    var k: int = 0;
+    while (k < n) {
+        trw_in_part[trw_in_partn] = buf[k];
+        trw_in_partn += 1;
+        if (trw_in_partn == 3) {
+            if (trw_in_n < 729) { trw_in[trw_in_n] = word_of(&trw_in_part[0]); trw_in_n += 1; }
+            trw_in_partn = 0;
+        }
+        k += 1;
+    }
+}
+
+// A complete event from the input words, if there is one.
+fn trw_take(ev: *trw_event) -> int {
+    if (trw_in_n < 2) { return 0; }
+    var n: int = trw_in[1];
+    if (n < 0 || n > 3) { trw_in_n = 0; return 0; }          // not a valid event: drop the rest
+    if (trw_in_n < 2 + n) { return 0; }
+    ev.type = trw_in[0];
+    ev.a = n > 0 ? trw_in[2] : 0;
+    ev.b = n > 1 ? trw_in[3] : 0;
+    ev.c = n > 2 ? trw_in[4] : 0;
+    var k: int = 0;
+    while (k + 2 + n < trw_in_n) { trw_in[k] = trw_in[k + 2 + n]; k += 1; }
+    trw_in_n -= 2 + n;
+    return 1;
+}
+
+// Wait up to timeout_ms (-1 = forever) for an event, also watching `extra`
+// (another descriptor, or -1). Returns 1 with an event in *ev, 2 if only
+// `extra` is readable, 0 on timeout, -1 when the server has gone.
+fn trw_wait(ev: *trw_event, extra: int, timeout_ms: int) -> int {
+    if (trw_take(ev)) { return 1; }
+    loop {
+        if (trw_dead) { return -1; }
+        var p: [2]pollfd;
+        p[0].fd = TRW_EV_FD;
+        p[0].events = POLLIN;
+        p[1].fd = extra;
+        p[1].events = POLLIN;
+        var r: int = poll(&p[0], 2, timeout_ms);
+        if (r < 0) {
+            if (errno == EINTR) { continue; }
+            return -1;
+        }
+        if (r == 0) { return 0; }
+        if (p[0].revents != 0) {
+            trw_fill_input();
+            if (trw_take(ev)) { return 1; }
+            if (trw_dead) { return -1; }
+        }
+        if (extra >= 0 && p[1].revents != 0) { return 2; }
+    }
+}

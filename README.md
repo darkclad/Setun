@@ -17,12 +17,16 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - 640×480 framebuffer, one tryte per pixel = 3^9 colours (27 levels per channel)
 - a tryte holds a Unicode code point directly
 
+![Trinux running its window system: a terminal, a clock, all 3^9 colours and a paint program](docs/screenshots/trinux-k8.png)
+
+*Trinux on the emulator: `trwm term clock colors paint`. The Colors window shows every one of the 3^9 pixel colours once.*
+
 ## Docs
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
-- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K7 running: an interactive POSIX-like system with a scripting shell and core utilities on a tfs root)
+- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K8 running: a POSIX-like system with a scripting shell, core utilities and a window system with a terminal)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 

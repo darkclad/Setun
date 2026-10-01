@@ -148,3 +148,46 @@ fn close_on_exec(t: *Task) {
         fd += 1;
     }
 }
+
+// ---- mmap: the framebuffer -------------------------------------------------------------
+//
+// Only /dev/fb0 can be mapped (MAP_SHARED, offset 0): its frames go into the
+// caller's address space at FB_VA as device pages (never copied on write,
+// never freed). Anonymous memory comes from brk.
+
+const MAP_SHARED: int = 1;
+const FB_VA_PAGE: int = -14348907;               // -3^15: the page index of the mapping
+const ENODEV_M: int = 19;
+
+fn fb_va() -> int { return FB_VA_PAGE * 19683 - 9841; }   // its first tryte
+
+fn sys_mmap(addr: int, len: int, prot: int, flags: int, fd: int, off: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    if (len <= 0 || off != 0 || flags % 2 != MAP_SHARED) { return -EINVAL; }
+    var i: int = files[f].ino;
+    if (inodes[i].type != I_CHR || inodes[i].rdev != DEV_FB0) { return -ENODEV_M; }
+    if (len > fb_size()) { return -EINVAL; }
+    var frames: int = (len + 19682) / 19683;
+    var t: *Task = current_task();
+    var k: int = 0;
+    while (k < frames) {
+        if (!map_device_page(t.l1, (FB_VA_PAGE + k) * 19683, FB_FIRST_FRAME + k)) { return -12; }
+        k += 1;
+    }
+    tlbflush();
+    return fb_va();
+}
+
+fn sys_munmap(addr: int, len: int) -> int {
+    if (addr != fb_va() || len <= 0) { return -EINVAL; }
+    var t: *Task = current_task();
+    var frames: int = (len + 19682) / 19683;
+    var k: int = 0;
+    while (k < frames && k < FB_MAX_FRAMES) {
+        unmap_device_page(t.l1, (FB_VA_PAGE + k) * 19683);
+        k += 1;
+    }
+    tlbflush();
+    return 0;
+}

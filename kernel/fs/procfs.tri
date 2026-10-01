@@ -218,7 +218,7 @@ fn proc_generate(i: int) -> int {
     var t: *Task = &tasks[ti];
     if (k == PROC_STAT) {
         pi(t.pid); ps(" ("); ps(&t.comm[0]); ps(") "); pc(state_char(t)); pc(' ');
-        pi(t.ppid); pc(' '); pi(t.pgid); pc(' '); pi(t.sid); ps(" 1281 "); pi(tty_pgrp);
+        pi(t.ppid); pc(' '); pi(t.pgid); pc(' '); pi(t.sid); ps(" 1281 "); pi(ttys[0].pgrp);
         ps(" 0 0 0 0 0 "); pi(t.ticks); ps(" 0 0 0 20 0 1 0 "); pi(t.start_time);
         ps(" 0 0\n");
         return 0;
@@ -230,6 +230,7 @@ fn proc_generate(i: int) -> int {
         ps("PPid:\t"); pi(t.ppid); pc('\n');
         ps("PGid:\t"); pi(t.pgid); pc('\n');
         ps("Sid:\t"); pi(t.sid); pc('\n');
+        ps("WChan:\t"); pi(t.state == TASK_SLEEPING ? t.wchan : 0); pc('\n');
         return 0;
     }
     // cmdline

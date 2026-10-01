@@ -214,7 +214,7 @@ fn k4_shell_files_dirs_and_status() {
         "cat: /nope: No such file or directory\n",
         "/dev/null | cat\ncat: /nope: No such file or directory\n",
         "cat: f: No such file or directory\n",
-        "$ cd /dev; ls\nconsole\nnull\ntty\nttyS0\nzero\n",
+        "$ cd /dev; ls\nconsole\nfb0\nkbd\nmouse\nnull\nptmx\npts\ntty\nttyS0\nzero\n",
         "init: /bin/sh exited with 0",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");

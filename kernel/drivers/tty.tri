@@ -1,21 +1,27 @@
-// tty: the console terminal, after Linux's n_tty line discipline.
+// tty: terminals, after Linux's n_tty line discipline, and pseudo-terminals.
 //
-// Input comes from the keyboard (USB HID usage codes) and the serial port.
-// Both raise IRQs; the timer tick and every read also poll them, so input
-// queued before the IRQs were enabled is not lost. In canonical mode
-// (ICANON) characters are collected into a line with erase (^H, DEL), kill
-// (^U) and end of file (^D); a read returns at most one line. With ICANON
-// off every character is passed through as it arrives. Output goes to the
-// serial port and the text screen.
+// Ten terminals share the code: tty 0 is the console (keyboard and serial
+// in; serial and the text screen out), ttys 1..9 are pseudo-terminals (the
+// slave side, /dev/pts/N, is a terminal like the console; whatever it
+// outputs is read from the master side, /dev/ptmx, and what the master
+// writes is typed into it).
 //
-// With ISIG, ^C, ^\ and ^Z send SIGINT, SIGQUIT and SIGTSTP to the
-// foreground process group (and flush the input); a read from any other
-// group gets SIGTTIN.
+// The line discipline: in canonical mode (ICANON) characters are collected
+// into a line with erase (^H, DEL), kill (^U) and end of file (^D); a read
+// returns at most one line. With ICANON off every character passes as it
+// arrives. With ISIG, ^C, ^\ and ^Z send SIGINT, SIGQUIT and SIGTSTP to the
+// terminal's foreground process group (and flush the input); a read from
+// another group of the same session gets SIGTTIN.
+//
+// Console input comes from IRQs, and the timer tick and every read also
+// poll the devices, so input queued before the IRQs were enabled is kept.
+// While /dev/kbd is open the keyboard goes there instead (raw events).
 
 import "../params.tri";
 import "../printk.tri";
 import "../sched.tri";
 import "../signal.tri";
+import "input.tri";
 
 // termios, one word per flag field (Linux field order and bit values)
 struct Termios {
@@ -59,43 +65,89 @@ const TCSETSF: int = 21508;
 const TIOCGPGRP: int = 21519;
 const TIOCSPGRP: int = 21520;
 const TIOCGWINSZ: int = 21523;
+const TIOCSWINSZ: int = 21524;
+const TIOCGPTN: int = 2147767344;
+const TIOCSPTLCK: int = 1074025521;
 const EIO: int = 5;
+const EAGAIN_: int = 11;
 
-const TTY_CHAN: int = 20000;          // wait channel for readers
+const NTTY: int = 10;                 // 0 = console, 1..9 = pseudo-terminals
+const TTY_CHAN: int = 20000;          // + tty: slave readers
+const PTM_CHAN: int = 20100;          // + tty: the master side
 const TTY_BUF: int = 2187;
 const LINE_MAX: int = 243;
 const EOF_MARK: int = -1;             // in the ready queue: ^D on an empty line
 
-var termios: Termios;
-var ready: [2187]tryte;               // characters a read may take
-var ready_head: int;
-var ready_count: int;
-var line: [243]char;                  // the line being edited (canonical mode)
-var line_len: int;
+struct Tty {
+    used: int;                        // pty allocated (the console always is)
+    iflag: int;
+    oflag: int;
+    cflag: int;
+    lflag: int;
+    cline: tryte;
+    cc: [19]tryte;
+    ready: [2187]tryte;               // characters a read may take
+    ready_head: int;
+    ready_count: int;
+    line: [243]char;                  // the line being edited (canonical mode)
+    line_len: int;
+    pgrp: int;                        // foreground process group (0 = none yet)
+    rows: int;
+    cols: int;
+    out: [2187]tryte;                 // pty: output waiting for the master
+    out_head: int;
+    out_count: int;
+    master_open: int;
+    slave_opens: int;
+    slave_seen: int;                  // the slave has been opened at least once
+}
+
+var ttys: [10]Tty;
 var kbd_shift: int;
 var kbd_ctrl: int;
-var tty_pgrp: int = 1;                // the foreground process group
+
+fn tty_reset(t: int) {
+    var y: *Tty = &ttys[t];
+    y.iflag = ICRNL;
+    y.oflag = OPOST + ONLCR;
+    y.cflag = 0;
+    y.lflag = ISIG + ICANON + ECHO + ECHOE + ECHOK;
+    y.cline = 0;
+    var k: int = 0;
+    while (k < 19) { y.cc[k] = 0; k += 1; }
+    y.cc[VINTR] = 3;
+    y.cc[VQUIT] = 28;
+    y.cc[VERASE] = 127;
+    y.cc[VKILL] = 21;
+    y.cc[VEOF] = 4;
+    y.cc[VMIN] = 1;
+    y.cc[VSUSP] = 26;
+    y.ready_head = 0;
+    y.ready_count = 0;
+    y.line_len = 0;
+    y.pgrp = 0;
+    y.rows = 24;
+    y.cols = 80;
+    y.out_head = 0;
+    y.out_count = 0;
+    y.master_open = 0;
+    y.slave_opens = 0;
+    y.slave_seen = 0;
+}
 
 fn tty_init() {
-    termios.c_iflag = ICRNL;
-    termios.c_oflag = OPOST + ONLCR;
-    termios.c_cflag = 0;
-    termios.c_lflag = ISIG + ICANON + ECHO + ECHOE + ECHOK;
-    termios.c_cc[VINTR] = 3;
-    termios.c_cc[VQUIT] = 28;
-    termios.c_cc[VERASE] = 127;
-    termios.c_cc[VKILL] = 21;
-    termios.c_cc[VEOF] = 4;
-    termios.c_cc[VTIME] = 0;
-    termios.c_cc[VMIN] = 1;
-    termios.c_cc[VSUSP] = 26;
+    tty_reset(0);
+    ttys[0].used = 1;
+    ttys[0].pgrp = 1;
+    ttys[0].rows = ROWS;
+    ttys[0].cols = COLS;
     out(KBD_CTRL, 1);
     out(SERIAL_CTRL, 1);
     out(TPIC_UNMASK, IRQ_KEYBOARD);
     out(TPIC_UNMASK, IRQ_SERIAL);
 }
 
-fn lflag(bit: int) -> int { return termios.c_lflag / bit % 2 != 0; }
+fn lflag(t: int, bit: int) -> int { return ttys[t].lflag / bit % 2 != 0; }
 
 // ---- a VT100 subset on the text screen ------------------------------------------
 //
@@ -182,8 +234,12 @@ fn screen_output(c: char) -> int {
     return 0;
 }
 
-fn tty_output(c: char) {
+// The text screen is shown only in text mode (fb.tri switches it).
+var screen_owned_by_fb: int;
+
+fn console_output(c: char) {
     putc(c);
+    if (screen_owned_by_fb) { return; }
     if (screen_output(c)) { return; }
     if (c == 8) {                                   // backspace: the screen cursor steps back
         if (screen_col > 0) {
@@ -195,82 +251,98 @@ fn tty_output(c: char) {
     screen_putc(c);
 }
 
-fn tty_echo(c: char) {
-    if (!lflag(ECHO)) { return; }
-    if (c < 32 && c != '\n' && c != '\t') {      // control characters echo as ^X
-        tty_output('^');
-        tty_output((c + 64) as char);
-        return;
-    }
-    tty_output(c);
-}
-
-fn erase_one() {
-    if (line_len == 0) { return; }
-    line_len -= 1;
-    if (lflag(ECHO) && lflag(ECHOE)) {
-        tty_output(8 as char);
-        tty_output(' ');
-        tty_output(8 as char);
-    }
-}
-
-fn ready_put(c: int) -> int {
-    if (ready_count == TTY_BUF) { return 0; }
-    ready[(ready_head + ready_count) % TTY_BUF] = c as tryte;
-    ready_count += 1;
+// One character of output from terminal t. For a pty it waits for the
+// master; returns 0 if it had to be dropped (the master is gone or full).
+fn tty_output(t: int, c: char) -> int {
+    if (t == 0) { console_output(c); return 1; }
+    var y: *Tty = &ttys[t];
+    if (!y.master_open || y.out_count == TTY_BUF) { return 0; }
+    y.out[(y.out_head + y.out_count) % TTY_BUF] = c as tryte;
+    y.out_count += 1;
+    wake_up(PTM_CHAN + t);
     return 1;
 }
 
-fn commit_line() {
-    var i: int = 0;
-    while (i < line_len) { ready_put(line[i]); i += 1; }
-    line_len = 0;
-    wake_up(TTY_CHAN);
+fn tty_echo(t: int, c: char) {
+    if (!lflag(t, ECHO)) { return; }
+    if (c < 32 && c != '\n' && c != '\t') {      // control characters echo as ^X
+        tty_output(t, '^');
+        tty_output(t, (c + 64) as char);
+        return;
+    }
+    tty_output(t, c);
 }
 
-// One character through the line discipline.
-fn tty_receive(c: char) {
-    if (c == '\r' && termios.c_iflag / ICRNL % 2 != 0) { c = '\n'; }
-    if (lflag(ISIG) && c != 0) {
+fn erase_one(t: int) {
+    var y: *Tty = &ttys[t];
+    if (y.line_len == 0) { return; }
+    y.line_len -= 1;
+    if (lflag(t, ECHO) && lflag(t, ECHOE)) {
+        tty_output(t, 8 as char);
+        tty_output(t, ' ');
+        tty_output(t, 8 as char);
+    }
+}
+
+fn ready_put(t: int, c: int) -> int {
+    var y: *Tty = &ttys[t];
+    if (y.ready_count == TTY_BUF) { return 0; }
+    y.ready[(y.ready_head + y.ready_count) % TTY_BUF] = c as tryte;
+    y.ready_count += 1;
+    return 1;
+}
+
+fn commit_line(t: int) {
+    var y: *Tty = &ttys[t];
+    var i: int = 0;
+    while (i < y.line_len) { ready_put(t, y.line[i]); i += 1; }
+    y.line_len = 0;
+    wake_up(TTY_CHAN + t);
+}
+
+// One character through terminal t's line discipline.
+fn tty_receive(t: int, c: char) {
+    var y: *Tty = &ttys[t];
+    if (c == '\r' && y.iflag / ICRNL % 2 != 0) { c = '\n'; }
+    if (lflag(t, ISIG) && c != 0) {
         var sig: int = 0;
-        if (c == termios.c_cc[VINTR]) { sig = SIGINT; }
-        else if (c == termios.c_cc[VQUIT]) { sig = SIGQUIT; }
-        else if (c == termios.c_cc[VSUSP]) { sig = SIGTSTP; }
+        if (c == y.cc[VINTR]) { sig = SIGINT; }
+        else if (c == y.cc[VQUIT]) { sig = SIGQUIT; }
+        else if (c == y.cc[VSUSP]) { sig = SIGTSTP; }
         if (sig != 0) {
-            tty_echo(c);                                    // "^C"
-            line_len = 0;                                   // flush, as without NOFLSH
-            ready_count = 0;
-            send_signal_pgrp(tty_pgrp, sig);
+            tty_echo(t, c);                                 // "^C"
+            y.line_len = 0;                                 // flush, as without NOFLSH
+            y.ready_count = 0;
+            if (y.pgrp > 0) { send_signal_pgrp(y.pgrp, sig); }
             return;
         }
     }
-    if (!lflag(ICANON)) {
-        if (ready_put(c)) { tty_echo(c); }
-        wake_up(TTY_CHAN);
+    if (!lflag(t, ICANON)) {
+        if (ready_put(t, c)) { tty_echo(t, c); }
+        wake_up(TTY_CHAN + t);
         return;
     }
-    if (c == termios.c_cc[VERASE] || c == 8) { erase_one(); return; }
-    if (c == termios.c_cc[VKILL]) {
-        while (line_len > 0) { erase_one(); }
+    if (c == y.cc[VERASE] || c == 8) { erase_one(t); return; }
+    if (c == y.cc[VKILL]) {
+        while (y.line_len > 0) { erase_one(t); }
         return;
     }
-    if (c == termios.c_cc[VEOF]) {
-        if (line_len == 0) { ready_put(EOF_MARK); wake_up(TTY_CHAN); }
-        else { commit_line(); }
+    if (c == y.cc[VEOF]) {
+        if (y.line_len == 0) { ready_put(t, EOF_MARK); wake_up(TTY_CHAN + t); }
+        else { commit_line(t); }
         return;
     }
     if (c == '\n') {
-        tty_echo(c);
-        line[line_len] = c;
-        line_len += 1;
-        commit_line();
+        tty_echo(t, c);
+        y.line[y.line_len] = c;
+        y.line_len += 1;
+        commit_line(t);
         return;
     }
-    if (line_len < LINE_MAX - 1) {
-        line[line_len] = c;
-        line_len += 1;
-        tty_echo(c);
+    if (y.line_len < LINE_MAX - 1) {
+        y.line[y.line_len] = c;
+        y.line_len += 1;
+        tty_echo(t, c);
     }
 }
 
@@ -307,101 +379,201 @@ fn hid_char(code: int) -> int {
 }
 
 fn kbd_event(ev: int) {
+    if (kbd_raw_event(ev)) { return; }               // /dev/kbd is open: raw events go there
     var code: int = ev < 0 ? -ev : ev;
     var down: int = ev > 0;
     if (code == 225 || code == 229) { kbd_shift = down; return; }
     if (code == 224 || code == 228) { kbd_ctrl = down; return; }
     if (!down) { return; }
     var c: int = hid_char(code);
-    if (c != 0) { tty_receive(c as char); }
+    if (c != 0) { tty_receive(0, c as char); }
 }
 
-// Drain both input devices into the line discipline.
+// Drain the console's input devices into its line discipline.
 fn tty_poll() {
     while (in(KBD_COUNT) > 0) { kbd_event(in(KBD_DATA)); }
-    while (in(SERIAL_RX_COUNT) > 0) { tty_receive(in(SERIAL_DATA) as char); }
+    while (in(SERIAL_RX_COUNT) > 0) { tty_receive(0, in(SERIAL_DATA) as char); }
 }
 
-// Is there something a read can return now?
-fn tty_can_read() -> int {
-    tty_poll();
-    return ready_count > 0;
+fn hung_up(t: int) -> int { return t != 0 && !ttys[t].master_open; }
+
+// Is there something a read can return now (or end of file)?
+fn tty_can_read(t: int) -> int {
+    if (t == 0) { tty_poll(); }
+    return ttys[t].ready_count > 0 || hung_up(t);
 }
 
-fn ready_take() -> int {
-    var c: int = ready[ready_head];
-    ready_head = (ready_head + 1) % TTY_BUF;
-    ready_count -= 1;
+fn ready_take(t: int) -> int {
+    var y: *Tty = &ttys[t];
+    var c: int = y.ready[y.ready_head];
+    y.ready_head = (y.ready_head + 1) % TTY_BUF;
+    y.ready_count -= 1;
     return c;
 }
 
-// Read into kernel-visible `buf`. Blocks until input is available.
-fn tty_read(buf: *tryte, n: int) -> int {
-    var t: *Task = current_task();
-    if (t.pgid != tty_pgrp && group_exists(tty_pgrp, t.sid)) {     // a background read
-        if (sig_ignored(t, SIGTTIN) || sigset_has(t.sig_blocked, SIGTTIN)) { return -EIO; }
-        send_signal_pgrp(t.pgid, SIGTTIN);
+// Read from terminal t into `buf`. Blocks until input is available.
+fn tty_read(t: int, buf: *tryte, n: int, nonblock: int) -> int {
+    var me: *Task = current_task();
+    var y: *Tty = &ttys[t];
+    if (y.pgrp > 0 && me.pgid != y.pgrp && group_exists(y.pgrp, me.sid)) {   // a background read
+        if (sig_ignored(me, SIGTTIN) || sigset_has(me.sig_blocked, SIGTTIN)) { return -EIO; }
+        send_signal_pgrp(me.pgid, SIGTTIN);
         return -ERESTARTSYS;                                    // read again once in the foreground
     }
     if (n == 0) { return 0; }
-    while (!tty_can_read()) {
-        if (sleep_on(TTY_CHAN)) { return -ERESTARTSYS; }
+    while (!tty_can_read(t)) {
+        if (nonblock) { return -EAGAIN_; }
+        if (sleep_on(TTY_CHAN + t)) { return -ERESTARTSYS; }
     }
     var k: int = 0;
-    while (k < n && ready_count > 0) {
-        if (ready[ready_head] == EOF_MARK) {
-            if (k == 0) { ready_take(); }           // ^D: this read returns 0
+    while (k < n && y.ready_count > 0) {
+        if (y.ready[y.ready_head] == EOF_MARK) {
+            if (k == 0) { ready_take(t); }          // ^D: this read returns 0
             break;
         }
-        var c: int = ready_take();
+        var c: int = ready_take(t);
         buf[k] = c as tryte;
         k += 1;
-        if (c == '\n' && lflag(ICANON)) { break; }   // one line per read
+        if (c == '\n' && lflag(t, ICANON)) { break; }   // one line per read
     }
-    return k;
+    return k;                                        // 0 after a hangup: end of file
 }
 
-fn tty_write(buf: *tryte, n: int) -> int {
+fn tty_write(t: int, buf: *tryte, n: int, nonblock: int) -> int {
     var i: int = 0;
     while (i < n) {
-        tty_output(buf[i] as char);
+        if (hung_up(t)) { return i > 0 ? i : -EIO; }
+        if (!tty_output(t, buf[i] as char)) {
+            if (nonblock) { return i > 0 ? i : -EAGAIN_; }
+            if (sleep_on(PTM_CHAN + t)) { return i > 0 ? i : -ERESTARTSYS; }   // wait for the master
+            continue;
+        }
         i += 1;
     }
     return n;
 }
 
-// ioctl on the terminal; `arg` has been checked to be a user address.
-fn tty_ioctl(cmd: int, arg: int) -> int {
+// ioctl on terminal t; `arg` has been checked to be a user address.
+fn tty_ioctl(t: int, cmd: int, arg: int) -> int {
+    var y: *Tty = &ttys[t];
     switch (cmd) {
         case TCGETS: {
-            memcpy(bytes(arg as *Termios), bytes(&termios), sizeof(Termios));
+            var u: *Termios = arg as *Termios;
+            u.c_iflag = y.iflag;
+            u.c_oflag = y.oflag;
+            u.c_cflag = y.cflag;
+            u.c_lflag = y.lflag;
+            u.c_line = y.cline;
+            var k: int = 0;
+            while (k < 19) { u.c_cc[k] = y.cc[k]; k += 1; }
             return 0;
         }
         case TCSETS, TCSETSW, TCSETSF: {
-            memcpy(bytes(&termios), bytes(arg as *Termios), sizeof(Termios));
-            if (cmd == TCSETSF) { ready_count = 0; line_len = 0; }
-            if (!lflag(ICANON)) { commit_line(); }    // a half-typed line becomes input
+            var u2: *Termios = arg as *Termios;
+            y.iflag = u2.c_iflag;
+            y.oflag = u2.c_oflag;
+            y.cflag = u2.c_cflag;
+            y.lflag = u2.c_lflag;
+            y.cline = u2.c_line;
+            var k2: int = 0;
+            while (k2 < 19) { y.cc[k2] = u2.c_cc[k2]; k2 += 1; }
+            if (cmd == TCSETSF) { y.ready_count = 0; y.line_len = 0; }
+            if (!lflag(t, ICANON)) { commit_line(t); }  // a half-typed line becomes input
             return 0;
         }
         case TIOCGPGRP: {
-            *(arg as *int) = tty_pgrp;
+            *(arg as *int) = y.pgrp;
             return 0;
         }
         case TIOCSPGRP: {
             var g: int = *(arg as *int);
             if (g <= 0) { return -EINVAL; }
             if (!group_exists(g, current_task().sid)) { return -EPERM_; }
-            tty_pgrp = g;
+            y.pgrp = g;
             return 0;
         }
         case TIOCGWINSZ: {
             var w: *Winsize = arg as *Winsize;
-            w.ws_row = ROWS;
-            w.ws_col = COLS;
-            w.ws_xpixel = 640;
-            w.ws_ypixel = 480;
+            w.ws_row = y.rows;
+            w.ws_col = y.cols;
+            w.ws_xpixel = y.cols * 8;
+            w.ws_ypixel = y.rows * 8;
+            return 0;
+        }
+        case TIOCSWINSZ: {
+            var w2: *Winsize = arg as *Winsize;
+            if (w2.ws_row <= 0 || w2.ws_col <= 0) { return -EINVAL; }
+            y.rows = w2.ws_row;
+            y.cols = w2.ws_col;
             return 0;
         }
     }
     return -25;                                         // ENOTTY
 }
+
+// ---- the master side (/dev/ptmx) ------------------------------------------------------
+
+// A free pseudo-terminal: its number, or -EAGAIN.
+fn pty_alloc() -> int {
+    var t: int = 1;
+    while (t < NTTY) {
+        if (!ttys[t].used) {
+            tty_reset(t);
+            ttys[t].used = 1;
+            ttys[t].master_open = 1;
+            return t;
+        }
+        t += 1;
+    }
+    return -EAGAIN_;
+}
+
+fn pty_release_if_done(t: int) {
+    if (ttys[t].used && !ttys[t].master_open && ttys[t].slave_opens == 0) {
+        ttys[t].used = 0;
+        devfs_pts_remove(t);
+    }
+}
+
+// The master went away: hang up the slave (SIGHUP to its group, reads see EOF).
+fn pty_master_close(t: int) {
+    var y: *Tty = &ttys[t];
+    y.master_open = 0;
+    if (y.pgrp > 0) {
+        send_signal_pgrp(y.pgrp, SIGHUP);
+        send_signal_pgrp(y.pgrp, SIGCONT);
+    }
+    wake_up(TTY_CHAN + t);
+    wake_up(PTM_CHAN + t);
+    pty_release_if_done(t);
+}
+
+fn pty_master_read(t: int, buf: *tryte, n: int, nonblock: int) -> int {
+    var y: *Tty = &ttys[t];
+    while (y.out_count == 0) {
+        if (y.slave_seen && y.slave_opens == 0) { return -EIO; }      // as on Linux
+        if (nonblock) { return -EAGAIN_; }
+        if (sleep_on(PTM_CHAN + t)) { return -ERESTARTSYS; }
+    }
+    var k: int = 0;
+    while (k < n && y.out_count > 0) {
+        buf[k] = y.out[y.out_head];
+        y.out_head = (y.out_head + 1) % TTY_BUF;
+        y.out_count -= 1;
+        k += 1;
+    }
+    wake_up(PTM_CHAN + t);                           // a writer waiting for room
+    return k;
+}
+
+// What the master writes is typed into the slave.
+fn pty_master_write(t: int, buf: *tryte, n: int) -> int {
+    var i: int = 0;
+    while (i < n) {
+        tty_receive(t, buf[i] as char);
+        i += 1;
+    }
+    return n;
+}
+
+fn pty_master_ready(t: int) -> int { return ttys[t].out_count > 0 || (ttys[t].slave_seen && ttys[t].slave_opens == 0); }

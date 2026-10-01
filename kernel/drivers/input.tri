@@ -1,0 +1,132 @@
+// input: raw keyboard and mouse events for a display server.
+//
+//   /dev/kbd    one word per event: +code on press, -code on release (USB
+//               HID usage IDs). While it is open the console gets no keys.
+//   /dev/mouse  six words per event: x, y (absolute, pixels), buttons
+//               (L + 3M + 9R), wheel steps, dx, dy.
+//
+// Each can be open once (like a grabbed evdev device): EBUSY otherwise.
+// Queues hold 81 events; when full the oldest are dropped.
+
+import "../params.tri";
+import "../sched.tri";
+
+const INPUT_CHAN: int = 20200;        // readers of either device
+const KQ: int = 81;
+const MQ: int = 81;
+const MOUSE_EVENT_WORDS: int = 6;
+const EBUSY_IN: int = 16;
+const EAGAIN_IN: int = 11;
+const EINVAL_IN: int = 22;
+
+var kbd_open: int;
+var kq: [81]int;
+var kq_head: int;
+var kq_count: int;
+
+var mouse_open: int;
+var mq: [486]int;                     // 81 events x 6 words
+var mq_head: int;
+var mq_count: int;
+var mouse_x: int;
+var mouse_y: int;
+var mouse_buttons: int;
+
+fn input_init() {
+    out(MOUSE_CTRL, 1);
+    out(TPIC_UNMASK, IRQ_MOUSE);
+}
+
+// From the console keyboard handler: 1 if the event went to /dev/kbd.
+fn kbd_raw_event(ev: int) -> int {
+    if (!kbd_open) { return 0; }
+    if (kq_count == KQ) { kq_head = (kq_head + 1) % KQ; kq_count -= 1; }
+    kq[(kq_head + kq_count) % KQ] = ev;
+    kq_count += 1;
+    wake_up(INPUT_CHAN);
+    return 1;
+}
+
+// The mouse IRQ (and the timer tick): collect motion, buttons and wheel.
+fn mouse_poll() {
+    var dx: int = in(MOUSE_DX);
+    var dy: int = in(MOUSE_DY);
+    var b: int = in(MOUSE_BUTTONS);
+    var wheel: int = in(MOUSE_WHEEL);
+    var x: int = in(MOUSE_X);
+    var y: int = in(MOUSE_Y);
+    if (dx == 0 && dy == 0 && b == mouse_buttons && wheel == 0 && x == mouse_x && y == mouse_y) { return; }
+    mouse_buttons = b;
+    mouse_x = x;
+    mouse_y = y;
+    if (!mouse_open) { return; }
+    if (mq_count == MQ) { mq_head = (mq_head + 1) % MQ; mq_count -= 1; }
+    var at: int = (mq_head + mq_count) % MQ * MOUSE_EVENT_WORDS;
+    mq[at] = x;
+    mq[at + 1] = y;
+    mq[at + 2] = b;
+    mq[at + 3] = wheel;
+    mq[at + 4] = dx;
+    mq[at + 5] = dy;
+    mq_count += 1;
+    wake_up(INPUT_CHAN);
+}
+
+fn kbd_dev_open() -> int {
+    if (kbd_open) { return -EBUSY_IN; }
+    kbd_open = 1;
+    kq_count = 0;
+    return 0;
+}
+
+fn kbd_dev_close() { kbd_open = 0; }
+
+fn mouse_dev_open() -> int {
+    if (mouse_open) { return -EBUSY_IN; }
+    mouse_open = 1;
+    mq_count = 0;
+    return 0;
+}
+
+fn mouse_dev_close() { mouse_open = 0; }
+
+// Whole events only: n must hold at least one.
+fn kbd_dev_read(buf: *tryte, n: int, nonblock: int) -> int {
+    if (n < 3) { return -EINVAL_IN; }
+    if ((buf as int + 1) % 3 != 0) { return -EINVAL_IN; }
+    while (kq_count == 0) {
+        if (nonblock) { return -EAGAIN_IN; }
+        if (sleep_on(INPUT_CHAN)) { return -ERESTARTSYS; }
+    }
+    var w: *int = (buf as int + 1) as *int;
+    var k: int = 0;
+    while (3 * (k + 1) <= n && kq_count > 0) {
+        w[k] = kq[kq_head];
+        kq_head = (kq_head + 1) % KQ;
+        kq_count -= 1;
+        k += 1;
+    }
+    return 3 * k;
+}
+
+fn mouse_dev_read(buf: *tryte, n: int, nonblock: int) -> int {
+    if (n < 3 * MOUSE_EVENT_WORDS) { return -EINVAL_IN; }
+    if ((buf as int + 1) % 3 != 0) { return -EINVAL_IN; }
+    while (mq_count == 0) {
+        if (nonblock) { return -EAGAIN_IN; }
+        if (sleep_on(INPUT_CHAN)) { return -ERESTARTSYS; }
+    }
+    var w: *int = (buf as int + 1) as *int;
+    var k: int = 0;
+    while (3 * MOUSE_EVENT_WORDS * (k + 1) <= n && mq_count > 0) {
+        var j: int = 0;
+        while (j < MOUSE_EVENT_WORDS) {
+            w[MOUSE_EVENT_WORDS * k + j] = mq[mq_head * MOUSE_EVENT_WORDS + j];
+            j += 1;
+        }
+        mq_head = (mq_head + 1) % MQ;
+        mq_count -= 1;
+        k += 1;
+    }
+    return 3 * MOUSE_EVENT_WORDS * k;
+}

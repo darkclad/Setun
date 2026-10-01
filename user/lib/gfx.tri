@@ -1,0 +1,185 @@
+// gfx: drawing on tryte-per-pixel surfaces (the framebuffer and window
+// buffers). A pixel is one tryte: trits 1-3 blue, 4-6 green, 7-9 red, each
+// channel -13..13, so 3^9 = 19683 colours (white 9841, black -9841).
+//
+// Inner loops are in assembly: filling and copying cost a few instructions
+// a pixel instead of the ~30 of a compiled loop.
+
+import "tlibc.tri";
+
+const TRANSPARENT: int = 19683;       // a text background that leaves pixels alone
+
+struct Surface {
+    data: *tryte;                     // first pixel; rows are `w` pixels apart
+    w: int;
+    h: int;
+}
+
+fn rgb(r: int, g: int, b: int) -> int { return r * 729 + g * 27 + b; }
+
+const WHITE: int = 9841;
+const BLACK: int = -9841;
+
+extern fn gfx_fill(dst: *tryte, value: int, n: int);
+extern fn gfx_copy(dst: *tryte, src: *tryte, n: int);
+
+fn _gfx_asm() {
+    asm {
+        "        b     _gfx_asm_end"
+        "gfx_fill:"
+        "        cmp   r3, 0"
+        "        ble   gfx_fill_done"
+        "gfx_fill_loop:"
+        "        stt   r2, [r1]"
+        "        add   r1, r1, 1"
+        "        sub   r3, r3, 1"
+        "        cmp   r3, 0"
+        "        bgt   gfx_fill_loop"
+        "gfx_fill_done:"
+        "        ret"
+        "gfx_copy:"
+        "        cmp   r3, 0"
+        "        ble   gfx_copy_done"
+        "gfx_copy_loop:"
+        "        ldt   r4, [r2]"
+        "        stt   r4, [r1]"
+        "        add   r1, r1, 1"
+        "        add   r2, r2, 1"
+        "        sub   r3, r3, 1"
+        "        cmp   r3, 0"
+        "        bgt   gfx_copy_loop"
+        "gfx_copy_done:"
+        "        ret"
+        "_gfx_asm_end:"
+    }
+}
+
+// A rectangle clipped to [0, w) x [0, h): its corners, or 0 if nothing is left.
+var clip_x0: int;
+var clip_y0: int;
+var clip_x1: int;
+var clip_y1: int;
+
+fn clip(s: *Surface, x: int, y: int, w: int, h: int) -> int {
+    clip_x0 = x < 0 ? 0 : x;
+    clip_y0 = y < 0 ? 0 : y;
+    clip_x1 = x + w > s.w ? s.w : x + w;
+    clip_y1 = y + h > s.h ? s.h : y + h;
+    return clip_x0 < clip_x1 && clip_y0 < clip_y1;
+}
+
+fn fill_rect(s: *Surface, x: int, y: int, w: int, h: int, color: int) {
+    if (!clip(s, x, y, w, h)) { return; }
+    var row: int = clip_y0;
+    while (row < clip_y1) {
+        gfx_fill(&s.data[row * s.w + clip_x0], color, clip_x1 - clip_x0);
+        row += 1;
+    }
+}
+
+fn put_pixel(s: *Surface, x: int, y: int, color: int) {
+    if (x >= 0 && y >= 0 && x < s.w && y < s.h) { s.data[y * s.w + x] = color as tryte; }
+}
+
+fn get_pixel(s: *Surface, x: int, y: int) -> int {
+    if (x >= 0 && y >= 0 && x < s.w && y < s.h) { return s.data[y * s.w + x]; }
+    return 0;
+}
+
+// Copy the rectangle (sx, sy, w, h) of src to (dx, dy) on dst, clipped to both.
+fn blit(dst: *Surface, dx: int, dy: int, src: *Surface, sx: int, sy: int, w: int, h: int) {
+    if (sx < 0) { dx -= sx; w += sx; sx = 0; }
+    if (sy < 0) { dy -= sy; h += sy; sy = 0; }
+    if (sx + w > src.w) { w = src.w - sx; }
+    if (sy + h > src.h) { h = src.h - sy; }
+    if (!clip(dst, dx, dy, w, h)) { return; }
+    var row: int = clip_y0;
+    while (row < clip_y1) {
+        var srow: int = sy + row - dy;
+        gfx_copy(&dst.data[row * dst.w + clip_x0], &src.data[srow * src.w + sx + clip_x0 - dx], clip_x1 - clip_x0);
+        row += 1;
+    }
+}
+
+// Move the rectangle's pixels up by dy rows (down if negative), filling the gap.
+fn scroll_rect(s: *Surface, x: int, y: int, w: int, h: int, dy: int, fill: int) {
+    if (!clip(s, x, y, w, h)) { return; }
+    var x0: int = clip_x0;
+    var y0: int = clip_y0;
+    var y1: int = clip_y1;
+    var n: int = clip_x1 - clip_x0;
+    if (dy > 0) {
+        var row: int = y0;
+        while (row + dy < y1) {
+            gfx_copy(&s.data[row * s.w + x0], &s.data[(row + dy) * s.w + x0], n);
+            row += 1;
+        }
+        while (row < y1) { gfx_fill(&s.data[row * s.w + x0], fill, n); row += 1; }
+    } else if (dy < 0) {
+        var r2: int = y1 - 1;
+        while (r2 + dy >= y0) {
+            gfx_copy(&s.data[r2 * s.w + x0], &s.data[(r2 + dy) * s.w + x0], n);
+            r2 -= 1;
+        }
+        while (r2 >= y0) { gfx_fill(&s.data[r2 * s.w + x0], fill, n); r2 -= 1; }
+    }
+}
+
+// ---- text ---------------------------------------------------------------------------------
+
+var font: [2048]tryte;                // 256 glyphs x 8 rows, bit 0 = leftmost pixel
+var font_ok: int;
+
+fn font_load(path: *char) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    var n: int = read(fd, &font[0] as *char, 2048);
+    close(fd);
+    font_ok = n == 2048;
+    return font_ok ? 0 : -1;
+}
+
+// One character with its top-left at (x, y), each font pixel scale x scale.
+fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) {
+    if (c < 0 || c > 255) { c = '?'; }
+    if (scale == 1 && x >= 0 && y >= 0 && x + 8 <= s.w && y + 8 <= s.h) {
+        // the common case: whole and unscaled, so no clipping per pixel
+        var r: int = 0;
+        while (r < 8) {
+            var b: int = font[c * 8 + r];
+            var p: *tryte = &s.data[(y + r) * s.w + x];
+            var k: int = 0;
+            while (k < 8) {
+                if (b % 2 != 0) { p[k] = fg as tryte; }
+                else if (bg != TRANSPARENT) { p[k] = bg as tryte; }
+                b = b / 2;
+                k += 1;
+            }
+            r += 1;
+        }
+        return;
+    }
+    var row: int = 0;
+    while (row < 8) {
+        var bits: int = font[c * 8 + row];
+        var col: int = 0;
+        while (col < 8) {
+            var on: int = bits % 2;
+            bits = bits / 2;
+            if (on) { fill_rect(s, x + col * scale, y + row * scale, scale, scale, fg); }
+            else if (bg != TRANSPARENT) { fill_rect(s, x + col * scale, y + row * scale, scale, scale, bg); }
+            col += 1;
+        }
+        row += 1;
+    }
+}
+
+fn draw_text(s: *Surface, x: int, y: int, text: *char, fg: int, bg: int, scale: int) {
+    var k: int = 0;
+    while (text[k] != 0) {
+        draw_char(s, x + 8 * scale * k, y, text[k], fg, bg, scale);
+        k += 1;
+    }
+}
+
+fn text_width(text: *char, scale: int) -> int { return 8 * scale * strlen(text); }

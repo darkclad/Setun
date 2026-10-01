@@ -1,0 +1,701 @@
+// trwm: the Trinux window system (a display server and window manager).
+//
+//   trwm [client ...]      e.g. trwm term clock
+//
+// It owns /dev/fb0 (mapped, 640x480), /dev/mouse and /dev/kbd, draws a
+// panel with launchers, and composites one window per client from the
+// pixels it keeps for them (the protocol is in lib/trw.tri). Click a title
+// bar to raise and drag a window, the box at its right end to close it;
+// keys go to the window in front. The panel's [Exit] ends the session and
+// gives the screen back to the text console.
+//
+// It logs to standard error, which tests read: "trwm: window 2 'Clock'
+// (pid 7)", "trwm: window 2 closed", "trwm: client 3: bad request".
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/gfx.tri";
+import "../lib/trw.tri";
+
+const MAXWIN: int = 9;
+const PANEL_H: int = 16;
+const TITLE_H: int = 14;
+const BORDER: int = 2;
+const RBUF: int = 6561;               // trytes of unparsed requests per client
+
+struct Win {
+    used: int;
+    created: int;
+    pid: int;
+    req_fd: int;                      // we read requests here
+    ev_fd: int;                       // and write events here
+    x: int;                           // the content's top-left on the screen
+    y: int;
+    w: int;
+    h: int;
+    pixels: *tryte;
+    title: [41]char;
+    rbuf: [6561]tryte;
+    rlen: int;
+    pressed: int;                     // a mouse button went down in the content
+}
+
+var wins: [9]Win;
+var order: [9]int;                    // bottom to top
+var norder: int;
+var screen: Surface;
+var fb_fd: int;
+var mouse_fd: int;
+var kbd_fd: int;
+var mx: int;
+var my: int;
+var mbuttons: int;
+var drag: int = -1;                   // the window being dragged
+var drag_dx: int;
+var drag_dy: int;
+var shift: int;
+var ctrl: int;
+var running: int = 1;
+var dirty: int;                       // the damage rectangle
+var dx0: int;
+var dy0: int;
+var dx1: int;
+var dy1: int;
+
+const DESK: int = -6 * 729 + -1 * 27 + 3;        // a ternary teal
+const PANEL: int = -9 * 729 - 9 * 27 - 8 * 1;
+const TITLE_ON: int = -10 * 729 - 6 * 27 + 8;
+const TITLE_OFF: int = -4 * 729 - 4 * 27 - 3;
+const FRAME: int = -11 * 729 - 11 * 27 - 11;
+
+fn log2(a: *char, b: *char) {
+    fputs(STDERR_FILENO, "trwm: ");
+    fputs(STDERR_FILENO, a);
+    if (b != null) { fputs(STDERR_FILENO, b); }
+    fputs(STDERR_FILENO, "\n");
+}
+
+fn log_window(w: int, what: *char) {
+    var b: [15]char;
+    fputs(STDERR_FILENO, "trwm: window ");
+    fputs(STDERR_FILENO, itoa(w, &b[0]));
+    fputs(STDERR_FILENO, what);
+}
+
+// ---- damage and drawing ------------------------------------------------------------------
+
+fn damage(x: int, y: int, w: int, h: int) {
+    if (w <= 0 || h <= 0) { return; }
+    if (!dirty) { dx0 = x; dy0 = y; dx1 = x + w; dy1 = y + h; dirty = 1; return; }
+    if (x < dx0) { dx0 = x; }
+    if (y < dy0) { dy0 = y; }
+    if (x + w > dx1) { dx1 = x + w; }
+    if (y + h > dy1) { dy1 = y + h; }
+}
+
+fn damage_window(i: int) {
+    var w: *Win = &wins[i];
+    damage(w.x - BORDER, w.y - TITLE_H - BORDER, w.w + 2 * BORDER, w.h + TITLE_H + 2 * BORDER);
+}
+
+fn top_window() -> int { return norder > 0 ? order[norder - 1] : -1; }
+
+struct Button {
+    x: int;
+    label: *char;
+    prog: *char;
+}
+
+var buttons: [5]Button;
+
+fn panel_init() {
+    var labels: [5]*char = { "Terminal", "Clock", "Colors", "Paint", "Exit" };
+    var progs: [5]*char = { "/bin/term", "/bin/clock", "/bin/colors", "/bin/paint", null };
+    var x: int = 72;
+    var k: int = 0;
+    while (k < 5) {
+        buttons[k].x = x;
+        buttons[k].label = labels[k];
+        buttons[k].prog = progs[k];
+        x += text_width(labels[k], 1) + 16;
+        k += 1;
+    }
+}
+
+// Repainting: the damage rectangle is drawn into a scratch buffer of its
+// size (desktop, panel, windows bottom to top, all shifted by its origin),
+// then copied to the screen row by row. gfx routines clip to the buffer, so
+// whatever lies outside the rectangle costs nothing.
+var scratch: *tryte;
+var scratch_size: int;
+
+fn scratch_surface(w: int, h: int, out: *Surface) -> int {
+    if (w * h > scratch_size) {
+        if (scratch != null) { free(scratch); }
+        scratch = malloc(w * h);
+        if (scratch == null) { scratch_size = 0; return 0; }
+        scratch_size = w * h;
+    }
+    out.data = scratch;
+    out.w = w;
+    out.h = h;
+    return 1;
+}
+
+// Render (ox, oy, w, h) of the screen entirely in a scratch buffer, then copy.
+fn render_rect(ox: int, oy: int, w: int, h: int) {
+    var s: Surface;
+    if (!scratch_surface(w, h, &s)) { return; }
+    gfx_fill(s.data, DESK, w * h);
+    // panel
+    if (oy < PANEL_H) {
+        var p: Surface;
+        p.data = s.data;
+        p.w = w;
+        p.h = h;
+        draw_panel_at(&p, -ox, -oy);
+    }
+    var k: int = 0;
+    while (k < norder) {
+        draw_window_at(&s, order[k], k == norder - 1, -ox, -oy);
+        k += 1;
+    }
+    var row: int = 0;
+    while (row < h) {
+        gfx_copy(&screen.data[(oy + row) * screen.w + ox], &s.data[row * w], w);
+        row += 1;
+    }
+}
+
+// The panel drawn with its origin moved by (ox, oy).
+fn draw_panel_at(s: *Surface, ox: int, oy: int) {
+    fill_rect(s, ox, oy, screen.w, PANEL_H, PANEL);
+    draw_text(s, ox + 6, oy + 4, "Trinux", rgb(13, 10, 0), TRANSPARENT, 1);
+    var k: int = 0;
+    while (k < 5) {
+        var w: int = text_width(buttons[k].label, 1) + 8;
+        fill_rect(s, ox + buttons[k].x, oy + 2, w, PANEL_H - 4, k == 4 ? rgb(4, -10, -10) : rgb(-6, -6, -2));
+        draw_text(s, ox + buttons[k].x + 4, oy + 4, buttons[k].label, WHITE, TRANSPARENT, 1);
+        k += 1;
+    }
+}
+
+fn draw_window_at(s: *Surface, i: int, focused: int, ox: int, oy: int) {
+    var w: *Win = &wins[i];
+    var x: int = w.x + ox;
+    var y: int = w.y + oy;
+    fill_rect(s, x - BORDER, y - TITLE_H - BORDER, w.w + 2 * BORDER, w.h + TITLE_H + 2 * BORDER, FRAME);
+    fill_rect(s, x, y - TITLE_H, w.w, TITLE_H - 1, focused ? TITLE_ON : TITLE_OFF);
+    draw_text(s, x + 4, y - TITLE_H + 3, &w.title[0], WHITE, TRANSPARENT, 1);
+    var cx: int = x + w.w - 12;
+    fill_rect(s, cx, y - TITLE_H + 2, 10, 9, rgb(10, -8, -8));
+    draw_char(s, cx + 1, y - TITLE_H + 3, 'x', WHITE, TRANSPARENT, 1);
+    var content: Surface;
+    content.data = w.pixels;
+    content.w = w.w;
+    content.h = w.h;
+    blit(s, x, y, &content, 0, 0, w.w, w.h);
+}
+
+fn flush_damage() {
+    if (!dirty) { return; }
+    dirty = 0;
+    if (dx0 < 0) { dx0 = 0; }
+    if (dy0 < 0) { dy0 = 0; }
+    if (dx1 > screen.w) { dx1 = screen.w; }
+    if (dy1 > screen.h) { dy1 = screen.h; }
+    if (dx0 >= dx1 || dy0 >= dy1) { return; }
+    render_rect(dx0, dy0, dx1 - dx0, dy1 - dy0);
+}
+
+// ---- windows and clients ----------------------------------------------------------------
+
+fn raise_window(i: int) {
+    var k: int = 0;
+    while (k < norder && order[k] != i) { k += 1; }
+    if (k == norder) { return; }
+    var old_top: int = top_window();
+    while (k < norder - 1) { order[k] = order[k + 1]; k += 1; }
+    order[norder - 1] = i;
+    if (old_top != i) {
+        if (old_top >= 0) { damage_window(old_top); send_event(old_top, TRW_FOCUS, 0, 0, 0, 1); }
+        damage_window(i);
+        send_event(i, TRW_FOCUS, 1, 0, 0, 1);
+    }
+}
+
+fn send_event(i: int, type: int, a: int, b: int, c: int, n: int) {
+    var w: *Win = &wins[i];
+    if (!w.used) { return; }
+    var m: [5]int = { type, n, a, b, c };
+    write(w.ev_fd, bytes(&m[0]) as *char, 3 * (2 + n));     // non-blocking: dropped if the client lags
+}
+
+fn close_window(i: int, why: *char) {
+    var w: *Win = &wins[i];
+    if (!w.used) { return; }
+    if (w.created) { damage_window(i); }
+    close(w.req_fd);
+    close(w.ev_fd);
+    if (w.pixels != null) { free(w.pixels); }
+    w.pixels = null;
+    w.used = 0;
+    w.created = 0;
+    var k: int = 0;
+    while (k < norder && order[k] != i) { k += 1; }
+    if (k < norder) {
+        while (k < norder - 1) { order[k] = order[k + 1]; k += 1; }
+        norder -= 1;
+    }
+    if (drag == i) { drag = -1; }
+    log_window(i, " closed");
+    if (why != null) { fputs(STDERR_FILENO, " ("); fputs(STDERR_FILENO, why); fputs(STDERR_FILENO, ")"); }
+    fputs(STDERR_FILENO, "\n");
+    if (norder > 0) { send_event(top_window(), TRW_FOCUS, 1, 0, 0, 1); }
+}
+
+fn spawn(path: *char) -> int {
+    var i: int = 0;
+    while (i < MAXWIN && wins[i].used) { i += 1; }
+    if (i == MAXWIN) { log2("too many windows; not starting ", path); return -1; }
+    var req: [2]int;
+    var ev: [2]int;
+    if (pipe(&req[0]) < 0 || pipe(&ev[0]) < 0) { log2("pipe failed for ", path); return -1; }
+    var pid: int = fork();
+    if (pid < 0) { log2("fork failed for ", path); return -1; }
+    if (pid == 0) {
+        dup2(req[1], TRW_REQ_FD);
+        dup2(ev[0], TRW_EV_FD);
+        var fd: int = 5;
+        while (fd < 27) { close(fd); fd += 1; }
+        signal(SIGPIPE, SIG_DFL);
+        var argv: [2]*char = { path, null };
+        execv(path, &argv[0]);
+        perror2("trwm", path);
+        _exit(127);
+    }
+    close(req[1]);
+    close(ev[0]);
+    fcntl(ev[1], F_SETFL, O_NONBLOCK);
+    fcntl(req[0], F_SETFD, FD_CLOEXEC);
+    fcntl(ev[1], F_SETFD, FD_CLOEXEC);
+    var w: *Win = &wins[i];
+    w.used = 1;
+    w.created = 0;
+    w.pid = pid;
+    w.req_fd = req[0];
+    w.ev_fd = ev[1];
+    w.rlen = 0;
+    w.pixels = null;
+    w.pressed = 0;
+    strncpy(&w.title[0], path, 40);
+    w.title[40] = 0;
+    return i;
+}
+
+fn bad_request(i: int, why: *char) {
+    var b: [15]char;
+    fputs(STDERR_FILENO, "trwm: client ");
+    fputs(STDERR_FILENO, itoa(i, &b[0]));
+    fputs(STDERR_FILENO, ": bad request (");
+    fputs(STDERR_FILENO, why);
+    fputs(STDERR_FILENO, ")\n");
+    kill(wins[i].pid, SIGTERM);
+    close_window(i, "bad request");
+}
+
+fn text_arg(args: *int, from: int, n: int, out: *char, max: int) {
+    var k: int = 0;
+    while (from + k < n && k < max - 1) {
+        var c: int = args[from + k];
+        out[k] = c >= 0 && c <= 9841 ? c as char : '?';
+        k += 1;
+    }
+    out[k] = 0;
+}
+
+// Carry out one request. Returns 0, or -1 if the client is cut off.
+fn handle_request(i: int, op: int, args: *int, n: int) -> int {
+    var w: *Win = &wins[i];
+    if (!w.created && op != TRW_CREATE) { bad_request(i, "no window yet"); return -1; }
+    var s: Surface;
+    s.data = w.pixels;
+    s.w = w.w;
+    s.h = w.h;
+    switch (op) {
+        case TRW_CREATE: {
+            if (w.created || n < 2 || args[0] < 8 || args[1] < 8 || args[0] > 620 || args[1] > 440) {
+                bad_request(i, "bad CREATE");
+                return -1;
+            }
+            w.w = args[0];
+            w.h = args[1];
+            w.pixels = malloc(w.w * w.h);
+            if (w.pixels == null) { bad_request(i, "out of memory"); return -1; }
+            gfx_fill(w.pixels, WHITE, w.w * w.h);
+            text_arg(args, 2, n, &w.title[0], 41);
+            var k: int = 0;
+            var used: int = 0;
+            while (k < MAXWIN) { if (wins[k].created) { used += 1; } k += 1; }
+            w.x = 24 + 28 * used;
+            w.y = PANEL_H + TITLE_H + 12 + 24 * used;
+            if (w.x + w.w > screen.w) { w.x = screen.w - w.w - BORDER; }
+            if (w.y + w.h > screen.h) { w.y = screen.h - w.h - BORDER; }
+            w.created = 1;
+            order[norder] = i;
+            norder += 1;
+            raise_window(i);
+            damage_window(i);
+            var b: [15]char;
+            log_window(i, " '");
+            fputs(STDERR_FILENO, &w.title[0]);
+            fputs(STDERR_FILENO, "' (pid ");
+            fputs(STDERR_FILENO, itoa(w.pid, &b[0]));
+            fputs(STDERR_FILENO, ")\n");
+        }
+        case TRW_FILL: {
+            if (n != 5) { bad_request(i, "bad FILL"); return -1; }
+            fill_rect(&s, args[0], args[1], args[2], args[3], args[4]);
+        }
+        case TRW_TEXT: {
+            if (n < 5 || args[4] < 1 || args[4] > 8) { bad_request(i, "bad TEXT"); return -1; }
+            var t: [243]char;
+            text_arg(args, 5, n, &t[0], 243);
+            draw_text(&s, args[0], args[1], &t[0], args[2], args[3], args[4]);
+        }
+        case TRW_PIXELS: {
+            if (n < 4 || args[2] <= 0 || args[3] <= 0 || args[2] * args[3] != n - 4) { bad_request(i, "bad PIXELS"); return -1; }
+            // clip once per row, then store straight into the window's pixels
+            var px0: int = args[0];
+            var pw: int = args[2];
+            var x0: int = px0 < 0 ? -px0 : 0;
+            var x1: int = px0 + pw > s.w ? s.w - px0 : pw;
+            var y: int = 0;
+            while (y < args[3]) {
+                var yy: int = args[1] + y;
+                if (yy >= 0 && yy < s.h) {
+                    var dst: *tryte = &s.data[yy * s.w + px0];
+                    var src: *int = &args[4 + y * pw];
+                    var x: int = x0;
+                    while (x < x1) { dst[x] = src[x] as tryte; x += 1; }
+                }
+                y += 1;
+            }
+        }
+        case TRW_SCROLL: {
+            if (n != 6) { bad_request(i, "bad SCROLL"); return -1; }
+            scroll_rect(&s, args[0], args[1], args[2], args[3], args[4], args[5]);
+        }
+        case TRW_FLUSH: {
+            if (n != 0) { bad_request(i, "bad FLUSH"); return -1; }
+            damage(w.x, w.y, w.w, w.h);
+        }
+        case TRW_TITLE: {
+            text_arg(args, 0, n, &w.title[0], 41);
+            damage_window(i);
+        }
+        case TRW_SPAWN: {
+            var path: [81]char;
+            text_arg(args, 0, n, &path[0], 81);
+            if (path[0] != '/') { bad_request(i, "SPAWN needs an absolute path"); return -1; }
+            spawn(&path[0]);
+        }
+        default: {
+            bad_request(i, "unknown op");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+var msg: [2187]int;
+
+// Read what client i sent and act on every complete message.
+fn client_input(i: int) {
+    var w: *Win = &wins[i];
+    var room: int = RBUF - w.rlen;
+    var r: int = read(w.req_fd, &w.rbuf[w.rlen] as *char, room);
+    if (r <= 0) {
+        if (r < 0 && (errno == EINTR || errno == EAGAIN)) { return; }
+        close_window(i, null);
+        return;
+    }
+    w.rlen += r;
+    var at: int = 0;
+    loop {
+        if (w.rlen - at < 6) { break; }
+        var op: int = word_of(&w.rbuf[at]);
+        var n: int = word_of(&w.rbuf[at + 3]);
+        if (n < 0 || n + 2 > TRW_MAX_MSG) { bad_request(i, "bad length"); return; }
+        if (w.rlen - at < 3 * (n + 2)) {
+            if (3 * (n + 2) > RBUF) { bad_request(i, "message too long"); return; }
+            break;
+        }
+        var k: int = 0;
+        while (k < n) { msg[k] = word_of(&w.rbuf[at + 6 + 3 * k]); k += 1; }
+        at += 3 * (n + 2);
+        if (handle_request(i, op, &msg[0], n) < 0) { return; }
+        if (!wins[i].used) { return; }
+    }
+    // keep the partial message
+    var j: int = 0;
+    while (at + j < w.rlen) { w.rbuf[j] = w.rbuf[at + j]; j += 1; }
+    w.rlen -= at;
+    if ((w.rlen % 3) != 0 && w.rlen > RBUF - 3) { bad_request(i, "garbled"); }
+}
+
+// ---- input -----------------------------------------------------------------------------------
+
+fn hit_window(x: int, y: int) -> int {
+    var k: int = norder - 1;
+    while (k >= 0) {
+        var i: int = order[k];
+        var w: *Win = &wins[i];
+        if (x >= w.x - BORDER && x < w.x + w.w + BORDER && y >= w.y - TITLE_H - BORDER && y < w.y + w.h + BORDER) { return i; }
+        k -= 1;
+    }
+    return -1;
+}
+
+fn quit_session() {
+    log2("exit", null);
+    running = 0;
+}
+
+fn mouse_press(x: int, y: int, b: int) {
+    if (y < PANEL_H) {
+        var k: int = 0;
+        while (k < 5) {
+            var bw: int = text_width(buttons[k].label, 1) + 8;
+            if (x >= buttons[k].x && x < buttons[k].x + bw) {
+                if (buttons[k].prog == null) { quit_session(); } else { spawn(buttons[k].prog); }
+                return;
+            }
+            k += 1;
+        }
+        return;
+    }
+    var i: int = hit_window(x, y);
+    if (i < 0) { return; }
+    var w: *Win = &wins[i];
+    raise_window(i);
+    if (y < w.y) {
+        if (x >= w.x + w.w - 12 && x < w.x + w.w - 2) {
+            send_event(i, TRW_CLOSE, 0, 0, 0, 0);
+            return;
+        }
+        drag = i;
+        drag_dx = x - w.x;
+        drag_dy = y - w.y;
+        return;
+    }
+    if (x >= w.x && x < w.x + w.w && y < w.y + w.h) {
+        w.pressed = 1;
+        send_event(i, TRW_BUTTON, x - w.x, y - w.y, b, 3);
+    }
+}
+
+fn mouse_event(x: int, y: int, b: int) {
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    if (x >= screen.w) { x = screen.w - 1; }
+    if (y >= screen.h) { y = screen.h - 1; }
+    var moved: int = x != mx || y != my;
+    var was: int = mbuttons;
+    mx = x;
+    my = y;
+    mbuttons = b;
+    var cur: fb_cursor;
+    cur.x = x;
+    cur.y = y;
+    cur.enable = 1;
+    ioctl(fb_fd, FBIO_CURSOR, &cur as int);
+    if (b % 3 != 0 && was % 3 == 0) { mouse_press(x, y, b); return; }       // left button went down
+    if (b % 3 == 0 && was % 3 != 0) {
+        drag = -1;
+        var k: int = 0;
+        while (k < MAXWIN) {
+            if (wins[k].used && wins[k].pressed) {
+                wins[k].pressed = 0;
+                send_event(k, TRW_BUTTON, x - wins[k].x, y - wins[k].y, b, 3);
+            }
+            k += 1;
+        }
+        return;
+    }
+    if (moved && drag >= 0) {
+        var w: *Win = &wins[drag];
+        damage_window(drag);
+        w.x = x - drag_dx;
+        w.y = y - drag_dy;
+        if (w.y - TITLE_H - BORDER < PANEL_H) { w.y = PANEL_H + TITLE_H + BORDER; }
+        damage_window(drag);
+        return;
+    }
+    if (moved) {
+        var t: int = top_window();
+        if (t >= 0 && wins[t].pressed) { send_event(t, TRW_MOTION, x - wins[t].x, y - wins[t].y, b, 3); }
+    }
+}
+
+// HID usage codes to characters, as the console keyboard does.
+fn hid_char(code: int) -> int {
+    var s: int = shift;
+    if (code >= 4 && code <= 29) {
+        if (ctrl) { return code - 3; }
+        return (s ? 'A' : 'a') + code - 4;
+    }
+    if (code >= 30 && code <= 39) {
+        var digits: *char = s ? "!@#$%^&*()" : "1234567890";
+        return digits[code - 30];
+    }
+    switch (code) {
+        case 40: return '\n';
+        case 41: return 27;
+        case 42: return 127;
+        case 43: return '\t';
+        case 44: return ' ';
+        case 45: return s ? '_' : '-';
+        case 46: return s ? '+' : '=';
+        case 47: return s ? '{' : '[';
+        case 48: return s ? '}' : ']';
+        case 49: return s ? '|' : '\\';
+        case 51: return s ? ':' : ';';
+        case 52: return s ? '"' : '\'';
+        case 53: return s ? '~' : '`';
+        case 54: return s ? '<' : ',';
+        case 55: return s ? '>' : '.';
+        case 56: return s ? '?' : '/';
+    }
+    return 0;
+}
+
+fn key_event(ev: int) {
+    var code: int = ev < 0 ? -ev : ev;
+    var down: int = ev > 0;
+    if (code == 225 || code == 229) { shift = down; return; }
+    if (code == 224 || code == 228) { ctrl = down; return; }
+    if (!down) { return; }
+    var c: int = hid_char(code);
+    var t: int = top_window();
+    if (c != 0 && t >= 0) { send_event(t, TRW_KEY, c, 0, 0, 1); }
+}
+
+// ---- main loop -----------------------------------------------------------------------------
+
+fn reap() {
+    loop {
+        var st: int;
+        var pid: int = waitpid(-1, &st, WNOHANG);
+        if (pid <= 0) { return; }
+        var k: int = 0;
+        while (k < MAXWIN) {
+            if (wins[k].used && wins[k].pid == pid) { close_window(k, "exited"); }
+            k += 1;
+        }
+    }
+}
+
+fn setup() -> int {
+    fb_fd = open("/dev/fb0", O_RDWR, 0);
+    if (fb_fd < 0) { perror2("trwm", "/dev/fb0"); return -1; }
+    mouse_fd = open("/dev/mouse", O_RDONLY + O_NONBLOCK, 0);
+    if (mouse_fd < 0) { perror2("trwm", "/dev/mouse"); return -1; }
+    kbd_fd = open("/dev/kbd", O_RDONLY + O_NONBLOCK, 0);
+    if (kbd_fd < 0) { perror2("trwm", "/dev/kbd"); return -1; }
+    if (font_load("/usr/share/font8x8") < 0) { perror2("trwm", "/usr/share/font8x8"); return -1; }
+    var info: fb_info;
+    info.mode = 0;
+    if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &info as int) < 0) { perror2("trwm", "set mode"); return -1; }
+    ioctl(fb_fd, FBIOGET_VSCREENINFO, &info as int);
+    var addr: int = mmap(0, info.pitch * info.yres, PROT_READ + PROT_WRITE, MAP_SHARED, fb_fd, 0);
+    if (addr == -1) { perror2("trwm", "mmap"); return -1; }
+    screen.data = addr as *tryte;
+    screen.w = info.xres;
+    screen.h = info.yres;
+    fcntl(fb_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(mouse_fd, F_SETFD, FD_CLOEXEC);
+    fcntl(kbd_fd, F_SETFD, FD_CLOEXEC);
+    signal(SIGPIPE, SIG_IGN);
+    panel_init();
+    mx = screen.w / 2;
+    my = screen.h / 2;
+    damage(0, 0, screen.w, screen.h);
+    var b1: [15]char;
+    var b2: [15]char;
+    fputs(STDERR_FILENO, "trwm: started ");
+    fputs(STDERR_FILENO, itoa(screen.w, &b1[0]));
+    fputs(STDERR_FILENO, "x");
+    fputs(STDERR_FILENO, itoa(screen.h, &b2[0]));
+    fputs(STDERR_FILENO, "\n");
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (setup() < 0) { return 1; }
+    var a: int = 1;
+    while (a < argc) {
+        var path: [81]char;
+        if (argv[a][0] == '/') { strncpy(&path[0], argv[a], 80); }
+        else { strcpy(&path[0], "/bin/"); strncat(&path[0], argv[a], 70); }
+        path[80] = 0;
+        spawn(&path[0]);
+        a += 1;
+    }
+    while (running) {
+        flush_damage();
+        var p: [11]pollfd;
+        var who: [11]int;
+        var n: int = 0;
+        p[0].fd = mouse_fd;
+        p[0].events = POLLIN;
+        p[1].fd = kbd_fd;
+        p[1].events = POLLIN;
+        n = 2;
+        var k: int = 0;
+        while (k < MAXWIN) {
+            if (wins[k].used) {
+                p[n].fd = wins[k].req_fd;
+                p[n].events = POLLIN;
+                who[n] = k;
+                n += 1;
+            }
+            k += 1;
+        }
+        var r: int = poll(&p[0], n, 500);
+        reap();
+        if (r < 0) { if (errno == EINTR) { continue; } break; }
+        if (p[0].revents != 0) {
+            var ev: [36]int;
+            var got: int = read(mouse_fd, bytes(&ev[0]) as *char, 108);
+            var j: int = 0;
+            while (got > 0 && j < got / 18) {
+                mouse_event(ev[6 * j], ev[6 * j + 1], ev[6 * j + 2]);
+                j += 1;
+            }
+        }
+        if (p[1].revents != 0) {
+            var kev: [27]int;
+            var got2: int = read(kbd_fd, bytes(&kev[0]) as *char, 81);
+            var j2: int = 0;
+            while (got2 > 0 && j2 < got2 / 3) { key_event(kev[j2]); j2 += 1; }
+        }
+        k = 2;
+        while (k < n) {
+            if (p[k].revents != 0 && wins[who[k]].used) { client_input(who[k]); }
+            k += 1;
+        }
+    }
+    // the end of the session: clients go, the console comes back
+    var i: int = 0;
+    while (i < MAXWIN) {
+        if (wins[i].used) { kill(wins[i].pid, SIGTERM); close_window(i, "session over"); }
+        i += 1;
+    }
+    var info: fb_info;
+    info.mode = -1;
+    ioctl(fb_fd, FBIOPUT_VSCREENINFO, &info as int);
+    close(fb_fd);
+    return 0;
+}

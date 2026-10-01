@@ -248,6 +248,91 @@ struct utsname {
     domainname: [65]char;
 }
 fn uname(u: *utsname) -> int { return _ret(syscall(160, u)); }
+
+// ---- poll.h ---------------------------------------------------------------------------
+
+struct pollfd {
+    fd: int;
+    events: int;
+    revents: int;
+}
+
+const POLLIN: int = 1;
+const POLLOUT: int = 4;
+const POLLERR: int = 8;
+const POLLHUP: int = 16;
+const POLLNVAL: int = 32;
+const O_NONBLOCK: int = 2048;
+const EAGAIN: int = 11;
+
+// poll: timeout in milliseconds, -1 = forever.
+fn poll(fds: *pollfd, n: int, timeout_ms: int) -> int {
+    if (timeout_ms < 0) { return _ret(syscall(73, fds, n, 0, 0)); }
+    var ts: [2]int;
+    ts[0] = timeout_ms / 1000;
+    ts[1] = timeout_ms % 1000 * 1000000;
+    return _ret(syscall(73, fds, n, &ts[0], 0));
+}
+
+// ---- sys/mman.h (the framebuffer is the only mappable file) -----------------------------
+
+const PROT_READ: int = 1;
+const PROT_WRITE: int = 2;
+const MAP_SHARED: int = 1;
+const MAP_FAILED: int = -1;
+
+// User addresses are negative here (user space is the negative half), so
+// only -1..-4095 are errors, as Linux does it.
+fn mmap(addr: int, len: int, prot: int, flags: int, fd: int, off: int) -> int {
+    var r: int = syscall(222, addr, len, prot, flags, fd, off);
+    if (r < 0 && r > -4096) { errno = -r; return MAP_FAILED; }
+    return r;
+}
+fn munmap(addr: int, len: int) -> int { return _ret(syscall(215, addr, len)); }
+
+// ---- pseudo-terminals (stdlib.h) ------------------------------------------------------
+
+const TIOCGPTN: int = 2147767344;
+const TIOCSPTLCK: int = 1074025521;
+const TIOCSWINSZ: int = 21524;
+
+fn posix_openpt(flags: int) -> int { return open("/dev/ptmx", flags, 0); }
+fn grantpt(fd: int) -> int { return 0; }              // single-user: nothing to grant
+fn unlockpt(fd: int) -> int {
+    var zero: int = 0;
+    return ioctl(fd, TIOCSPTLCK, &zero as int);
+}
+
+// ptsname_r: the slave's path ("/dev/pts/N") into buf.
+fn ptsname_r(fd: int, buf: *char, size: int) -> int {
+    var n: int;
+    if (ioctl(fd, TIOCGPTN, &n as int) < 0) { return -1; }
+    if (size < 12) { errno = ERANGE; return -1; }
+    var p: *char = "/dev/pts/";
+    var k: int = 0;
+    while (p[k] != 0) { buf[k] = p[k]; k += 1; }
+    itoa(n, &buf[k]);
+    return 0;
+}
+
+// ---- the framebuffer (linux/fb.h, Trinux's word layout) --------------------------------
+
+const FBIOGET_VSCREENINFO: int = 17920;
+const FBIOPUT_VSCREENINFO: int = 17921;
+const FBIO_CURSOR: int = 17928;
+
+struct fb_info {
+    xres: int;
+    yres: int;
+    pitch: int;
+    mode: int;                         // -1 text, 0 = 640x480, 1 = 800x600
+}
+
+struct fb_cursor {
+    x: int;
+    y: int;
+    enable: int;
+}
 fn brk(addr: int) -> int { return syscall(214, addr); }
 
 // getcwd: the working directory into buf; returns buf, or null.

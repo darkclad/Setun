@@ -77,9 +77,14 @@ fn file_close(f: int) {
     if (files[f].refs > 0) { return; }
     var i: int = files[f].ino;
     if (inodes[i].type == I_FIFO) { pipe_close(inodes[i].rdev, writable(f)); }
+    if (inodes[i].type == I_CHR) { dev_close(inodes[i].rdev, f); }
     inodes[i].opens -= 1;
     inode_release(i);
 }
+
+const O_NONBLOCK_: int = 2048;
+
+fn nonblocking(f: int) -> int { return has(files[f].flags, O_NONBLOCK_); }
 
 fn file_read(f: int, buf: *tryte, n: int) -> int {
     if (!readable(f)) { return -EBADF; }
@@ -87,8 +92,8 @@ fn file_read(f: int, buf: *tryte, n: int) -> int {
     var node: *Inode = &inodes[i];
     switch (node.type) {
         case I_DIR: return -EISDIR;
-        case I_FIFO: return pipe_read(node.rdev, buf, n);
-        case I_CHR: return dev_read(node.rdev, buf, n);
+        case I_FIFO: return pipe_read(node.rdev, buf, n, nonblocking(f));
+        case I_CHR: return dev_read(node.rdev, f, buf, n, nonblocking(f));
     }
     var r: int = vfs_read(i, files[f].pos, buf, n);
     if (r > 0) { files[f].pos += r; }
@@ -101,8 +106,8 @@ fn file_write(f: int, buf: *tryte, n: int) -> int {
     var node: *Inode = &inodes[i];
     switch (node.type) {
         case I_DIR: return -EISDIR;
-        case I_FIFO: return pipe_write(node.rdev, buf, n);
-        case I_CHR: return dev_write(node.rdev, buf, n);
+        case I_FIFO: return pipe_write(node.rdev, buf, n, nonblocking(f));
+        case I_CHR: return dev_write(node.rdev, f, buf, n, nonblocking(f));
     }
     if (has(files[f].flags, O_APPEND)) { files[f].pos = node.size; }
     if (n == 0) { return 0; }
@@ -231,6 +236,14 @@ fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     }
     var f: int = file_alloc(i, flags);
     if (f < 0) { return f; }
+    if (inodes[i].type == I_CHR) {
+        var d: int = dev_open(inodes[i].rdev, f);
+        if (d < 0) {
+            files[f].refs = 0;
+            inodes[i].opens -= 1;
+            return d;
+        }
+    }
     var fd: int = fd_install(f, 0);
     if (fd < 0) { file_close(f); return fd; }
     current_task().fd_cloexec[fd] = has(flags, O_CLOEXEC_) as tryte;
@@ -263,12 +276,13 @@ fn sys_lseek(fd: int, off: int, whence: int) -> int {
     var f: int = fd_file(fd);
     if (f < 0) { return f; }
     var node: *Inode = &inodes[files[f].ino];
-    if (node.type == I_FIFO || node.type == I_CHR) { return -ESPIPE; }
+    var is_fb: int = node.type == I_CHR && node.rdev == DEV_FB0;    // fbdev seeks over its pixels
+    if (node.type == I_FIFO || (node.type == I_CHR && !is_fb)) { return -ESPIPE; }
     var pos: int;
     switch (whence) {
         case SEEK_SET: pos = off;
         case SEEK_CUR: pos = files[f].pos + off;
-        case SEEK_END: pos = node.size + off;
+        case SEEK_END: pos = (is_fb ? fb_size() : node.size) + off;
         default: return -EINVAL;
     }
     if (pos < 0) { return -EINVAL; }
@@ -450,9 +464,9 @@ fn sys_ioctl(fd: int, cmd: int, arg: int) -> int {
     var f: int = fd_file(fd);
     if (f < 0) { return f; }
     var i: int = files[f].ino;
-    if (inodes[i].type != I_CHR || !dev_is_tty(inodes[i].rdev)) { return -25; }   // ENOTTY
+    if (inodes[i].type != I_CHR || !dev_ioctl_known(inodes[i].rdev, f, cmd)) { return -25; }   // ENOTTY
     if (!user_range_ok(arg - 1, sizeof(Termios))) { return -EFAULT; }
-    return tty_ioctl(cmd, arg);
+    return dev_ioctl(inodes[i].rdev, f, cmd, arg);
 }
 
 fn sys_sync() -> int {
@@ -550,4 +564,83 @@ fn sys_reboot(magic1: int, magic2: int, cmd: int) -> int {
         out(SYSCTL_POWER, -1);
     }
     loop { hlt(); }
+}
+
+// ---- poll ------------------------------------------------------------------------------
+
+struct Pollfd {
+    fd: int;
+    events: int;
+    revents: int;
+}
+
+const POLLIN_: int = 1;
+const POLLOUT_: int = 4;
+const POLLERR: int = 8;
+const POLLHUP_: int = 16;
+const POLLNVAL: int = 32;
+const MAX_POLL: int = 81;
+
+// The bits common to two small flag sets (Trine's & is tritwise).
+fn bits_and(a: int, b: int) -> int {
+    var r: int = 0;
+    var bit: int = 1;
+    while (bit <= 32) {
+        if (a / bit % 2 != 0 && b / bit % 2 != 0) { r += bit; }
+        bit *= 2;
+    }
+    return r;
+}
+
+fn file_poll(f: int) -> int {
+    var i: int = files[f].ino;
+    var node: *Inode = &inodes[i];
+    if (node.type == I_FIFO) {
+        var p: int = node.rdev;
+        if (writable(f)) {
+            if (pipes[p].readers == 0) { return POLLERR; }
+            return pipes[p].count < PIPE_SIZE ? POLLOUT_ : 0;
+        }
+        var r: int = 0;
+        if (pipes[p].count > 0) { r += POLLIN_; }
+        if (pipes[p].writers == 0) { r += POLLHUP_; }
+        return r;
+    }
+    if (node.type == I_CHR) { return dev_poll(node.rdev, f); }
+    return POLLIN_ + POLLOUT_;                       // files and directories never block
+}
+
+// ppoll(fds, nfds, timeout, sigmask): timeout null = wait forever.
+fn sys_ppoll(fds: int, nfds: int, tsp: int, sigmask: int) -> int {
+    if (nfds < 0 || nfds > MAX_POLL) { return -EINVAL; }
+    if (nfds > 0 && !user_range_ok(fds - 1, sizeof(Pollfd) * nfds)) { return -EFAULT; }
+    var until: int = -1;
+    if (tsp != 0) {
+        if (!user_range_ok(tsp - 1, 6)) { return -EFAULT; }
+        var ts: *int = tsp as *int;
+        if (ts[0] < 0 || ts[1] < 0 || ts[1] > 999999999) { return -EINVAL; }
+        until = jiffies + ts[0] * HZ + (ts[1] + 9999999) / 10000000;
+    }
+    var pf: *Pollfd = fds as *Pollfd;
+    loop {
+        var count: int = 0;
+        var k: int = 0;
+        while (k < nfds) {
+            var p: *Pollfd = &pf[k];
+            p.revents = 0;
+            if (p.fd >= 0) {
+                var f: int = fd_file(p.fd);
+                if (f < 0) {
+                    p.revents = POLLNVAL;
+                } else {
+                    p.revents = bits_and(file_poll(f), p.events + POLLERR + POLLHUP_);
+                }
+                if (p.revents != 0) { count += 1; }
+            }
+            k += 1;
+        }
+        if (count > 0) { return count; }
+        if (until >= 0 && jiffies >= until) { return 0; }
+        if (sleep_on(POLL_CHAN)) { return -EINTR; }
+    }
 }

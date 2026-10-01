@@ -91,6 +91,7 @@ struct File {
     ino: int;
     pos: int;
     flags: int;                       // O_* flags from open
+    priv: int;                        // per-file device state (ptmx: the pty number)
 }
 
 var files: [243]File;
@@ -657,6 +658,7 @@ fn file_alloc(ino: int, flags: int) -> int {
             files[f].ino = ino;
             files[f].pos = 0;
             files[f].flags = flags;
+            files[f].priv = 0;
             inodes[ino].opens += 1;
             return f;
         }

@@ -1,0 +1,47 @@
+// /bin/badclient: a window-system client that breaks the protocol, for the
+// tests. Its name (it is linked under several) picks the mistake:
+//   nocreate  draws before creating a window
+//   unknown   sends an unknown request
+//   huge      sends an impossible length
+//   crash     creates a window, then dies of SIGSEGV
+//   bigwin    asks for a window larger than the screen
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/trw.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var me: *char = strrchr(argv[0], '/');
+    me = me == null ? argv[0] : &me[1];
+    if (streq(me, "nocreate")) {
+        trw_fill(0, 0, 10, 10, 0);
+        trw_flush();
+    } else if (streq(me, "unknown")) {
+        trw_create(50, 50, "Unknown");
+        trw_msg(99, null, 0, null);
+        trw_flush();
+    } else if (streq(me, "huge")) {
+        trw_create(50, 50, "Huge");
+        var m: [2]int = { TRW_FILL, 99999 };
+        trw_send_now();
+        write(TRW_REQ_FD, bytes(&m[0]) as *char, 6);
+    } else if (streq(me, "crash")) {
+        trw_create(60, 40, "Crash");
+        trw_flush();
+        var t: timespec;
+        t.tv_sec = 1;
+        t.tv_nsec = 0;
+        nanosleep(&t, null);
+        var p: *int = null;
+        return *p;
+    } else if (streq(me, "bigwin")) {
+        trw_create(5000, 50, "Big");
+        trw_flush();
+    }
+    // wait to be cut off (the server closes our pipes) or closed
+    var ev: trw_event;
+    loop {
+        var r: int = trw_wait(&ev, -1, -1);
+        if (r < 0 || (r == 1 && ev.type == TRW_CLOSE)) { return 0; }
+    }
+}

@@ -1,37 +1,179 @@
 // devfs: /dev and the character devices behind it.
 //
-// Device numbers follow Linux (major * 256 + minor). Every terminal node is
-// the one console tty in K4; virtual consoles come with the window system.
+// Device numbers follow Linux (major * 256 + minor):
+//   null 1,3   zero 1,5   ttyS0 4,64   tty 5,0   console 5,1   ptmx 5,2
+//   pts/N 136,N   fb0 29,0   mouse 13,63   kbd 13,64
+// tty, console and ttyS0 are all the console terminal; each open of ptmx
+// makes a new pseudo-terminal whose slave appears as /dev/pts/N.
 
 import "../printk.tri";
 import "vfs.tri";
 import "../drivers/tty.tri";
+import "../drivers/fb.tri";
+import "../drivers/input.tri";
 
 const DEV_NULL: int = 259;            // 1,3
 const DEV_ZERO: int = 261;            // 1,5
 const DEV_TTYS0: int = 1088;          // 4,64
 const DEV_TTY: int = 1280;            // 5,0
 const DEV_CONSOLE: int = 1281;        // 5,1
+const DEV_PTMX: int = 1282;           // 5,2
+const DEV_PTS0: int = 34816;          // 136,0
+const DEV_FB0: int = 7424;            // 29,0
+const DEV_MOUSE: int = 3391;          // 13,63
+const DEV_KBD: int = 3392;            // 13,64
 
-fn dev_is_tty(rdev: int) -> int { return rdev == DEV_TTY || rdev == DEV_CONSOLE || rdev == DEV_TTYS0; }
+const POLLIN: int = 1;
+const POLLOUT: int = 4;
+const POLLHUP: int = 16;
 
-fn dev_read(rdev: int, buf: *tryte, n: int) -> int {
+var pts_dir: int = -1;
+
+// Which terminal a device is: 0..9, or -1.
+fn dev_tty(rdev: int, f: int) -> int {
+    if (rdev == DEV_TTY || rdev == DEV_CONSOLE || rdev == DEV_TTYS0) { return 0; }
+    if (rdev > DEV_PTS0 && rdev < DEV_PTS0 + NTTY) { return rdev - DEV_PTS0; }
+    return -1;
+}
+
+fn dev_is_tty(rdev: int) -> int { return dev_tty(rdev, -1) >= 0; }
+
+// open(2) on a device node: may refuse, may set up per-file state.
+fn dev_open(rdev: int, f: int) -> int {
+    if (rdev == DEV_FB0) { return fb_dev_open(); }
+    if (rdev == DEV_MOUSE) { return mouse_dev_open(); }
+    if (rdev == DEV_KBD) { return kbd_dev_open(); }
+    if (rdev == DEV_PTMX) {
+        var t: int = pty_alloc();
+        if (t < 0) { return t; }
+        files[f].priv = t;
+        devfs_pts_add(t);
+        return 0;
+    }
+    var s: int = dev_tty(rdev, f);
+    if (s > 0) {
+        if (!ttys[s].used || !ttys[s].master_open) { return -5; }       // EIO: no master
+        ttys[s].slave_opens += 1;
+        ttys[s].slave_seen = 1;
+    }
+    return 0;
+}
+
+fn dev_close(rdev: int, f: int) {
+    if (rdev == DEV_FB0) { fb_dev_close(); return; }
+    if (rdev == DEV_MOUSE) { mouse_dev_close(); return; }
+    if (rdev == DEV_KBD) { kbd_dev_close(); return; }
+    if (rdev == DEV_PTMX) { pty_master_close(files[f].priv); return; }
+    var s: int = dev_tty(rdev, f);
+    if (s > 0) {
+        ttys[s].slave_opens -= 1;
+        wake_up(PTM_CHAN + s);
+        pty_release_if_done(s);
+    }
+}
+
+fn dev_read(rdev: int, f: int, buf: *tryte, n: int, nonblock: int) -> int {
     if (rdev == DEV_NULL) { return 0; }
     if (rdev == DEV_ZERO) {
         memset(buf, 0, n);
         return n;
     }
-    return tty_read(buf, n);
+    if (rdev == DEV_PTMX) { return pty_master_read(files[f].priv, buf, n, nonblock); }
+    if (rdev == DEV_FB0) {
+        var r: int = fb_dev_read(files[f].pos, buf, n);
+        if (r > 0) { files[f].pos += r; }
+        return r;
+    }
+    if (rdev == DEV_MOUSE) { return mouse_dev_read(buf, n, nonblock); }
+    if (rdev == DEV_KBD) { return kbd_dev_read(buf, n, nonblock); }
+    var t: int = dev_tty(rdev, f);
+    if (t >= 0) { return tty_read(t, buf, n, nonblock); }
+    return -22;
 }
 
-fn dev_write(rdev: int, buf: *tryte, n: int) -> int {
+fn dev_write(rdev: int, f: int, buf: *tryte, n: int, nonblock: int) -> int {
     if (rdev == DEV_NULL || rdev == DEV_ZERO) { return n; }
-    return tty_write(buf, n);
+    if (rdev == DEV_PTMX) { return pty_master_write(files[f].priv, buf, n); }
+    if (rdev == DEV_FB0) {
+        var r: int = fb_dev_write(files[f].pos, buf, n);
+        if (r > 0) { files[f].pos += r; }
+        return r;
+    }
+    if (rdev == DEV_MOUSE || rdev == DEV_KBD) { return -22; }       // EINVAL: input only
+    var t: int = dev_tty(rdev, f);
+    if (t >= 0) { return tty_write(t, buf, n, nonblock); }
+    return -22;
 }
 
-fn mknod(dir: int, name: *char, rdev: int, mode: int) {
+fn dev_ioctl(rdev: int, f: int, cmd: int, arg: int) -> int {
+    if (rdev == DEV_FB0) { return fb_dev_ioctl(cmd, arg); }
+    if (rdev == DEV_PTMX) {
+        var t: int = files[f].priv;
+        if (cmd == TIOCGPTN) { *(arg as *int) = t; return 0; }
+        if (cmd == TIOCSPTLCK) { return 0; }                         // never locked
+        return tty_ioctl(t, cmd, arg);                               // termios and winsize of the pair
+    }
+    var s: int = dev_tty(rdev, f);
+    if (s >= 0) { return tty_ioctl(s, cmd, arg); }
+    return -25;                                                      // ENOTTY
+}
+
+// Does the device take this ioctl? (Unknown commands are ENOTTY before the
+// argument is looked at, as on Linux.)
+fn dev_ioctl_known(rdev: int, f: int, cmd: int) -> int {
+    if (rdev == DEV_FB0) { return cmd == FBIOGET_VSCREENINFO || cmd == FBIOPUT_VSCREENINFO || cmd == FBIO_CURSOR; }
+    var tty: int = rdev == DEV_PTMX || dev_tty(rdev, f) >= 0;
+    if (!tty) { return 0; }
+    if (rdev == DEV_PTMX && (cmd == TIOCGPTN || cmd == TIOCSPTLCK)) { return 1; }
+    return cmd == TCGETS || cmd == TCSETS || cmd == TCSETSW || cmd == TCSETSF || cmd == TIOCGPGRP
+        || cmd == TIOCSPGRP || cmd == TIOCGWINSZ || cmd == TIOCSWINSZ;
+}
+
+// poll(2) readiness: POLLIN / POLLOUT / POLLHUP.
+fn dev_poll(rdev: int, f: int) -> int {
+    if (rdev == DEV_NULL || rdev == DEV_ZERO || rdev == DEV_FB0) { return POLLIN + POLLOUT; }
+    if (rdev == DEV_MOUSE) { mouse_poll(); return mq_count > 0 ? POLLIN : 0; }
+    if (rdev == DEV_KBD) { tty_poll(); return kq_count > 0 ? POLLIN : 0; }
+    if (rdev == DEV_PTMX) {
+        var t: int = files[f].priv;
+        var m: int = POLLOUT;
+        if (ttys[t].out_count > 0) { m += POLLIN; }
+        if (ttys[t].slave_seen && ttys[t].slave_opens == 0) { m += POLLHUP; }
+        return m;
+    }
+    var s: int = dev_tty(rdev, f);
+    if (s >= 0) {
+        var r: int = 0;
+        if (tty_can_read(s)) { r += POLLIN; }
+        if (hung_up(s)) { r += POLLHUP; }
+        else if (s == 0 || ttys[s].out_count < TTY_BUF) { r += POLLOUT; }
+        return r;
+    }
+    return 0;
+}
+
+fn mknod(dir: int, name: *char, rdev: int, mode: int) -> int {
     var i: int = ram_create(dir, name, strlen(name), I_CHR, mode);
     if (i >= 0) { inodes[i].rdev = rdev; }
+    return i;
+}
+
+fn devfs_pts_add(t: int) {
+    if (pts_dir < 0) { return; }
+    var name: [15]char;
+    itoa(t, &name[0]);
+    mknod(pts_dir, &name[0], DEV_PTS0 + t, 400);     // 0620
+}
+
+fn devfs_pts_remove(t: int) {
+    if (pts_dir < 0) { return; }
+    var name: [15]char;
+    itoa(t, &name[0]);
+    var i: int = ram_lookup(pts_dir, &name[0], strlen(&name[0]));
+    if (i < 0) { return; }
+    ram_dir_remove(pts_dir, i);
+    inodes[i].unlinked = 1;
+    inode_release(i);
 }
 
 // Mount a devfs (a ramfs instance holding the device nodes) on /dev.
@@ -46,5 +188,10 @@ fn devfs_init() -> int {
     mknod(dir, "tty", DEV_TTY, 438);
     mknod(dir, "console", DEV_CONSOLE, 384);    // 0600
     mknod(dir, "ttyS0", DEV_TTYS0, 432);        // 0660
+    mknod(dir, "ptmx", DEV_PTMX, 438);
+    mknod(dir, "fb0", DEV_FB0, 432);
+    mknod(dir, "mouse", DEV_MOUSE, 432);
+    mknod(dir, "kbd", DEV_KBD, 432);
+    pts_dir = ram_create(dir, "pts", 3, I_DIR, 493);
     return 0;
 }
