@@ -349,6 +349,10 @@ fn kbd_event(ev: int) {
     if (kbd_raw_event(ev)) { return; }               // /dev/kbd is open: raw events go there
     var c: int = keymap_event(ev);                    // US or Russian, Alt+Shift switches
     if (c != 0) { tty_receive(0, c as char); }
+    else if (km_seq != null) {                        // arrows and the like: an escape sequence
+        var k: int = 0;
+        while (km_seq[k] != 0) { tty_receive(0, km_seq[k]); k += 1; }
+    }
 }
 
 // Drain the console's input devices into its line discipline.

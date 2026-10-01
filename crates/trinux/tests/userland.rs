@@ -389,6 +389,54 @@ fn sh_aliases_and_local_errors() {
 }
 
 #[test]
+fn sh_line_editing() {
+    let out = session(
+        &[
+            "echo helo\u{1b}[Dl",                         // Left, then insert
+            "echo first",
+            "\u{1b}[A",                                   // Up: the last line again
+            "ec\thi",                                     // Tab completes a command
+            "cat /etc/mo\t",                              // and a file name
+            "true /usr/lib/trwtest/\t\t",                 // the second Tab lists the choices
+            "echo abc def\u{17}ghi",                      // ^W deletes a word
+            "garbage\u{15}echo ok-after-kill",            // ^U the line so far
+            "cho xy\u{1}e\u{5}z",                         // ^A to the start, ^E to the end
+            "echo abd\u{7f}c",                            // Backspace
+            "echo abXc\u{1b}[D\u{1b}[D\u{1b}[3~",         // Delete at the cursor
+            "echo mid\u{1b}[H\u{1b}[F!",                  // Home and End keys
+            "echo kept\u{1b}[A\u{1b}[B",                  // Up then Down brings the typed line back
+            "echo xy\u{1b}[D\u{4}",                       // ^D inside a line deletes
+            "echo \u{1b}[Zok",                            // an unknown sequence is ignored
+            "echo /nonexist\t",                           // Tab without a match does nothing
+            "history",
+            "exit",
+        ],
+        500_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "\nhello\n",
+            "$ echo first\nfirst\n$ \r$ echo first\u{1b}[K\nfirst\n",
+            "$ echo hi\nhi\n",
+            "$ cat /etc/motd \nWelcome to Trinux",
+            "\nbigwin  crash  huge  nocreate  unknown\n",
+            "\nabc ghi\n",
+            "\nok-after-kill\n",
+            "\nxyz\n",
+            "$ echo abd\u{8} \u{8}c\nabc\n",
+            "\nabc\n$ echo mid",
+            "\nmid!\n",
+            "\nkept\n",
+            "\nx\n",
+            "\nok\n",
+            "\n/nonexist\n",
+            "    1  echo hello\n    2  echo first\n    3  echo hi\n",
+        ],
+    );
+}
+
+#[test]
 fn text_tools() {
     let out = session(
         &[

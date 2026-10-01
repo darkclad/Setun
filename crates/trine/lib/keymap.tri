@@ -1,8 +1,9 @@
 // keymap: USB HID usage codes to characters, in two layouts: US and
 // Russian (ЙЦУКЕН, as on Windows). Alt+Shift switches between them (either
 // key first), Caps Lock flips the case of letters, and Ctrl+letter gives a
-// control code by key position in either layout. Each program that imports
-// this keeps its own keyboard state.
+// control code by key position in either layout. The arrows, Home, End,
+// Insert, Delete, Page Up and Page Down type VT100 escape sequences instead
+// (km_seq). Each program that imports this keeps its own keyboard state.
 
 const KM_US: int = 0;
 const KM_RU: int = 1;
@@ -12,6 +13,7 @@ var km_ctrl: int;
 var km_alt: int;
 var km_caps: int;
 var km_layout: int;
+var km_seq: *char;                    // the sequence the last key typed, if any
 
 fn keymap_set_layout(l: int) { km_layout = l == KM_RU ? KM_RU : KM_US; }
 
@@ -79,10 +81,29 @@ fn keymap_char(code: int) -> int {
     return 0;
 }
 
-// A key event (+code pressed, -code released): the character it types, or 0.
+// The escape sequence a key types, or null.
+fn keymap_sequence(code: int) -> *char {
+    switch (code) {
+        case 73: return "\e[2~";                        // Insert
+        case 74: return "\e[H";                         // Home
+        case 75: return "\e[5~";                        // Page Up
+        case 76: return "\e[3~";                        // Delete
+        case 77: return "\e[F";                         // End
+        case 78: return "\e[6~";                        // Page Down
+        case 79: return "\e[C";                         // Right
+        case 80: return "\e[D";                         // Left
+        case 81: return "\e[B";                         // Down
+        case 82: return "\e[A";                         // Up
+    }
+    return null;
+}
+
+// A key event (+code pressed, -code released): the character it types, or
+// 0 (then km_seq holds the escape sequence it types, if any).
 fn keymap_event(ev: int) -> int {
     var code: int = ev < 0 ? -ev : ev;
     var down: int = ev > 0;
+    km_seq = null;
     if (code == 225 || code == 229) {                   // Shift
         if (down && !km_shift && km_alt) { km_layout = 1 - km_layout; }
         km_shift = down;
@@ -96,5 +117,6 @@ fn keymap_event(ev: int) -> int {
     if (code == 224 || code == 228) { km_ctrl = down; return 0; }
     if (!down) { return 0; }
     if (code == 57) { km_caps = !km_caps; return 0; }  // Caps Lock
+    km_seq = keymap_sequence(code);
     return keymap_char(code);
 }

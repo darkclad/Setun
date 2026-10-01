@@ -15,7 +15,8 @@
 // Variables and export; prefix assignments (VAR=x cmd).
 // Builtins: : true false echo cd pwd exit export unset set shift read
 // test [ break continue jobs fg bg kill wait exec umask type eval . return
-// local alias unalias.
+// local alias unalias history. At a terminal, lines are edited with the
+// arrows, history and Tab completion (see "line editing").
 //
 // Function bodies, eval text and . files are lexed and parsed into the tail
 // of src and the token and node arrays, run, and then that tail is dropped
@@ -1944,9 +1945,9 @@ var continue_count: int;
 var loop_depth: int;
 
 fn is_builtin(name: *char) -> int {
-    var list: [31]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
+    var list: [32]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
         "test", "[", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", "eval", ".",
-        "return", "local", "alias", "unalias", null };
+        "return", "local", "alias", "unalias", "history", null };
     var k: int = 0;
     while (list[k] != null) {
         if (streq(list[k], name)) { return 1; }
@@ -2321,6 +2322,21 @@ fn builtin(argc: int, argv: **char) -> int {
     if (streq(name, ".")) { return builtin_dot(argc, argv); }
     if (streq(name, "return")) { return builtin_return(argc, argv); }
     if (streq(name, "local")) { return builtin_local(argc, argv); }
+    if (streq(name, "history")) {
+        var h: int = 0;
+        while (h < nhist) {
+            var nb: [15]char;
+            var num: *char = itoa(h + 1, &nb[0]);
+            var pad: int = strlen(num);
+            while (pad < 5) { puts(" "); pad += 1; }
+            puts(num);
+            puts("  ");
+            puts(hist[h]);
+            puts("\n");
+            h += 1;
+        }
+        return 0;
+    }
     if (streq(name, "alias")) { return builtin_alias(argc, argv); }
     if (streq(name, "unalias")) { return builtin_unalias(argc, argv); }
     if (streq(name, "set")) { return builtin_set(argc, argv); }
@@ -3055,6 +3071,361 @@ fn prompt(name: *char, dflt: *char) {
     fputs(STDERR_FILENO, p == null ? dflt : p);
 }
 
+// ---- line editing --------------------------------------------------------------------------------
+//
+// At a terminal the shell reads each line itself, with the terminal in raw
+// mode (no ICANON or ECHO; ISIG stays on, so ^C still interrupts):
+//   Left Right Home End, ^A ^E    move          Up Down     the history
+//   Backspace Delete ^K ^U ^W     delete        Tab         complete a name
+//   ^D on an empty line           end of input  Enter       done
+// Typing at the end of the line echoes just the character, so the output is
+// what canonical mode would have shown; other edits redraw the line with
+// \r, ESC[K and ESC[nD (the console and the terminal window both have them).
+
+const HIST_MAX: int = 81;
+const ED_MAX: int = 2186;
+
+var hist: [81]*char;                  // oldest first
+var nhist: int;
+var ed_buf: [2187]char;
+var ed_len: int;
+var ed_pos: int;
+var ed_prompt: *char;
+var ed_saved: [2187]char;             // the line being typed while browsing the history
+var ed_hist_at: int;
+var ed_tabs: int;                     // Tabs in a row (the second lists the choices)
+
+fn ed_write(s: *char, n: int) { if (n > 0) { write(STDERR_FILENO, s, n); } }
+fn ed_puts(s: *char) { ed_write(s, strlen(s)); }
+
+fn ed_putc(c: int) {
+    var b: [1]char;
+    b[0] = c as char;
+    ed_write(&b[0], 1);
+}
+
+fn ed_left(n: int) {
+    if (n <= 0) { return; }
+    var b: [15]char;
+    ed_puts("\e[");
+    ed_puts(itoa(n, &b[0]));
+    ed_puts("D");
+}
+
+fn ed_redraw() {
+    ed_puts("\r");
+    ed_puts(ed_prompt);
+    ed_write(&ed_buf[0], ed_len);
+    ed_puts("\e[K");
+    ed_left(ed_len - ed_pos);
+}
+
+// Insert n characters at the cursor.
+fn ed_insert(s: *char, n: int) {
+    if (ed_len + n > ED_MAX) { n = ED_MAX - ed_len; }
+    if (n <= 0) { return; }
+    var at_end: int = ed_pos == ed_len;
+    var k: int = ed_len - 1;
+    while (k >= ed_pos) { ed_buf[k + n] = ed_buf[k]; k -= 1; }
+    k = 0;
+    while (k < n) { ed_buf[ed_pos + k] = s[k]; k += 1; }
+    ed_len += n;
+    ed_pos += n;
+    if (at_end) { ed_write(s, n); } else { ed_redraw(); }
+}
+
+// Delete n characters starting at index i.
+fn ed_delete(i: int, n: int) {
+    if (i < 0) { n += i; i = 0; }
+    if (i + n > ed_len) { n = ed_len - i; }
+    if (n <= 0) { return; }
+    var at_end: int = i + n == ed_len && ed_pos == ed_len;
+    var k: int = i;
+    while (k + n < ed_len) { ed_buf[k] = ed_buf[k + n]; k += 1; }
+    ed_len -= n;
+    if (ed_pos > i + n) { ed_pos -= n; } else if (ed_pos > i) { ed_pos = i; }
+    if (at_end && n == 1) { ed_putc(8); ed_putc(' '); ed_putc(8); } else { ed_redraw(); }   // as ECHOE does
+}
+
+fn ed_load(s: *char) {
+    ed_len = strlen(s);
+    if (ed_len > ED_MAX) { ed_len = ED_MAX; }
+    var k: int = 0;
+    while (k < ed_len) { ed_buf[k] = s[k]; k += 1; }
+    ed_pos = ed_len;
+    ed_redraw();
+}
+
+fn hist_add(s: *char) {
+    if (s[0] == 0) { return; }
+    if (nhist > 0 && streq(hist[nhist - 1], s)) { return; }
+    if (nhist == HIST_MAX) {
+        free(hist[0] as *tryte);
+        var k: int = 1;
+        while (k < nhist) { hist[k - 1] = hist[k]; k += 1; }
+        nhist -= 1;
+    }
+    hist[nhist] = strdup(s);
+    nhist += 1;
+}
+
+fn ed_history(dir: int) {
+    if (dir < 0 && ed_hist_at == 0) { return; }
+    if (dir > 0 && ed_hist_at >= nhist) { return; }
+    if (ed_hist_at == nhist) {                         // leaving the line being typed: keep it
+        var k: int = 0;
+        while (k < ed_len) { ed_saved[k] = ed_buf[k]; k += 1; }
+        ed_saved[ed_len] = 0;
+    }
+    ed_hist_at += dir;
+    ed_load(ed_hist_at == nhist ? &ed_saved[0] : hist[ed_hist_at]);
+}
+
+// ---- completion ----
+
+const CMAX: int = 243;
+var cand: [243]*char;
+var ncand: int;
+
+fn cand_add(s: *char, dir: int) {
+    var k: int = 0;
+    while (k < ncand) { if (strncmp(cand[k], s, strlen(s)) == 0 && strlen(cand[k]) == strlen(s) + dir) { return; } k += 1; }
+    if (ncand == CMAX) { return; }
+    var c: *char = malloc(strlen(s) + 2) as *char;
+    strcpy(c, s);
+    if (dir) { strcat(c, "/"); }
+    cand[ncand] = c;
+    ncand += 1;
+}
+
+fn cand_clear() {
+    var k: int = 0;
+    while (k < ncand) { free(cand[k] as *tryte); k += 1; }
+    ncand = 0;
+}
+
+fn starts_with(s: *char, p: *char, n: int) -> int { return strncmp(s, p, n) == 0; }
+
+// Entries of directory dir starting with prefix p (n characters).
+fn cand_dir(dir: *char, p: *char, n: int, only_programs: int) {
+    var d: *DIR = opendir(dir);
+    if (d == null) { return; }
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        var name: *char = &e.d_name[0];
+        if (name[0] == '.' && p[0] != '.') { continue; }
+        if (streq(name, ".") || streq(name, "..")) { continue; }
+        if (!starts_with(name, p, n)) { continue; }
+        var path: [486]char;
+        strncpy(&path[0], dir, 240);
+        path[240] = 0;
+        strcat(&path[0], "/");
+        strncat(&path[0], name, 240);
+        var st: stat_t;
+        var isdir: int = stat(&path[0], &st) == 0 && S_ISDIR(st.st_mode);
+        if (only_programs && isdir) { continue; }
+        cand_add(name, isdir);
+    }
+    closedir(d);
+}
+
+fn ed_complete() {
+    var ws: int = ed_pos;
+    while (ws > 0 && ed_buf[ws - 1] != ' ' && ed_buf[ws - 1] != '\t' && strchr(";&|<>(", ed_buf[ws - 1]) == null) { ws -= 1; }
+    var word: [243]char;
+    var wl: int = ed_pos - ws;
+    if (wl > 242) { return; }
+    var k: int = 0;
+    while (k < wl) { word[k] = ed_buf[ws + k]; k += 1; }
+    word[wl] = 0;
+    var b: int = ws;
+    while (b > 0 && (ed_buf[b - 1] == ' ' || ed_buf[b - 1] == '\t')) { b -= 1; }
+    var command: int = (b == 0 || strchr(";&|(", ed_buf[b - 1]) != null) && strchr(&word[0], '/') == null;
+    cand_clear();
+    var stem: int = 0;                                  // where the completed part starts in word
+    if (command) {
+        var names: [31]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
+            "test", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", "eval",
+            "return", "local", "alias", "unalias", "history", null, null };
+        k = 0;
+        while (names[k] != null) { if (starts_with(names[k], &word[0], wl)) { cand_add(names[k], 0); } k += 1; }
+        k = 0;
+        while (k < nfuncs) { if (fname[k] != null && starts_with(fname[k], &word[0], wl)) { cand_add(fname[k], 0); } k += 1; }
+        k = 0;
+        while (k < naliases) { if (aname[k] != null && starts_with(aname[k], &word[0], wl)) { cand_add(aname[k], 0); } k += 1; }
+        var path: *char = var_get("PATH");
+        if (path == null) { path = "/bin:/sbin"; }
+        var i: int = 0;
+        loop {
+            var dir: [243]char;
+            var n: int = 0;
+            while (path[i] != 0 && path[i] != ':' && n < 242) { dir[n] = path[i]; n += 1; i += 1; }
+            dir[n] = 0;
+            cand_dir(n == 0 ? "." : &dir[0], &word[0], wl, 1);
+            if (path[i] == 0) { break; }
+            i += 1;
+        }
+    } else {
+        var slash: int = -1;
+        k = 0;
+        while (k < wl) { if (word[k] == '/') { slash = k; } k += 1; }
+        var dir2: [243]char;
+        if (slash < 0) { strcpy(&dir2[0], "."); }
+        else if (slash == 0) { strcpy(&dir2[0], "/"); }
+        else { strncpy(&dir2[0], &word[0], slash); dir2[slash] = 0; }
+        stem = slash + 1;
+        cand_dir(&dir2[0], &word[stem], wl - stem, 0);
+    }
+    if (ncand == 0) { return; }
+    // the longest common prefix of the candidates
+    var common: int = strlen(cand[0]);
+    k = 1;
+    while (k < ncand) {
+        var j: int = 0;
+        while (j < common && cand[k][j] == cand[0][j]) { j += 1; }
+        common = j;
+        k += 1;
+    }
+    var have: int = wl - stem;
+    if (common > have) {
+        ed_insert(&cand[0][have], common - have);
+        if (ncand == 1 && cand[0][common - 1] != '/') { ed_insert(" ", 1); }
+        ed_tabs = 0;
+        return;
+    }
+    if (ncand == 1) {
+        if (cand[0][common - 1] != '/') { ed_insert(" ", 1); }
+        return;
+    }
+    if (ed_tabs < 2) { return; }                       // the second Tab lists them
+    qsort((&cand[0]) as *int, ncand, &cmp_fields);
+    ed_puts("\n");
+    k = 0;
+    while (k < ncand) {
+        if (k > 0) { ed_puts("  "); }
+        ed_puts(cand[k]);
+        k += 1;
+    }
+    ed_puts("\n");
+    ed_redraw();
+}
+
+// One key from the terminal: a character, or one of these for an escape
+// sequence. -1 = interrupted, -2 = end of input.
+const K_UP: int = 100000;
+const K_DOWN: int = 100001;
+const K_RIGHT: int = 100002;
+const K_LEFT: int = 100003;
+const K_HOME: int = 100004;
+const K_END: int = 100005;
+const K_DEL: int = 100006;
+const K_NONE: int = 100007;
+
+fn ed_getc() -> int {
+    var c: [1]char;
+    var r: int = read(STDIN_FILENO, &c[0], 1);
+    if (r < 0) { return errno == EINTR ? -1 : -2; }
+    if (r == 0) { return -2; }
+    return c[0];
+}
+
+fn ed_key() -> int {
+    var c: int = ed_getc();
+    if (c != 27) { return c; }
+    c = ed_getc();
+    if (c < 0) { return c; }
+    if (c != '[' && c != 'O') { return K_NONE; }
+    var num: int = 0;
+    loop {
+        c = ed_getc();
+        if (c < 0) { return c; }
+        if (c >= '0' && c <= '9') { num = num * 10 + c - '0'; continue; }
+        if (c == ';') { continue; }
+        break;
+    }
+    if (c == 'A') { return K_UP; }
+    if (c == 'B') { return K_DOWN; }
+    if (c == 'C') { return K_RIGHT; }
+    if (c == 'D') { return K_LEFT; }
+    if (c == 'H') { return K_HOME; }
+    if (c == 'F') { return K_END; }
+    if (c == '~') {
+        if (num == 1 || num == 7) { return K_HOME; }
+        if (num == 4 || num == 8) { return K_END; }
+        if (num == 3) { return K_DEL; }
+    }
+    return K_NONE;
+}
+
+// Read a line with editing, after prompt p, onto src (with its newline):
+// 1 = a line, 0 = end of input, -1 = interrupted. Falls back to plain
+// reading when standard input is not a terminal.
+fn edit_line_into_src(p: *char) -> int {
+    var saved: termios;
+    if (tcgetattr(STDIN_FILENO, &saved) < 0) {
+        fputs(STDERR_FILENO, p);
+        return read_line_into_src(STDIN_FILENO);
+    }
+    var raw: termios;
+    tcgetattr(STDIN_FILENO, &raw);
+    if (raw.c_lflag / ICANON % 2 != 0) { raw.c_lflag -= ICANON; }
+    if (raw.c_lflag / ECHO % 2 != 0) { raw.c_lflag -= ECHO; }
+    raw.c_cc[VMIN] = 1;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    ed_prompt = p;
+    ed_len = 0;
+    ed_pos = 0;
+    ed_hist_at = nhist;
+    ed_tabs = 0;
+    ed_puts(p);
+    var result: int = 1;
+    loop {
+        var c: int = ed_key();
+        if (c != '\t') { ed_tabs = 0; }
+        if (c == -1) { ed_puts("^C"); result = -1; break; }
+        if (c == -2) { result = ed_len > 0 ? 1 : 0; if (ed_len > 0) { ed_puts("\n"); } break; }
+        if (c == '\n' || c == '\r') { ed_puts("\n"); break; }
+        if (c == 4) {                                   // ^D
+            if (ed_len == 0) { result = 0; break; }
+            ed_delete(ed_pos, 1);
+        } else if (c == 127 || c == 8) { ed_delete(ed_pos - 1, 1); }
+        else if (c == K_DEL) { ed_delete(ed_pos, 1); }
+        else if (c == K_LEFT) { if (ed_pos > 0) { ed_pos -= 1; ed_left(1); } }
+        else if (c == K_RIGHT) { if (ed_pos < ed_len) { ed_pos += 1; ed_puts("\e[C"); } }
+        else if (c == K_HOME || c == 1) { ed_pos = 0; ed_redraw(); }
+        else if (c == K_END || c == 5) { ed_pos = ed_len; ed_redraw(); }
+        else if (c == K_UP) { ed_history(-1); }
+        else if (c == K_DOWN) { ed_history(1); }
+        else if (c == 11) { ed_delete(ed_pos, ed_len - ed_pos); }      // ^K
+        else if (c == 21) { ed_delete(0, ed_pos); }                     // ^U
+        else if (c == 23) {                                             // ^W: the word before the cursor
+            var w: int = ed_pos;
+            while (w > 0 && ed_buf[w - 1] == ' ') { w -= 1; }
+            while (w > 0 && ed_buf[w - 1] != ' ') { w -= 1; }
+            ed_delete(w, ed_pos - w);
+        } else if (c == '\t') { ed_tabs += 1; ed_complete(); }
+        else if (c >= 32 && c < K_UP) {
+            var ch: [1]char;
+            ch[0] = c as char;
+            ed_insert(&ch[0], 1);
+        }
+    }
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    if (result != 1) { return result; }
+    ed_buf[ed_len] = 0;
+    hist_add(&ed_buf[0]);
+    var k: int = 0;
+    while (k < ed_len && src_len < SRC_MAX - 2) { src[src_len] = ed_buf[k]; src_len += 1; k += 1; }
+    if (src_len < SRC_MAX - 2) { src[src_len] = '\n'; src_len += 1; }
+    return 1;
+}
+
+fn prompt_text(name: *char, dflt: *char) -> *char {
+    var p: *char = var_get(name);
+    return p == null ? dflt : p;
+}
+
 fn interactive_loop() -> int {
     loop {
         reap_jobs();
@@ -3062,8 +3433,7 @@ fn interactive_loop() -> int {
         abort_line = 0;
         break_count = 0;
         continue_count = 0;
-        prompt("PS1", "$ ");
-        var r: int = read_line_into_src(STDIN_FILENO);
+        var r: int = edit_line_into_src(prompt_text("PS1", "$ "));
         if (r < 0) { puts("\n"); continue; }
         if (r == 0) { break; }
         // more lines while the command is unfinished
@@ -3082,8 +3452,7 @@ fn interactive_loop() -> int {
                 last_status = 2;
                 break;
             }
-            prompt("PS2", "> ");
-            var r2: int = read_line_into_src(STDIN_FILENO);
+            var r2: int = edit_line_into_src(prompt_text("PS2", "> "));
             if (r2 < 0) { puts("\n"); break; }
             if (r2 == 0) {
                 err("syntax error: unexpected end of file", null);

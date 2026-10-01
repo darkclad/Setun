@@ -558,6 +558,10 @@ fn key_event(ev: int) {
     }
     var t: int = top_window();
     if (c != 0 && t >= 0) { send_event(t, TRW_KEY, c, 0, 0, 1); }
+    if (c == 0 && km_seq != null && t >= 0) {
+        var k: int = 0;
+        while (km_seq[k] != 0) { send_event(t, TRW_KEY, km_seq[k], 0, 0, 1); k += 1; }
+    }
 }
 
 // ---- main loop -----------------------------------------------------------------------------

@@ -304,6 +304,34 @@ fn the_console_keyboard_has_a_russian_layout() {
 }
 
 #[test]
+fn arrow_keys_edit_the_shell_line() {
+    let mut s = Session::boot();
+    // the console: Left goes through the kernel's keymap as ESC [ D
+    s.mark = s.out.len();
+    s.type_text("echo helo");
+    s.key(80, false, false); // Left
+    s.type_text("l\n");
+    s.expect("\nhello\n", 60);
+    s.key(82, false, false); // Up: the line again
+    s.type_text("\n");
+    s.expect("\u{1b}[K\nhello\n", 60);
+    // the terminal window: the keys come through trwm and the pty
+    s.console("trwm term &");
+    s.wait_for("trwm: window 0 'Terminal'", 200);
+    s.run(40);
+    s.click(TERM_X + 500, TERM_Y - 8);
+    s.type_text("echo one\n");
+    s.run(40);
+    s.key(82, false, false); // Up
+    s.key(80, false, false); // Left, Left: before "ne"
+    s.key(80, false, false);
+    s.type_text("x\n");
+    s.run(60);
+    let text = s.term_text(5);
+    assert!(text.contains(&"oxne".to_string()), "{text:#?}");
+}
+
+#[test]
 fn trwm_switches_layout_and_shows_it() {
     let mut s = Session::boot();
     s.console("trwm term &");
