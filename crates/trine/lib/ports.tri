@@ -40,6 +40,7 @@ const MOUSE_WHEEL: int = 138;
 const MOUSE_CTRL: int = 139;
 const MOUSE_X: int = 140;
 const MOUSE_Y: int = 141;
+const MOUSE_PENDING: int = 142;       // button changes still queued (BUTTONS pops one)
 
 // Serial console (block 6)
 const SERIAL_DATA: int = 162;

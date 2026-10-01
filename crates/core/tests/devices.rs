@@ -168,6 +168,24 @@ fn keyboard_mouse_serial() {
     assert_eq!(inp(&mut m, block::MOUSE, 2), 10, "L + 9·R");
     m.dev.mouse_abs(100, 50);
     assert_eq!((inp(&mut m, block::MOUSE, 5), inp(&mut m, block::MOUSE, 6)), (100, 50));
+    // A press and a release between two reads both stay, each with its position.
+    m.dev.mouse_buttons(false, false, false);
+    assert_eq!(inp(&mut m, block::MOUSE, 2), 0);
+    m.dev.mouse_buttons(true, false, false);
+    m.dev.mouse_abs(120, 60);
+    m.dev.mouse_buttons(false, false, false);
+    assert_eq!(inp(&mut m, block::MOUSE, 7), 2, "two changes pending");
+    assert_eq!(inp(&mut m, block::MOUSE, 2), 1, "the press first");
+    assert_eq!((inp(&mut m, block::MOUSE, 5), inp(&mut m, block::MOUSE, 6)), (100, 50), "where it was pressed");
+    assert_eq!(inp(&mut m, block::MOUSE, 2), 0, "then the release");
+    assert_eq!((inp(&mut m, block::MOUSE, 5), inp(&mut m, block::MOUSE, 6)), (120, 60));
+    assert_eq!(inp(&mut m, block::MOUSE, 7), 0);
+    assert_eq!(inp(&mut m, block::MOUSE, 2), 0, "the current state once drained");
+    for _ in 0..40 {
+        m.dev.mouse_buttons(true, false, false);
+        m.dev.mouse_buttons(false, false, false);
+    }
+    assert_eq!(inp(&mut m, block::MOUSE, 7), 27, "the FIFO keeps the newest 27 changes");
 
     m.dev.serial_input("Жa");
     assert_eq!(inp(&mut m, block::SERIAL, 1), 2);

@@ -76,7 +76,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
 <div class="wrap">
   <header>
     <h1 class="mark">SETUN<span>-386</span></h1>
-    <p class="tag">A balanced-ternary computer, running in your browser.</p>
+    <p class="tag">A balanced-ternary computer booting Trinux, its POSIX-style OS, in your browser.</p>
     <div class="facts" aria-label="Machine facts">
       <span>tryte <b>3² trits</b></span>
       <span>word <b>3³ trits</b></span>
@@ -112,18 +112,28 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       </dl>
 
       <div class="controls">
-        <button type="button" id="btn-gfx">Graphics (Tab)</button>
-        <button type="button" id="btn-text">Text (Esc)</button>
+        <button type="button" id="btn-wm" data-trinux>Window system</button>
         <button type="button" id="btn-reset">Power-cycle</button>
+        <button type="button" id="btn-fresh" data-trinux>Fresh disk</button>
+        <button type="button" id="btn-gfx" data-demo hidden>Graphics (Tab)</button>
+        <button type="button" id="btn-text" data-demo hidden>Text (Esc)</button>
+      </div>
+      <div class="controls">
+        <label class="label" for="machine" style="align-self:center">Boot</label>
+        <select id="machine">
+          <option value="0" selected>Trinux</option>
+          <option value="1">Demo ROM</option>
+        </select>
         <label class="label" for="speed" style="align-self:center">Clock</label>
         <select id="speed">
           <option value="1">1 MIPS</option>
-          <option value="10" selected>10 MIPS</option>
+          <option value="10">10 MIPS</option>
           <option value="20">20 MIPS</option>
-          <option value="0">Max</option>
+          <option value="0" selected>Max</option>
         </select>
       </div>
-      <p class="legend">Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
+      <p class="legend" data-trinux>Click the screen and type at the <kbd>$</kbd> prompt, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it.</p>
+      <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
     </aside>
   </div>
 
@@ -131,7 +141,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     <div class="label">Serial console</div>
     <pre id="serial" aria-live="polite"></pre>
     <form id="send">
-      <input id="line" autocomplete="off" placeholder="Send text to the machine, e.g. Привет, Setun!" aria-label="Text to send over serial">
+      <input id="line" autocomplete="off" placeholder="A command for the Trinux shell, e.g. echo Привет, Setun!" aria-label="Text to send over serial">
       <button type="submit">Send</button>
     </form>
     <div class="error" id="error" hidden></div>
@@ -196,30 +206,74 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       showError("The emulator could not start: " + err.message + ". This browser may block WebAssembly here.");
       return;
     }
-    wasm.setun_init(19683, Date.now() / 1000);
+    function showKind() {
+      const trinux = wasm.setun_kind() === 0;
+      document.querySelectorAll("[data-trinux]").forEach((el) => { el.hidden = !trinux; });
+      document.querySelectorAll("[data-demo]").forEach((el) => { el.hidden = trinux; });
+    }
+    wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
+    showKind();
     const decoder = new TextDecoder();
 
     function press(code) { wasm.setun_key(code, 1); wasm.setun_key(code, 0); }
+    // Characters to (HID code, shift) on a US layout, for key events that
+    // carry no physical key code (some input methods, automation).
+    const CHAR = {};
+    const rows = [["1234567890", "!@#$%^&*()", 30], ["-=[]\\", "_+{}|", 45], [";'`,./", ":\"~<>?", 51]];
+    for (const [plain, shifted, first] of rows) {
+      for (let i = 0; i < plain.length; i++) {
+        CHAR[plain[i]] = [first + i, 0];
+        CHAR[shifted[i]] = [first + i, 1];
+      }
+    }
+    for (let i = 0; i < 26; i++) {
+      CHAR[String.fromCharCode(97 + i)] = [4 + i, 0];
+      CHAR[String.fromCharCode(65 + i)] = [4 + i, 1];
+    }
+    CHAR[" "] = [44, 0];
+    const typed = new Set();
     canvas.addEventListener("keydown", (e) => {
       const c = HID[e.code];
-      if (c !== undefined) { wasm.setun_key(c, 1); e.preventDefault(); }
+      if (c !== undefined) { wasm.setun_key(c, 1); e.preventDefault(); return; }
+      const k = CHAR[e.key] || (e.key === "Enter" ? [40, 0] : e.key === "Backspace" ? [42, 0] : null);
+      if (!k) return;
+      if (k[1]) wasm.setun_key(225, 1);
+      wasm.setun_key(k[0], 1);
+      wasm.setun_key(k[0], 0);
+      if (k[1]) wasm.setun_key(225, 0);
+      typed.add(e.key);
+      e.preventDefault();
     });
     canvas.addEventListener("keyup", (e) => {
       const c = HID[e.code];
-      if (c !== undefined) { wasm.setun_key(c, 0); e.preventDefault(); }
+      if (c !== undefined) { wasm.setun_key(c, 0); e.preventDefault(); return; }
+      if (typed.delete(e.key)) e.preventDefault();         // already pressed and released
     });
     canvas.addEventListener("focus", () => { $("hint").hidden = true; });
     canvas.addEventListener("blur", () => { $("hint").hidden = false; });
     let buttons = 0;
-    function mouse(e) {
+    // Mouse states queue up and reach the machine one by one, each followed
+    // by a short slice of emulation, so a quick press-move-release between
+    // two frames is still seen in order (the device holds only one state).
+    const mouseQueue = [];
+    function mouse(e, isButton) {
       const r = canvas.getBoundingClientRect();
       const x = Math.floor((e.clientX - r.left) * canvas.width / r.width);
       const y = Math.floor((e.clientY - r.top) * canvas.height / r.height);
-      wasm.setun_mouse(x, y, buttons);
+      const last = mouseQueue[mouseQueue.length - 1];
+      if (!isButton && last && last.motion) { last.x = x; last.y = y; }   // consecutive motion: keep the latest
+      else mouseQueue.push({ x, y, buttons, motion: !isButton });
     }
-    canvas.addEventListener("mousemove", mouse);
-    canvas.addEventListener("mousedown", (e) => { buttons |= [1, 2, 4][e.button] || 0; mouse(e); canvas.focus(); });
-    canvas.addEventListener("mouseup", (e) => { buttons &= ~([1, 2, 4][e.button] || 0); mouse(e); });
+    function feedMouse() {
+      while (mouseQueue.length) {
+        const m = mouseQueue.shift();
+        wasm.setun_mouse(m.x, m.y, m.buttons);
+        if (mouseQueue.length) wasm.setun_run(30000);
+      }
+    }
+    canvas.addEventListener("mousemove", (e) => mouse(e, false));
+    canvas.addEventListener("mousedown", (e) => { buttons |= [1, 2, 4][e.button] || 0; mouse(e, true); canvas.focus(); });
+    canvas.addEventListener("mouseup", (e) => { buttons &= ~([1, 2, 4][e.button] || 0); mouse(e, true); });
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
     canvas.addEventListener("wheel", (e) => { wasm.setun_wheel(Math.sign(e.deltaY)); e.preventDefault(); }, { passive: false });
 
@@ -229,9 +283,17 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       for (const ch of text) wasm.setun_serial_char(ch.codePointAt(0));
       $("line").value = "";
     });
+    function sendLine(text) { for (const ch of text + "\n") wasm.setun_serial_char(ch.codePointAt(0)); }
+    $("btn-wm").addEventListener("click", () => { sendLine("trwm term clock colors paint &"); canvas.focus(); });
     $("btn-gfx").addEventListener("click", () => press(43));
     $("btn-text").addEventListener("click", () => press(41));
     $("btn-reset").addEventListener("click", () => { wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
+    $("btn-fresh").addEventListener("click", () => { wasm.setun_fresh_disk(Date.now() / 1000); serialEl.textContent = ""; });
+    $("machine").addEventListener("change", () => {
+      wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
+      serialEl.textContent = "";
+      showKind();
+    });
 
     let img = null, last = performance.now(), executed = 0, statT = last, off = false;
     const modes = { "-1": "text 80×30", "0": "640×480", "1": "800×600" };
@@ -240,12 +302,15 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     function frame(now) {
       // Catch up after throttled frames, but never more than half a second.
       const dt = Math.min(now - last, 500); last = now;
+      feedMouse();
       const target = Number($("speed").value);
-      // Max: spend about 12 ms of each frame emulating.
+      // Max: emulate for three quarters of the time between frames (8-40 ms),
+      // so slow or throttled frame rates still get most of the CPU.
       let n = target > 0 ? Math.round(target * 1e6 * dt / 1000) : 0;
       if (target === 0) {
+        const budget = Math.min(Math.max(dt * 0.75, 8), 40);
         const t0 = performance.now(); n = 0;
-        while (performance.now() - t0 < 12) { off = wasm.setun_run(50000) === 1; n += 50000; if (off) break; }
+        while (performance.now() - t0 < budget) { off = wasm.setun_run(50000) === 1; n += 50000; if (off) break; }
       } else if (n > 0) {
         off = wasm.setun_run(n) === 1;
       }

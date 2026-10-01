@@ -47,8 +47,18 @@ fn kbd_raw_event(ev: int) -> int {
     return 1;
 }
 
-// The mouse IRQ (and the timer tick): collect motion, buttons and wheel.
+// The mouse IRQ: collect motion, buttons and wheel. The device queues
+// button changes with their positions; take them all, oldest first.
 fn mouse_poll() {
+    var k: int = 0;
+    loop {
+        mouse_poll_one();
+        k += 1;
+        if (in(MOUSE_PENDING) <= 0 || k > 27) { return; }
+    }
+}
+
+fn mouse_poll_one() {
     var dx: int = in(MOUSE_DX);
     var dy: int = in(MOUSE_DY);
     var b: int = in(MOUSE_BUTTONS);

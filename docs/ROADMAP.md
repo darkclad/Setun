@@ -17,7 +17,7 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4, accepted).
    - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages ✅ (TLB cache: later, as an optimization)
    - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T1B2 image, DMA), display (text + 3^9-colour framebuffer) ✅
    - tests ✅: 20 CPU/MMU tests and 13 device tests (timer-interrupt program, ROM boot, DMA)
-4. **Front ends** ✅: native (`setun`: minifb window, stdio serial, headless PNG screenshots) and **WASM** (`web/`: canvas, keyboard/mouse, serial console, front-panel lamps)
+4. **Front ends** ✅: native (`setun`: minifb window, stdio serial, headless PNG screenshots) and **WASM** (`web/`: canvas, keyboard/mouse, serial console, front-panel lamps; boots Trinux from a disk built into the module)
 5. **Assembler and disassembler** ✅: text syntax with form selection and branch relaxation, round-trip-safe disassembler, `setun-asm` CLI; the demo ROM is now `demo.s`
 6. **Compiler** for **Trine** ✅ ([`LANGUAGE.md`](LANGUAGE.md) v0.2): `trine build/run`, stdlib (ports, rt, console), 19 end-to-end tests; `examples/mandel.tri` renders the Mandelbrot set
 7. **BIOS** ✅ ([`bios/bios.tri`](../bios/bios.tri), [`BOOT.md`](BOOT.md)): machine check, RTC date, disk boot with signature, monitor shell; `setun` boots it by default; `trine build --boot` makes boot disks

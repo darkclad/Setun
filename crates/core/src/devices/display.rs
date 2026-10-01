@@ -115,9 +115,11 @@ impl Display {
             self.render_text(fb, out, w);
         } else {
             let pitch = self.geometry().2 as usize;
+            let pal = palette();
             for y in 0..h {
-                for x in 0..w {
-                    out[y * w + x] = pixel_rgb(fb[y * pitch + x] as i64);
+                let row = &fb[y * pitch..y * pitch + w];
+                for (o, &t) in out[y * w..(y + 1) * w].iter_mut().zip(row) {
+                    *o = pal[(t as i32 + 9841) as usize];
                 }
             }
         }
@@ -154,6 +156,12 @@ impl Display {
             }
         }
     }
+}
+
+/// pixel_rgb for every tryte value, computed once (indexed by value + 9841).
+fn palette() -> &'static [u32] {
+    static PAL: OnceLock<Vec<u32>> = OnceLock::new();
+    PAL.get_or_init(|| (-9841..=9841).map(pixel_rgb).collect())
 }
 
 /// Colour of a graphics pixel tryte: trits 1–3 R, 4–6 G, 7–9 B, each

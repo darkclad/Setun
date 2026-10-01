@@ -513,6 +513,14 @@ fn mouse_event(x: int, y: int, b: int) {
     ioctl(fb_fd, FBIO_CURSOR, &cur as int);
     if (b % 3 != 0 && was % 3 == 0) { mouse_press(x, y, b); return; }       // left button went down
     if (b % 3 == 0 && was % 3 != 0) {
+        if (drag >= 0 && moved) {                      // the drag ends where the button came up
+            var dw: *Win = &wins[drag];
+            damage_window(drag);
+            dw.x = x - drag_dx;
+            dw.y = y - drag_dy;
+            if (dw.y - TITLE_H - BORDER < PANEL_H) { dw.y = PANEL_H + TITLE_H + BORDER; }
+            damage_window(drag);
+        }
         drag = -1;
         var k: int = 0;
         while (k < MAXWIN) {

@@ -594,6 +594,8 @@ version = "0.1.0"
 dependencies = [
  "setun-core",
  "setun-demo",
+ "trine",
+ "trinux",
 ]
 
 [[package]]

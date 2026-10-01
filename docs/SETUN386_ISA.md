@@ -512,11 +512,12 @@ Control values are ternary wherever that is natural.
 |---|---|
 | 0 | `DX` (reading clears it) |
 | 1 | `DY` (reading clears it) |
-| 2 | `BUTTONS` = `L + 3·M + 9·R` (1 = down) |
+| 2 | `BUTTONS` = `L + 3·M + 9·R` (1 = down). Reading pops the oldest queued button change and latches the position where it happened (see 7); with none queued it is the current state. |
 | 3 | `WHEEL` |
 | 4 | `CTRL` |
-| 5 | `ABS_X` (absolute position, for the browser) |
+| 5 | `ABS_X` (absolute position, for the browser; after a `BUTTONS` read that popped a change, that change's position) |
 | 6 | `ABS_Y` |
+| 7 | `PENDING`: button changes still queued (a FIFO of 27), so a quick press and release between two reads is not lost |
 
 **Serial console (162)**
 

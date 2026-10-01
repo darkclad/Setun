@@ -283,3 +283,26 @@ fn k8_kernel_interfaces() {
     let n = s.out.matches(" ok\n").count();
     assert!(n >= 45, "only {n} checks:\n{}", s.out);
 }
+
+/// A press, a move and a release 3 ms apart (as a browser delivers a quick
+/// drag between two frames, while clients keep the kernel busy): the mouse's
+/// FIFO of button changes keeps the press and the release apart.
+#[test]
+fn k8_a_quick_drag_is_not_lost() {
+    let mut s = Session::boot();
+    s.console("trwm term clock colors paint &");
+    s.wait_for("trwm: window 3 'Paint'", 300);
+    s.run(80);
+    // Paint is the fourth window: content at (108, 114), title bar above it
+    assert_eq!(s.pixel(223, 105), TITLE_ON);
+    s.m.dev.mouse_abs(223, 105);
+    s.m.run(30_000);
+    s.m.dev.mouse_buttons(true, false, false);
+    s.m.run(30_000);
+    s.m.dev.mouse_abs(331, 252);
+    s.m.run(30_000);
+    s.m.dev.mouse_buttons(false, false, false);
+    s.run(10);
+    assert_eq!(s.pixel(331, 252), TITLE_ON, "the title bar moved with the drag");
+    assert_ne!(s.pixel(223, 105), TITLE_ON, "and left its old place");
+}

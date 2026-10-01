@@ -39,7 +39,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | `crates/asm` | assembler, disassembler and the `setun-asm` tool ([`docs/ASSEMBLER.md`](docs/ASSEMBLER.md)) |
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
 | `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio |
-| `crates/web` + `web/` | browser front end: WebAssembly exports and the front-panel page |
+| `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in) and the front-panel page |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
 | `examples/` | Trine programs, e.g. `mandel.tri` |
 | `bios/` | the BIOS (`bios.tri`, built into `setun`) and a sample boot sector |
@@ -60,12 +60,18 @@ cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
-sh web/build.sh                                # rebuild web/setun.wasm
+sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
 python -m http.server 8386 --directory web     # then open http://localhost:8386
 ```
 
-Speed: about 20 MIPS native and 16 MIPS in the browser (release build); the
-machine is paced at 10 MIPS, a 386DX-33.
+The browser page boots Trinux from the built-in disk (3^7 pages of RAM): type
+at the prompt, or press **Window system** for `trwm term clock colors paint`.
+Power-cycle keeps the disk, so files written in the browser survive a reboot;
+**Fresh disk** restores it. The old demo ROM is still under **Boot**.
+
+Speed: about 20 MIPS native and 16 MIPS in the browser for the demo ROM; Trinux
+(paging, user mode) runs at about 4-5 MIPS in a browser tab. The clock can be
+paced or left at Max.
 
 ## Credits
 
