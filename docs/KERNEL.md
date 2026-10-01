@@ -431,7 +431,10 @@ Kernel-mode faults on user addresses go through the same path, so system calls c
 Every terminal node is the same tty in K4; separate virtual consoles come with the window system.
 
 **tty** ([`kernel/drivers/tty.tri`](../kernel/drivers/tty.tri)), after Linux's `n_tty`:
-- **Input:** the keyboard (USB HID codes with shift and ctrl) and the serial port, on IRQs 1 and 3. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
+- **Input:** the keyboard (USB HID codes with shift and ctrl) and the serial port, on IRQs 1 and 3. Keys become characters through `keymap.tri` (in the Trine standard library, shared with `trwm`):
+  - two layouts, US and Russian ЙЦУКЕН (as on Windows: `ё` on the backquote key, `№;:?` on Shift+3/4/6/7, `.`/`,` on the slash key);
+  - **Alt+Shift** switches layout, whichever key is pressed first. Caps Lock flips the case of letters in both layouts, and Ctrl+letter gives the control code of the key's position, so `^C` stays on the same key in Russian;
+  - the console and `trwm` each keep their own layout, and `trwm` shows its layout (`EN`/`RU`) at the right end of the panel. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
 - **Canonical mode:** erase (`^H`, DEL), kill (`^U`), EOF (`^D`), `ICRNL`, echo (control characters as `^X`). A read returns at most one line.
 - **Raw mode:** clear `ICANON` and characters pass straight through.
 - **ioctl:** `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF` and `TIOCGWINSZ` (80×30, 640×480). `termios` has one word per flag field, then `c_line` and `c_cc[19]` as trytes; Linux bit values.
@@ -841,7 +844,7 @@ The server keeps every window's pixels (server-side rendering), so clients never
 | `colors` | every one of the 3^9 = 19683 pixel colours, once each |
 | `paint` | draws with the mouse, with a colour strip |
 
-`mkdisk` generates `/usr/share/font8x8` from the same font the emulator's text mode uses: 352 glyphs, namely code points 0..255 followed by the Cyrillic block U+0400..U+045F as glyphs 256..351. `gfx.tri` maps a code point to its glyph (`font_glyph`) and draws `?` for anything else.
+`mkdisk` generates `/usr/share/font8x8` from the same font the emulator's text mode uses: 353 glyphs, namely code points 0..255, then the Cyrillic block U+0400..U+045F as glyphs 256..351, then № (for the Russian keyboard layout) as glyph 352. `gfx.tri` maps a code point to its glyph (`font_glyph`) and draws `?` for anything else.
 
 **Pixels and gfx:** a pixel is one tryte: red, green and blue are 3 trits each, so there are 27 levels per channel. `lib/gfx.tri` has surfaces, clipped fill, blit, scroll and text (scaled or not), and a fast path for whole unscaled characters.
 

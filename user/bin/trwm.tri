@@ -17,6 +17,7 @@ import "../lib/string.tri";
 import "../lib/stdlib.tri";
 import "../lib/gfx.tri";
 import "../lib/trw.tri";
+import "keymap.tri";
 
 const MAXWIN: int = 9;
 const PANEL_H: int = 16;
@@ -54,8 +55,6 @@ var mbuttons: int;
 var drag: int = -1;                   // the window being dragged
 var drag_dx: int;
 var drag_dy: int;
-var shift: int;
-var ctrl: int;
 var running: int = 1;
 var dirty: int;                       // the damage rectangle
 var dx0: int;
@@ -179,6 +178,7 @@ fn draw_panel_at(s: *Surface, ox: int, oy: int) {
         draw_text(s, ox + buttons[k].x + 4, oy + 4, buttons[k].label, WHITE, TRANSPARENT, 1);
         k += 1;
     }
+    draw_text(s, ox + screen.w - 22, oy + 4, keymap_layout_name(), WHITE, TRANSPARENT, 1);   // keyboard layout
 }
 
 fn draw_window_at(s: *Surface, i: int, focused: int, ox: int, oy: int) {
@@ -547,45 +547,15 @@ fn mouse_event(x: int, y: int, b: int) {
     }
 }
 
-// HID usage codes to characters, as the console keyboard does.
-fn hid_char(code: int) -> int {
-    var s: int = shift;
-    if (code >= 4 && code <= 29) {
-        if (ctrl) { return code - 3; }
-        return (s ? 'A' : 'a') + code - 4;
-    }
-    if (code >= 30 && code <= 39) {
-        var digits: *char = s ? "!@#$%^&*()" : "1234567890";
-        return digits[code - 30];
-    }
-    switch (code) {
-        case 40: return '\n';
-        case 41: return 27;
-        case 42: return 127;
-        case 43: return '\t';
-        case 44: return ' ';
-        case 45: return s ? '_' : '-';
-        case 46: return s ? '+' : '=';
-        case 47: return s ? '{' : '[';
-        case 48: return s ? '}' : ']';
-        case 49: return s ? '|' : '\\';
-        case 51: return s ? ':' : ';';
-        case 52: return s ? '"' : '\'';
-        case 53: return s ? '~' : '`';
-        case 54: return s ? '<' : ',';
-        case 55: return s ? '>' : '.';
-        case 56: return s ? '?' : '/';
-    }
-    return 0;
-}
-
+// Keys become characters as on the console (keymap.tri: US or Russian,
+// Alt+Shift switches); the panel shows the layout.
 fn key_event(ev: int) {
-    var code: int = ev < 0 ? -ev : ev;
-    var down: int = ev > 0;
-    if (code == 225 || code == 229) { shift = down; return; }
-    if (code == 224 || code == 228) { ctrl = down; return; }
-    if (!down) { return; }
-    var c: int = hid_char(code);
+    var layout: int = km_layout;
+    var c: int = keymap_event(ev);
+    if (km_layout != layout) {
+        log2("layout ", keymap_layout_name());
+        damage(0, 0, screen.w, PANEL_H);
+    }
     var t: int = top_window();
     if (c != 0 && t >= 0) { send_event(t, TRW_KEY, c, 0, 0, 1); }
 }

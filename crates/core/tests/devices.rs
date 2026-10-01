@@ -389,6 +389,8 @@ fn the_cyrillic_glyphs() {
     for (cyr, lat) in [('А', 'A'), ('О', 'O'), ('р', 'p'), ('у', 'y'), ('Ё', 'Ë'), ('ј', 'j')] {
         assert_eq!(glyph8x8(cyr as u32), glyph8x8(lat as u32), "{cyr} vs {lat}");
     }
+    // № for the Russian keyboard layout's Shift+3
+    assert!(glyph8x8(devices::NUMERO).is_some_and(|g| g.iter().any(|&r| r != 0)));
     // past the block, and in gaps, there is nothing
     assert_eq!(glyph8x8(CYRILLIC_LAST + 1), None);
     assert_eq!(glyph8x8(0x0500), None);

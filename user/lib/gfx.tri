@@ -128,13 +128,15 @@ fn scroll_rect(s: *Surface, x: int, y: int, w: int, h: int, dy: int, fill: int) 
 // ---- text ---------------------------------------------------------------------------------
 
 // The font file: glyphs for code points 0..255, then the Cyrillic block
-// U+0400..U+045F as glyphs 256..351; 8 rows each, bit 0 = leftmost pixel.
-const FONT_GLYPHS: int = 352;
-const FONT_TRYTES: int = 2816;
+// U+0400..U+045F as glyphs 256..351, then № as 352; 8 rows each, bit 0 =
+// leftmost pixel.
+const FONT_GLYPHS: int = 353;
+const FONT_TRYTES: int = 2824;
+const NUMERO: int = 8470;
 const CYRILLIC_FIRST: int = 1024;
 const CYRILLIC_LAST: int = 1119;
 
-var font: [2816]tryte;
+var font: [2824]tryte;
 var font_ok: int;
 
 fn font_load(path: *char) -> int {
@@ -150,6 +152,7 @@ fn font_load(path: *char) -> int {
 fn font_glyph(c: int) -> int {
     if (c >= 0 && c <= 255) { return c; }
     if (c >= CYRILLIC_FIRST && c <= CYRILLIC_LAST) { return 256 + c - CYRILLIC_FIRST; }
+    if (c == NUMERO) { return 352; }
     return '?';
 }
 

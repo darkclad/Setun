@@ -245,6 +245,98 @@ fn k8_window_system_end_to_end() {
     s.expect("console-ok\n", 60);
 }
 
+// HID usage codes used below
+const ALT: i64 = 226;
+const SHIFT: i64 = 225;
+const CAPS: i64 = 57;
+
+impl Session {
+    /// Press keys one at a time (no modifiers).
+    fn keys(&mut self, codes: &[i64]) {
+        for &c in codes {
+            self.key(c, false, false);
+        }
+    }
+
+    /// Alt+Shift, pressing `first` before the other one.
+    fn switch_layout(&mut self, first: i64) {
+        let second = if first == ALT { SHIFT } else { ALT };
+        self.m.dev.key(first, true);
+        self.m.dev.key(second, true);
+        self.m.dev.key(second, false);
+        self.m.dev.key(first, false);
+        self.run(1);
+    }
+}
+
+// g h b d t n on a US keyboard are п р и в е т in the Russian layout
+const PRIVET: [i64; 6] = [10, 11, 5, 7, 23, 17];
+
+#[test]
+fn the_console_keyboard_has_a_russian_layout() {
+    let mut s = Session::boot();
+    s.mark = s.out.len();
+    s.type_text("echo ");
+    s.switch_layout(ALT);
+    s.keys(&PRIVET);
+    s.key(44, false, false);
+    s.key(19, true, false); // Shift+P: З
+    s.key(32, true, false); // Shift+3: №
+    s.keys(&[CAPS, 10, CAPS]); // Caps Lock: П
+    s.keys(&[53, 56]); // ` /: ё .
+    s.m.dev.key(ALT, true); // Alt with a letter does not switch, and types the letter
+    s.key(10, false, false);
+    s.m.dev.key(ALT, false);
+    s.switch_layout(SHIFT); // back to US, the other key first
+    s.type_text(" ok\n");
+    s.expect("echo привет З№Пё.п ok\nпривет З№Пё.п ok\n", 60);
+    // Ctrl+letter is a control code by key position in either layout
+    s.switch_layout(ALT);
+    s.keys(&[4, 22, 7]); // ф ы в
+    s.key(6, false, true); // Ctrl+C (the key under с)
+    s.expect("фыв^C\n$ ", 60);
+    // keys the layout has nothing for type nothing (F1), and Enter still works
+    s.keys(&[58, 40]);
+    s.run(10);
+    s.switch_layout(ALT);
+    s.console("echo back-in-us");
+    s.expect("back-in-us\n", 60);
+}
+
+#[test]
+fn trwm_switches_layout_and_shows_it() {
+    let mut s = Session::boot();
+    s.console("trwm term &");
+    s.wait_for("trwm: window 0 'Terminal'", 200);
+    s.run(40);
+    s.click(TERM_X + 500, TERM_Y - 8);
+    let font = trinux::font8x8_table();
+    let panel_text = |s: &Session| -> String {
+        (0..2)
+            .map(|k| {
+                let x0 = W as i64 - 22 + 8 * k;
+                let cell: Vec<i16> = (0..8).map(|y| (0..8).map(|x| (s.pixel(x0 + x, 4 + y) == WHITE) as i16 * (1 << x)).sum()).collect();
+                (b'A'..=b'Z').find(|&c| font[c as usize * 8..c as usize * 8 + 8] == cell[..]).map(|c| c as char).unwrap_or('?')
+            })
+            .collect()
+    };
+    assert_eq!(panel_text(&s), "EN");
+    s.type_text("echo ");
+    s.switch_layout(ALT);
+    s.expect("trwm: layout RU", 30);
+    s.run(10);
+    assert_eq!(panel_text(&s), "RU", "the panel shows the layout");
+    s.keys(&PRIVET);
+    s.switch_layout(SHIFT);
+    s.expect("trwm: layout EN", 30);
+    s.type_text("\n");
+    s.run(60);
+    assert_eq!(panel_text(&s), "EN");
+    let text = s.term_text(4);
+    assert!(text.contains(&canonical("$ echo привет")), "{text:#?}");
+    assert!(text.contains(&canonical("привет")), "{text:#?}");
+}
+
 #[test]
 fn the_terminal_window_shows_cyrillic() {
     let mut s = Session::boot();

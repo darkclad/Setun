@@ -22,6 +22,7 @@ import "../printk.tri";
 import "../sched.tri";
 import "../signal.tri";
 import "input.tri";
+import "keymap.tri";
 
 // termios, one word per flag field (Linux field order and bit values)
 struct Termios {
@@ -103,8 +104,6 @@ struct Tty {
 }
 
 var ttys: [10]Tty;
-var kbd_shift: int;
-var kbd_ctrl: int;
 
 fn tty_reset(t: int) {
     var y: *Tty = &ttys[t];
@@ -346,46 +345,9 @@ fn tty_receive(t: int, c: char) {
     }
 }
 
-// Keyboard: USB HID usage codes, +press / -release.
-fn hid_char(code: int) -> int {
-    var s: int = kbd_shift;
-    if (code >= 4 && code <= 29) {
-        if (kbd_ctrl) { return code - 3; }            // ^A = 1 ...
-        return (s ? 'A' : 'a') + code - 4;
-    }
-    if (code >= 30 && code <= 39) {
-        var digits: *char = s ? "!@#$%^&*()" : "1234567890";
-        return digits[code - 30];
-    }
-    switch (code) {
-        case 40: return '\n';
-        case 41: return 27;
-        case 42: return 127;
-        case 43: return '\t';
-        case 44: return ' ';
-        case 45: return s ? '_' : '-';
-        case 46: return s ? '+' : '=';
-        case 47: return s ? '{' : '[';
-        case 48: return s ? '}' : ']';
-        case 49: return s ? '|' : '\\';
-        case 51: return s ? ':' : ';';
-        case 52: return s ? '"' : '\'';
-        case 53: return s ? '~' : '`';
-        case 54: return s ? '<' : ',';
-        case 55: return s ? '>' : '.';
-        case 56: return s ? '?' : '/';
-    }
-    return 0;
-}
-
 fn kbd_event(ev: int) {
     if (kbd_raw_event(ev)) { return; }               // /dev/kbd is open: raw events go there
-    var code: int = ev < 0 ? -ev : ev;
-    var down: int = ev > 0;
-    if (code == 225 || code == 229) { kbd_shift = down; return; }
-    if (code == 224 || code == 228) { kbd_ctrl = down; return; }
-    if (!down) { return; }
-    var c: int = hid_char(code);
+    var c: int = keymap_event(ev);                    // US or Russian, Alt+Shift switches
     if (c != 0) { tty_receive(0, c as char); }
 }
 

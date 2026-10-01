@@ -3,13 +3,15 @@
 //! the same style. Strokes are two pixels wide, capitals stand on rows 0–6,
 //! lowercase letters on rows 2–6, and accented capitals are squeezed into
 //! rows 2–6 under their accent. Letters that look like Latin ones reuse the
-//! Latin glyph.
+//! Latin glyph. № is here too, for the Russian keyboard layout.
 
 use std::sync::OnceLock;
 
 /// First and last code points of the Cyrillic block covered here.
 pub const CYRILLIC_FIRST: u32 = 0x400;
 pub const CYRILLIC_LAST: u32 = 0x45F;
+/// № (U+2116), on Shift+3 in the Russian keyboard layout.
+pub const NUMERO: u32 = 0x2116;
 
 enum Src {
     /// The same picture as this font8x8 character.
@@ -165,6 +167,9 @@ pub fn glyph8x8(cp: u32) -> Option<[u8; 8]> {
                 .collect()
         });
         return Some(table[(cp - CYRILLIC_FIRST) as usize]);
+    }
+    if cp == NUMERO {
+        return Some(rows(&["#...#...", "##..#.#.", "#.#.##.#", "#..##.#.", "#...#...", "#...####", "#...#...", B]));
     }
     font8x8(char::from_u32(cp)?)
 }

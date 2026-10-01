@@ -1,0 +1,100 @@
+// keymap: USB HID usage codes to characters, in two layouts: US and
+// Russian (ЙЦУКЕН, as on Windows). Alt+Shift switches between them (either
+// key first), Caps Lock flips the case of letters, and Ctrl+letter gives a
+// control code by key position in either layout. Each program that imports
+// this keeps its own keyboard state.
+
+const KM_US: int = 0;
+const KM_RU: int = 1;
+
+var km_shift: int;
+var km_ctrl: int;
+var km_alt: int;
+var km_caps: int;
+var km_layout: int;
+
+fn keymap_set_layout(l: int) { km_layout = l == KM_RU ? KM_RU : KM_US; }
+
+fn keymap_layout_name() -> *char { return km_layout == KM_RU ? "RU" : "EN"; }
+
+// A Cyrillic lowercase letter, or its capital.
+fn km_cyr(c: int, upper: int) -> int {
+    if (!upper) { return c; }
+    if (c == 'ё') { return 'Ё'; }
+    return c - 32;                                      // а..я → А..Я
+}
+
+// The character key `code` types now, or 0.
+fn keymap_char(code: int) -> int {
+    var s: int = km_shift;
+    var up: int = km_shift != km_caps;                  // letters: Shift xor Caps Lock
+    var ru: int = km_layout == KM_RU;
+    if (code >= 4 && code <= 29) {
+        if (km_ctrl) { return code - 3; }               // ^A = 1 ...
+        if (ru) {
+            var letters: *char = "фисвуапршолдьтщзйкыегмцчня";   // the keys a..z
+            return km_cyr(letters[code - 4], up);
+        }
+        return (up ? 'A' : 'a') + code - 4;
+    }
+    if (code >= 30 && code <= 39) {
+        if (ru && s) {
+            var ru_shifted: *char = "!\"№;%:?*()";
+            return ru_shifted[code - 30];
+        }
+        var digits: *char = s ? "!@#$%^&*()" : "1234567890";
+        return digits[code - 30];
+    }
+    if (ru) {
+        switch (code) {
+            case 47: return km_cyr('х', up);
+            case 48: return km_cyr('ъ', up);
+            case 49: return s ? '/' : '\\';
+            case 51: return km_cyr('ж', up);
+            case 52: return km_cyr('э', up);
+            case 53: return km_cyr('ё', up);
+            case 54: return km_cyr('б', up);
+            case 55: return km_cyr('ю', up);
+            case 56: return s ? ',' : '.';
+        }
+    }
+    switch (code) {
+        case 40: return '\n';
+        case 41: return 27;
+        case 42: return 127;
+        case 43: return '\t';
+        case 44: return ' ';
+        case 45: return s ? '_' : '-';
+        case 46: return s ? '+' : '=';
+        case 47: return s ? '{' : '[';
+        case 48: return s ? '}' : ']';
+        case 49: return s ? '|' : '\\';
+        case 51: return s ? ':' : ';';
+        case 52: return s ? '"' : '\'';
+        case 53: return s ? '~' : '`';
+        case 54: return s ? '<' : ',';
+        case 55: return s ? '>' : '.';
+        case 56: return s ? '?' : '/';
+    }
+    return 0;
+}
+
+// A key event (+code pressed, -code released): the character it types, or 0.
+fn keymap_event(ev: int) -> int {
+    var code: int = ev < 0 ? -ev : ev;
+    var down: int = ev > 0;
+    if (code == 225 || code == 229) {                   // Shift
+        if (down && !km_shift && km_alt) { km_layout = 1 - km_layout; }
+        km_shift = down;
+        return 0;
+    }
+    if (code == 226 || code == 230) {                   // Alt
+        if (down && !km_alt && km_shift) { km_layout = 1 - km_layout; }
+        km_alt = down;
+        return 0;
+    }
+    if (code == 224 || code == 228) { km_ctrl = down; return 0; }
+    if (!down) { return 0; }
+    if (code == 57) { km_caps = !km_caps; return 0; }  // Caps Lock
+    return keymap_char(code);
+}

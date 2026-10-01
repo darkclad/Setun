@@ -79,8 +79,8 @@ pub fn user_dir() -> PathBuf {
 pub const FONT_SOURCE: &str = "<font8x8>";
 
 /// Glyphs in the font file: code points 0..255, then the Cyrillic block
-/// U+0400..U+045F as glyphs 256..351.
-pub const FONT_GLYPHS: usize = 352;
+/// U+0400..U+045F as glyphs 256..351, then № as glyph 352.
+pub const FONT_GLYPHS: usize = 353;
 
 /// The font file's glyph for a code point, if it has one.
 pub fn font_index(cp: u32) -> Option<usize> {
@@ -88,13 +88,18 @@ pub fn font_index(cp: u32) -> Option<usize> {
     match cp {
         0..=255 => Some(cp as usize),
         CYRILLIC_FIRST..=CYRILLIC_LAST => Some(256 + (cp - CYRILLIC_FIRST) as usize),
+        setun_core::devices::NUMERO => Some(352),
         _ => None,
     }
 }
 
 /// The code point of font file glyph `i` (the inverse of `font_index`).
 pub fn font_char(i: usize) -> char {
-    let cp = if i < 256 { i as u32 } else { setun_core::devices::CYRILLIC_FIRST + (i - 256) as u32 };
+    let cp = match i {
+        0..=255 => i as u32,
+        352 => setun_core::devices::NUMERO,
+        _ => setun_core::devices::CYRILLIC_FIRST + (i - 256) as u32,
+    };
     char::from_u32(cp).unwrap_or('?')
 }
 
