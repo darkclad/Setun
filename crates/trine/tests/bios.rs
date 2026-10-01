@@ -1,0 +1,74 @@
+//! The BIOS (bios/bios.tri) on the emulator.
+
+use trine::{bios_rom, build_source, run_machine, Options, Outcome};
+
+fn bios() -> Vec<i16> {
+    bios_rom().unwrap_or_else(|e| panic!("BIOS does not compile: {e}"))
+}
+
+fn screen(m: &setun_core::Machine) -> Vec<String> {
+    let fb = m.mem.framebuffer();
+    (0..30)
+        .map(|r| {
+            (0..80)
+                .map(|c| u32::try_from(fb[3 * (r * 80 + c)] as i64).ok().and_then(char::from_u32).filter(|c| *c >= ' ').unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn boots_a_disk() {
+    let src = include_str!("../../../bios/boot_hello.tri");
+    let disk = build_source("boot_hello.tri", src, None, &Options::boot()).unwrap_or_else(|e| panic!("{e}")).image;
+    assert_eq!(disk.len(), 19_683, "one sector");
+    let r = run_machine(&bios(), Some(&disk), 30_000_000, "");
+    assert_eq!(r.outcome, Outcome::Exit(42), "serial:\n{}", r.serial);
+    assert!(r.serial.contains("SETUN-386 BIOS 1.0"), "{}", r.serial);
+    assert!(r.serial.contains("729 pages × 3^9 trytes = 14348907 trytes   test OK"), "{}", r.serial);
+    assert!(r.serial.contains("Clock   2026-09-21 14:13:20 UTC"), "{}", r.serial);
+    assert!(r.serial.contains("Disk 0  1 sector (19683 trytes)"), "{}", r.serial);
+    assert!(r.serial.contains("disk 0 ... booting"), "{}", r.serial);
+    assert!(r.serial.contains("Hello from the boot sector! Booted from disk 0, 729 pages of RAM."), "{}", r.serial);
+    let s = screen(&r.machine);
+    assert!(s[0].contains("SETUN-386 BIOS 1.0"), "{:?}", s[0]);
+}
+
+#[test]
+fn monitor_without_a_disk() {
+    let input = "help\ntime\ndump -59049 2\nfrob\nboot\noff\n";
+    let r = run_machine(&bios(), None, 60_000_000, input);
+    let out = &r.serial;
+    assert!(out.contains("disk 0 ... no disk"), "{out}");
+    assert!(out.contains("Monitor ready; type help."), "{out}");
+    assert!(out.contains("dump A [N]"), "help listed: {out}");
+    assert!(out.contains("-59049  "), "dump printed the reset vector: {out}");
+    assert!(out.contains("unknown command; type help"), "{out}");
+    assert!(r.machine.powered_off, "`off` powered the machine down:\n{out}");
+}
+
+#[test]
+fn refuses_a_disk_without_the_boot_signature() {
+    let blank = vec![0i16; 19_683];
+    let r = run_machine(&bios(), Some(&blank), 20_000_000, "off\n");
+    assert!(r.serial.contains("not bootable (no boot signature)"), "{}", r.serial);
+    assert!(r.machine.powered_off);
+}
+
+#[test]
+fn keyboard_input_reaches_the_monitor() {
+    let mut m = setun_core::Machine::new(729, 1_790_000_000);
+    m.load_rom(&bios());
+    m.run(3_000_000);
+    // "off" + Enter typed on the keyboard (HID usages).
+    for code in [18, 9, 9, 40] {
+        m.dev.key(code, true);
+        m.run(200_000);
+        m.dev.key(code, false);
+        m.run(200_000);
+    }
+    m.run(2_000_000);
+    assert!(m.powered_off, "{}", m.dev.serial.take_output());
+}

@@ -600,7 +600,7 @@ One sector is 39 366 bytes.
    - set `ITB`;
    - read the RAM size from `SYSCTL`;
    - clear the text screen and run a self-test;
-   - load **disk sector 0 into frame 1**, then jump to its centre (physical 19 683 = 3^9) with `r1` = boot disk and `r2` = RAM frame count. This is the analogue of the PC's 0x7C00 boot sector.
+   - load **disk sector 0 into frame 1**, check the boot signature `0zCAFEBABE` in its last word, then jump to its centre (physical 19 683 = 3^9) with `r1` = boot disk and `r2` = RAM frame count. This is the analogue of the PC's 0x7C00 boot sector. The full protocol is in [`BOOT.md`](BOOT.md).
 3. **Boot sector / loader**: loads the kernel, builds page tables, sets `PTB`, turns on `PG`, and enters the kernel.
 
 ## 10. Notes for the compiler

@@ -1,0 +1,351 @@
+// Setun-386 BIOS.
+//
+// Runs from ROM at reset (ring +1, paging off). Checks the machine, shows
+// what it found, then boots disk 0 (docs/BOOT.md). Without a bootable disk
+// it starts a small monitor on the keyboard and the serial console.
+//
+// Memory: frame 1 is kept free for the boot sector; the BIOS stack is in
+// frame 2 and its globals start in frame 3 (trine Options::bios()).
+
+import "console.tri";
+
+const VERSION: *char = "1.0";
+
+const A_TITLE: tryte = 0t+++--+000;   // white on blue
+const A_TEXT:  tryte = 0t+++---000;   // white on black
+const A_LABEL: tryte = 0t-++---000;   // cyan
+const A_OK:    tryte = 0t-+----000;   // green
+const A_WARN:  tryte = 0t++----000;   // yellow
+const A_ERR:   tryte = 0t+-----000;   // red
+
+// Boot protocol
+const BOOT_FRAME_START: int = 9842;   // first tryte of frame 1
+const BOOT_ENTRY: int = 19683;        // centre of frame 1
+const BOOT_MAGIC_ADDR: int = 29523;   // last word of frame 1
+const BOOT_MAGIC: int = 0zCAFEBABE;
+
+var ram_frames: int;
+var boot_disk: int;
+var shift: int;
+
+// ---- output helpers --------------------------------------------------------
+
+fn colour(a: tryte) { screen_attr = a; }
+
+fn label(s: *char) {
+    colour(A_LABEL);
+    print(s);
+    colour(A_TEXT);
+}
+
+fn print2(v: int) {                       // two digits, leading zero
+    if (v < 10) { print("0"); }
+    print_int(v);
+}
+
+fn title_bar() {
+    var i: int = 0;
+    while (i < COLS) {
+        var c: *tryte = cell(i);
+        c[0] = ' ';
+        c[1] = A_TITLE;
+        i += 1;
+    }
+    colour(A_TITLE);
+    screen_col = 1;
+    print("SETUN-386 BIOS ");
+    print(VERSION);
+    screen_puts("                balanced ternary · every size a power of 3");
+    colour(A_TEXT);
+    print("\n\n");
+}
+
+// ---- machine checks ----------------------------------------------------------
+
+fn print_cpu() {
+    label("  CPU     ");
+    print("Setun-386, ISA v0.");
+    print_int(mfc(CPUID));
+    print(", ring +1, 27 registers of 27 trits\n");
+}
+
+// Write, read back and restore a few trytes in a frame.
+fn test_frame(f: int) -> int {
+    var base: int = f * PAGE - 9841;            // first tryte of the frame
+    var offsets: [3]int = { 0, 9841, 19682 };
+    var k: int = 0;
+    while (k < 3) {
+        var p: *tryte = (base + offsets[k]) as *tryte;
+        var old: tryte = *p;
+        *p = 0t+-+-+-+-+;
+        if (*p != 0t+-+-+-+-+) { return 0; }
+        *p = 0t-+-+-+-+-;
+        if (*p != 0t-+-+-+-+-) { return 0; }
+        *p = old;
+        k += 1;
+    }
+    return 1;
+}
+
+fn print_ram() {
+    label("  RAM     ");
+    print_int(ram_frames);
+    print(" pages × 3^9 trytes = ");
+    print_int(ram_frames * PAGE);
+    print(" trytes   ");
+    // Frame 0 and the last frame (frames 1-3 belong to the boot sector and the BIOS).
+    var ok: int = test_frame(0) && test_frame(ram_frames - 1);
+    if (ok) { colour(A_OK); print("test OK\n"); }
+    else { colour(A_ERR); print("TEST FAILED\n"); }
+    colour(A_TEXT);
+}
+
+// Unix seconds to a civil date (proleptic Gregorian, UTC).
+fn print_time() {
+    var t: int = in(RTC_SECONDS);
+    var days: int = t / 86400;
+    var secs: int = t % 86400;
+    if (secs < 0) { secs += 86400; days -= 1; }
+    var z: int = days + 719468;
+    var era: int = (z >= 0 ? z : z - 146096) / 146097;
+    var doe: int = z - era * 146097;
+    var yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: int = yoe + era * 400;
+    var doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    var mp: int = (5 * doy + 2) / 153;
+    var d: int = doy - (153 * mp + 2) / 5 + 1;
+    var m: int = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) { y += 1; }
+    label("  Clock   ");
+    print_int(y); print("-"); print2(m); print("-"); print2(d);
+    print(" "); print2(secs / 3600); print(":"); print2(secs / 60 % 60); print(":"); print2(secs % 60);
+    print(" UTC\n");
+}
+
+fn print_disk(n: int) {
+    var sectors: int = in(DISK_SECTORS + 27 * n);
+    label(n == 0 ? "  Disk 0  " : "  Disk 1  ");
+    if (sectors == 0) { print("none\n"); return; }
+    print_int(sectors);
+    print(sectors == 1 ? " sector (" : " sectors (");
+    print_int(sectors * PAGE);
+    print(" trytes)\n");
+}
+
+fn print_info() {
+    print_cpu();
+    print_ram();
+    print_time();
+    print_disk(0);
+    print_disk(1);
+}
+
+// ---- booting -----------------------------------------------------------------------
+
+fn fail(msg: *char) -> int {
+    colour(A_ERR);
+    print(msg);
+    colour(A_TEXT);
+    print("\n");
+    return 0;
+}
+
+// Load disk 0 sector 0 into frame 1 and jump to it. Returns 0 on failure.
+fn try_boot() -> int {
+    print("\n");
+    label("  Boot    ");
+    print("disk 0 ... ");
+    if (in(DISK_SECTORS) == 0) { return fail("no disk"); }
+    out(DISK_LBA, 0);
+    out(DISK_COUNT, 1);
+    out(DISK_DMA, BOOT_FRAME_START);
+    out(DISK_CMD, -1);
+    while (in(DISK_STATUS) == 1) {}
+    if (in(DISK_STATUS) != 0) {
+        fail("read error ");
+        print_int(in(DISK_ERROR));
+        return 0;
+    }
+    var magic: *int = BOOT_MAGIC_ADDR as *int;
+    if (*magic != BOOT_MAGIC) { return fail("not bootable (no boot signature)"); }
+    colour(A_OK);
+    print("booting\n");
+    colour(A_TEXT);
+    boot_disk = 0;
+    jump_to_boot_sector();
+    return 0;                                   // not reached
+}
+
+fn jump_to_boot_sector() {
+    asm {
+        "        ldw   r1, [boot_disk]"
+        "        ldw   r2, [ram_frames]"
+        "        li    r3, 19683"
+        "        jalr  r0, r3"
+    }
+}
+
+// ---- input ------------------------------------------------------------------------
+
+fn hid_char(code: int) -> char {
+    if (code >= 4 && code <= 29) {
+        return ((shift ? 'A' : 'a') + code - 4) as char;
+    }
+    if (code >= 30 && code <= 39) {
+        var digits: *char = shift ? "!@#$%^&*()" : "1234567890";
+        return digits[code - 30];
+    }
+    switch (code) {
+        case 40: return '\n';
+        case 42: return 8 as char;
+        case 44: return ' ';
+        case 45: return shift ? '_' : '-';
+        case 46: return shift ? '+' : '=';
+        case 54: return shift ? '<' : ',';
+        case 55: return shift ? '>' : '.';
+        case 56: return shift ? '?' : '/';
+    }
+    return 0;
+}
+
+// Next typed character from the keyboard or the serial console, or 0.
+fn read_key() -> char {
+    if (in(KBD_COUNT) > 0) {
+        var ev: int = in(KBD_DATA);
+        if (ev == 225 || ev == 229) { shift = 1; return 0; }
+        if (ev == -225 || ev == -229) { shift = 0; return 0; }
+        if (ev > 0) { return hid_char(ev); }
+        return 0;
+    }
+    var c: char = getc();
+    if (c == '\r') { return '\n'; }
+    return c;
+}
+
+var line: [80]char;
+
+fn read_line() {
+    var n: int = 0;
+    loop {
+        var c: char = read_key();
+        if (c == 0) { continue; }
+        if (c == '\n') { print("\n"); break; }
+        if (c == 8 || c == 127) {
+            if (n > 0) {
+                n -= 1;
+                putc(8 as char); putc(' '); putc(8 as char);   // erase on a terminal
+                if (screen_col > 0) {
+                    screen_col -= 1;
+                    var p: *tryte = cell(screen_row * COLS + screen_col);
+                    p[0] = ' ';
+                    out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+                }
+            }
+            continue;
+        }
+        if (n < 79) {
+            line[n] = c;
+            n += 1;
+            putc(c);
+            screen_putc(c);
+        }
+    }
+    line[n] = 0;
+}
+
+// ---- monitor ----------------------------------------------------------------------
+
+var at: int;                                     // parse position in `line`
+
+fn skip_spaces() { while (line[at] == ' ') { at += 1; } }
+
+// The next word equals `w`?
+fn word_is(w: *char) -> int {
+    skip_spaces();
+    var i: int = 0;
+    while (w[i] != 0) {
+        if (line[at + i] != w[i]) { return 0; }
+        i += 1;
+    }
+    if (line[at + i] != 0 && line[at + i] != ' ') { return 0; }
+    at += i;
+    return 1;
+}
+
+// Parse a decimal number; `ok` reports success.
+var ok: int;
+fn number() -> int {
+    skip_spaces();
+    var neg: int = 0;
+    if (line[at] == '-') { neg = 1; at += 1; }
+    ok = line[at] >= '0' && line[at] <= '9';
+    var v: int = 0;
+    while (line[at] >= '0' && line[at] <= '9') {
+        v = v * 10 + (line[at] - '0');
+        at += 1;
+    }
+    return neg ? -v : v;
+}
+
+fn cmd_dump() {
+    var addr: int = number();
+    if (!ok) { print("usage: dump ADDRESS [WORDS]   (a word address, a multiple of 3)\n"); return; }
+    if (addr % 3 != 0) { print("the address must be a multiple of 3\n"); return; }
+    var n: int = number();
+    if (!ok) { n = 9; }
+    var buf: [15]char;
+    while (n > 0) {
+        colour(A_LABEL);
+        print_int(addr);
+        colour(A_TEXT);
+        print("  ");
+        var w: int = *(addr as *int);
+        print(itoa27(w, &buf[0]));
+        print("  ");
+        print_int(w);
+        print("\n");
+        addr += 3;
+        n -= 1;
+    }
+}
+
+fn help() {
+    print("  help            this list\n");
+    print("  info            CPU, RAM, clock and disks\n");
+    print("  time            the clock\n");
+    print("  dump A [N]      N words of memory from word address A (base 27 and decimal)\n");
+    print("  boot            boot from disk 0\n");
+    print("  reset / off     restart / power off\n");
+}
+
+fn monitor() {
+    colour(A_WARN);
+    print("\nNo bootable disk. Monitor ready; type help.\n");
+    colour(A_TEXT);
+    loop {
+        colour(A_OK);
+        print("> ");
+        colour(A_TEXT);
+        read_line();
+        at = 0;
+        if (word_is("")) { continue; }
+        else if (word_is("help")) { help(); }
+        else if (word_is("info")) { print_info(); }
+        else if (word_is("time")) { print_time(); }
+        else if (word_is("dump")) { cmd_dump(); }
+        else if (word_is("boot")) { try_boot(); }
+        else if (word_is("reset")) { out(SYSCTL_POWER, 1); }
+        else if (word_is("off")) { out(SYSCTL_POWER, -1); }
+        else { print("unknown command; type help\n"); }
+    }
+}
+
+fn main() -> int {
+    ram_frames = in(SYSCTL_RAM_FRAMES);
+    screen_clear();
+    title_bar();
+    print_info();
+    try_boot();
+    monitor();
+    return 0;
+}

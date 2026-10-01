@@ -2,7 +2,7 @@
 //!
 //! A window showing the display (text or graphics mode), keyboard and mouse
 //! input, and the serial console on stdin/stdout. Without `--rom` it boots
-//! the built-in demo ROM.
+//! the built-in BIOS (from bios/bios.tri); `--demo` boots the old demo ROM.
 //!
 //! ```text
 //! setun [--rom FILE.t1b2] [--disk FILE.t1b2] [--ram FRAMES] [--mips N]
@@ -18,6 +18,7 @@ use std::sync::mpsc;
 
 struct Args {
     rom: Option<PathBuf>,
+    demo: bool,
     disk: Option<PathBuf>,
     ram_frames: i64,
     mips: f64,
@@ -30,7 +31,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: setun [--rom FILE.t1b2] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale N]\n\
+        "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale N]\n\
          \x20            [--headless INSTRUCTIONS] [--keys TEXT] [--screenshot FILE.png]\n\
          \n\
          --ram FRAMES     RAM in 3^9-tryte pages (default 19683 = 3^18 trytes)\n\
@@ -46,6 +47,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let mut a = Args {
         rom: None,
+        demo: false,
         disk: None,
         ram_frames: setun_core::memory::DEFAULT_RAM_FRAMES,
         mips: 10.0,
@@ -60,6 +62,7 @@ fn parse_args() -> Args {
         let mut val = || it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--rom" => a.rom = Some(val().into()),
+            "--demo" => a.demo = true,
             "--disk" => a.disk = Some(val().into()),
             "--ram" => a.ram_frames = val().parse().unwrap_or_else(|_| usage()),
             "--mips" => a.mips = val().parse().unwrap_or_else(|_| usage()),
@@ -100,7 +103,16 @@ fn build_machine(args: &Args) -> Machine {
             m.load_rom(&rom);
             m
         }
-        None => setun_demo::machine(args.ram_frames, unix_now()),
+        None if args.demo => setun_demo::machine(args.ram_frames, unix_now()),
+        None => {
+            let rom = trine::bios_rom().unwrap_or_else(|e| {
+                eprintln!("setun: the built-in BIOS does not compile: {e}");
+                std::process::exit(1)
+            });
+            let mut m = Machine::new(args.ram_frames, unix_now());
+            m.load_rom(&rom);
+            m
+        }
     };
     if let Some(path) = &args.disk {
         match FileDisk::open(path) {

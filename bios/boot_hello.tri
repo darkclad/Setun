@@ -1,0 +1,15 @@
+// A boot sector: the BIOS loads this from disk 0 and jumps to it.
+//
+//   trine build --boot bios/boot_hello.tri -o hello.disk
+//   setun --disk hello.disk
+
+import "console.tri";
+
+fn main(disk: int, ram: int) -> int {
+    print("\nHello from the boot sector! Booted from disk ");
+    print_int(disk);
+    print(", ");
+    print_int(ram);
+    print(" pages of RAM.\n");
+    return 42;
+}

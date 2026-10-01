@@ -568,14 +568,32 @@ impl Compiler {
         self.emit("pop lr");
         self.emit("ret");
         // `extern fn`s may live in assembly; the assembler reports any that are missing.
-        if !matches!(self.globals.get("main"), Some(Global::Func { defined: true, .. })) {
-            return err(Pos::default(), "no `fn main()` defined");
+        match self.globals.get("main") {
+            Some(Global::Func { defined: true, ty: Ty::Fn(ps, _) }) => {
+                if ps.len() > 2 || ps.iter().any(|p| !p.is_integer()) {
+                    return err(Pos::default(), "`main` takes at most two int parameters (boot disk, RAM pages)");
+                }
+            }
+            _ => return err(Pos::default(), "no `fn main()` defined"),
         }
 
         let mut text = self.code.join("\n");
         text.push('\n');
         for (l, s) in &self.strings {
             text += &format!("{l}: .string \"{}\"\n", escape(s));
+        }
+        // Global variables as assembler constants, so inline asm can name them.
+        let mut vars: Vec<(&String, &String)> = self
+            .globals
+            .iter()
+            .filter_map(|(n, g)| match g {
+                Global::Var { label, .. } => Some((n, label)),
+                _ => None,
+            })
+            .collect();
+        vars.sort();
+        for (n, addr) in vars {
+            text += &format!("{n} = {addr}\n");
         }
         Ok(Compiled { text, data_start: self.data_start, data_end: self.data_cursor })
     }

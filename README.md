@@ -21,6 +21,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
+- [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 
@@ -36,12 +37,15 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 | `crates/web` + `web/` | browser front end: WebAssembly exports and the front-panel page |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
 | `examples/` | Trine programs, e.g. `mandel.tri` |
+| `bios/` | the BIOS (`bios.tri`, built into `setun`) and a sample boot sector |
 
 ## Build and run
 
 ```
 cargo test
-cargo run --release -p setun-native            # window with the demo ROM
+cargo run --release -p setun-native            # window: boots the BIOS (--demo: demo ROM)
+cargo run --release -p trine -- build --boot bios/boot_hello.tri -o hello.disk
+cargo run --release -p setun-native -- --disk hello.disk     # BIOS boots it
 cargo run --release -p setun-native -- --help  # options: --rom, --disk, --ram, --mips, --headless, --screenshot
 cargo run --release -p trine -- run examples/hello.tri        # compile + run headless
 cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2

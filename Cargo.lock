@@ -585,6 +585,7 @@ dependencies = [
  "png",
  "setun-core",
  "setun-demo",
+ "trine",
 ]
 
 [[package]]
