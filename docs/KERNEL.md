@@ -256,7 +256,7 @@ fmt_nl(f);
 | K4 ✅ | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
 | K5 ✅ | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
 | K6 ✅ | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
-| K7 | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
+| K7 ✅ | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
 | K8 | (then) the window system on the framebuffer | – |
 
 **Decisions for review:**
@@ -676,3 +676,99 @@ At boot the kernel mounts the tfs volume as `/`, and prints `VFS: Mounted root (
 - **Fallback:** the initramfs root still boots.
 - **`ps` and `/proc`:** `ps` and the `/proc` files show the expected processes and fields.
 - **Host refusals:** the host tfs refuses bad names, duplicates, impossible geometry and damaged superblocks, and its fsck reports out-of-range or doubly used blocks, wrong link and free counts, unreachable inodes and bad entries. It found a real inode leak in `mkdisk` on the way.
+
+## 20. K7 as built
+
+**Kernel additions for user space:**
+- **Environment:** `execve` copies `envp` along with `argv`, and builds Linux's stack layout (`argv[]`, NULL, `envp[]`, NULL). `envp` arrives in `r3`.
+  - The user startup code stores it in the program's `environ` global when the program has one (tlibc does), like glibc's start code.
+  - Init gets `HOME=/` and `TERM=linux`, as on Linux.
+  - Argument and environment strings share 2187 trytes and 81 slots (`E2BIG` past that).
+  - A path or string outside user space gives `EFAULT`.
+- **New system calls:**
+
+  | Call | Number |
+  |---|---|
+  | `fcntl` | 25: `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` |
+  | `linkat` | 37: hard links, tfs only; `EPERM` for a directory or on ramfs, `EXDEV` across file systems |
+  | `fchmodat` | 53 |
+  | `clock_gettime` | 113: `CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the ticks |
+  | `uname` | 160: six 65-character fields |
+  | `umask` | 166: 022 at boot, applied when creating files and directories |
+  | `getuid`, `geteuid`, `getgid`, `getegid` | 174–177: always 0, since the system is single-user |
+
+- **Close-on-exec:** `O_CLOEXEC` on `openat`, `pipe2` and `dup3`, and `FD_CLOEXEC`; `execve` closes the marked descriptors.
+- **Console:** a VT100 subset on the text screen: cursor position (`ESC[r;cH`), `ESC[J`/`2J`, `ESC[K`, cursor moves (`A`–`D`), and colours (`ESC[…m` with 0, 30–37, 40–47). The serial port passes escape sequences through unchanged.
+- **Trine and the user layout:**
+  - Trine gains the `\e` escape.
+  - User code may now be 27 pages (`USER_DATA = USER_BASE + 27·3^9`), to make room for the shell.
+
+**tlibc** is split like the C headers. A program imports only what it uses:
+
+| Module | Contents |
+|---|---|
+| `lib/tlibc.tri` | the core (unistd, fcntl, signal, stat, dirent, termios, wait, sysinfo, mount, statfs, reboot, utsname, uid calls), plus `getenv`, `execv`, `execvp` (`$PATH`), `exit` |
+| `lib/string.tri` | `strcpy`, `strncpy`, `strcat`, `strncat`, `strncmp`, `memcmp`, `memmove`, `strchr`, `strrchr`, `strstr`, `strspn`, `strcspn` |
+| `lib/ctype.tri` | the ASCII classes, `toupper`, `tolower` |
+| `lib/stdlib.tri` | first-fit `malloc`/`free`/`calloc`/`realloc` over `sbrk` (results are word-aligned, like C's), `strdup`/`strndup`, `strtol` (bases 2–36, `ERANGE` clamping at ±(3^27−1)/2), `atoi`, `setenv`/`unsetenv`, `qsort` |
+| `lib/stdio.tri` | buffered `FILE` (`fopen`/`fdopen`/`fclose`/`fflush`, `fgetc`/`ungetc`/`fgets`, `fputc`/`fputs_f`/`fput_int`/`fput_padded`) |
+| `lib/getopt.tri` | POSIX `getopt` (clusters, arguments, `:` mode, `--`) |
+| `lib/time.tri` | `time`, `gmtime_r`, a `strftime` subset |
+| `lib/testexpr.tri` | the `test`/`[` expression, shared by the shell and `/bin/test` |
+
+There is still no `printf`; the typed writers replace it (§12).
+
+**`/bin/sh`** ([`user/bin/sh.tri`](../user/bin/sh.tri)) was rewritten as a tokenizer, a recursive-descent parser building a syntax tree, and an executor:
+- **Grammar:**
+  - simple commands, pipelines with `!`, lists (`;`, `&`, `&&`, `||`, newline);
+  - `if`/`elif`/`else`, `while`, `until`, `for` (with or without `in`), `case` with `|` patterns;
+  - `( … )` subshells and `{ … }` groups;
+  - redirections on any command, compound ones included (`while read l; do …; done < file`): `<`, `>`, `>>`, `n<&m`, `n>&m`, `n>&-`.
+- **Expansions:**
+  - quoting with `'…'`, `"…"` and `\`;
+  - `$name`, `${name}`, `${name:-w}`, `${name-w}`, `${name:+w}`, `${name:=w}`, `${name:?w}`, `${#name}`;
+  - `$?`, `$$`, `$!`, `$#`, `$@` (`"$@"` keeps the words), `$*`, `$-`, `$0`–`$9`;
+  - `$(…)` (nested; trailing newlines removed);
+  - `$((…))`: `+ - * / %`, comparisons, `&& || !`, parentheses, variables;
+  - `~`, field splitting of unquoted results, and globbing (`* ? [...] [!...]`, sorted; a pattern that matches nothing stays literal).
+- **Variables:** `export`, `unset`, and prefix assignments (`VAR=x cmd` exports to that command only). The shell imports the environment at startup, and `PATH` defaults to `/bin:/sbin`.
+- **Builtins:** `: true false echo cd pwd exit export unset set shift read test [ break continue jobs fg bg kill wait exec umask type`.
+  - `set -e`, `set -x` and `set -- args`;
+  - `break n` and `continue n`;
+  - `read` takes one character at a time, so it leaves the rest of its input for the next reader;
+  - `exec` with only redirections makes them permanent.
+- **Input:** multi-line commands at the terminal continue with `PS2` (`> `).
+- **Errors:**
+  - syntax errors print bash's message ("syntax error near unexpected token `fi'") and set status 2;
+  - an expansion error (division by zero, `${x:?}`, a bad substitution) abandons the whole command line, and makes a non-interactive shell exit;
+  - commands that are not found give 127, and ones that are not executable give 126.
+- **Not yet:** functions, `eval`, `.`, here-documents, aliases.
+
+**Utilities** (`/bin`):
+- `head`, `tail`, `wc`;
+- `grep` (basic regular expressions, `-i -v -c -n -q`, status 0/1/2);
+- `sort` (`-r -n -u`), `uniq` (`-c`);
+- `cp`, `ln`, `chmod` (octal and `ugoa±=rwx`).
+
+A busybox-style multi-call program, stored once with hard links, provides `rmdir basename dirname env printenv uname date clear seq tee yes kill test [`. `mkdisk` makes a hard link for each source file that appears under several names.
+
+**Verified** (`crates/trinux/tests/userland.rs`):
+- **The shell language:** each construct above, including nested `continue 2`, `"$@"`, globbing, `while read … < file`, compound redirections, scripts with arguments, `set -e`/`-x`, and multi-line input.
+- **Shell errors:** 24 cases, each with its message and status. Expansion errors stop the rest of the line.
+- **The utilities**, and 28 utility failure cases, each with its message and status.
+- **libctest:** about 80 checks, including:
+  - malloc stress;
+  - `strtol` edge cases;
+  - setenv refusals;
+  - environment inheritance through `execvp`;
+  - `FILE` I/O;
+  - `getopt`;
+  - `gmtime` on a leap day;
+  - umask, chmod, link and fcntl errors;
+  - close-on-exec;
+  - `E2BIG`, and `EFAULT` for `execve`.
+- **The screen:** `clear` erases it through the VT100 subset.
+- **Bugs found:**
+  - `chmod` combined permission bits with `|`, which in Trine is tritwise max, not binary OR;
+  - `malloc` returned the first tryte instead of a word-aligned address;
+  - init passed an empty environment to the shell.

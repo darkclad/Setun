@@ -12,7 +12,7 @@ import "vm.tri";
 import "fs/vfs.tri";
 
 const TEF_MAGIC: int = 31857270901;
-const MAX_ARGS: int = 32;
+const MAX_ARGS: int = 81;             // argv and envp strings together
 const ARG_BYTES: int = 2187;
 
 const E2BIG: int = 7;
@@ -23,8 +23,9 @@ const ENOMEM: int = 12;
 // Arguments, copied into the kernel before the old address space goes.
 var exec_path: [81]char;
 var exec_buf: [2187]char;
-var exec_arg: [32]int;                // offsets into exec_buf
+var exec_arg: [81]int;                // offsets into exec_buf: argv, then envp
 var exec_argc: int;
+var exec_envc: int;
 var exec_cwd: int;                    // where a relative path starts
 var exec_hdr: [6]int;
 
@@ -33,6 +34,7 @@ var load_l1: int;
 var load_entry: int;
 var load_sp: int;
 var load_argv: int;
+var load_envp: int;
 var load_heap: int;
 var load_brk: int;
 
@@ -90,19 +92,22 @@ fn exec_load() -> int {
     // Stack: the top page now, the rest on demand.
     var f: int = alloc_user_frame();
     if (f < 0 || !map_page(l1, USER_STACK, f, 1, 0)) { free_address_space(l1); return -ENOMEM; }
-    // Strings just below the top, then argv[], NULL, envp NULL.
+    // Strings just below the top, then argv[], NULL, envp[], NULL (as on Linux).
+    var nstr: int = exec_argc + exec_envc;
     var total: int = 0;
     var k: int = 0;
-    while (k < exec_argc) {
+    while (k < nstr) {
         total += strlen(&exec_buf[exec_arg[k]]) + 1;
         k += 1;
     }
     var strings: int = USER_STACK - 3 - total;
-    var argv: int = (strings - 3 * (exec_argc + 3)) / 3 * 3;
+    var argv: int = (strings - 3 * (nstr + 3)) / 3 * 3;
+    var envp: int = argv + 3 * (exec_argc + 1);
     var at: int = strings;
     k = 0;
-    while (k < exec_argc) {
-        poke_word(l1, argv + 3 * k, at);
+    while (k < nstr) {
+        var slot: int = k < exec_argc ? argv + 3 * k : envp + 3 * (k - exec_argc);
+        poke_word(l1, slot, at);
         var s: *char = &exec_buf[exec_arg[k]];
         var j: int = 0;
         loop {
@@ -114,12 +119,13 @@ fn exec_load() -> int {
         k += 1;
     }
     poke_word(l1, argv + 3 * exec_argc, 0);           // argv[argc] = NULL
-    poke_word(l1, argv + 3 * (exec_argc + 1), 0);     // envp[0] = NULL
+    poke_word(l1, envp + 3 * exec_envc, 0);           // envp[envc] = NULL
 
     load_l1 = l1;
     load_entry = entry;
     load_sp = argv - 3;
     load_argv = argv;
+    load_envp = envp;
     load_heap = bss;
     load_brk = bss + bss_size;
     return 0;
@@ -139,24 +145,44 @@ fn copy_user_string(src: int, dst: *char, max: int) -> int {
     return -1;
 }
 
-// Gather execve's path and argv from user space. Returns 0 or -errno.
-fn collect_exec_args(path: int, argv: int) -> int {
-    if (copy_user_string(path, &exec_path[0], 81) < 0) { return -ENOENT; }
-    exec_argc = 0;
-    var used: int = 0;
-    if (argv == 0) { return 0; }
-    if (!is_user_address(argv)) { return -14; }
-    var vec: *int = argv as *int;
+var exec_used: int;
+
+// Append the strings of a user vector (argv or envp) to exec_buf. Returns
+// how many, or -errno.
+fn collect_vector(vecp: int, first: int) -> int {
+    if (vecp == 0) { return 0; }
+    if (!is_user_address(vecp)) { return -14; }
+    var vec: *int = vecp as *int;
+    var n: int = 0;
     loop {
-        var s: int = vec[exec_argc];
-        if (s == 0) { break; }
-        if (exec_argc == MAX_ARGS) { return -E2BIG; }
-        var n: int = copy_user_string(s, &exec_buf[used], ARG_BYTES - used);
-        if (n < 0) { return -E2BIG; }
-        exec_arg[exec_argc] = used;
-        used += n + 1;
-        exec_argc += 1;
+        if (!is_user_address(vecp + 3 * n)) { return -14; }
+        var s: int = vec[n];
+        if (s == 0) { return n; }
+        if (first + n == MAX_ARGS) { return -E2BIG; }
+        if (!is_user_address(s)) { return -14; }
+        var len: int = copy_user_string(s, &exec_buf[exec_used], ARG_BYTES - exec_used);
+        if (len < 0) { return -E2BIG; }
+        exec_arg[first + n] = exec_used;
+        exec_used += len + 1;
+        n += 1;
     }
+}
+
+// Gather execve's path, argv and envp from user space. Returns 0 or -errno.
+fn collect_exec_args(path: int, argv: int, envp: int) -> int {
+    if (path == 0 || !is_user_address(path)) { return -14; }
+    var pl: int = copy_user_string(path, &exec_path[0], 81);
+    if (pl < 0) { return -36; }                       // ENAMETOOLONG
+    if (pl == 0) { return -ENOENT; }
+    exec_used = 0;
+    exec_argc = 0;
+    exec_envc = 0;
+    var n: int = collect_vector(argv, 0);
+    if (n < 0) { return n; }
+    exec_argc = n;
+    n = collect_vector(envp, exec_argc);
+    if (n < 0) { return n; }
+    exec_envc = n;
     return 0;
 }
 
@@ -172,4 +198,21 @@ fn set_kernel_exec(path: *char) {
     exec_buf[i] = 0;
     exec_arg[0] = 0;
     exec_argc = 1;
+    // Linux gives init HOME=/ and TERM=linux.
+    exec_used = i + 1;
+    exec_envc = 0;
+    add_kernel_env("HOME=/");
+    add_kernel_env("TERM=linux");
+}
+
+fn add_kernel_env(s: *char) {
+    exec_arg[exec_argc + exec_envc] = exec_used;
+    var k: int = 0;
+    loop {
+        exec_buf[exec_used] = s[k];
+        exec_used += 1;
+        if (s[k] == 0) { break; }
+        k += 1;
+    }
+    exec_envc += 1;
 }

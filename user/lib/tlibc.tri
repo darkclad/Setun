@@ -2,6 +2,11 @@
 //
 // System calls use the Linux generic numbers and return -errno on failure;
 // these wrappers set `errno` and return -1, as POSIX specifies.
+//
+// This file is the core (unistd.h, fcntl.h, signal.h, ...). Like C headers,
+// the rest is imported only where needed: string.tri, ctype.tri,
+// stdlib.tri (malloc, setenv, strtol, qsort), stdio.tri (FILE),
+// getopt.tri and time.tri.
 
 import "rt.tri";
 
@@ -35,6 +40,9 @@ const ERANGE: int = 34;
 const ENAMETOOLONG: int = 36;
 const ENOSYS: int = 38;
 const ENOTEMPTY: int = 39;
+const E2BIG: int = 7;
+const EMLINK: int = 31;
+const EDOM: int = 33;
 const EXDEV: int = 18;
 const ENODEV: int = 19;
 const EFBIG: int = 27;
@@ -95,6 +103,7 @@ const S_IFDIR: int = 16384;
 const S_IFREG: int = 32768;
 
 var errno: int;
+var environ: **char;                   // set by the startup code (envp)
 
 fn _ret(r: int) -> int {
     if (r < 0) { errno = -r; return -1; }
@@ -160,8 +169,85 @@ fn setsid() -> int { return _ret(syscall(157)); }
 fn getppid() -> int { return syscall(173); }
 fn sched_yield() -> int { return _ret(syscall(124)); }
 fn _exit(code: int) { syscall(93, code); }
+fn exit(code: int) { syscall(93, code); }           // no atexit handlers; stdio FILEs flush on fclose
 fn fork() -> int { return _ret(syscall(220, SIGCHLD, 0, 0, 0, 0)); }
 fn execve(path: *char, argv: **char, envp: **char) -> int { return _ret(syscall(221, path, argv, envp)); }
+fn execv(path: *char, argv: **char) -> int { return execve(path, argv, environ); }
+
+// execvp: a name without '/' is looked up in $PATH (default /bin:/sbin).
+fn execvp(file: *char, argv: **char) -> int {
+    var k: int = 0;
+    while (file[k] != 0) {
+        if (file[k] == '/') { return execve(file, argv, environ); }
+        k += 1;
+    }
+    var path: *char = getenv("PATH");
+    if (path == null) { path = "/bin:/sbin"; }
+    var saw_eacces: int = 0;
+    var i: int = 0;
+    loop {
+        var full: [243]char;
+        var n: int = 0;
+        while (path[i] != 0 && path[i] != ':' && n < 200) { full[n] = path[i]; n += 1; i += 1; }
+        if (n == 0) { full[n] = '.'; n += 1; }
+        full[n] = '/';
+        n += 1;
+        var j: int = 0;
+        while (file[j] != 0 && n < 242) { full[n] = file[j]; n += 1; j += 1; }
+        full[n] = 0;
+        execve(&full[0], argv, environ);
+        if (errno == EACCES) { saw_eacces = 1; }
+        else if (errno != ENOENT && errno != ENOTDIR) { return -1; }
+        if (path[i] == 0) { break; }
+        i += 1;
+    }
+    errno = saw_eacces ? EACCES : ENOENT;
+    return -1;
+}
+
+// getenv: the value of `name` in the environment, or null.
+fn getenv(name: *char) -> *char {
+    if (environ == null) { return null; }
+    var i: int = 0;
+    while (environ[i] != null) {
+        var e: *char = environ[i];
+        var k: int = 0;
+        while (name[k] != 0 && e[k] == name[k]) { k += 1; }
+        if (name[k] == 0 && e[k] == '=') { return &e[k + 1]; }
+        i += 1;
+    }
+    return null;
+}
+
+fn getuid() -> int { return syscall(174); }
+fn geteuid() -> int { return syscall(175); }
+fn getgid() -> int { return syscall(176); }
+fn getegid() -> int { return syscall(177); }
+fn umask(mask: int) -> int { return syscall(166, mask); }
+fn chmod(path: *char, mode: int) -> int { return _ret(syscall(53, AT_FDCWD, path, mode, 0)); }
+fn link(old: *char, new: *char) -> int { return _ret(syscall(37, AT_FDCWD, old, AT_FDCWD, new, 0)); }
+
+// fcntl.h
+const F_DUPFD: int = 0;
+const F_GETFD: int = 1;
+const F_SETFD: int = 2;
+const F_GETFL: int = 3;
+const F_SETFL: int = 4;
+const F_DUPFD_CLOEXEC: int = 1030;
+const FD_CLOEXEC: int = 1;
+const O_CLOEXEC: int = 524288;
+fn fcntl(fd: int, cmd: int, arg: int) -> int { return _ret(syscall(25, fd, cmd, arg)); }
+
+// sys/utsname.h
+struct utsname {
+    sysname: [65]char;
+    nodename: [65]char;
+    release: [65]char;
+    version: [65]char;
+    machine: [65]char;
+    domainname: [65]char;
+}
+fn uname(u: *utsname) -> int { return _ret(syscall(160, u)); }
 fn brk(addr: int) -> int { return syscall(214, addr); }
 
 // getcwd: the working directory into buf; returns buf, or null.
@@ -396,6 +482,10 @@ struct timespec {
 
 fn nanosleep(req: *timespec, rem: *timespec) -> int { return _ret(syscall(101, req, rem)); }
 
+const CLOCK_REALTIME: int = 0;
+const CLOCK_MONOTONIC: int = 1;
+fn clock_gettime(clk: int, ts: *timespec) -> int { return _ret(syscall(113, clk, ts)); }
+
 // sleep: returns the seconds left if a signal cut it short.
 fn sleep(seconds: int) -> int {
     var req: timespec;
@@ -513,6 +603,9 @@ fn strerror(e: int) -> *char {
         case ENOSYS: return "Function not implemented";
         case ENOTEMPTY: return "Directory not empty";
         case EXDEV: return "Invalid cross-device link";
+        case E2BIG: return "Argument list too long";
+        case EMLINK: return "Too many links";
+        case EDOM: return "Numerical argument out of domain";
         case ENODEV: return "No such device";
         case EFBIG: return "File too large";
     }

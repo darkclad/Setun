@@ -11,7 +11,7 @@ fn main(argc: int, argv: **char) -> int {
     var pid: int = fork();
     if (pid == 0) {
         var args: [2]*char = { "sh", null };
-        execve("/bin/sh", &args[0], null);
+        execve("/bin/sh", &args[0], environ);           // HOME=/ TERM=linux from the kernel
         perror2("init", "/bin/sh");
         _exit(127);
     }

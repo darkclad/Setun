@@ -1,0 +1,60 @@
+// tail [-n N] [file]: the last N lines (default 10).
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/stdio.tri";
+import "../lib/getopt.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var lines: int = 10;
+    var c: int = getopt(argc, argv, "n:");
+    while (c != -1) {
+        if (c == 'n') {
+            var end: *char;
+            lines = strtol(optarg, &end, 10);
+            if (end == optarg || end[0] != 0 || lines < 0) {
+                fputs(STDERR_FILENO, "tail: invalid number of lines: '");
+                fputs(STDERR_FILENO, optarg);
+                fputs(STDERR_FILENO, "'\n");
+                return 1;
+            }
+        } else {
+            fputs(STDERR_FILENO, "usage: tail [-n lines] [file]\n");
+            return 1;
+        }
+        c = getopt(argc, argv, "n:");
+    }
+    var f: *FILE = stdin();
+    if (optind < argc && !streq(argv[optind], "-")) {
+        f = fopen(argv[optind], "r");
+        if (f == null) { perror2("tail", argv[optind]); return 1; }
+    }
+    // Keep the whole input (it is small on this machine), then print the end.
+    var cap: int = 19683;
+    var buf: *char = malloc(cap) as *char;
+    var n: int = 0;
+    loop {
+        var ch: int = fgetc(f);
+        if (ch == EOF) { break; }
+        if (n == cap) {
+            cap *= 3;
+            buf = realloc(buf as *tryte, cap) as *char;
+            if (buf == null) { fputs(STDERR_FILENO, "tail: out of memory\n"); return 1; }
+        }
+        buf[n] = ch as char;
+        n += 1;
+    }
+    var start: int = n;
+    var seen: int = 0;
+    if (start > 0 && buf[start - 1] == '\n') { start -= 1; }
+    while (start > 0) {
+        if (buf[start - 1] == '\n') {
+            seen += 1;
+            if (seen == lines) { break; }
+        }
+        start -= 1;
+    }
+    if (lines == 0) { start = n; }
+    write(STDOUT_FILENO, &buf[start], n - start);
+    return 0;
+}

@@ -1,0 +1,55 @@
+// head [-n N] [file ...]: the first N lines (default 10).
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/stdio.tri";
+import "../lib/getopt.tri";
+
+var lines: int = 10;
+
+fn head(f: *FILE) {
+    var n: int = 0;
+    while (n < lines) {
+        var c: int = fgetc(f);
+        if (c == EOF) { return; }
+        fputc(c, stdout());
+        if (c == '\n') { n += 1; }
+    }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var c: int = getopt(argc, argv, "n:");
+    while (c != -1) {
+        if (c == 'n') {
+            var end: *char;
+            lines = strtol(optarg, &end, 10);
+            if (end == optarg || end[0] != 0 || lines < 0) {
+                fputs(STDERR_FILENO, "head: invalid number of lines: '");
+                fputs(STDERR_FILENO, optarg);
+                fputs(STDERR_FILENO, "'\n");
+                return 1;
+            }
+        } else {
+            fputs(STDERR_FILENO, "usage: head [-n lines] [file ...]\n");
+            return 1;
+        }
+        c = getopt(argc, argv, "n:");
+    }
+    if (optind == argc) { head(stdin()); return 0; }
+    var status: int = 0;
+    var i: int = optind;
+    while (i < argc) {
+        var f: *FILE = streq(argv[i], "-") ? stdin() : fopen(argv[i], "r");
+        if (f == null) { perror2("head", argv[i]); status = 1; }
+        else {
+            if (argc - optind > 1) {
+                if (i > optind) { puts("\n"); }
+                puts("==> "); puts(argv[i]); puts(" <==\n");
+            }
+            head(f);
+            if (f != stdin()) { fclose(f); }
+        }
+        i += 1;
+    }
+    return status;
+}

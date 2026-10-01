@@ -1,0 +1,150 @@
+// sys: identity, time, permissions, links and descriptor flags.
+
+import "params.tri";
+import "printk.tri";
+import "arch.tri";
+import "vm.tri";
+import "fs/vfs.tri";
+import "fs/tfs.tri";
+import "fs/file.tri";
+import "sched.tri";
+
+const CLOCK_REALTIME: int = 0;
+const CLOCK_MONOTONIC: int = 1;
+
+const F_DUPFD: int = 0;
+const F_GETFD: int = 1;
+const F_SETFD: int = 2;
+const F_GETFL: int = 3;
+const F_SETFL: int = 4;
+const F_DUPFD_CLOEXEC: int = 1030;
+const FD_CLOEXEC: int = 1;
+const O_CLOEXEC: int = 524288;
+const O_NONBLOCK: int = 2048;
+const EMLINK: int = 31;
+
+// struct utsname: six fields of 65 characters (Linux's sizes).
+struct Utsname {
+    sysname: [65]char;
+    nodename: [65]char;
+    release: [65]char;
+    version: [65]char;
+    machine: [65]char;
+    domainname: [65]char;
+}
+
+fn sys_uname(buf: int) -> int {
+    if (!user_range_ok(buf - 1, sizeof(Utsname))) { return -EFAULT; }
+    var u: *Utsname = buf as *Utsname;
+    copy_str(&u.sysname[0], "Trinux", 65);
+    copy_str(&u.nodename[0], "setun", 65);
+    copy_str(&u.release[0], TRINUX_VERSION, 65);
+    copy_str(&u.version[0], "#7 K7 balanced ternary", 65);
+    copy_str(&u.machine[0], "setun386", 65);
+    copy_str(&u.domainname[0], "(none)", 65);
+    return 0;
+}
+
+// clock_gettime: REALTIME from the RTC, MONOTONIC from the timer ticks.
+fn sys_clock_gettime(clk: int, ts: int) -> int {
+    if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC) { return -EINVAL; }
+    if (!user_range_ok(ts - 1, 6)) { return -EFAULT; }
+    var t: *int = ts as *int;
+    if (clk == CLOCK_REALTIME) {
+        t[0] = in(RTC_SECONDS);
+        t[1] = in(RTC_MICROS) * 1000;
+    } else {
+        t[0] = jiffies / HZ;
+        t[1] = jiffies % HZ * 10000000;
+    }
+    return 0;
+}
+
+fn sys_umask(mask: int) -> int {
+    var t: *Task = current_task();
+    var old: int = t.umask;
+    t.umask = (mask % 512 + 512) % 512;
+    return old;
+}
+
+fn sys_fchmodat(dirfd: int, path: int, mode: int) -> int {
+    var r: int = get_path(path);
+    if (r < 0) { return r; }
+    var base: int = dir_base(dirfd);
+    if (base < 0) { return base; }
+    var i: int = path_lookup(&kpath[0], base);
+    if (i < 0) { return i; }
+    if (inodes[i].fs == FS_PROC) { return -EPERM; }
+    inodes[i].mode = (mode % 4096 + 4096) % 4096;
+    inodes[i].mtime = in(RTC_SECONDS);
+    if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
+    return 0;
+}
+
+// linkat: a second name for a file. tfs only (a ramfs inode has one name).
+fn sys_linkat(olddirfd: int, oldpath: int, newdirfd: int, newpath: int) -> int {
+    var r: int = get_path_into(oldpath, &kpath[0]);
+    if (r < 0) { return r; }
+    r = get_path_into(newpath, &kpath2[0]);
+    if (r < 0) { return r; }
+    if ((olddirfd != AT_FDCWD && kpath[0] != '/') || (newdirfd != AT_FDCWD && kpath2[0] != '/')) { return -EINVAL; }
+    var cwd: int = current_task().cwd;
+    var src: int = path_lookup(&kpath[0], cwd);
+    if (src < 0) { return src; }
+    if (inodes[src].type == I_DIR) { return -EPERM; }        // no links to directories
+    var dir: int = walk(&kpath2[0], cwd, 1);
+    if (dir < 0) { return dir; }
+    if (leaf_is_dot()) { return -EEXIST; }
+    var exists: int = fs_lookup(dir, &leaf[0], leaf_len);
+    if (exists >= 0) { return -EEXIST; }
+    if (exists != -ENOENT_) { return exists; }
+    if (inodes[dir].mnt != inodes[src].mnt) { return -EXDEV; }
+    if (inodes[src].fs != FS_TFS) { return -EPERM; }
+    if (inodes[src].nlink >= 19683) { return -EMLINK; }
+    if (leaf_len > TFS_NAME_MAX) { return -ENAMETOOLONG; }
+    r = dir_add(dir, &leaf[0], leaf_len, inodes[src].ino_no);
+    if (r < 0) { return r; }
+    inodes[src].nlink += 1;
+    tfs_isave(src);
+    return 0;
+}
+
+fn sys_fcntl(fd: int, cmd: int, arg: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    var t: *Task = current_task();
+    switch (cmd) {
+        case F_DUPFD, F_DUPFD_CLOEXEC: {
+            if (arg < 0 || arg >= NFDS) { return -EINVAL; }
+            var nfd: int = fd_install(f, arg);
+            if (nfd < 0) { return nfd; }
+            files[f].refs += 1;
+            t.fd_cloexec[nfd] = (cmd == F_DUPFD_CLOEXEC) as tryte;
+            return nfd;
+        }
+        case F_GETFD: return t.fd_cloexec[fd];
+        case F_SETFD: { t.fd_cloexec[fd] = (arg % 2 != 0) as tryte; return 0; }
+        case F_GETFL: return files[f].flags;
+        case F_SETFL: {
+            var keep: int = files[f].flags - (has(files[f].flags, O_APPEND) ? O_APPEND : 0) - (has(files[f].flags, O_NONBLOCK) ? O_NONBLOCK : 0);
+            files[f].flags = keep + (has(arg, O_APPEND) ? O_APPEND : 0) + (has(arg, O_NONBLOCK) ? O_NONBLOCK : 0);
+            return 0;
+        }
+    }
+    return -EINVAL;
+}
+
+fn sys_getuid() -> int { return 0; }       // single-user: everyone is root (KERNEL.md §12)
+
+// execve succeeded: close the descriptors marked close-on-exec.
+fn close_on_exec(t: *Task) {
+    var fd: int = 0;
+    while (fd < NFDS) {
+        if (t.fd_cloexec[fd] && t.fds[fd] != 0) {
+            file_close(t.fds[fd] - 1);
+            t.fds[fd] = 0;
+        }
+        t.fd_cloexec[fd] = 0;
+        fd += 1;
+    }
+}

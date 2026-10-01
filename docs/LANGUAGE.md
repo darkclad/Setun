@@ -29,7 +29,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - `42` and `1_000` (decimal)
   - `0t+-0` (balanced ternary: `+` `0` `-`, most significant first) = 6
   - `0zMMm` (base 27: `0`, `A`–`M` = +1…+13, `a`–`m` = −1…−13)
-- **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \0 \\ \' \"`.
+- **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
 - **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char`
 - `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.

@@ -22,7 +22,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4, accepted)
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
-- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K6 running: processes, a tfs root on disk, /proc, tty, pipes, signals, a job-control shell)
+- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K7 running: an interactive POSIX-like system with a scripting shell and core utilities on a tfs root)
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 

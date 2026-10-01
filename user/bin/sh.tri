@@ -1,65 +1,1229 @@
-// /bin/sh: a small POSIX-style shell with job control.
+// /bin/sh: a POSIX-style shell with job control.
 //
-//   sh                  interactive on standard input (prompt "$ " on a tty)
-//   sh -c 'commands'    run one command string
-//   sh script           run a file
+//   sh                     interactive on standard input (PS1, PS2 on a tty)
+//   sh -c 'cmds' [name args]
+//   sh script [args]
 //
-// Supported: pipelines (|), lists (; && || &), redirections (< > >> and
-// n> n>> n< n>&m), quoting ('...', "...", \), comments (#), $? $$ $!, and
-// the builtins cd, pwd, exit, jobs, fg, bg, kill. Commands without a / are
-// looked up in /bin, then /sbin.
-//
-// Job control (interactive only): every pipeline is a process group; the
-// foreground one owns the terminal (tcsetpgrp), so ^C and ^Z reach it and
-// not the shell. A stopped job can be resumed with fg or bg.
+// Language: simple commands, pipelines (| !), lists (; & && || newline),
+// if/elif/else, while, until, for, case, ( subshells ), { groups },
+// redirections (< > >> <& >& n>... on any command), quoting ('' "" \),
+// parameters ($name ${name} ${name:-w} ${name-w} ${name:+w} ${name:=w}
+// ${name:?w} ${#name} $? $$ $! $# $@ $* $- $0..$9), $(command substitution),
+// $((arithmetic)), ~, field splitting and globbing (* ? [...]).
+// Variables and export; prefix assignments (VAR=x cmd).
+// Builtins: : true false echo cd pwd exit export unset set shift read
+// test [ break continue jobs fg bg kill wait exec umask type.
+// Not yet: functions, eval, ., here-documents, aliases.
 
 import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/ctype.tri";
+import "../lib/stdlib.tri";
+import "../lib/testexpr.tri";
+
+// ---- tokens ---------------------------------------------------------------------------
 
 const T_WORD: int = 0;
-const T_PIPE: int = 1;
+const T_NEWLINE: int = 1;
 const T_SEMI: int = 2;
-const T_AND: int = 3;
-const T_OR: int = 4;
-const T_REDIR: int = 5;
-const T_AMP: int = 6;
+const T_AMP: int = 3;
+const T_PIPE: int = 4;
+const T_AND: int = 5;
+const T_OR: int = 6;
+const T_LPAREN: int = 7;
+const T_RPAREN: int = 8;
+const T_DSEMI: int = 9;
+const T_REDIR: int = 10;
+const T_EOF: int = 11;
 
 const R_IN: int = 0;                  // n<file
 const R_OUT: int = 1;                 // n>file
 const R_APPEND: int = 2;              // n>>file
-const R_DUP: int = 3;                 // n>&m
+const R_DUPOUT: int = 3;              // n>&m
+const R_DUPIN: int = 4;               // n<&m
 
-const MAX_TOKENS: int = 243;
-const MAX_ARGS: int = 81;
-const MAX_CMDS: int = 27;
-const LINE_MAX: int = 729;
-const MAX_JOBS: int = 9;
+const SRC_MAX: int = 19683;
+const MAXTOK: int = 2187;
+const MAXNODE: int = 729;
 
-// Markers the tokenizer leaves in words, expanded when a command runs, so
-// that `false; echo $?` sees the status of `false`.
-const VAR_STATUS: char = 1;
-const VAR_PID: char = 2;
-const VAR_BANG: char = 3;
-
-var tok_kind: [243]int;
-var tok_word: [243]*char;
-var tok_fd: [243]int;                 // T_REDIR: the descriptor redirected
-var tok_mode: [243]int;               // T_REDIR: R_*
-var tok_start: [243]int;              // where the token starts in the line
-var tok_end: [243]int;                // and where it ends
+var src: [19684]char;
+var src_len: int;
+var tkind: [2187]int;
+var tstart: [2187]int;
+var tend: [2187]int;
+var tfd: [2187]int;
+var tmode: [2187]int;
 var ntok: int;
-var words: [2187]char;
-var wp: int;
-var cur_line: *char;
+var lex_incomplete: int;
 
-var expbuf: [2187]char;               // expanded words of the command being run
-var ep: int;
+fn err(a: *char, b: *char) {
+    fputs(STDERR_FILENO, "sh: ");
+    fputs(STDERR_FILENO, a);
+    if (b != null) { fputs(STDERR_FILENO, b); }
+    fputs(STDERR_FILENO, "\n");
+}
+
+fn is_name_start(c: int) -> int { return isalpha(c) || c == '_'; }
+fn is_name_char(c: int) -> int { return isalnum(c) || c == '_'; }
+
+fn ends_word(c: char) -> int {
+    return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' || c == '<' || c == '>' || c == '(' || c == ')';
+}
+
+// Scanners return the index after the construct, or -1 if the text ends first.
+fn scan_squote(i: int) -> int {
+    while (i < src_len && src[i] != '\'') { i += 1; }
+    if (i >= src_len) { return -1; }
+    return i + 1;
+}
+
+fn scan_dquote(i: int) -> int {
+    while (i < src_len && src[i] != '"') {
+        if (src[i] == '\\') { i += 2; continue; }
+        if (src[i] == '$' && src[i + 1] == '(') { i = scan_paren(i + 2); if (i < 0) { return -1; } continue; }
+        if (src[i] == '$' && src[i + 1] == '{') { i = scan_brace(i + 2); if (i < 0) { return -1; } continue; }
+        i += 1;
+    }
+    if (i >= src_len) { return -1; }
+    return i + 1;
+}
+
+fn scan_paren(i: int) -> int {
+    var depth: int = 1;
+    while (depth > 0) {
+        if (i >= src_len) { return -1; }
+        var c: char = src[i];
+        if (c == '\\') { i += 2; continue; }
+        if (c == '\'') { i = scan_squote(i + 1); if (i < 0) { return -1; } continue; }
+        if (c == '"') { i = scan_dquote(i + 1); if (i < 0) { return -1; } continue; }
+        if (c == '(') { depth += 1; }
+        if (c == ')') { depth -= 1; }
+        i += 1;
+    }
+    return i;
+}
+
+fn scan_brace(i: int) -> int {
+    while (i < src_len && src[i] != '}') {
+        if (src[i] == '\'') { i = scan_squote(i + 1); if (i < 0) { return -1; } continue; }
+        if (src[i] == '"') { i = scan_dquote(i + 1); if (i < 0) { return -1; } continue; }
+        if (src[i] == '\\') { i += 2; continue; }
+        i += 1;
+    }
+    if (i >= src_len) { return -1; }
+    return i + 1;
+}
+
+fn scan_word(i: int) -> int {
+    while (i < src_len && !ends_word(src[i])) {
+        var c: char = src[i];
+        if (c == '\\') {
+            if (i + 1 >= src_len) { return -1; }
+            i += 2;
+        } else if (c == '\'') {
+            i = scan_squote(i + 1);
+        } else if (c == '"') {
+            i = scan_dquote(i + 1);
+        } else if (c == '$' && src[i + 1] == '(') {
+            i = scan_paren(i + 2);
+        } else if (c == '$' && src[i + 1] == '{') {
+            i = scan_brace(i + 2);
+        } else {
+            i += 1;
+        }
+        if (i < 0) { return -1; }
+    }
+    return i;
+}
+
+fn add_tok(kind: int, a: int, b: int) -> int {
+    if (ntok >= MAXTOK - 1) { err("too many words", null); return 0; }
+    tkind[ntok] = kind;
+    tstart[ntok] = a;
+    tend[ntok] = b;
+    ntok += 1;
+    return 1;
+}
+
+// Tokenize src. 0 = fine, 1 = the text ends inside a quote, 2 = too long.
+fn lex() -> int {
+    ntok = 0;
+    lex_incomplete = 0;
+    var i: int = 0;
+    src[src_len] = 0;
+    while (i < src_len) {
+        var c: char = src[i];
+        if (c == ' ' || c == '\t') { i += 1; continue; }
+        if (c == '\\' && src[i + 1] == '\n') { i += 2; continue; }       // line continuation
+        if (c == '#') {
+            while (i < src_len && src[i] != '\n') { i += 1; }
+            continue;
+        }
+        var a: int = i;
+        if (c == '\n') { add_tok(T_NEWLINE, a, a + 1); i += 1; continue; }
+        if (c == ';') {
+            if (src[i + 1] == ';') { add_tok(T_DSEMI, a, a + 2); i += 2; } else { add_tok(T_SEMI, a, a + 1); i += 1; }
+            continue;
+        }
+        if (c == '&') {
+            if (src[i + 1] == '&') { add_tok(T_AND, a, a + 2); i += 2; } else { add_tok(T_AMP, a, a + 1); i += 1; }
+            continue;
+        }
+        if (c == '|') {
+            if (src[i + 1] == '|') { add_tok(T_OR, a, a + 2); i += 2; } else { add_tok(T_PIPE, a, a + 1); i += 1; }
+            continue;
+        }
+        if (c == '(') { add_tok(T_LPAREN, a, a + 1); i += 1; continue; }
+        if (c == ')') { add_tok(T_RPAREN, a, a + 1); i += 1; continue; }
+        if (c == '<' || c == '>' || (isdigit(c) && (src[i + 1] == '<' || src[i + 1] == '>'))) {
+            var fd: int = -1;
+            if (isdigit(c)) { fd = c - '0'; i += 1; }
+            var mode: int;
+            if (src[i] == '<') {
+                i += 1;
+                mode = R_IN;
+                if (src[i] == '&') { mode = R_DUPIN; i += 1; }
+                if (fd < 0) { fd = 0; }
+            } else {
+                i += 1;
+                mode = R_OUT;
+                if (src[i] == '>') { mode = R_APPEND; i += 1; }
+                else if (src[i] == '&') { mode = R_DUPOUT; i += 1; }
+                else if (src[i] == '|') { i += 1; }
+                if (fd < 0) { fd = 1; }
+            }
+            if (!add_tok(T_REDIR, a, i)) { return 2; }
+            tfd[ntok - 1] = fd;
+            tmode[ntok - 1] = mode;
+            continue;
+        }
+        var e: int = scan_word(i);
+        if (e < 0) { lex_incomplete = 1; return 1; }
+        if (!add_tok(T_WORD, a, e)) { return 2; }
+        i = e;
+    }
+    add_tok(T_EOF, src_len, src_len);
+    return 0;
+}
+
+fn tok_is(t: int, s: *char) -> int {
+    if (tkind[t] != T_WORD) { return 0; }
+    var n: int = tend[t] - tstart[t];
+    var k: int = 0;
+    while (k < n) {
+        if (src[tstart[t] + k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return s[n] == 0;
+}
+
+// ---- the syntax tree ----------------------------------------------------------------------
+
+const N_CMD: int = 1;                 // a: first token, b: end token
+const N_PIPELINE: int = 2;            // a: first element (linked by next), d: negated
+const N_AND: int = 3;                 // a, b
+const N_OR: int = 4;
+const N_LIST: int = 5;                // a: first item (linked by next; bg flag on items)
+const N_IF: int = 6;                  // a: condition, b: then, c: else (or -1)
+const N_WHILE: int = 7;               // a: condition, b: body, d: 1 for until
+const N_FOR: int = 8;                 // a: name token, b..c: word tokens (b = -1: "$@"), d: body
+const N_CASE: int = 9;                // a: word token, b: first item
+const N_CASEITEM: int = 10;           // a..b: pattern tokens ('|' between), c: body
+const N_SUBSHELL: int = 11;           // a: list
+const N_GROUP: int = 12;              // a: list
+
+var nkind: [729]int;
+var na: [729]int;
+var nb: [729]int;
+var nc: [729]int;
+var nd: [729]int;
+var nnext: [729]int;
+var nbg: [729]int;
+var nra: [729]int;                    // redirections after a compound command: tokens nra..nrb
+var nrb: [729]int;
+var nsa: [729]int;                    // source text span
+var nsb: [729]int;
+var nnodes: int;
+
+var tp: int;                          // parser position
+var parse_error: int;
+var parse_incomplete: int;
+
+fn new_node(kind: int, first_tok: int) -> int {
+    if (nnodes >= MAXNODE) { err("program too large", null); parse_error = 1; return 0; }
+    var n: int = nnodes;
+    nnodes += 1;
+    nkind[n] = kind;
+    na[n] = -1;
+    nb[n] = -1;
+    nc[n] = -1;
+    nd[n] = 0;
+    nnext[n] = -1;
+    nbg[n] = 0;
+    nra[n] = 0;
+    nrb[n] = 0;
+    nsa[n] = tstart[first_tok];
+    nsb[n] = tstart[first_tok];
+    return n;
+}
+
+fn end_node(n: int) -> int {
+    if (tp > 0) { nsb[n] = tend[tp - 1]; }
+    return n;
+}
+
+fn syntax(t: int) -> int {
+    if (parse_error) { return -1; }
+    if (tkind[t] == T_EOF) {
+        parse_incomplete = 1;
+    } else {
+        var b: [81]char;
+        var n: int = tend[t] - tstart[t];
+        if (n > 79) { n = 79; }
+        var k: int = 0;
+        while (k < n) { b[k] = src[tstart[t] + k]; k += 1; }
+        b[n] = 0;
+        if (tkind[t] == T_NEWLINE) { strcpy(&b[0], "newline"); }
+        fputs(STDERR_FILENO, "sh: syntax error near unexpected token `");
+        fputs(STDERR_FILENO, &b[0]);
+        fputs(STDERR_FILENO, "'\n");
+    }
+    parse_error = 1;
+    return -1;
+}
+
+fn skip_newlines() { while (tkind[tp] == T_NEWLINE) { tp += 1; } }
+
+fn list_ends() -> int {
+    var k: int = tkind[tp];
+    if (k == T_EOF || k == T_RPAREN || k == T_DSEMI) { return 1; }
+    return tok_is(tp, "then") || tok_is(tp, "else") || tok_is(tp, "elif") || tok_is(tp, "fi") || tok_is(tp, "do")
+        || tok_is(tp, "done") || tok_is(tp, "esac") || tok_is(tp, "}");
+}
+
+fn expect_word(s: *char) -> int {
+    if (!tok_is(tp, s)) { return syntax(tp); }
+    tp += 1;
+    return 0;
+}
+
+fn parse_list() -> int {
+    var n: int = new_node(N_LIST, tp);
+    var last: int = -1;
+    skip_newlines();
+    while (!list_ends()) {
+        var item: int = parse_and_or();
+        if (item < 0) { return -1; }
+        if (last < 0) { na[n] = item; } else { nnext[last] = item; }
+        last = item;
+        var k: int = tkind[tp];
+        if (k == T_SEMI || k == T_NEWLINE) { tp += 1; }
+        else if (k == T_AMP) { nbg[item] = 1; tp += 1; }
+        else { break; }
+        skip_newlines();
+    }
+    return end_node(n);
+}
+
+fn parse_and_or() -> int {
+    var left: int = parse_pipeline();
+    if (left < 0) { return -1; }
+    while (tkind[tp] == T_AND || tkind[tp] == T_OR) {
+        var kind: int = tkind[tp] == T_AND ? N_AND : N_OR;
+        var start: int = nsa[left];
+        tp += 1;
+        skip_newlines();
+        var right: int = parse_pipeline();
+        if (right < 0) { return -1; }
+        var n: int = new_node(kind, tp);
+        na[n] = left;
+        nb[n] = right;
+        nsa[n] = start;
+        nsb[n] = nsb[right];
+        left = n;
+    }
+    return left;
+}
+
+fn parse_pipeline() -> int {
+    var n: int = new_node(N_PIPELINE, tp);
+    if (tok_is(tp, "!")) { nd[n] = 1; tp += 1; }
+    var first: int = parse_command();
+    if (first < 0) { return -1; }
+    na[n] = first;
+    var last: int = first;
+    while (tkind[tp] == T_PIPE) {
+        tp += 1;
+        skip_newlines();
+        var e: int = parse_command();
+        if (e < 0) { return -1; }
+        nnext[last] = e;
+        last = e;
+    }
+    return end_node(n);
+}
+
+// Redirections after a compound command.
+fn parse_redirs(n: int) -> int {
+    nra[n] = tp;
+    while (tkind[tp] == T_REDIR) {
+        if (tkind[tp + 1] != T_WORD) { return syntax(tp + 1); }
+        tp += 2;
+    }
+    nrb[n] = tp;
+    return end_node(n);
+}
+
+fn parse_command() -> int {
+    if (tok_is(tp, "if")) { return parse_if(); }
+    if (tok_is(tp, "while") || tok_is(tp, "until")) { return parse_while(); }
+    if (tok_is(tp, "for")) { return parse_for(); }
+    if (tok_is(tp, "case")) { return parse_case(); }
+    if (tok_is(tp, "{")) {
+        var g: int = new_node(N_GROUP, tp);
+        tp += 1;
+        na[g] = parse_list();
+        if (na[g] < 0 || expect_word("}") < 0) { return -1; }
+        return parse_redirs(g);
+    }
+    if (tkind[tp] == T_LPAREN) {
+        var s: int = new_node(N_SUBSHELL, tp);
+        tp += 1;
+        na[s] = parse_list();
+        if (na[s] < 0) { return -1; }
+        if (tkind[tp] != T_RPAREN) { return syntax(tp); }
+        tp += 1;
+        return parse_redirs(s);
+    }
+    var n: int = new_node(N_CMD, tp);
+    na[n] = tp;
+    while (tkind[tp] == T_WORD || tkind[tp] == T_REDIR) {
+        if (tkind[tp] == T_REDIR) {
+            if (tkind[tp + 1] != T_WORD) { return syntax(tp + 1); }
+            tp += 1;
+        }
+        tp += 1;
+    }
+    if (tp == na[n]) { return syntax(tp); }
+    nb[n] = tp;
+    return end_node(n);
+}
+
+fn parse_if() -> int {
+    var n: int = new_node(N_IF, tp);
+    tp += 1;                                            // if / elif
+    na[n] = parse_list();
+    if (na[n] < 0 || expect_word("then") < 0) { return -1; }
+    nb[n] = parse_list();
+    if (nb[n] < 0) { return -1; }
+    if (tok_is(tp, "elif")) {
+        nc[n] = parse_if();                             // consumes up to and including fi
+        if (nc[n] < 0) { return -1; }
+        return end_node(n);
+    }
+    if (tok_is(tp, "else")) {
+        tp += 1;
+        nc[n] = parse_list();
+        if (nc[n] < 0) { return -1; }
+    }
+    if (expect_word("fi") < 0) { return -1; }
+    return parse_redirs(n);
+}
+
+fn parse_while() -> int {
+    var n: int = new_node(N_WHILE, tp);
+    nd[n] = tok_is(tp, "until");
+    tp += 1;
+    na[n] = parse_list();
+    if (na[n] < 0 || expect_word("do") < 0) { return -1; }
+    nb[n] = parse_list();
+    if (nb[n] < 0 || expect_word("done") < 0) { return -1; }
+    return parse_redirs(n);
+}
+
+fn parse_for() -> int {
+    var n: int = new_node(N_FOR, tp);
+    tp += 1;
+    if (tkind[tp] != T_WORD) { return syntax(tp); }
+    na[n] = tp;
+    tp += 1;
+    skip_newlines();
+    if (tok_is(tp, "in")) {
+        tp += 1;
+        nb[n] = tp;
+        while (tkind[tp] == T_WORD) { tp += 1; }
+        nc[n] = tp;
+        if (tkind[tp] != T_SEMI && tkind[tp] != T_NEWLINE) { return syntax(tp); }
+        tp += 1;
+    } else if (tkind[tp] == T_SEMI) {
+        tp += 1;
+    }
+    skip_newlines();
+    if (expect_word("do") < 0) { return -1; }
+    nd[n] = parse_list();
+    if (nd[n] < 0 || expect_word("done") < 0) { return -1; }
+    return parse_redirs(n);
+}
+
+fn parse_case() -> int {
+    var n: int = new_node(N_CASE, tp);
+    tp += 1;
+    if (tkind[tp] != T_WORD) { return syntax(tp); }
+    na[n] = tp;
+    tp += 1;
+    skip_newlines();
+    if (expect_word("in") < 0) { return -1; }
+    skip_newlines();
+    var last: int = -1;
+    while (!tok_is(tp, "esac")) {
+        if (tkind[tp] == T_EOF) { return syntax(tp); }
+        var it: int = new_node(N_CASEITEM, tp);
+        if (tkind[tp] == T_LPAREN) { tp += 1; }
+        na[it] = tp;
+        loop {
+            if (tkind[tp] != T_WORD) { return syntax(tp); }
+            tp += 1;
+            if (tkind[tp] == T_PIPE) { tp += 1; continue; }
+            break;
+        }
+        nb[it] = tp;
+        if (tkind[tp] != T_RPAREN) { return syntax(tp); }
+        tp += 1;
+        nc[it] = parse_list();
+        if (nc[it] < 0) { return -1; }
+        if (tkind[tp] == T_DSEMI) { tp += 1; }
+        else if (!tok_is(tp, "esac")) { return syntax(tp); }
+        skip_newlines();
+        if (last < 0) { nb[n] = it; } else { nnext[last] = it; }
+        last = it;
+    }
+    tp += 1;
+    return parse_redirs(n);
+}
+
+// Parse the tokens: the program's list, or -1 (parse_incomplete says whether
+// more input could finish it).
+fn parse() -> int {
+    tp = 0;
+    nnodes = 0;
+    parse_error = 0;
+    parse_incomplete = 0;
+    var n: int = parse_list();
+    if (n < 0) { return -1; }
+    if (tkind[tp] != T_EOF) { return syntax(tp); }
+    return n;
+}
+
+// ---- variables ---------------------------------------------------------------------------------
+
+const NVARS: int = 243;
+
+var vname: [243]*char;
+var vval: [243]*char;
+var vexported: [243]int;
+var nvars: int;
+
+var pos_args: [81]*char;              // $1..
+var npos: int;
+var arg0: *char;
 
 var last_status: int;
-var last_bg: int;                     // $!
-var interactive: int;
+var last_bg: int;
+var opt_errexit: int;
+var opt_xtrace: int;
+var in_condition: int;
+
+fn var_find(name: *char) -> int {
+    var i: int = 0;
+    while (i < nvars) {
+        if (vname[i] != null && streq(vname[i], name)) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn var_get(name: *char) -> *char {
+    var i: int = var_find(name);
+    return i < 0 ? null : vval[i];
+}
+
+fn is_exported(name: *char) -> int {
+    var i: int = var_find(name);
+    return i >= 0 && vexported[i];
+}
+
+fn valid_name(s: *char) -> int {
+    if (!is_name_start(s[0])) { return 0; }
+    var k: int = 1;
+    while (s[k] != 0) { if (!is_name_char(s[k])) { return 0; } k += 1; }
+    return 1;
+}
+
+fn var_set(name: *char, value: *char, export: int) -> int {
+    var i: int = var_find(name);
+    if (i < 0) {
+        i = 0;
+        while (i < nvars && vname[i] != null) { i += 1; }
+        if (i == nvars) {
+            if (nvars == NVARS) { err("too many variables", null); return -1; }
+            nvars += 1;
+        }
+        vname[i] = strdup(name);
+        vval[i] = null;
+        vexported[i] = 0;
+    }
+    var v: *char = strdup(value);
+    if (vval[i] != null) { free(vval[i] as *tryte); }
+    vval[i] = v;
+    if (export) { vexported[i] = 1; }
+    return 0;
+}
+
+fn var_unset(name: *char) {
+    var i: int = var_find(name);
+    if (i < 0) { return; }
+    free(vname[i] as *tryte);
+    free(vval[i] as *tryte);
+    vname[i] = null;
+    vval[i] = null;
+    vexported[i] = 0;
+}
+
+fn import_environ() {
+    if (environ == null) { return; }
+    var i: int = 0;
+    while (environ[i] != null) {
+        var e: *char = environ[i];
+        var name: [81]char;
+        var k: int = 0;
+        while (e[k] != 0 && e[k] != '=' && k < 80) { name[k] = e[k]; k += 1; }
+        name[k] = 0;
+        if (e[k] == '=' && valid_name(&name[0])) { var_set(&name[0], &e[k + 1], 1); }
+        i += 1;
+    }
+}
+
+// The exported variables as an envp vector (malloc'd; used right before exec).
+fn build_envp() -> **char {
+    var n: int = 0;
+    var i: int = 0;
+    while (i < nvars) { if (vname[i] != null && vexported[i]) { n += 1; } i += 1; }
+    var v: **char = malloc(3 * (n + 1)) as **char;
+    var k: int = 0;
+    i = 0;
+    while (i < nvars) {
+        if (vname[i] != null && vexported[i]) {
+            var nl: int = strlen(vname[i]);
+            var e: *char = malloc(nl + strlen(vval[i]) + 2) as *char;
+            strcpy(e, vname[i]);
+            e[nl] = '=';
+            strcpy(&e[nl + 1], vval[i]);
+            v[k] = e;
+            k += 1;
+        }
+        i += 1;
+    }
+    v[k] = null;
+    return v;
+}
+
+// ---- expansion ------------------------------------------------------------------------------------
+//
+// Words expand into fields in the pool `ex`, pointed to by `fields`; both
+// grow like stacks, and every consumer puts them back.
+
+var ex: [19683]char;
+var exp: int;
+var fields: [729]*char;
+var nfields: int;
+var fstart: int;                      // where the field being built starts in ex
+var fstarted: int;                    // the field exists even if empty ("")
+var fglob: int;                       // it has unquoted glob characters
+var fsuppress: int;                   // "$@" with no parameters: no field
+var split_mode: int;                  // field splitting and globbing on
+var expand_error: int;
+
+fn put(c: char) {
+    if (exp < SRC_MAX - 2) { ex[exp] = c; exp += 1; }
+    else if (!expand_error) { err("expansion too long", null); expand_error = 1; }
+}
+
+fn put_str(s: *char, quoted: int) {
+    var k: int = 0;
+    while (s[k] != 0) {
+        var c: char = s[k];
+        if (!quoted && split_mode && (c == ' ' || c == '\t' || c == '\n')) {
+            if (fstarted) { finish_field(); }
+        } else {
+            put(c);
+            fstarted = 1;
+        }
+        k += 1;
+    }
+}
+
+fn push_field(p: *char) {
+    if (nfields < 728) { fields[nfields] = p; nfields += 1; }
+    else if (!expand_error) { err("too many words", null); expand_error = 1; }
+}
+
+fn finish_field() {
+    if (!fstarted || (fsuppress && exp == fstart)) {
+        exp = fstart;
+        fstarted = 0;
+        fglob = 0;
+        fsuppress = 0;
+        return;
+    }
+    put(0);
+    var p: *char = &ex[fstart];
+    if (fglob && split_mode) {
+        var before: int = nfields;
+        glob_into(p);
+        if (nfields == before) { push_field(p); }
+    } else {
+        push_field(p);
+    }
+    fstart = exp;
+    fstarted = 0;
+    fglob = 0;
+    fsuppress = 0;
+}
+
+fn special_var(c: char, buf: *char) -> *char {
+    switch (c) {
+        case '?': return itoa(last_status, buf);
+        case '$': return itoa(getpid(), buf);
+        case '!': return itoa(last_bg, buf);
+        case '#': return itoa(npos, buf);
+        case '-': {
+            var k: int = 0;
+            if (opt_errexit) { buf[k] = 'e'; k += 1; }
+            if (opt_xtrace) { buf[k] = 'x'; k += 1; }
+            buf[k] = 0;
+            return buf;
+        }
+        case '0': return arg0;
+    }
+    if (c >= '1' && c <= '9') { return c - '0' <= npos ? pos_args[c - '1'] : ""; }
+    return "";
+}
+
+// $@ and $*: quoted "$@" gives one field per parameter.
+fn put_params(quoted: int, at: int) {
+    if (npos == 0 && quoted && at) { fsuppress = 1; return; }
+    var k: int = 0;
+    while (k < npos) {
+        if (k > 0) {
+            if (quoted && at) { finish_field(); fstarted = 1; }
+            else if (quoted) { put(' '); }
+            else { if (fstarted) { finish_field(); } }
+        }
+        put_str(pos_args[k], quoted);
+        if (quoted) { fstarted = 1; }
+        k += 1;
+    }
+}
+
+// Expand src[a..b) as one string, appended at ex[exp] (no splitting).
+fn expand_quoted_into(a: int, b: int) -> int {
+    var m: int = exp;
+    var save_split: int = split_mode;
+    var save_fs: int = fstart;
+    var save_started: int = fstarted;
+    var save_glob: int = fglob;
+    split_mode = 0;
+    fstart = exp;
+    expand_span(a, b, 1);
+    put(0);
+    split_mode = save_split;
+    fstart = save_fs;
+    fstarted = save_started;
+    fglob = save_glob;
+    return m;
+}
+
+// A ${...} expression in src[a..b) (without the braces).
+fn expand_braced(a: int, b: int, quoted: int) {
+    var name: [81]char;
+    var buf: [15]char;
+    var length: int = 0;
+    var i: int = a;
+    if (src[i] == '#' && i + 1 < b) { length = 1; i += 1; }
+    var k: int = 0;
+    if (i >= b) { err("bad substitution", null); expand_error = 1; return; }
+    var c0: char = src[i];
+    if (is_name_start(c0)) {
+        while (i < b && is_name_char(src[i]) && k < 80) { name[k] = src[i]; k += 1; i += 1; }
+    } else if (isdigit(c0)) {
+        while (i < b && isdigit(src[i]) && k < 80) { name[k] = src[i]; k += 1; i += 1; }
+    } else if (c0 == '?' || c0 == '#' || c0 == '$' || c0 == '!' || c0 == '@' || c0 == '*' || c0 == '-') {
+        name[0] = c0;
+        k = 1;
+        i += 1;
+    } else {
+        err("bad substitution", null);
+        expand_error = 1;
+        return;
+    }
+    name[k] = 0;
+    var val: *char = null;
+    if (is_name_start(name[0])) {
+        val = var_get(&name[0]);
+    } else if (isdigit(name[0])) {
+        var n: int = atoi(&name[0]);
+        val = n == 0 ? arg0 : (n <= npos ? pos_args[n - 1] : null);
+    } else {
+        if ((name[0] == '@' || name[0] == '*') && !length && i == b) { put_params(quoted, name[0] == '@'); return; }
+        if ((name[0] == '@' || name[0] == '*') && length) { put_str(itoa(npos, &buf[0]), 1); fstarted = 1; return; }
+        val = special_var(name[0], &buf[0]);
+    }
+    if (length) {
+        if (i != b) { err("bad substitution", null); expand_error = 1; return; }
+        put_str(itoa(val == null ? 0 : strlen(val), &buf[0]), 1);
+        fstarted = 1;
+        return;
+    }
+    if (i == b) {
+        if (val != null) { put_str(val, quoted); }
+        if (quoted) { fstarted = 1; }
+        return;
+    }
+    var colon: int = 0;
+    if (src[i] == ':') { colon = 1; i += 1; }
+    var op: char = src[i];
+    i += 1;
+    var unset: int = val == null || (colon && val[0] == 0);
+    if (op == '-') {
+        if (unset) { expand_span(i, b, quoted); } else { put_str(val, quoted); }
+    } else if (op == '=') {
+        if (unset) {
+            if (!is_name_start(name[0])) { err(&name[0], ": cannot assign in this way"); expand_error = 1; return; }
+            var m: int = expand_quoted_into(i, b);
+            var_set(&name[0], &ex[m], 0);
+            exp = m;
+            put_str(var_get(&name[0]), quoted);
+        } else {
+            put_str(val, quoted);
+        }
+    } else if (op == '+') {
+        if (!unset) { expand_span(i, b, quoted); }
+    } else if (op == '?') {
+        if (unset) {
+            var m2: int = expand_quoted_into(i, b);
+            fputs(STDERR_FILENO, "sh: ");
+            fputs(STDERR_FILENO, &name[0]);
+            fputs(STDERR_FILENO, ": ");
+            fputs(STDERR_FILENO, ex[m2] != 0 ? &ex[m2] : "parameter null or not set");
+            fputs(STDERR_FILENO, "\n");
+            exp = m2;
+            expand_error = 1;
+            if (!interactive) { _exit(1); }
+        } else {
+            put_str(val, quoted);
+        }
+    } else {
+        err("bad substitution", null);
+        expand_error = 1;
+        return;
+    }
+    if (quoted) { fstarted = 1; }
+}
+
+// $... at src[i]. Returns the index after it.
+fn expand_dollar(i: int, quoted: int) -> int {
+    var c: char = src[i + 1];
+    var buf: [15]char;
+    if (c == '(' && src[i + 2] == '(') {
+        var e: int = scan_paren(i + 2);                 // just past the closing ))
+        if (e < 0 || src[e - 1] != ')' || src[e - 2] != ')') { err("bad arithmetic", null); expand_error = 1; return src_len; }
+        var v: int = arith_span(i + 3, e - 2);
+        put_str(itoa(v, &buf[0]), 1);
+        fstarted = 1;
+        return e;
+    }
+    if (c == '(') {
+        var e2: int = scan_paren(i + 2);
+        if (e2 < 0) { return src_len; }
+        command_substitution(i + 2, e2 - 1, quoted);
+        return e2;
+    }
+    if (c == '{') {
+        var e3: int = scan_brace(i + 2);
+        if (e3 < 0) { return src_len; }
+        expand_braced(i + 2, e3 - 1, quoted);
+        return e3;
+    }
+    if (c == '@' || c == '*') { put_params(quoted, c == '@'); return i + 2; }
+    if (c == '?' || c == '$' || c == '!' || c == '#' || c == '-' || isdigit(c)) {
+        put_str(special_var(c, &buf[0]), quoted);
+        if (quoted) { fstarted = 1; }
+        return i + 2;
+    }
+    if (is_name_start(c)) {
+        var name: [81]char;
+        var k: int = 0;
+        var j: int = i + 1;
+        while (is_name_char(src[j]) && k < 80) { name[k] = src[j]; k += 1; j += 1; }
+        name[k] = 0;
+        var v: *char = var_get(&name[0]);
+        if (v != null) { put_str(v, quoted); }
+        if (quoted) { fstarted = 1; }
+        return j;
+    }
+    put('$');
+    fstarted = 1;
+    return i + 1;
+}
+
+// Expand src[a..b) into the current field (quoted: no splitting).
+fn expand_span(a: int, b: int, quoted: int) {
+    var i: int = a;
+    while (i < b && !expand_error) {
+        var c: char = src[i];
+        if (c == '\\') {
+            if (quoted) {
+                var n: char = src[i + 1];
+                if (n == '$' || n == '"' || n == '\\' || n == '`') { put(n); i += 2; }
+                else if (n == '\n') { i += 2; }
+                else { put('\\'); i += 1; }
+            } else {
+                if (i + 1 < b) { put(src[i + 1]); }
+                i += 2;
+            }
+            fstarted = 1;
+        } else if (c == '\'' && !quoted) {
+            i += 1;
+            while (i < b && src[i] != '\'') { put(src[i]); i += 1; }
+            i += 1;
+            fstarted = 1;
+        } else if (c == '"' && !quoted) {
+            var e: int = scan_dquote(i + 1);
+            if (e < 0) { e = b + 1; }
+            expand_span(i + 1, e - 1, 1);
+            fstarted = 1;
+            i = e;
+        } else if (c == '$') {
+            i = expand_dollar(i, quoted);
+        } else if (c == '~' && !quoted && i == a && (i + 1 == b || src[i + 1] == '/')) {
+            var h: *char = var_get("HOME");
+            put_str(h == null ? "/" : h, 1);
+            fstarted = 1;
+            i += 1;
+        } else {
+            if (!quoted && (c == '*' || c == '?' || c == '[')) { fglob = 1; }
+            put(c);
+            fstarted = 1;
+            i += 1;
+        }
+    }
+}
+
+// Expand token t into fields (split = field splitting and globbing).
+fn expand_word(t: int, split: int) {
+    split_mode = split;
+    fstart = exp;
+    fstarted = 0;
+    fglob = 0;
+    fsuppress = 0;
+    expand_span(tstart[t], tend[t], 0);
+    finish_field();
+}
+
+// One string for token t from src index `from`, no splitting (assignments,
+// redirection targets, case words and patterns).
+fn expand_one(t: int, from: int) -> *char {
+    split_mode = 0;
+    fstart = exp;
+    fstarted = 1;
+    fglob = 0;
+    fsuppress = 0;
+    var m: int = exp;
+    expand_span(from, tend[t], 0);
+    put(0);
+    fstart = exp;
+    return &ex[m];
+}
+
+// ---- globbing ---------------------------------------------------------------------------------------
+
+// fnmatch: * ? [abc] [a-z] [!x] and \ escapes.
+fn fnmatch(p: *char, s: *char) -> int {
+    loop {
+        var c: char = p[0];
+        if (c == 0) { return s[0] == 0; }
+        if (c == '*') {
+            while (p[0] == '*') { p = &p[1]; }
+            if (p[0] == 0) { return 1; }
+            loop {
+                if (fnmatch(p, s)) { return 1; }
+                if (s[0] == 0) { return 0; }
+                s = &s[1];
+            }
+        }
+        if (s[0] == 0) { return 0; }
+        if (c == '?') {
+            p = &p[1];
+            s = &s[1];
+            continue;
+        }
+        if (c == '[') {
+            var k: int = 1;
+            var neg: int = p[1] == '!' || p[1] == '^';
+            if (neg) { k = 2; }
+            var hit: int = 0;
+            var first: int = 1;
+            while (p[k] != 0 && (p[k] != ']' || first)) {
+                if (p[k + 1] == '-' && p[k + 2] != ']' && p[k + 2] != 0) {
+                    if (s[0] >= p[k] && s[0] <= p[k + 2]) { hit = 1; }
+                    k += 3;
+                } else {
+                    if (s[0] == p[k]) { hit = 1; }
+                    k += 1;
+                }
+                first = 0;
+            }
+            if (p[k] != ']') {                              // no closing bracket: a literal [
+                if (s[0] != '[') { return 0; }
+                p = &p[1];
+                s = &s[1];
+                continue;
+            }
+            if (hit == neg) { return 0; }
+            p = &p[k + 1];
+            s = &s[1];
+            continue;
+        }
+        if (c == '\\' && p[1] != 0) { p = &p[1]; c = p[0]; }
+        if (c != s[0]) { return 0; }
+        p = &p[1];
+        s = &s[1];
+    }
+}
+
+fn cmp_fields(a: int, b: int) -> int { return strcmp(a as *char, b as *char); }
+
+// Matches of pattern p (a wildcard in the last component only), sorted.
+fn glob_into(p: *char) {
+    var slash: int = -1;
+    var k: int = 0;
+    while (p[k] != 0) { if (p[k] == '/') { slash = k; } k += 1; }
+    var dir: [243]char;
+    var pat: *char = p;
+    if (slash >= 0) {
+        k = 0;
+        while (k < slash && k < 242) { dir[k] = p[k]; k += 1; }
+        dir[k] = 0;
+        if (slash == 0) { strcpy(&dir[0], "/"); }
+        pat = &p[slash + 1];
+    } else {
+        strcpy(&dir[0], ".");
+    }
+    var d: *DIR = opendir(&dir[0]);
+    if (d == null) { return; }
+    var first: int = nfields;
+    loop {
+        var e: *dirent = readdir(d);
+        if (e == null) { break; }
+        if (e.d_name[0] == '.' && pat[0] != '.') { continue; }
+        if (!fnmatch(pat, &e.d_name[0])) { continue; }
+        var start: int = exp;
+        if (slash >= 0) {
+            var j: int = 0;
+            while (j <= slash) { put(p[j]); j += 1; }
+        }
+        var m: int = 0;
+        while (e.d_name[m] != 0) { put(e.d_name[m]); m += 1; }
+        put(0);
+        push_field(&ex[start]);
+    }
+    closedir(d);
+    qsort((&fields[first]) as *int, nfields - first, &cmp_fields);
+}
+
+// ---- arithmetic -----------------------------------------------------------------------------------------
+//
+// $(( )): + - * / % ( ), unary - + !, comparisons, == !=, && ||, names.
+
+var ar: *char;
+var ar_pos: int;
+var ar_error: int;
+
+fn ar_fail(msg: *char) -> int {
+    if (!ar_error) { err("arithmetic: ", msg); }
+    ar_error = 1;
+    return 0;
+}
+
+fn ar_space() { while (ar[ar_pos] == ' ' || ar[ar_pos] == '\t' || ar[ar_pos] == '\n') { ar_pos += 1; } }
+
+fn ar_primary() -> int {
+    ar_space();
+    var c: char = ar[ar_pos];
+    if (c == '(') {
+        ar_pos += 1;
+        var v: int = ar_or();
+        ar_space();
+        if (ar[ar_pos] != ')') { return ar_fail("missing )"); }
+        ar_pos += 1;
+        return v;
+    }
+    if (c == '-') { ar_pos += 1; return -ar_primary(); }
+    if (c == '+') { ar_pos += 1; return ar_primary(); }
+    if (c == '!') { ar_pos += 1; return !ar_primary(); }
+    if (isdigit(c)) {
+        var v2: int = 0;
+        while (isdigit(ar[ar_pos])) { v2 = v2 * 10 + ar[ar_pos] - '0'; ar_pos += 1; }
+        return v2;
+    }
+    if (is_name_start(c)) {
+        var name: [81]char;
+        var k: int = 0;
+        while (is_name_char(ar[ar_pos]) && k < 80) { name[k] = ar[ar_pos]; k += 1; ar_pos += 1; }
+        name[k] = 0;
+        var s: *char = var_get(&name[0]);
+        if (s == null || s[0] == 0) { return 0; }
+        var end: *char;
+        var v3: int = strtol(s, &end, 10);
+        if (end[0] != 0) { return ar_fail("not a number"); }
+        return v3;
+    }
+    return ar_fail("syntax error");
+}
+
+fn ar_mul() -> int {
+    var v: int = ar_primary();
+    loop {
+        ar_space();
+        var c: char = ar[ar_pos];
+        if (c != '*' && c != '/' && c != '%') { return v; }
+        ar_pos += 1;
+        var w: int = ar_primary();
+        if (c == '*') { v = v * w; }
+        else if (w == 0) { return ar_fail("division by zero"); }
+        else if (c == '/') { v = v / w; }
+        else { v = v % w; }
+    }
+}
+
+fn ar_add() -> int {
+    var v: int = ar_mul();
+    loop {
+        ar_space();
+        var c: char = ar[ar_pos];
+        if (c != '+' && c != '-') { return v; }
+        ar_pos += 1;
+        var w: int = ar_mul();
+        v = c == '+' ? v + w : v - w;
+    }
+}
+
+fn ar_cmp() -> int {
+    var v: int = ar_add();
+    loop {
+        ar_space();
+        var c: char = ar[ar_pos];
+        var d: char = ar[ar_pos + 1];
+        if (c == '<' && d == '=') { ar_pos += 2; v = v <= ar_add(); }
+        else if (c == '>' && d == '=') { ar_pos += 2; v = v >= ar_add(); }
+        else if (c == '<') { ar_pos += 1; v = v < ar_add(); }
+        else if (c == '>') { ar_pos += 1; v = v > ar_add(); }
+        else if (c == '=' && d == '=') { ar_pos += 2; v = v == ar_add(); }
+        else if (c == '!' && d == '=') { ar_pos += 2; v = v != ar_add(); }
+        else { return v; }
+    }
+}
+
+fn ar_and() -> int {
+    var v: int = ar_cmp();
+    loop {
+        ar_space();
+        if (ar[ar_pos] != '&' || ar[ar_pos + 1] != '&') { return v; }
+        ar_pos += 2;
+        var w: int = ar_cmp();
+        v = v && w;
+    }
+}
+
+fn ar_or() -> int {
+    var v: int = ar_and();
+    loop {
+        ar_space();
+        if (ar[ar_pos] != '|' || ar[ar_pos + 1] != '|') { return v; }
+        ar_pos += 2;
+        var w: int = ar_and();
+        v = v || w;
+    }
+}
+
+fn arith_span(a: int, b: int) -> int {
+    var m: int = expand_quoted_into(a, b);              // $ inside first, then evaluate
+    ar = &ex[m];
+    ar_pos = 0;
+    ar_error = 0;
+    var v: int = ar_or();
+    ar_space();
+    if (!ar_error && ar[ar_pos] != 0) { ar_fail("syntax error"); }
+    if (ar_error) { expand_error = 1; }
+    exp = m;
+    return v;
+}
+
+// ---- command substitution -----------------------------------------------------------------------------
+
 var job_control: int;
+var interactive: int;
+
+fn command_substitution(a: int, b: int, quoted: int) {
+    var p: [2]int;
+    if (pipe(&p[0]) < 0) { err("pipe failed", null); expand_error = 1; return; }
+    var pid: int = fork();
+    if (pid < 0) { err("fork failed", null); expand_error = 1; return; }
+    if (pid == 0) {
+        close(p[0]);
+        dup2(p[1], 1);
+        close(p[1]);
+        job_control = 0;
+        interactive = 0;
+        var n: int = b - a;
+        memmove(&src[0] as *tryte, &src[a] as *tryte, n);
+        src_len = n;
+        exp = 0;
+        nfields = 0;
+        _exit(run_source());
+    }
+    close(p[1]);
+    var start: int = exp;
+    var buf: [729]char;
+    loop {
+        var r: int = read(p[0], &buf[0], 729);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        var k: int = 0;
+        while (k < r) { if (exp < SRC_MAX - 2) { ex[exp] = buf[k]; exp += 1; } k += 1; }
+    }
+    close(p[0]);
+    var st: int = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    last_status = status_of(st);
+    while (exp > start && ex[exp - 1] == '\n') { exp -= 1; }       // trailing newlines go
+    // Re-insert the output as text, splitting it when unquoted.
+    var len: int = exp - start;
+    var tmp: *char = malloc(len + 1) as *char;
+    if (tmp == null) { expand_error = 1; return; }
+    var j: int = 0;
+    while (j < len) { tmp[j] = ex[start + j]; j += 1; }
+    tmp[len] = 0;
+    exp = start;
+    put_str(tmp, quoted);
+    if (quoted) { fstarted = 1; }
+    free(tmp as *tryte);
+}
+
+// ---- jobs ------------------------------------------------------------------------------------------------
+
+const MAX_JOBS: int = 9;
 var shell_pgid: int;
-var syntax_error: int;
 
 struct Job {
     used: int;
@@ -75,159 +1239,13 @@ struct Job {
 
 var jobs: [9]Job;
 
-fn err(a: *char, b: *char) {
-    fputs(STDERR_FILENO, "sh: ");
-    fputs(STDERR_FILENO, a);
-    fputs(STDERR_FILENO, b);
-    fputs(STDERR_FILENO, "\n");
-}
-
-// ---- tokens -------------------------------------------------------------------------
-
-fn add_tok(kind: int, at: int) -> int {
-    if (ntok == MAX_TOKENS) { err("too many words", ""); syntax_error = 1; return 0; }
-    tok_kind[ntok] = kind;
-    tok_word[ntok] = null;
-    tok_start[ntok] = at;
-    tok_end[ntok] = at + 1;
-    ntok += 1;
-    return 1;
-}
-
-fn put_char(c: char) {
-    if (wp < 2186) { words[wp] = c; wp += 1; }
-}
-
-fn is_digit(c: char) -> int { return c >= '0' && c <= '9'; }
-
-fn ends_word(c: char) -> int {
-    return c == 0 || c == ' ' || c == '\t' || c == '\n' || c == '|' || c == '&' || c == ';' || c == '<' || c == '>';
-}
-
-// $? $$ $! become markers; any other $ is literal.
-fn dollar(s: *char, i: int) -> int {
-    if (s[i + 1] == '?') { put_char(VAR_STATUS); return i + 2; }
-    if (s[i + 1] == '$') { put_char(VAR_PID); return i + 2; }
-    if (s[i + 1] == '!') { put_char(VAR_BANG); return i + 2; }
-    put_char('$');
-    return i + 1;
-}
-
-// Split a line into tokens. Returns 0 on a syntax error.
-fn tokenize(s: *char) -> int {
-    ntok = 0;
-    wp = 0;
-    syntax_error = 0;
-    cur_line = s;
-    var i: int = 0;
-    loop {
-        while (s[i] == ' ' || s[i] == '\t') { i += 1; }
-        var c: char = s[i];
-        var start: int = i;
-        if (c == 0 || c == '\n' || c == '#') { break; }
-        if (c == '|') {
-            if (s[i + 1] == '|') { add_tok(T_OR, i); i += 2; } else { add_tok(T_PIPE, i); i += 1; }
-        } else if (c == '&') {
-            if (s[i + 1] == '&') { add_tok(T_AND, i); i += 2; } else { add_tok(T_AMP, i); i += 1; }
-        } else if (c == ';') {
-            add_tok(T_SEMI, i);
-            i += 1;
-        } else if (c == '<' || c == '>' || (is_digit(c) && (s[i + 1] == '<' || s[i + 1] == '>'))) {
-            var fd: int = -1;
-            if (is_digit(c)) { fd = c - '0'; i += 1; }
-            if (!add_tok(T_REDIR, start)) { return 0; }
-            var t: int = ntok - 1;
-            if (s[i] == '<') {
-                tok_mode[t] = R_IN;
-                tok_fd[t] = fd < 0 ? 0 : fd;
-                i += 1;
-            } else {
-                tok_fd[t] = fd < 0 ? 1 : fd;
-                tok_mode[t] = R_OUT;
-                i += 1;
-                if (s[i] == '>') { tok_mode[t] = R_APPEND; i += 1; }
-                else if (s[i] == '&') { tok_mode[t] = R_DUP; i += 1; }
-            }
-        } else {
-            if (!add_tok(T_WORD, start)) { return 0; }
-            tok_word[ntok - 1] = &words[wp];
-            while (!ends_word(s[i])) {
-                if (s[i] == '\'') {
-                    i += 1;
-                    while (s[i] != '\'') {
-                        if (s[i] == 0) { err("unterminated quote", ""); return 0; }
-                        put_char(s[i]);
-                        i += 1;
-                    }
-                    i += 1;
-                } else if (s[i] == '"') {
-                    i += 1;
-                    while (s[i] != '"') {
-                        if (s[i] == 0) { err("unterminated quote", ""); return 0; }
-                        if (s[i] == '$') { i = dollar(s, i); continue; }
-                        if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\\' || s[i + 1] == '$')) { i += 1; }
-                        put_char(s[i]);
-                        i += 1;
-                    }
-                    i += 1;
-                } else if (s[i] == '\\') {
-                    i += 1;
-                    if (s[i] != 0 && s[i] != '\n') { put_char(s[i]); i += 1; }
-                } else if (s[i] == '$') {
-                    i = dollar(s, i);
-                } else {
-                    put_char(s[i]);
-                    i += 1;
-                }
-            }
-            put_char(0);
-        }
-        tok_end[ntok - 1] = i;
-        if (syntax_error) { return 0; }
-    }
-    return 1;
-}
-
-// A word with $? $$ $! substituted (in expbuf when it changes).
-fn expand(w: *char) -> *char {
-    var k: int = 0;
-    var plain: int = 1;
-    while (w[k] != 0) {
-        if (w[k] == VAR_STATUS || w[k] == VAR_PID || w[k] == VAR_BANG) { plain = 0; }
-        k += 1;
-    }
-    if (plain) { return w; }
-    var start: int = ep;
-    k = 0;
-    while (w[k] != 0) {
-        if (w[k] == VAR_STATUS || w[k] == VAR_PID || w[k] == VAR_BANG) {
-            var num: [15]char;
-            var v: int = last_status;
-            if (w[k] == VAR_PID) { v = getpid(); }
-            if (w[k] == VAR_BANG) { v = last_bg; }
-            var s: *char = itoa(v, &num[0]);
-            var j: int = 0;
-            while (s[j] != 0 && ep < 2186) { expbuf[ep] = s[j]; ep += 1; j += 1; }
-        } else if (ep < 2186) {
-            expbuf[ep] = w[k];
-            ep += 1;
-        }
-        k += 1;
-    }
-    expbuf[ep] = 0;
-    ep += 1;
-    return &expbuf[start];
-}
-
-// ---- jobs --------------------------------------------------------------------------------
-
 fn status_of(st: int) -> int {
     if (WIFEXITED(st)) { return WEXITSTATUS(st); }
     if (WIFSTOPPED(st)) { return 128 + WSTOPSIG(st); }
     return 128 + WTERMSIG(st);
 }
 
-fn new_job(a: int, b: int) -> int {
+fn new_job(node: int) -> int {
     var j: int = 0;
     while (j < MAX_JOBS) {
         if (!jobs[j].used) {
@@ -239,8 +1257,8 @@ fn new_job(a: int, b: int) -> int {
             jb.stopped = 0;
             jb.status = 0;
             var n: int = 0;
-            var k: int = tok_start[a];
-            while (k < tok_end[b - 1] && n < 80) { jb.cmd[n] = cur_line[k]; n += 1; k += 1; }
+            var k: int = nsa[node];
+            while (k < nsb[node] && n < 80) { jb.cmd[n] = src[k] == '\n' ? ' ' : src[k]; n += 1; k += 1; }
             jb.cmd[n] = 0;
             return j;
         }
@@ -261,7 +1279,6 @@ fn put_job_line(j: int, state: *char, amp: int) {
     puts("\n");
 }
 
-// Record what wait() said about `pid`. Returns its job, or -1.
 fn job_update(pid: int, st: int) -> int {
     var j: int = 0;
     while (j < MAX_JOBS) {
@@ -288,7 +1305,15 @@ fn job_update(pid: int, st: int) -> int {
     return -1;
 }
 
-// Wait for a foreground job to finish or stop; returns its status.
+fn add_pid(j: int, pid: int) {
+    var jb: *Job = &jobs[j];
+    if (jb.npids < 27) {
+        jb.pids[jb.npids] = pid;
+        jb.npids += 1;
+        jb.alive += 1;
+    }
+}
+
 fn wait_fg(j: int) -> int {
     var jb: *Job = &jobs[j];
     var i: int = 0;
@@ -316,13 +1341,12 @@ fn wait_fg(j: int) -> int {
     var st: int = jb.status;
     jb.used = 0;
     if (WIFSIGNALED(st)) {
-        if (WTERMSIG(st) == SIGINT) { puts("\n"); }
+        if (WTERMSIG(st) == SIGINT) { if (interactive) { puts("\n"); } }
         else if (WTERMSIG(st) != SIGPIPE) { fputs(STDERR_FILENO, strsignal(WTERMSIG(st))); fputs(STDERR_FILENO, "\n"); }
     }
     return status_of(st);
 }
 
-// Before a prompt: collect finished and stopped background jobs.
 fn reap_jobs() {
     loop {
         var st: int = 0;
@@ -344,15 +1368,12 @@ fn reap_jobs() {
     }
 }
 
-// "%n" or nothing (the newest job). Returns the job, or -1 after a message.
 fn find_job(argc: int, argv: **char, who: *char) -> int {
     var j: int = -1;
     if (argc > 1) {
         var a: *char = argv[1];
-        if (a[0] == '%') { a = &a[1]; }
-        var n: int = 0;
-        var k: int = 0;
-        while (is_digit(a[k])) { n = n * 10 + a[k] - '0'; k += 1; }
+        if (a[0] != '%') { return -1; }
+        var n: int = atoi(&a[1]);
         if (n >= 1 && n <= MAX_JOBS && jobs[n - 1].used) { j = n - 1; }
     } else {
         var k: int = MAX_JOBS - 1;
@@ -362,33 +1383,51 @@ fn find_job(argc: int, argv: **char, who: *char) -> int {
     return j;
 }
 
-// ---- running commands ----------------------------------------------------------------
+// ---- redirections ----------------------------------------------------------------------------------------
 
-// Apply the redirections in tokens [a, b). Returns 0, or -1 after a message.
-fn redirect(a: int, b: int) -> int {
+var saved_fd: [10]int;                // copies made while a builtin or compound runs
+
+// Apply the redirections among tokens [a, b). With save, remember the old
+// descriptors first (in saved_fd). Returns 0, or -1 after a message.
+fn redirect(a: int, b: int, save: int) -> int {
     var t: int = a;
     while (t < b) {
-        if (tok_kind[t] == T_REDIR) {
-            if (t + 1 >= b || tok_kind[t + 1] != T_WORD) { err("syntax error: redirection without a target", ""); return -1; }
-            var target: *char = expand(tok_word[t + 1]);
-            var fd: int;
-            switch (tok_mode[t]) {
-                case R_IN: fd = open(target, O_RDONLY, 0);
-                case R_OUT: fd = open(target, O_WRONLY + O_CREAT + O_TRUNC, 420);
-                case R_APPEND: fd = open(target, O_WRONLY + O_CREAT + O_APPEND, 420);
-                default: {
-                    if (!is_digit(target[0]) || target[1] != 0) { err("bad descriptor: ", target); return -1; }
-                    fd = dup(target[0] - '0');
-                }
+        if (tkind[t] == T_REDIR) {
+            var mark: int = exp;
+            var target: *char = expand_one(t + 1, tstart[t + 1]);
+            if (expand_error) { exp = mark; return -1; }
+            var want: int = tfd[t];
+            if (save && want < 10 && saved_fd[want] == -2) {
+                saved_fd[want] = fcntl(want, F_DUPFD_CLOEXEC, 10);
+                if (saved_fd[want] < 0) { saved_fd[want] = -1; }
             }
+            var fd: int;
+            var mode: int = tmode[t];
+            if (mode == R_DUPOUT || mode == R_DUPIN) {
+                if (streq(target, "-")) {
+                    close(want);
+                } else {
+                    if (!isdigit(target[0]) || target[1] != 0) { err("bad descriptor: ", target); exp = mark; return -1; }
+                    fd = target[0] - '0';
+                    if (fd != want && dup2(fd, want) < 0) { err(target, ": bad file descriptor"); exp = mark; return -1; }
+                }
+                exp = mark;
+                t += 2;
+                continue;
+            }
+            if (mode == R_IN) { fd = open(target, O_RDONLY, 0); }
+            else if (mode == R_OUT) { fd = open(target, O_WRONLY + O_CREAT + O_TRUNC, 438); }
+            else { fd = open(target, O_WRONLY + O_CREAT + O_APPEND, 438); }
             if (fd < 0) {
                 perror2("sh", target);
+                exp = mark;
                 return -1;
             }
-            if (fd != tok_fd[t]) {
-                dup2(fd, tok_fd[t]);
+            if (fd != want) {
+                dup2(fd, want);
                 close(fd);
             }
+            exp = mark;
             t += 1;
         }
         t += 1;
@@ -396,40 +1435,212 @@ fn redirect(a: int, b: int) -> int {
     return 0;
 }
 
-// The words of tokens [a, b), skipping redirections, as argv. Returns argc.
-fn collect_args(a: int, b: int, argv: **char) -> int {
-    var n: int = 0;
-    var t: int = a;
-    while (t < b) {
-        if (tok_kind[t] == T_REDIR) { t += 2; continue; }
-        if (n < MAX_ARGS - 1) { argv[n] = expand(tok_word[t]); n += 1; }
-        t += 1;
-    }
-    argv[n] = null;
-    return n;
+fn save_begin() {
+    var k: int = 0;
+    while (k < 10) { saved_fd[k] = -2; k += 1; }
 }
+
+fn save_restore() {
+    var k: int = 0;
+    while (k < 10) {
+        if (saved_fd[k] >= 0) { dup2(saved_fd[k], k); close(saved_fd[k]); }
+        else if (saved_fd[k] == -1) { close(k); }       // it was closed before
+        saved_fd[k] = -2;
+        k += 1;
+    }
+}
+
+// ---- builtins -----------------------------------------------------------------------------------------------
+
+var break_count: int;
+var continue_count: int;
+var loop_depth: int;
 
 fn is_builtin(name: *char) -> int {
-    return streq(name, "cd") || streq(name, "pwd") || streq(name, "exit") || streq(name, "jobs")
-        || streq(name, "fg") || streq(name, "bg") || streq(name, "kill");
-}
-
-fn parse_int(s: *char, out: *int) -> int {
-    var neg: int = 0;
+    var list: [26]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
+        "test", "[", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", null, null };
     var k: int = 0;
-    if (s[0] == '-') { neg = 1; k = 1; }
-    if (!is_digit(s[k])) { return 0; }
-    var n: int = 0;
-    while (is_digit(s[k])) { n = n * 10 + s[k] - '0'; k += 1; }
-    if (s[k] != 0) { return 0; }
-    *out = neg ? -n : n;
-    return 1;
+    while (list[k] != null) {
+        if (streq(list[k], name)) { return 1; }
+        k += 1;
+    }
+    return 0;
 }
 
-// A signal by number or name, with or without "SIG".
+fn builtin_echo(argc: int, argv: **char) -> int {
+    var i: int = 1;
+    var nl: int = 1;
+    while (i < argc && streq(argv[i], "-n")) { nl = 0; i += 1; }
+    var first: int = 1;
+    while (i < argc) {
+        if (!first) { puts(" "); }
+        puts(argv[i]);
+        first = 0;
+        i += 1;
+    }
+    if (nl) { puts("\n"); }
+    return 0;
+}
+
+fn builtin_cd(argc: int, argv: **char) -> int {
+    var dir: *char = argc > 1 ? argv[1] : var_get("HOME");
+    if (dir == null) { dir = "/"; }
+    if (argc > 1 && streq(dir, "-")) {
+        dir = var_get("OLDPWD");
+        if (dir == null) { err("cd: OLDPWD not set", null); return 1; }
+    }
+    var old: [243]char;
+    if (getcwd(&old[0], 243) == null) { old[0] = 0; }
+    if (chdir(dir) < 0) { perror2("sh: cd", dir); return 1; }
+    var now: [243]char;
+    if (getcwd(&now[0], 243) != null) { var_set("PWD", &now[0], is_exported("PWD")); }
+    var_set("OLDPWD", &old[0], is_exported("OLDPWD"));
+    return 0;
+}
+
+fn builtin_export(argc: int, argv: **char, unexport: int) -> int {
+    if (argc == 1 && !unexport) {
+        var i: int = 0;
+        while (i < nvars) {
+            if (vname[i] != null && vexported[i]) {
+                puts("export ");
+                puts(vname[i]);
+                puts("=\"");
+                puts(vval[i]);
+                puts("\"\n");
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    var status: int = 0;
+    var k: int = 1;
+    while (k < argc) {
+        var a: *char = argv[k];
+        var name: [81]char;
+        var n: int = 0;
+        while (a[n] != 0 && a[n] != '=' && n < 80) { name[n] = a[n]; n += 1; }
+        name[n] = 0;
+        if (!valid_name(&name[0]) || (unexport && a[n] == '=')) {
+            fputs(STDERR_FILENO, unexport ? "sh: unset: `" : "sh: export: `");
+            fputs(STDERR_FILENO, a);
+            fputs(STDERR_FILENO, "': not a valid identifier\n");
+            status = 1;
+        } else if (unexport) {
+            var_unset(&name[0]);
+        } else if (a[n] == '=') {
+            var_set(&name[0], &a[n + 1], 1);
+        } else {
+            var i2: int = var_find(&name[0]);
+            if (i2 < 0) { var_set(&name[0], "", 1); } else { vexported[i2] = 1; }
+        }
+        k += 1;
+    }
+    return status;
+}
+
+fn set_positional(argc: int, argv: **char) {
+    var k: int = 0;
+    while (k < npos) { free(pos_args[k] as *tryte); k += 1; }
+    npos = 0;
+    while (npos < argc && npos < 81) {
+        pos_args[npos] = strdup(argv[npos]);
+        npos += 1;
+    }
+}
+
+fn builtin_set(argc: int, argv: **char) -> int {
+    if (argc == 1) {
+        var i: int = 0;
+        while (i < nvars) {
+            if (vname[i] != null) { puts(vname[i]); puts("="); puts(vval[i]); puts("\n"); }
+            i += 1;
+        }
+        return 0;
+    }
+    var k: int = 1;
+    while (k < argc && (argv[k][0] == '-' || argv[k][0] == '+')) {
+        if (streq(argv[k], "--")) { k += 1; set_positional(argc - k, &argv[k]); return 0; }
+        var on: int = argv[k][0] == '-';
+        var j: int = 1;
+        while (argv[k][j] != 0) {
+            if (argv[k][j] == 'e') { opt_errexit = on; }
+            else if (argv[k][j] == 'x') { opt_xtrace = on; }
+            else { err("set: bad option: ", argv[k]); return 2; }
+            j += 1;
+        }
+        k += 1;
+    }
+    if (k < argc) { set_positional(argc - k, &argv[k]); }
+    return 0;
+}
+
+fn builtin_shift(argc: int, argv: **char) -> int {
+    var n: int = argc > 1 ? atoi(argv[1]) : 1;
+    if (n < 0 || n > npos) { err("shift: can't shift that many", null); return 1; }
+    var k: int = 0;
+    while (k < n) { free(pos_args[k] as *tryte); k += 1; }
+    k = 0;
+    while (k + n < npos) { pos_args[k] = pos_args[k + n]; k += 1; }
+    npos -= n;
+    return 0;
+}
+
+// read [-r] [name ...]: one line from standard input, a character at a time
+// (so the rest stays for the next reader), split on blanks.
+fn builtin_read(argc: int, argv: **char) -> int {
+    var raw: int = 0;
+    var k: int = 1;
+    if (k < argc && streq(argv[k], "-r")) { raw = 1; k += 1; }
+    var j: int = k;
+    while (j < argc) {
+        if (!valid_name(argv[j])) {
+            fputs(STDERR_FILENO, "sh: read: `");
+            fputs(STDERR_FILENO, argv[j]);
+            fputs(STDERR_FILENO, "': not a valid identifier\n");
+            return 2;
+        }
+        j += 1;
+    }
+    var line: [2187]char;
+    var n: int = 0;
+    var got_eof: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { return 130; }
+        if (r <= 0) { got_eof = 1; break; }
+        if (c[0] == '\\' && !raw) {
+            r = read(STDIN_FILENO, &c[0], 1);
+            if (r <= 0) { got_eof = 1; break; }
+            if (c[0] == '\n') { continue; }
+        } else if (c[0] == '\n') {
+            break;
+        }
+        if (n < 2186) { line[n] = c[0]; n += 1; }
+    }
+    line[n] = 0;
+    if (k == argc) { var_set("REPLY", &line[0], 0); return got_eof; }
+    var i: int = 0;
+    while (k < argc) {
+        while (line[i] == ' ' || line[i] == '\t') { i += 1; }
+        var start: int = i;
+        if (k == argc - 1) {
+            var e: int = n;
+            while (e > start && (line[e - 1] == ' ' || line[e - 1] == '\t')) { e -= 1; }
+            line[e] = 0;
+        } else {
+            while (line[i] != 0 && line[i] != ' ' && line[i] != '\t') { i += 1; }
+            if (line[i] != 0) { line[i] = 0; i += 1; }
+        }
+        var_set(argv[k], &line[start], is_exported(argv[k]));
+        k += 1;
+    }
+    return got_eof;
+}
+
 fn parse_signal(s: *char) -> int {
-    var n: int;
-    if (parse_int(s, &n)) { return n >= 0 && n < NSIG ? n : -1; }
+    if (isdigit(s[0])) { var n: int = atoi(s); return n < NSIG ? n : -1; }
     if (s[0] == 'S' && s[1] == 'I' && s[2] == 'G') { s = &s[3]; }
     var sig: int = 1;
     while (sig < NSIG) {
@@ -451,12 +1662,9 @@ fn builtin_kill(argc: int, argv: **char) -> int {
         return 0;
     }
     if (argc > 2 && streq(argv[1], "-s")) { sig = parse_signal(argv[2]); i = 3; }
-    else if (argc > 1 && argv[1][0] == '-' && !is_digit(argv[1][1]) || argc > 2 && argv[1][0] == '-' && is_digit(argv[1][1])) {
-        sig = parse_signal(&argv[1][1]);
-        i = 2;
-    }
-    if (sig < 0) { err("kill: bad signal", ""); return 1; }
-    if (i == argc) { err("usage: kill [-s sig | -sig] pid | %job ...", ""); return 2; }
+    else if (argc > 2 && argv[1][0] == '-') { sig = parse_signal(&argv[1][1]); i = 2; }
+    if (sig < 0) { err("kill: bad signal", null); return 1; }
+    if (i == argc) { err("usage: kill [-s sig | -sig] pid | %job ...", null); return 2; }
     var status: int = 0;
     while (i < argc) {
         var pid: int;
@@ -466,33 +1674,90 @@ fn builtin_kill(argc: int, argv: **char) -> int {
             if (j < 0) { status = 1; i += 1; continue; }
             pid = -jobs[j].pgid;
             if (sig == SIGCONT || sig == SIGKILL || sig == SIGTERM) { jobs[j].stopped = 0; }
-        } else if (!parse_int(argv[i], &pid)) {
-            err("kill: bad pid: ", argv[i]);
-            status = 1;
-            i += 1;
-            continue;
+        } else {
+            var end: *char;
+            pid = strtol(argv[i], &end, 10);
+            if (end == argv[i] || end[0] != 0) {
+                err("kill: bad pid: ", argv[i]);
+                status = 1;
+                i += 1;
+                continue;
+            }
         }
         if (kill(pid, sig) < 0) { perror2("sh: kill", argv[i]); status = 1; }
-        else if (pid < 0 && sig != SIGCONT && sig != 0) { kill(pid, SIGCONT); }   // a stopped job must wake to die
+        else if (pid < 0 && sig != SIGCONT && sig != 0) { kill(pid, SIGCONT); }
         i += 1;
     }
     return status;
 }
 
-fn builtin(argc: int, argv: **char) -> int {
-    if (streq(argv[0], "cd")) {
-        var dir: *char = argc > 1 ? argv[1] : "/";
-        if (chdir(dir) < 0) { perror2("sh: cd", dir); return 1; }
-        return 0;
+fn builtin_wait(argc: int, argv: **char) -> int {
+    var status: int = 0;
+    if (argc > 1) {
+        if (argv[1][0] == '%') {
+            var j: int = find_job(argc, argv, "wait");
+            if (j < 0) { return 127; }
+            while (jobs[j].used && jobs[j].alive > 0) {
+                var st2: int;
+                var r: int = waitpid(-1, &st2, 0);
+                if (r < 0) { if (errno == EINTR) { return 130; } break; }
+                job_update(r, st2);
+            }
+            status = status_of(jobs[j].status);
+            jobs[j].used = 0;
+            return status;
+        }
+        var pid: int = atoi(argv[1]);
+        var st: int;
+        if (pid > 0 && waitpid(pid, &st, 0) == pid) {
+            var jj0: int = job_update(pid, st);
+            if (jj0 >= 0 && jobs[jj0].alive == 0) { jobs[jj0].used = 0; }
+            return status_of(st);
+        }
+        err("wait: no such child: ", argv[1]);
+        return 127;
     }
-    if (streq(argv[0], "pwd")) {
+    loop {
+        var st3: int;
+        var r2: int = waitpid(-1, &st3, 0);
+        if (r2 < 0) {
+            if (errno == EINTR) { return 130; }
+            break;
+        }
+        var jj: int = job_update(r2, st3);
+        if (jj >= 0 && jobs[jj].alive == 0) { jobs[jj].used = 0; }
+    }
+    return status;
+}
+
+fn builtin(argc: int, argv: **char) -> int {
+    var name: *char = argv[0];
+    if (streq(name, ":") || streq(name, "true")) { return 0; }
+    if (streq(name, "false")) { return 1; }
+    if (streq(name, "echo")) { return builtin_echo(argc, argv); }
+    if (streq(name, "cd")) { return builtin_cd(argc, argv); }
+    if (streq(name, "pwd")) {
         var buf: [243]char;
         if (getcwd(&buf[0], 243) == null) { perror2("sh", "pwd"); return 1; }
         puts(&buf[0]);
         puts("\n");
         return 0;
     }
-    if (streq(argv[0], "jobs")) {
+    if (streq(name, "export")) { return builtin_export(argc, argv, 0); }
+    if (streq(name, "unset")) { return builtin_export(argc, argv, 1); }
+    if (streq(name, "set")) { return builtin_set(argc, argv); }
+    if (streq(name, "shift")) { return builtin_shift(argc, argv); }
+    if (streq(name, "read")) { return builtin_read(argc, argv); }
+    if (streq(name, "test") || streq(name, "[")) { return test_eval(argc, argv); }
+    if (streq(name, "break") || streq(name, "continue")) {
+        var n: int = argc > 1 ? atoi(argv[1]) : 1;
+        if (n < 1) { err(name, ": loop count must be positive"); return 1; }
+        if (loop_depth == 0) { return 0; }
+        if (n > loop_depth) { n = loop_depth; }
+        if (streq(name, "break")) { break_count = n; } else { continue_count = n; }
+        return 0;
+    }
+    if (streq(name, "jobs")) {
         var j: int = 0;
         while (j < MAX_JOBS) {
             if (jobs[j].used) { put_job_line(j, jobs[j].stopped ? "Stopped" : "Running", !jobs[j].stopped); }
@@ -500,16 +1765,16 @@ fn builtin(argc: int, argv: **char) -> int {
         }
         return 0;
     }
-    if (streq(argv[0], "fg") || streq(argv[0], "bg")) {
-        if (!job_control) { err(argv[0], ": no job control"); return 1; }
-        var j: int = find_job(argc, argv, argv[0]);
-        if (j < 0) { return 1; }
-        var jb: *Job = &jobs[j];
-        if (streq(argv[0], "bg")) {
+    if (streq(name, "fg") || streq(name, "bg")) {
+        if (!job_control) { err(name, ": no job control"); return 1; }
+        var j2: int = find_job(argc, argv, name);
+        if (j2 < 0) { return 1; }
+        var jb: *Job = &jobs[j2];
+        if (streq(name, "bg")) {
             jb.stopped = 0;
             kill(-jb.pgid, SIGCONT);
             puts("[");
-            put_int(j + 1);
+            put_int(j2 + 1);
             puts("] ");
             puts(&jb.cmd[0]);
             puts(" &\n");
@@ -520,43 +1785,89 @@ fn builtin(argc: int, argv: **char) -> int {
         tcsetpgrp(STDIN_FILENO, jb.pgid);
         jb.stopped = 0;
         kill(-jb.pgid, SIGCONT);
-        return wait_fg(j);
+        return wait_fg(j2);
     }
-    if (streq(argv[0], "kill")) { return builtin_kill(argc, argv); }
+    if (streq(name, "kill")) { return builtin_kill(argc, argv); }
+    if (streq(name, "wait")) { return builtin_wait(argc, argv); }
+    if (streq(name, "umask")) {
+        if (argc == 1) {
+            var m: int = umask(0);
+            umask(m);
+            var o: [5]char;
+            o[0] = '0';
+            o[1] = ('0' + m / 64 % 8) as char;
+            o[2] = ('0' + m / 8 % 8) as char;
+            o[3] = ('0' + m % 8) as char;
+            o[4] = 0;
+            puts(&o[0]);
+            puts("\n");
+            return 0;
+        }
+        var v: int = 0;
+        var k: int = 0;
+        while (argv[1][k] >= '0' && argv[1][k] <= '7') { v = v * 8 + argv[1][k] - '0'; k += 1; }
+        if (k == 0 || argv[1][k] != 0) { err("umask: bad mask: ", argv[1]); return 1; }
+        umask(v);
+        return 0;
+    }
+    if (streq(name, "type")) {
+        var st: int = 0;
+        var i: int = 1;
+        while (i < argc) {
+            puts(argv[i]);
+            if (is_builtin(argv[i])) { puts(" is a shell builtin\n"); }
+            else {
+                var path: [243]char;
+                if (find_in_path(argv[i], &path[0])) { puts(" is "); puts(&path[0]); puts("\n"); }
+                else { puts(": not found\n"); st = 1; }
+            }
+            i += 1;
+        }
+        return st;
+    }
     // exit [n]
     var code: int = last_status;
     if (argc > 1) {
-        code = 0;
-        var k: int = 0;
-        while (is_digit(argv[1][k])) { code = code * 10 + argv[1][k] - '0'; k += 1; }
+        var end: *char;
+        code = strtol(argv[1], &end, 10);
+        if (end == argv[1] || end[0] != 0) { err("exit: numeric argument required: ", argv[1]); code = 2; }
     }
+    if (interactive) { fputs(STDERR_FILENO, "exit\n"); }
     _exit(code);
     return code;
 }
 
-// In a child: run the command, never return.
-fn exec_command(argc: int, argv: **char) {
-    if (is_builtin(argv[0])) { _exit(builtin(argc, argv)); }
-    var k: int = 0;
-    var has_slash: int = 0;
-    while (argv[0][k] != 0) { if (argv[0][k] == '/') { has_slash = 1; } k += 1; }
-    if (has_slash) {
-        execve(argv[0], argv, null);
+// ---- running commands ----------------------------------------------------------------------------------------
+
+fn find_in_path(name: *char, out: *char) -> int {
+    var path: *char = var_get("PATH");
+    if (path == null) { path = "/bin:/sbin"; }
+    var i: int = 0;
+    loop {
+        var n: int = 0;
+        while (path[i] != 0 && path[i] != ':' && n < 200) { out[n] = path[i]; n += 1; i += 1; }
+        if (n == 0) { out[n] = '.'; n += 1; }
+        out[n] = '/';
+        n += 1;
+        var j: int = 0;
+        while (name[j] != 0 && n < 242) { out[n] = name[j]; n += 1; j += 1; }
+        out[n] = 0;
+        var st: stat_t;
+        if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) { return 1; }
+        if (path[i] == 0) { return 0; }
+        i += 1;
+    }
+}
+
+// In a child (or for exec): run argv; never returns.
+fn exec_external(argc: int, argv: **char) {
+    var envp: **char = build_envp();
+    if (strchr(argv[0], '/') != null) {
+        execve(argv[0], argv, envp);
     } else {
-        var dirs: [2]*char = { "/bin/", "/sbin/" };         // PATH=/bin:/sbin
-        var d: int = 0;
-        while (d < 2) {
-            var path: [243]char;
-            var p: *char = dirs[d];
-            var n: int = 0;
-            while (p[n] != 0) { path[n] = p[n]; n += 1; }
-            k = 0;
-            while (argv[0][k] != 0 && n < 242) { path[n] = argv[0][k]; n += 1; k += 1; }
-            path[n] = 0;
-            execve(&path[0], argv, null);
-            if (errno != ENOENT) { break; }
-            d += 1;
-        }
+        var path: [243]char;
+        if (find_in_path(argv[0], &path[0])) { execve(&path[0], argv, envp); }
+        else { errno = ENOENT; }
     }
     if (errno == ENOENT) {
         err(argv[0], ": not found");
@@ -564,21 +1875,6 @@ fn exec_command(argc: int, argv: **char) {
     }
     perror2("sh", argv[0]);
     _exit(126);
-}
-
-// A builtin in the shell itself, with its redirections undone afterwards.
-fn run_builtin_here(a: int, b: int, argc: int, argv: **char) -> int {
-    var saved: [3]int;
-    var fd: int = 0;
-    while (fd < 3) { saved[fd] = dup(fd); fd += 1; }
-    var status: int = 1;
-    if (redirect(a, b) == 0) { status = builtin(argc, argv); }
-    fd = 0;
-    while (fd < 3) {
-        if (saved[fd] >= 0) { dup2(saved[fd], fd); close(saved[fd]); }
-        fd += 1;
-    }
-    return status;
 }
 
 fn default_signals() {
@@ -589,113 +1885,424 @@ fn default_signals() {
     signal(SIGTTOU, SIG_DFL);
 }
 
-// Run the pipeline in tokens [a, b), in the background if `bg`; returns its status.
-fn run_pipeline(a: int, b: int, bg: int) -> int {
-    var starts: [27]int;
-    var ends: [27]int;
-    var n: int = 0;
-    var s: int = a;
-    var t: int = a;
-    while (t <= b) {
-        if (t == b || tok_kind[t] == T_PIPE) {
-            if (t == s || n == MAX_CMDS) { err("syntax error near |", ""); return 2; }
-            starts[n] = s;
-            ends[n] = t;
-            n += 1;
-            s = t + 1;
-        }
-        t += 1;
+// After fork, in a child of job j.
+fn child_setup(j: int, bg: int) {
+    if (job_control) {
+        setpgid(0, jobs[j].pgid);
+        if (!bg) { tcsetpgrp(STDIN_FILENO, getpgrp()); }
+        default_signals();
+    } else if (bg) {
+        signal(SIGINT, SIG_IGN);                        // POSIX: async lists ignore SIGINT/SIGQUIT
+        signal(SIGQUIT, SIG_IGN);
     }
-    ep = 0;
-    var argv: [81]*char;
-    if (n == 1 && !bg) {
-        var argc: int = collect_args(a, b, &argv[0]);
-        if (argc > 0 && is_builtin(argv[0])) { return run_builtin_here(a, b, argc, &argv[0]); }
-    }
-    var j: int = new_job(a, b);
-    if (j < 0) { err("too many jobs", ""); return 1; }
-    var jb: *Job = &jobs[j];
-    var prev: int = -1;                          // read end of the previous pipe
-    var i: int = 0;
-    while (i < n) {
-        var p: [2]int;
-        if (i < n - 1 && pipe(&p[0]) < 0) { perror2("sh", "pipe"); break; }
-        var pid: int = fork();
-        if (pid < 0) { perror2("sh", "fork"); break; }
-        if (pid == 0) {
-            if (job_control) {
-                setpgid(0, jb.pgid);
-                if (!bg) { tcsetpgrp(STDIN_FILENO, getpgrp()); }
-                default_signals();
-            } else if (bg) {
-                signal(SIGINT, SIG_IGN);                 // POSIX: async lists ignore SIGINT/SIGQUIT
-                signal(SIGQUIT, SIG_IGN);
-            }
-            if (prev >= 0) { dup2(prev, 0); close(prev); }
-            if (i < n - 1) { close(p[0]); dup2(p[1], 1); close(p[1]); }
-            if (redirect(starts[i], ends[i]) < 0) { _exit(1); }
-            ep = 0;
-            var argc: int = collect_args(starts[i], ends[i], &argv[0]);
-            if (argc == 0) { _exit(0); }
-            exec_command(argc, &argv[0]);
-        }
-        if (jb.pgid == 0) { jb.pgid = job_control ? pid : shell_pgid; }
-        if (job_control) {
-            setpgid(pid, jb.pgid);
-            if (!bg) { tcsetpgrp(STDIN_FILENO, jb.pgid); }
-        }
-        jb.pids[jb.npids] = pid;
-        jb.npids += 1;
-        jb.alive += 1;
-        if (prev >= 0) { close(prev); }
-        if (i < n - 1) { close(p[1]); prev = p[0]; }
-        i += 1;
-    }
-    if (prev >= 0) { close(prev); }
-    if (jb.npids == 0) { jb.used = 0; return 1; }
-    if (bg) {
-        last_bg = jb.pids[jb.npids - 1];
-        if (interactive) {
-            puts("[");
-            put_int(j + 1);
-            puts("] ");
-            put_int(last_bg);
-            puts("\n");
-        }
-        return 0;
-    }
-    return wait_fg(j);
+    job_control = 0;                                    // a child does no job control itself
+    interactive = 0;
 }
 
-fn is_separator(k: int) -> int { return k == T_SEMI || k == T_AND || k == T_OR || k == T_AMP; }
+fn parent_track(j: int, pid: int, bg: int) {
+    if (jobs[j].pgid == 0) { jobs[j].pgid = job_control ? pid : shell_pgid; }
+    if (job_control) {
+        setpgid(pid, jobs[j].pgid);
+        if (!bg) { tcsetpgrp(STDIN_FILENO, jobs[j].pgid); }
+    }
+    add_pid(j, pid);
+}
 
-// Run a tokenized line: pipelines joined by ; && || &.
-fn run_list() -> int {
-    var status: int = last_status;
-    var op: int = T_SEMI;
-    var pos: int = 0;
-    while (pos < ntok) {
-        var end: int = pos;
-        while (end < ntok && !is_separator(tok_kind[end])) { end += 1; }
-        if (end == pos && end < ntok && tok_kind[end] != T_SEMI) { err("syntax error near && || &", ""); return 2; }
-        var bg: int = end < ntok && tok_kind[end] == T_AMP;
-        var go: int = op == T_SEMI || op == T_AMP || (op == T_AND && status == 0) || (op == T_OR && status != 0);
-        if (end > pos && go) {
-            status = run_pipeline(pos, end, bg);
-            last_status = status;
+fn xtrace(argc: int, argv: **char) {
+    fputs(STDERR_FILENO, "+");
+    var k: int = 0;
+    while (k < argc) { fputs(STDERR_FILENO, " "); fputs(STDERR_FILENO, argv[k]); k += 1; }
+    fputs(STDERR_FILENO, "\n");
+}
+
+// Is token t an assignment word (NAME=...)? The index of its '=', or -1.
+fn assignment_eq(t: int) -> int {
+    if (tkind[t] != T_WORD) { return -1; }
+    var i: int = tstart[t];
+    if (!is_name_start(src[i])) { return -1; }
+    while (i < tend[t] && is_name_char(src[i])) { i += 1; }
+    return i < tend[t] && src[i] == '=' ? i : -1;
+}
+
+fn assignment_name(t: int, eq: int, name: *char) {
+    var k: int = 0;
+    while (k < eq - tstart[t] && k < 80) { name[k] = src[tstart[t] + k]; k += 1; }
+    name[k] = 0;
+}
+
+// VAR=value before a command: exported to that command only (we are its child).
+fn apply_prefix_assignments(a: int, first_word: int) {
+    var t: int = a;
+    while (t < first_word) {
+        if (tkind[t] == T_REDIR) { t += 2; continue; }
+        var eq: int = assignment_eq(t);
+        var value: *char = expand_one(t, eq + 1);
+        var name: [81]char;
+        assignment_name(t, eq, &name[0]);
+        var_set(&name[0], value, 1);
+        t += 1;
+    }
+}
+
+// A simple command. in_child: we are already a forked child, so exec directly.
+fn exec_simple(n: int, in_child: int) -> int {
+    var ex_mark: int = exp;
+    var f_mark: int = nfields;
+    expand_error = 0;
+    var a: int = na[n];
+    var b: int = nb[n];
+    var t: int = a;
+    var first_word: int = b;
+    while (t < b) {
+        if (tkind[t] == T_REDIR) { t += 2; continue; }
+        if (assignment_eq(t) < 0) { first_word = t; break; }
+        t += 1;
+    }
+    var argv_start: int = nfields;
+    t = first_word;
+    while (t < b && !expand_error) {
+        if (tkind[t] == T_REDIR) { t += 2; continue; }
+        expand_word(t, 1);
+        t += 1;
+    }
+    var status: int = 0;
+    var argc: int = nfields - argv_start;
+    if (expand_error) {
+        exp = ex_mark;
+        nfields = f_mark;
+        return expansion_failed();
+    }
+    push_field(null);
+    var argv: **char = &fields[argv_start];
+    if (argc == 0) {
+        // assignments (and redirections) only; $? is that of the last $(...)
+        last_status = 0;
+        t = a;
+        while (t < b && !expand_error) {
+            if (tkind[t] == T_REDIR) { t += 2; continue; }
+            var eq: int = assignment_eq(t);
+            var m: int = exp;
+            var value: *char = expand_one(t, eq + 1);
+            var name: [81]char;
+            assignment_name(t, eq, &name[0]);
+            if (!expand_error) { var_set(&name[0], value, is_exported(&name[0])); }
+            exp = m;
+            t += 1;
         }
-        if (end < ntok) { op = tok_kind[end]; end += 1; }
-        pos = end;
+        status = expand_error ? expansion_failed() : last_status;
+        save_begin();
+        if (redirect(a, b, 1) < 0) { status = 1; }
+        save_restore();
+        exp = ex_mark;
+        nfields = f_mark;
+        return status;
+    }
+    if (opt_xtrace) { xtrace(argc, argv); }
+    if (streq(argv[0], "exec")) {
+        if (redirect(a, b, 0) < 0) { exp = ex_mark; nfields = f_mark; return 1; }
+        if (argc > 1) {
+            apply_prefix_assignments(a, first_word);
+            exec_external(argc - 1, &argv[1]);
+        }
+        exp = ex_mark;
+        nfields = f_mark;
+        return 0;
+    }
+    if (is_builtin(argv[0])) {
+        save_begin();
+        if (redirect(a, b, 1) < 0) { status = 1; }
+        else { status = builtin(argc, argv); }
+        save_restore();
+        exp = ex_mark;
+        nfields = f_mark;
+        return status;
+    }
+    if (in_child) {
+        if (redirect(a, b, 0) < 0) { _exit(1); }
+        apply_prefix_assignments(a, first_word);
+        exec_external(argc, argv);
+    }
+    var j: int = new_job(n);
+    if (j < 0) { err("too many jobs", null); exp = ex_mark; nfields = f_mark; return 1; }
+    var pid: int = fork();
+    if (pid < 0) { perror2("sh", "fork"); jobs[j].used = 0; exp = ex_mark; nfields = f_mark; return 1; }
+    if (pid == 0) {
+        child_setup(j, 0);
+        if (redirect(a, b, 0) < 0) { _exit(1); }
+        apply_prefix_assignments(a, first_word);
+        exec_external(argc, argv);
+    }
+    parent_track(j, pid, 0);
+    status = wait_fg(j);
+    exp = ex_mark;
+    nfields = f_mark;
+    return status;
+}
+
+// Run node n in a forked child (pipe ends already in place); never returns.
+fn run_in_child(n: int) {
+    if (nkind[n] == N_CMD) { _exit(exec_simple(n, 1)); }
+    _exit(exec_node(n));
+}
+
+fn exec_pipeline(n: int) -> int {
+    var first: int = na[n];
+    var status: int;
+    if (nnext[first] < 0) {
+        if (nkind[first] == N_CMD) { status = exec_simple(first, 0); }
+        else { status = exec_node(first); }
+    } else {
+        var j: int = new_job(n);
+        if (j < 0) { err("too many jobs", null); return 1; }
+        var prev: int = -1;
+        var e: int = first;
+        while (e >= 0) {
+            var p: [2]int;
+            var last: int = nnext[e] < 0;
+            if (!last && pipe(&p[0]) < 0) { perror2("sh", "pipe"); break; }
+            var pid: int = fork();
+            if (pid < 0) { perror2("sh", "fork"); break; }
+            if (pid == 0) {
+                child_setup(j, 0);
+                if (prev >= 0) { dup2(prev, 0); close(prev); }
+                if (!last) { close(p[0]); dup2(p[1], 1); close(p[1]); }
+                run_in_child(e);
+            }
+            parent_track(j, pid, 0);
+            if (prev >= 0) { close(prev); }
+            if (!last) { close(p[1]); prev = p[0]; }
+            e = nnext[e];
+        }
+        if (prev >= 0) { close(prev); }
+        if (jobs[j].npids == 0) { jobs[j].used = 0; return 1; }
+        status = wait_fg(j);
+    }
+    if (nd[n]) { status = status == 0 ? 1 : 0; }
+    return status;
+}
+
+fn run_background(n: int) -> int {
+    var j: int = new_job(n);
+    if (j < 0) { err("too many jobs", null); return 1; }
+    var pid: int = fork();
+    if (pid < 0) { perror2("sh", "fork"); jobs[j].used = 0; return 1; }
+    if (pid == 0) {
+        child_setup(j, 1);
+        // a single simple command needs no further fork
+        if (nkind[n] == N_PIPELINE && nd[n] == 0 && nnext[na[n]] < 0 && nkind[na[n]] == N_CMD) { run_in_child(na[n]); }
+        _exit(exec_node(n));
+    }
+    parent_track(j, pid, 1);
+    last_bg = pid;
+    if (interactive) {
+        puts("[");
+        put_int(j + 1);
+        puts("] ");
+        put_int(pid);
+        puts("\n");
+    }
+    return 0;
+}
+
+// An expansion error abandons the whole command line (POSIX), and a
+// non-interactive shell exits.
+var abort_line: int;
+
+fn expansion_failed() -> int {
+    if (!interactive) { _exit(1); }
+    abort_line = 1;
+    return 1;
+}
+
+fn loop_should_stop() -> int { return break_count > 0 || continue_count > 0 || abort_line; }
+
+fn exec_list(n: int) -> int {
+    var status: int = 0;
+    var it: int = na[n];
+    while (it >= 0) {
+        if (nbg[it]) { status = run_background(it); }
+        else {
+            status = exec_node(it);
+            if (opt_errexit && status != 0 && in_condition == 0 && nkind[it] != N_AND && nkind[it] != N_OR
+                && !(nkind[it] == N_PIPELINE && nd[it])) {
+                _exit(status);
+            }
+        }
+        last_status = status;
+        if (loop_should_stop()) { break; }
+        it = nnext[it];
     }
     return status;
 }
 
-fn run_line(s: *char) {
-    if (!tokenize(s)) { last_status = 2; return; }
-    if (ntok > 0) { run_list(); }
+// A loop body finished: 1 if the loop must stop now.
+fn loop_after_body() -> int {
+    if (abort_line) { return 1; }
+    if (break_count > 0) { break_count -= 1; return 1; }
+    if (continue_count > 0) {
+        continue_count -= 1;
+        if (continue_count > 0) { return 1; }               // continue an outer loop
+    }
+    return 0;
 }
 
-// ---- input --------------------------------------------------------------------------
+fn exec_compound(n: int) -> int {
+    var status: int = 0;
+    switch (nkind[n]) {
+        case N_LIST: return exec_list(n);
+        case N_AND, N_OR: {
+            in_condition += 1;
+            status = exec_node(na[n]);
+            in_condition -= 1;
+            last_status = status;
+            if ((nkind[n] == N_AND) == (status == 0)) { status = exec_node(nb[n]); }
+            return status;
+        }
+        case N_IF: {
+            in_condition += 1;
+            var c: int = exec_node(na[n]);
+            in_condition -= 1;
+            if (c == 0) { return exec_node(nb[n]); }
+            if (nc[n] >= 0) { return exec_node(nc[n]); }
+            return 0;
+        }
+        case N_WHILE: {
+            loop_depth += 1;
+            loop {
+                in_condition += 1;
+                var c2: int = exec_node(na[n]);
+                in_condition -= 1;
+                if (loop_should_stop()) { if (loop_after_body()) { break; } continue; }
+                if ((c2 == 0) == (nd[n] != 0)) { break; }
+                status = exec_node(nb[n]);
+                if (loop_after_body()) { break; }
+            }
+            loop_depth -= 1;
+            return status;
+        }
+        case N_FOR: {
+            var ex_mark: int = exp;
+            var f_mark: int = nfields;
+            var name: [81]char;
+            var len: int = tend[na[n]] - tstart[na[n]];
+            if (len > 80) { len = 80; }
+            var k: int = 0;
+            while (k < len) { name[k] = src[tstart[na[n]] + k]; k += 1; }
+            name[k] = 0;
+            if (!valid_name(&name[0])) { err("for: bad variable name: ", &name[0]); return 2; }
+            var first: int = nfields;
+            expand_error = 0;
+            if (nb[n] < 0) {
+                var p: int = 0;
+                while (p < npos) { push_field(pos_args[p]); p += 1; }
+            } else {
+                var t: int = nb[n];
+                while (t < nc[n]) { expand_word(t, 1); t += 1; }
+            }
+            if (expand_error) { exp = ex_mark; nfields = f_mark; return expansion_failed(); }
+            var count: int = nfields - first;
+            loop_depth += 1;
+            var i: int = 0;
+            while (i < count) {
+                var_set(&name[0], fields[first + i], is_exported(&name[0]));
+                status = exec_node(nd[n]);
+                if (loop_after_body()) { break; }
+                i += 1;
+            }
+            loop_depth -= 1;
+            exp = ex_mark;
+            nfields = f_mark;
+            return status;
+        }
+        case N_CASE: {
+            var ex_mark2: int = exp;
+            expand_error = 0;
+            var word: *char = expand_one(na[n], tstart[na[n]]);
+            if (expand_error) { exp = ex_mark2; return expansion_failed(); }
+            var it: int = nb[n];
+            while (it >= 0) {
+                var t2: int = na[it];
+                while (t2 < nb[it]) {
+                    if (tkind[t2] == T_WORD) {
+                        var m: int = exp;
+                        var pat: *char = expand_one(t2, tstart[t2]);
+                        var hit: int = fnmatch(pat, word);
+                        exp = m;
+                        if (hit) {
+                            status = exec_node(nc[it]);
+                            exp = ex_mark2;
+                            return status;
+                        }
+                    }
+                    t2 += 1;
+                }
+                it = nnext[it];
+            }
+            exp = ex_mark2;
+            return 0;
+        }
+        case N_SUBSHELL: {
+            var pid: int = fork();
+            if (pid < 0) { perror2("sh", "fork"); return 1; }
+            if (pid == 0) {
+                job_control = 0;
+                interactive = 0;
+                _exit(exec_node(na[n]));
+            }
+            var st: int = 0;
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            return status_of(st);
+        }
+        case N_GROUP: return exec_node(na[n]);
+        case N_PIPELINE: return exec_pipeline(n);
+        case N_CMD: return exec_simple(n, 0);
+    }
+    return 0;
+}
+
+fn exec_node(n: int) -> int {
+    if (n < 0) { return 0; }
+    var k: int = nkind[n];
+    if (k != N_CMD && k != N_PIPELINE && nrb[n] > nra[n]) {
+        // redirections on a compound command: save, apply, run, restore
+        var outer: [10]int;
+        var i: int = 0;
+        while (i < 10) { outer[i] = saved_fd[i]; i += 1; }
+        save_begin();
+        var status: int = 1;
+        if (redirect(nra[n], nrb[n], 1) == 0) {
+            var mine: [10]int;
+            i = 0;
+            while (i < 10) { mine[i] = saved_fd[i]; saved_fd[i] = -2; i += 1; }
+            status = exec_compound(n);
+            i = 0;
+            while (i < 10) { saved_fd[i] = mine[i]; i += 1; }
+        }
+        save_restore();
+        i = 0;
+        while (i < 10) { saved_fd[i] = outer[i]; i += 1; }
+        return status;
+    }
+    return exec_compound(n);
+}
+
+// Tokenize, parse and run src. Returns the status (2 for a syntax error).
+fn run_source() -> int {
+    if (lex() != 0) {
+        if (lex_incomplete) { err("syntax error: unterminated quote", null); }
+        return 2;
+    }
+    var n: int = parse();
+    if (n < 0) {
+        if (parse_incomplete) { err("syntax error: unexpected end of file", null); }
+        return 2;
+    }
+    var status: int = exec_node(n);
+    last_status = status;
+    return status;
+}
+
+// ---- input ----------------------------------------------------------------------------------------------------
 
 var inbuf: [2187]char;
 var in_len: int;
@@ -704,63 +2311,120 @@ var got_sigint: int;
 
 fn on_sigint(sig: int) { got_sigint = 1; }
 
-// The next line from fd into `line` (without the newline): 1, or 0 at end
-// of file, or -1 if a signal interrupted the read.
-fn read_line(fd: int, line: *char) -> int {
+// Append the next line from fd to src (with its newline): 1 = a line,
+// 0 = end of file, -1 = interrupted.
+fn read_line_into_src(fd: int) -> int {
     var n: int = 0;
     loop {
         if (in_pos == in_len) {
             var r: int = read(fd, &inbuf[0], 2187);
             if (r < 0 && errno == EINTR) { in_pos = 0; in_len = 0; return -1; }
-            if (r <= 0) {
-                line[n] = 0;
-                return n > 0;
-            }
+            if (r <= 0) { return n > 0; }
             in_len = r;
             in_pos = 0;
         }
         var c: char = inbuf[in_pos];
         in_pos += 1;
-        if (c == '\n') { line[n] = 0; return 1; }
-        if (n < LINE_MAX - 1) { line[n] = c; n += 1; }
+        if (src_len < SRC_MAX - 2) { src[src_len] = c; src_len += 1; }
+        n += 1;
+        if (c == '\n') { return 1; }
     }
+}
+
+fn prompt(name: *char, dflt: *char) {
+    var p: *char = var_get(name);
+    fputs(STDERR_FILENO, p == null ? dflt : p);
+}
+
+fn interactive_loop() -> int {
+    loop {
+        reap_jobs();
+        src_len = 0;
+        abort_line = 0;
+        break_count = 0;
+        continue_count = 0;
+        prompt("PS1", "$ ");
+        var r: int = read_line_into_src(STDIN_FILENO);
+        if (r < 0) { puts("\n"); continue; }
+        if (r == 0) { break; }
+        // more lines while the command is unfinished
+        loop {
+            var l: int = lex();
+            if (l == 0) {
+                var n: int = parse();
+                if (n >= 0) {
+                    exp = 0;
+                    nfields = 0;
+                    last_status = exec_node(n);
+                    break;
+                }
+                if (!parse_incomplete) { last_status = 2; break; }
+            } else if (l != 1) {
+                last_status = 2;
+                break;
+            }
+            prompt("PS2", "> ");
+            var r2: int = read_line_into_src(STDIN_FILENO);
+            if (r2 < 0) { puts("\n"); break; }
+            if (r2 == 0) {
+                err("syntax error: unexpected end of file", null);
+                last_status = 2;
+                break;
+            }
+        }
+    }
+    fputs(STDERR_FILENO, "exit\n");
+    return last_status;
+}
+
+fn read_script(fd: int, name: *char) -> int {
+    src_len = 0;
+    loop {
+        var r: int = read(fd, &src[src_len], SRC_MAX - 1 - src_len);
+        if (r < 0) { perror2("sh", name); return -1; }
+        if (r == 0) { break; }
+        src_len += r;
+        if (src_len >= SRC_MAX - 1) { err(name, ": script too long"); return -1; }
+    }
+    return 0;
 }
 
 fn main(argc: int, argv: **char) -> int {
     shell_pgid = getpgrp();
+    import_environ();
+    if (var_get("PATH") == null) { var_set("PATH", "/bin:/sbin", 1); }
+    arg0 = argv[0];
+    save_begin();
     if (argc > 2 && streq(argv[1], "-c")) {
-        run_line(argv[2]);
-        return last_status;
+        if (argc > 3) { arg0 = argv[3]; set_positional(argc - 4, &argv[4]); }
+        var n: int = strlen(argv[2]);
+        if (n >= SRC_MAX - 1) { err("-c: command too long", null); return 2; }
+        strcpy(&src[0], argv[2]);
+        src_len = n;
+        return run_source();
     }
-    var fd: int = STDIN_FILENO;
     if (argc > 1) {
-        fd = open(argv[1], O_RDONLY, 0);
+        var fd: int = open(argv[1], O_RDONLY, 0);
         if (fd < 0) { perror2("sh", argv[1]); return 127; }
+        arg0 = argv[1];
+        set_positional(argc - 2, &argv[2]);
+        if (read_script(fd, argv[1]) < 0) { return 2; }
+        close(fd);
+        return run_source();
     }
-    interactive = fd == STDIN_FILENO && isatty(STDIN_FILENO);
-    if (interactive) {
-        // Job control: our own process group, owning the terminal.
-        job_control = 1;
-        setpgid(0, 0);
-        shell_pgid = getpgrp();
-        tcsetpgrp(STDIN_FILENO, shell_pgid);
-        signal(SIGINT, &on_sigint as int);           // ^C at the prompt: a fresh prompt
-        signal(SIGQUIT, SIG_IGN);
-        signal(SIGTSTP, SIG_IGN);
-        signal(SIGTTIN, SIG_IGN);
-        signal(SIGTTOU, SIG_IGN);
+    interactive = isatty(STDIN_FILENO);
+    if (!interactive) {
+        if (read_script(STDIN_FILENO, "stdin") < 0) { return 2; }
+        return run_source();
     }
-    var line: [729]char;
-    loop {
-        if (interactive) {
-            reap_jobs();
-            fputs(STDERR_FILENO, "$ ");
-        }
-        var r: int = read_line(fd, &line[0]);
-        if (r < 0) { puts("\n"); continue; }
-        if (r == 0) { break; }
-        run_line(&line[0]);
-    }
-    if (interactive) { fputs(STDERR_FILENO, "exit\n"); }
-    return last_status;
+    job_control = 1;
+    setpgid(0, 0);
+    shell_pgid = getpgrp();
+    tcsetpgrp(STDIN_FILENO, shell_pgid);
+    signal(SIGINT, &on_sigint as int);                 // ^C at the prompt: a fresh prompt
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    return interactive_loop();
 }

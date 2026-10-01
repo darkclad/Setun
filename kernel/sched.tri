@@ -12,6 +12,7 @@ import "drivers/tty.tri";
 import "signal.tri";
 import "fs/tfs.tri";
 import "fs/procfs.tri";
+import "sys.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
@@ -61,6 +62,16 @@ const SYS_EXIT_GROUP: int = 94;
 const SYS_SCHED_YIELD: int = 124;
 const SYS_GETPID: int = 172;
 const SYS_GETPPID: int = 173;
+const SYS_FCNTL: int = 25;
+const SYS_LINKAT: int = 37;
+const SYS_FCHMODAT: int = 53;
+const SYS_CLOCK_GETTIME: int = 113;
+const SYS_UNAME: int = 160;
+const SYS_UMASK: int = 166;
+const SYS_GETUID: int = 174;
+const SYS_GETEUID: int = 175;
+const SYS_GETGID: int = 176;
+const SYS_GETEGID: int = 177;
 const SYS_RENAMEAT: int = 38;
 const SYS_UMOUNT2: int = 39;
 const SYS_MOUNT: int = 40;
@@ -123,6 +134,8 @@ struct Task {
     nanosleep_until: int;             // ...this jiffy
     start_time: int;                  // jiffies at fork
     cmdline_len: int;
+    umask: int;
+    fd_cloexec: [27]tryte;            // per descriptor: close on execve
     comm: [27]char;                   // the program's name (procfs)
     cmdline: [81]char;                // its arguments, NUL-separated
 }
@@ -176,7 +189,7 @@ fn prepare_stack(t: *Task) {
 }
 
 // Enter user mode at `entry` with stack `sp`, r1 = argc, r2 = argv.
-fn set_user_entry(f: *int, entry: int, sp: int, argc: int, argv: int) {
+fn set_user_entry(f: *int, entry: int, sp: int, argc: int, argv: int, envp: int) {
     var i: int = 0;
     while (i < FRAME_WORDS) { f[i] = 0; i += 1; }
     f[F_EPC] = entry;
@@ -184,6 +197,7 @@ fn set_user_entry(f: *int, entry: int, sp: int, argc: int, argv: int) {
     f[F_KSP] = sp;
     f[0] = argc;
     f[1] = argv;
+    f[2] = envp;
 }
 
 // Pick the next runnable user task after `from` (round robin), or idle.
@@ -258,6 +272,7 @@ fn spawn_init(path: *char) -> int {
     next_pid += 1;
     t.ppid = 0;
     t.start_time = jiffies;
+    t.umask = 18;                                     // 022
     set_comm(t);
     t.pgid = t.pid;
     t.sid = t.pid;
@@ -268,7 +283,7 @@ fn spawn_init(path: *char) -> int {
     t.heap_start = load_heap;
     t.brk = load_brk;
     fs_init_task(t);
-    set_user_entry(task_frame(t), load_entry, load_sp, exec_argc, load_argv);
+    set_user_entry(task_frame(t), load_entry, load_sp, exec_argc, load_argv, load_envp);
     prepare_stack(t);
     t.state = TASK_RUNNABLE;
     user_tasks_alive += 1;
@@ -299,6 +314,9 @@ fn do_fork(f: *int) -> int {
     var k: int = 0;
     while (k < 81) { child.cmdline[k] = parent.cmdline[k]; k += 1; }
     child.cmdline_len = parent.cmdline_len;
+    child.umask = parent.umask;
+    var c: int = 0;
+    while (c < 27) { child.fd_cloexec[c] = parent.fd_cloexec[c]; c += 1; }
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     var cf: *int = task_frame(child);
@@ -312,7 +330,7 @@ fn do_fork(f: *int) -> int {
 }
 
 fn do_execve(f: *int) -> int {
-    var r: int = collect_exec_args(f[0], f[1]);
+    var r: int = collect_exec_args(f[0], f[1], f[2]);
     if (r < 0) { return r; }
     exec_cwd = current_task().cwd;
     r = exec_load();
@@ -326,8 +344,9 @@ fn do_execve(f: *int) -> int {
     tlbflush();
     if (old != 0) { free_address_space(old); }
     signals_exec(t);
+    close_on_exec(t);
     set_comm(t);
-    set_user_entry(f, load_entry, load_sp, exec_argc, load_argv);
+    set_user_entry(f, load_entry, load_sp, exec_argc, load_argv, load_envp);
     return exec_argc;                                 // r1 = argc (set_user_entry already wrote it)
 }
 
@@ -615,6 +634,13 @@ fn do_syscall(f: *int, n: int) {
         case SYS_WAIT4: f[F_R1] = do_wait4(f[0], f[1], f[2]);
         case SYS_NANOSLEEP: f[F_R1] = sys_nanosleep(f[0], f[1]);
         case SYS_RENAMEAT: f[F_R1] = sys_renameat(f[0], f[1], f[2], f[3]);
+        case SYS_FCNTL: f[F_R1] = sys_fcntl(f[0], f[1], f[2]);
+        case SYS_LINKAT: f[F_R1] = sys_linkat(f[0], f[1], f[2], f[3]);
+        case SYS_FCHMODAT: f[F_R1] = sys_fchmodat(f[0], f[1], f[2]);
+        case SYS_CLOCK_GETTIME: f[F_R1] = sys_clock_gettime(f[0], f[1]);
+        case SYS_UNAME: f[F_R1] = sys_uname(f[0]);
+        case SYS_UMASK: f[F_R1] = sys_umask(f[0]);
+        case SYS_GETUID, SYS_GETEUID, SYS_GETGID, SYS_GETEGID: f[F_R1] = sys_getuid();
         case SYS_UMOUNT2: f[F_R1] = sys_umount2(f[0], f[1]);
         case SYS_MOUNT: f[F_R1] = sys_mount(f[0], f[1], f[2], f[3], f[4]);
         case SYS_STATFS: f[F_R1] = sys_statfs(f[0], f[1]);

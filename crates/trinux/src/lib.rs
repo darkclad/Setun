@@ -81,9 +81,16 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     let mut v: Vec<(String, PathBuf)> = vec![("/sbin/init".into(), u.join("init.tri"))];
     for prog in [
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
-        "df", "k3test", "sigtest", "fstest",
+        "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
+        "fdcheck",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
+    }
+    // One multi-call program under many names (hard links on tfs).
+    for applet in [
+        "rmdir", "basename", "dirname", "env", "printenv", "uname", "date", "clear", "seq", "tee", "yes", "kill", "test", "[",
+    ] {
+        v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }
     for name in ["reboot", "poweroff", "halt"] {
         v.push((format!("/sbin/{name}"), u.join("bin/reboot.tri")));
@@ -148,10 +155,17 @@ pub fn build_tfs(files: &[(String, PathBuf)], blocks: usize, inodes: usize) -> R
     for d in ROOT_DIRS {
         fs.mkdir_p(d)?;
     }
+    // The same source under several names becomes hard links to one file.
+    let mut written: Vec<(&PathBuf, String)> = Vec::new();
     for (name, src) in files {
+        if let Some((_, first)) = written.iter().find(|(p, _)| *p == src) {
+            fs.link(first, name).map_err(|e| format!("{name}: {e}"))?;
+            continue;
+        }
         let data = initramfs_file(src)?;
         let perm = if src.extension().is_some_and(|e| e == "tri") { 0o755 } else { 0o644 };
         fs.write_file(name, &data, perm).map_err(|e| format!("{name}: {e}"))?;
+        written.push((src, name.clone()));
     }
     Ok(fs)
 }

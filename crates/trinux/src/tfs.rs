@@ -470,6 +470,24 @@ impl Tfs {
         Ok(ino)
     }
 
+    /// A second name for an existing file (a hard link).
+    pub fn link(&mut self, existing: &str, path: &str) -> Result<(), String> {
+        let ino = self.lookup(existing)?;
+        if self.inode_word(ino, I_MODE) / 4096 % 16 * 4096 == S_IFDIR {
+            return err(format!("tfs: {existing}: cannot link a directory"));
+        }
+        let (dir, name) = path.rsplit_once('/').ok_or(format!("tfs: {path}: not absolute"))?;
+        Self::check_name(name)?;
+        let d = self.mkdir_p(dir)?;
+        if self.dir_lookup(d, name)?.is_some() {
+            return err(format!("tfs: {path}: exists"));
+        }
+        self.add_entry(d, name, ino)?;
+        let n = self.inode_word(ino, I_NLINK);
+        self.set_inode_word(ino, I_NLINK, n + 1);
+        Ok(())
+    }
+
     pub fn read_file(&self, path: &str) -> Result<Vec<i16>, String> {
         self.read_inode(self.lookup(path)?)
     }

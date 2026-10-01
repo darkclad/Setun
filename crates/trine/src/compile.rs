@@ -165,6 +165,8 @@ pub struct Compiled {
     pub text: String,
     pub data_start: i64,
     pub data_end: i64,
+    /// The program has a global `environ` (tlibc): user startup code stores envp there.
+    pub has_environ: bool,
 }
 
 type R<T> = Result<T, Error>;
@@ -595,7 +597,8 @@ impl Compiler {
         for (n, addr) in vars {
             text += &format!("{n} = {addr}\n");
         }
-        Ok(Compiled { text, data_start: self.data_start, data_end: self.data_cursor })
+        let has_environ = matches!(self.globals.get("environ"), Some(Global::Var { .. }));
+        Ok(Compiled { text, data_start: self.data_start, data_end: self.data_cursor, has_environ })
     }
 
     fn define(&mut self, name: &str, g: Global, pos: Pos) -> R<()> {

@@ -1,0 +1,14 @@
+// /bin/fdcheck: exit with the number of open descriptors among 3..26
+// (libctest uses it to check close-on-exec).
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var n: int = 0;
+    var fd: int = 3;
+    while (fd < 27) {
+        if (fcntl(fd, F_GETFD, 0) >= 0) { n += 1; }
+        fd += 1;
+    }
+    return n;
+}

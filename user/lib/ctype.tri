@@ -1,0 +1,13 @@
+// ctype.h for tlibc: ASCII classes (other code points are "other").
+
+fn isdigit(c: int) -> int { return c >= '0' && c <= '9'; }
+fn isupper(c: int) -> int { return c >= 'A' && c <= 'Z'; }
+fn islower(c: int) -> int { return c >= 'a' && c <= 'z'; }
+fn isalpha(c: int) -> int { return isupper(c) || islower(c); }
+fn isalnum(c: int) -> int { return isalpha(c) || isdigit(c); }
+fn isspace(c: int) -> int { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12; }
+fn isxdigit(c: int) -> int { return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+fn isprint(c: int) -> int { return c >= 32 && c < 127; }
+fn ispunct(c: int) -> int { return isprint(c) && !isalnum(c) && c != ' '; }
+fn toupper(c: int) -> int { return islower(c) ? c - 32 : c; }
+fn tolower(c: int) -> int { return isupper(c) ? c + 32 : c; }

@@ -1,0 +1,63 @@
+// getopt (unistd.h) for tlibc: POSIX short options, "ab:c" style.
+
+import "tlibc.tri";
+
+var optind: int = 1;
+var optarg: *char;
+var optopt: int;
+var opterr: int = 1;
+var opt_next: int;                    // position inside a cluster like -abc
+
+// The next option character, '?' for an unknown one or a missing argument
+// (':' instead when optstring starts with ':'), or -1 when the options end.
+fn getopt(argc: int, argv: **char, opts: *char) -> int {
+    optarg = null;
+    if (opt_next == 0) {
+        if (optind >= argc) { return -1; }
+        var a: *char = argv[optind];
+        if (a[0] != '-' || a[1] == 0) { return -1; }
+        if (a[1] == '-' && a[2] == 0) { optind += 1; return -1; }    // "--"
+        opt_next = 1;
+    }
+    var arg: *char = argv[optind];
+    var c: int = arg[opt_next];
+    opt_next += 1;
+    var colon: int = opts[0] == ':';
+    var k: int = colon ? 1 : 0;
+    while (opts[k] != 0 && opts[k] != c) { k += 1; }
+    if (opts[k] == 0 || c == ':') {
+        optopt = c;
+        if (arg[opt_next] == 0) { opt_next = 0; optind += 1; }
+        if (opterr && !colon) { opt_message(argv[0], "invalid option -- '", c); }
+        return '?';
+    }
+    if (opts[k + 1] == ':') {                           // takes an argument
+        if (arg[opt_next] != 0) {
+            optarg = &arg[opt_next];
+            optind += 1;
+        } else if (optind + 1 < argc) {
+            optarg = argv[optind + 1];
+            optind += 2;
+        } else {
+            optopt = c;
+            opt_next = 0;
+            optind += 1;
+            if (opterr && !colon) { opt_message(argv[0], "option requires an argument -- '", c); }
+            return colon ? ':' : '?';
+        }
+        opt_next = 0;
+        return c;
+    }
+    if (arg[opt_next] == 0) { opt_next = 0; optind += 1; }
+    return c;
+}
+
+fn opt_message(prog: *char, what: *char, c: int) {
+    var ch: [1]char;
+    ch[0] = c as char;
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, what);
+    write(STDERR_FILENO, &ch[0], 1);
+    fputs(STDERR_FILENO, "'\n");
+}

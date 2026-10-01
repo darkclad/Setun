@@ -147,6 +147,7 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                         'n' => '\n',
                         't' => '\t',
                         'r' => '\r',
+                        'e' => '\x1b',
                         '0' => '\0',
                         '\\' => '\\',
                         '\'' => '\'',

@@ -1,0 +1,163 @@
+// test / [ : the POSIX conditional expression, shared by sh and /bin/test.
+//
+//   ! e   e -a e   e -o e   ( e )
+//   -e -f -d -r -w -x -s -c -p FILE    -z -n STRING    -t FD
+//   s = s   s != s   n -eq n  -ne -lt -le -gt -ge
+//
+// test_eval returns 0 (true), 1 (false) or 2 (error, after a message).
+
+import "tlibc.tri";
+
+var te_argv: **char;
+var te_argc: int;
+var te_pos: int;
+var te_error: int;
+
+fn te_peek() -> *char { return te_pos < te_argc ? te_argv[te_pos] : null; }
+
+fn te_fail(msg: *char, what: *char) -> int {
+    if (!te_error) {
+        fputs(STDERR_FILENO, "test: ");
+        fputs(STDERR_FILENO, msg);
+        if (what != null) { fputs(STDERR_FILENO, what); }
+        fputs(STDERR_FILENO, "\n");
+    }
+    te_error = 1;
+    return 0;
+}
+
+fn te_number(s: *char, out: *int) -> int {
+    var k: int = 0;
+    var neg: int = 0;
+    while (s[k] == ' ') { k += 1; }
+    if (s[k] == '-' || s[k] == '+') { neg = s[k] == '-'; k += 1; }
+    if (s[k] < '0' || s[k] > '9') { return te_fail("integer expression expected: ", s); }
+    var v: int = 0;
+    while (s[k] >= '0' && s[k] <= '9') { v = v * 10 + s[k] - '0'; k += 1; }
+    if (s[k] != 0) { return te_fail("integer expression expected: ", s); }
+    *out = neg ? -v : v;
+    return 1;
+}
+
+fn te_unary_op(s: *char) -> int {
+    return s != null && s[0] == '-' && s[1] != 0 && s[2] == 0 && strchr_c("efdrwxsczntp", s[1]);
+}
+
+fn strchr_c(set: *char, c: char) -> int {
+    var k: int = 0;
+    while (set[k] != 0) { if (set[k] == c) { return 1; } k += 1; }
+    return 0;
+}
+
+fn te_binary_op(s: *char) -> int {
+    if (s == null) { return 0; }
+    return streq(s, "=") || streq(s, "!=") || streq(s, "-eq") || streq(s, "-ne") || streq(s, "-lt")
+        || streq(s, "-le") || streq(s, "-gt") || streq(s, "-ge");
+}
+
+fn te_unary(op: char, arg: *char) -> int {
+    if (op == 'z') { return arg[0] == 0; }
+    if (op == 'n') { return arg[0] != 0; }
+    if (op == 't') {
+        var fd: int;
+        if (!te_number(arg, &fd)) { return 0; }
+        return isatty(fd);
+    }
+    var st: stat_t;
+    if (stat(arg, &st) < 0) { return 0; }
+    switch (op) {
+        case 'e', 'r', 'w': return 1;                   // single-user: root may read and write
+        case 'f': return S_ISREG(st.st_mode);
+        case 'd': return S_ISDIR(st.st_mode);
+        case 'c': return S_ISCHR(st.st_mode);
+        case 'p': return S_ISFIFO(st.st_mode);
+        case 's': return st.st_size > 0;
+        case 'x': return st.st_mode / 64 % 2 != 0 || st.st_mode / 8 % 2 != 0 || st.st_mode % 2 != 0;
+    }
+    return 0;
+}
+
+fn te_binary(a: *char, op: *char, b: *char) -> int {
+    if (streq(op, "=")) { return streq(a, b); }
+    if (streq(op, "!=")) { return !streq(a, b); }
+    var x: int;
+    var y: int;
+    if (!te_number(a, &x) || !te_number(b, &y)) { return 0; }
+    if (streq(op, "-eq")) { return x == y; }
+    if (streq(op, "-ne")) { return x != y; }
+    if (streq(op, "-lt")) { return x < y; }
+    if (streq(op, "-le")) { return x <= y; }
+    if (streq(op, "-gt")) { return x > y; }
+    return x >= y;
+}
+
+fn te_primary() -> int {
+    var s: *char = te_peek();
+    if (s == null) { return te_fail("argument expected", null); }
+    if (streq(s, "!")) { te_pos += 1; return !te_primary(); }
+    if (streq(s, "(")) {
+        te_pos += 1;
+        var v: int = te_or();
+        var c: *char = te_peek();
+        if (c == null || !streq(c, ")")) { return te_fail("missing ')'", null); }
+        te_pos += 1;
+        return v;
+    }
+    // a binary expression takes precedence: [ -n = -n ] compares strings
+    if (te_pos + 2 < te_argc + 1 && te_pos + 1 < te_argc && te_binary_op(te_argv[te_pos + 1]) && te_pos + 2 < te_argc) {
+        var a: *char = te_argv[te_pos];
+        var op: *char = te_argv[te_pos + 1];
+        var b: *char = te_argv[te_pos + 2];
+        te_pos += 3;
+        return te_binary(a, op, b);
+    }
+    if (te_unary_op(s) && te_pos + 1 < te_argc) {
+        te_pos += 2;
+        return te_unary(s[1], te_argv[te_pos - 1]);
+    }
+    te_pos += 1;                                        // a lone string: true if non-empty
+    return s[0] != 0;
+}
+
+fn te_and() -> int {
+    var v: int = te_primary();
+    while (te_peek() != null && streq(te_peek(), "-a")) {
+        te_pos += 1;
+        var w: int = te_primary();
+        v = v && w;
+    }
+    return v;
+}
+
+fn te_or() -> int {
+    var v: int = te_and();
+    while (te_peek() != null && streq(te_peek(), "-o")) {
+        te_pos += 1;
+        var w: int = te_and();
+        v = v || w;
+    }
+    return v;
+}
+
+// argv[0] is "test" or "["; for "[" the last argument must be "]".
+fn test_eval(argc: int, argv: **char) -> int {
+    te_error = 0;
+    var me: *char = argv[0];
+    var k: int = 0;
+    while (argv[0][k] != 0) { if (argv[0][k] == '/') { me = &argv[0][k + 1]; } k += 1; }
+    if (streq(me, "[")) {
+        if (argc < 2 || !streq(argv[argc - 1], "]")) {
+            fputs(STDERR_FILENO, "[: missing ']'\n");
+            return 2;
+        }
+        argc -= 1;
+    }
+    te_argv = argv;
+    te_argc = argc;
+    te_pos = 1;
+    if (argc == 1) { return 1; }                        // no expression: false
+    var v: int = te_or();
+    if (!te_error && te_pos < te_argc) { te_fail("too many arguments", null); }
+    if (te_error) { return 2; }
+    return v ? 0 : 1;
+}

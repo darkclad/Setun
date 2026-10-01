@@ -129,6 +129,7 @@ fn fd_install(f: int, from: int) -> int {
     while (fd < NFDS) {
         if (t.fds[fd] == 0) {
             t.fds[fd] = f + 1;
+            t.fd_cloexec[fd] = 0;
             return fd;
         }
         fd += 1;
@@ -194,6 +195,21 @@ fn dir_base_for(dirfd: int, path: *char) -> int {
 
 fn dir_base(dirfd: int) -> int { return dir_base_for(dirfd, &kpath[0]); }
 
+// mode without the bits set in the umask (both octal permission sets).
+fn apply_umask(mode: int) -> int {
+    var m: int = (mode % 4096 + 4096) % 4096;
+    var u: int = current_task().umask;
+    var r: int = 0;
+    var b: int = 1;
+    while (b < 4096) {
+        if (m / b % 2 != 0 && u / b % 2 == 0) { r += b; }
+        b *= 2;
+    }
+    return r;
+}
+
+const O_CLOEXEC_: int = 524288;
+
 fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     var r: int = get_path(path);
     if (r < 0) { return r; }
@@ -202,7 +218,7 @@ fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     var i: int = path_lookup(&kpath[0], base);
     if (i >= 0 && has(flags, O_CREAT) && has(flags, O_EXCL)) { return -EEXIST; }
     if (i == -ENOENT_ && has(flags, O_CREAT)) {
-        i = vfs_create(&kpath[0], base, I_REG, (mode % 512 + 512) % 512);
+        i = vfs_create(&kpath[0], base, I_REG, apply_umask(mode % 512));
     }
     if (i < 0) { return i; }
     var acc: int = flags % 4;
@@ -216,7 +232,8 @@ fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     var f: int = file_alloc(i, flags);
     if (f < 0) { return f; }
     var fd: int = fd_install(f, 0);
-    if (fd < 0) { file_close(f); }
+    if (fd < 0) { file_close(f); return fd; }
+    current_task().fd_cloexec[fd] = has(flags, O_CLOEXEC_) as tryte;
     return fd;
 }
 
@@ -274,6 +291,7 @@ fn sys_dup3(fd: int, nfd: int, flags: int) -> int {
     var t: *Task = current_task();
     if (t.fds[nfd] != 0) { file_close(t.fds[nfd] - 1); }
     t.fds[nfd] = f + 1;
+    t.fd_cloexec[nfd] = has(flags, O_CLOEXEC_) as tryte;
     files[f].refs += 1;
     return nfd;
 }
@@ -299,6 +317,8 @@ fn sys_pipe2(fds: int, flags: int) -> int {
     var out_fds: *int = fds as *int;
     out_fds[0] = rfd;
     out_fds[1] = wfd;
+    current_task().fd_cloexec[rfd] = has(flags, O_CLOEXEC_) as tryte;
+    current_task().fd_cloexec[wfd] = has(flags, O_CLOEXEC_) as tryte;
     return 0;
 }
 
@@ -386,7 +406,7 @@ fn sys_mkdirat(dirfd: int, path: int, mode: int) -> int {
     if (r < 0) { return r; }
     var base: int = dir_base(dirfd);
     if (base < 0) { return base; }
-    var i: int = vfs_create(&kpath[0], base, I_DIR, (mode % 512 + 512) % 512);
+    var i: int = vfs_create(&kpath[0], base, I_DIR, apply_umask(mode % 512));
     return i < 0 ? i : 0;
 }
 

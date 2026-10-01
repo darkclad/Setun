@@ -1,0 +1,269 @@
+// A multi-call program, chosen by argv[0] like busybox: the small tools.
+//
+//   rmdir dir ...        basename path [suffix]   dirname path
+//   env [NAME=v ...] [cmd [args]]                 printenv [NAME]
+//   uname [-asnrvm]      date [+format]           clear
+//   seq [first] last     tee [-a] [file ...]      yes [word]
+//   kill [-sig] pid ...  test / [ expression      sleep is separate
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/time.tri";
+import "../lib/testexpr.tri";
+
+fn name_of(p: *char) -> *char {
+    var s: *char = strrchr(p, '/');
+    return s == null ? p : &s[1];
+}
+
+fn usage(s: *char) -> int {
+    fputs(STDERR_FILENO, "usage: ");
+    fputs(STDERR_FILENO, s);
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}
+
+fn do_rmdir(argc: int, argv: **char) -> int {
+    if (argc < 2) { return usage("rmdir dir ..."); }
+    var status: int = 0;
+    var i: int = 1;
+    while (i < argc) {
+        if (rmdir(argv[i]) < 0) { perror2("rmdir", argv[i]); status = 1; }
+        i += 1;
+    }
+    return status;
+}
+
+fn do_basename(argc: int, argv: **char) -> int {
+    if (argc < 2 || argc > 3) { return usage("basename path [suffix]"); }
+    var buf: [243]char;
+    strncpy(&buf[0], argv[1], 242);
+    buf[242] = 0;
+    var n: int = strlen(&buf[0]);
+    while (n > 1 && buf[n - 1] == '/') { n -= 1; buf[n] = 0; }
+    var b: *char = &buf[0];
+    var s: *char = strrchr(b, '/');
+    if (s != null && s[1] != 0) { b = &s[1]; }
+    if (argc == 3) {
+        var bl: int = strlen(b);
+        var sl: int = strlen(argv[2]);
+        if (sl < bl && streq(&b[bl - sl], argv[2])) { b[bl - sl] = 0; }
+    }
+    puts(b);
+    puts("\n");
+    return 0;
+}
+
+fn do_dirname(argc: int, argv: **char) -> int {
+    if (argc != 2) { return usage("dirname path"); }
+    var buf: [243]char;
+    strncpy(&buf[0], argv[1], 242);
+    buf[242] = 0;
+    var n: int = strlen(&buf[0]);
+    while (n > 1 && buf[n - 1] == '/') { n -= 1; buf[n] = 0; }
+    var s: *char = strrchr(&buf[0], '/');
+    if (s == null) { puts(".\n"); return 0; }
+    if (s == &buf[0]) { puts("/\n"); return 0; }
+    s[0] = 0;
+    puts(&buf[0]);
+    puts("\n");
+    return 0;
+}
+
+fn do_env(argc: int, argv: **char) -> int {
+    var i: int = 1;
+    if (i < argc && streq(argv[i], "-i")) {
+        environ = null;
+        i += 1;
+    }
+    while (i < argc && strchr(argv[i], '=') != null) {
+        var eq: *char = strchr(argv[i], '=');
+        eq[0] = 0;
+        if (setenv(argv[i], &eq[1], 1) < 0) { perror2("env", argv[i]); return 125; }
+        i += 1;
+    }
+    if (i == argc) {
+        var k: int = 0;
+        if (environ != null) {
+            while (environ[k] != null) { puts(environ[k]); puts("\n"); k += 1; }
+        }
+        return 0;
+    }
+    execvp(argv[i], &argv[i]);
+    perror2("env", argv[i]);
+    return errno == ENOENT ? 127 : 126;
+}
+
+fn do_printenv(argc: int, argv: **char) -> int {
+    if (argc == 1) { return do_env(1, argv); }
+    var v: *char = getenv(argv[1]);
+    if (v == null) { return 1; }
+    puts(v);
+    puts("\n");
+    return 0;
+}
+
+fn do_uname(argc: int, argv: **char) -> int {
+    var u: utsname;
+    if (uname(&u) < 0) { perror2("uname", "uname"); return 1; }
+    var s: int = 0;
+    var n: int = 0;
+    var r: int = 0;
+    var v: int = 0;
+    var m: int = 0;
+    var i: int = 1;
+    while (i < argc) {
+        if (argv[i][0] != '-' || argv[i][1] == 0) { return usage("uname [-asnrvm]"); }
+        var k: int = 1;
+        while (argv[i][k] != 0) {
+            var c: char = argv[i][k];
+            if (c == 'a') { s = 1; n = 1; r = 1; v = 1; m = 1; }
+            else if (c == 's') { s = 1; }
+            else if (c == 'n') { n = 1; }
+            else if (c == 'r') { r = 1; }
+            else if (c == 'v') { v = 1; }
+            else if (c == 'm') { m = 1; }
+            else {
+                fputs(STDERR_FILENO, "uname: invalid option -- '");
+                write(STDERR_FILENO, &argv[i][k], 1);
+                fputs(STDERR_FILENO, "'\n");
+                return 1;
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    if (!n && !r && !v && !m) { s = 1; }
+    var first: int = 1;
+    if (s) { puts(&u.sysname[0]); first = 0; }
+    if (n) { if (!first) { puts(" "); } puts(&u.nodename[0]); first = 0; }
+    if (r) { if (!first) { puts(" "); } puts(&u.release[0]); first = 0; }
+    if (v) { if (!first) { puts(" "); } puts(&u.version[0]); first = 0; }
+    if (m) { if (!first) { puts(" "); } puts(&u.machine[0]); }
+    puts("\n");
+    return 0;
+}
+
+fn do_date(argc: int, argv: **char) -> int {
+    var fmt: *char = "%a %b %e %H:%M:%S UTC %Y";
+    if (argc > 2 || (argc == 2 && argv[1][0] != '+')) { return usage("date [+format]"); }
+    if (argc == 2) { fmt = &argv[1][1]; }
+    var t: tm;
+    gmtime_r(time(null), &t);
+    var buf: [243]char;
+    strftime(&buf[0], 243, fmt, &t);
+    puts(&buf[0]);
+    puts("\n");
+    return 0;
+}
+
+fn do_seq(argc: int, argv: **char) -> int {
+    if (argc < 2 || argc > 3) { return usage("seq [first] last"); }
+    var end: *char;
+    var first: int = 1;
+    var last: int;
+    if (argc == 3) {
+        first = strtol(argv[1], &end, 10);
+        if (end == argv[1] || end[0] != 0) { return usage("seq [first] last"); }
+    }
+    last = strtol(argv[argc - 1], &end, 10);
+    if (end == argv[argc - 1] || end[0] != 0) {
+        fputs(STDERR_FILENO, "seq: invalid number: ");
+        fputs(STDERR_FILENO, argv[argc - 1]);
+        fputs(STDERR_FILENO, "\n");
+        return 1;
+    }
+    var i: int = first;
+    while (i <= last) { put_int(i); puts("\n"); i += 1; }
+    return 0;
+}
+
+fn do_tee(argc: int, argv: **char) -> int {
+    var i: int = 1;
+    var flags: int = O_WRONLY + O_CREAT + O_TRUNC;
+    if (i < argc && streq(argv[i], "-a")) { flags = O_WRONLY + O_CREAT + O_APPEND; i += 1; }
+    var fds: [24]int;
+    var n: int = 0;
+    var status: int = 0;
+    while (i < argc && n < 24) {
+        var fd: int = open(argv[i], flags, 438);
+        if (fd < 0) { perror2("tee", argv[i]); status = 1; } else { fds[n] = fd; n += 1; }
+        i += 1;
+    }
+    var buf: [2187]char;
+    loop {
+        var r: int = read(STDIN_FILENO, &buf[0], 2187);
+        if (r <= 0) { break; }
+        write(STDOUT_FILENO, &buf[0], r);
+        var k: int = 0;
+        while (k < n) { write(fds[k], &buf[0], r); k += 1; }
+    }
+    return status;
+}
+
+fn do_yes(argc: int, argv: **char) -> int {
+    var word: *char = argc > 1 ? argv[1] : "y";
+    var line: [243]char;
+    strncpy(&line[0], word, 240);
+    line[240] = 0;
+    strcat(&line[0], "\n");
+    var n: int = strlen(&line[0]);
+    loop {
+        if (write(STDOUT_FILENO, &line[0], n) < 0) { return 1; }     // stops at EPIPE (or SIGPIPE)
+    }
+}
+
+fn do_kill(argc: int, argv: **char) -> int {
+    var sig: int = SIGTERM;
+    var i: int = 1;
+    if (argc > 1 && argv[1][0] == '-' && argc > 2) {
+        var s: *char = &argv[1][1];
+        if (s[0] >= '0' && s[0] <= '9') { sig = atoi(s); }
+        else {
+            if (s[0] == 'S' && s[1] == 'I' && s[2] == 'G') { s = &s[3]; }
+            sig = -1;
+            var k: int = 1;
+            while (k < NSIG) { if (streq(s, signame(k))) { sig = k; } k += 1; }
+        }
+        if (sig < 0 || sig >= NSIG) { fputs(STDERR_FILENO, "kill: invalid signal\n"); return 1; }
+        i = 2;
+    }
+    if (i == argc) { return usage("kill [-sig] pid ..."); }
+    var status: int = 0;
+    while (i < argc) {
+        var end: *char;
+        var pid: int = strtol(argv[i], &end, 10);
+        if (end == argv[i] || end[0] != 0) {
+            fputs(STDERR_FILENO, "kill: invalid pid: ");
+            fputs(STDERR_FILENO, argv[i]);
+            fputs(STDERR_FILENO, "\n");
+            status = 1;
+        } else if (kill(pid, sig) < 0) {
+            perror2("kill", argv[i]);
+            status = 1;
+        }
+        i += 1;
+    }
+    return status;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var me: *char = name_of(argv[0]);
+    if (streq(me, "rmdir")) { return do_rmdir(argc, argv); }
+    if (streq(me, "basename")) { return do_basename(argc, argv); }
+    if (streq(me, "dirname")) { return do_dirname(argc, argv); }
+    if (streq(me, "env")) { return do_env(argc, argv); }
+    if (streq(me, "printenv")) { return do_printenv(argc, argv); }
+    if (streq(me, "uname")) { return do_uname(argc, argv); }
+    if (streq(me, "date")) { return do_date(argc, argv); }
+    if (streq(me, "clear")) { puts("\e[H\e[2J"); return 0; }
+    if (streq(me, "seq")) { return do_seq(argc, argv); }
+    if (streq(me, "tee")) { return do_tee(argc, argv); }
+    if (streq(me, "yes")) { return do_yes(argc, argv); }
+    if (streq(me, "kill")) { return do_kill(argc, argv); }
+    if (streq(me, "test") || streq(me, "[")) { return test_eval(argc, argv); }
+    fputs(STDERR_FILENO, me);
+    fputs(STDERR_FILENO, ": unknown applet\n");
+    return 127;
+}

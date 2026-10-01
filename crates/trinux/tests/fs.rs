@@ -170,7 +170,8 @@ fn k6_initramfs_root_still_boots() {
         .unwrap_or_else(|e| panic!("{e}"))
         .trytes;
     let (out, _) = session(&disk, &["echo ramfs root", "ls /proc/1", "exit"], 100_000_000);
-    assert_has(&out, &["initramfs: 26 files", "VFS: Mounted root (ramfs from the initramfs)", "ramfs root\n", "cmdline\nstat\nstatus\n"]);
+    let count = format!("initramfs: {} files", trinux::default_files().len());
+    assert_has(&out, &[&count, "VFS: Mounted root (ramfs from the initramfs)", "ramfs root\n", "cmdline\nstat\nstatus\n"]);
 }
 
 #[test]

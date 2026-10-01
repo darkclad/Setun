@@ -1,0 +1,42 @@
+// uniq [-c] [file]: drop repeated adjacent lines (-c: count them).
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/stdio.tri";
+import "../lib/getopt.tri";
+
+var prev: [2187]char;
+var cur: [2187]char;
+
+fn main(argc: int, argv: **char) -> int {
+    var counts: int = 0;
+    var c: int = getopt(argc, argv, "c");
+    while (c != -1) {
+        if (c == 'c') { counts = 1; }
+        else { fputs(STDERR_FILENO, "usage: uniq [-c] [file]\n"); return 1; }
+        c = getopt(argc, argv, "c");
+    }
+    var f: *FILE = stdin();
+    if (optind < argc) {
+        f = fopen(argv[optind], "r");
+        if (f == null) { perror2("uniq", argv[optind]); return 1; }
+    }
+    var have: int = 0;
+    var n: int = 0;
+    loop {
+        var got: int = fgets(&cur[0], 2187, f) != null;
+        if (got && have && streq(&cur[0], &prev[0])) { n += 1; continue; }
+        if (have) {
+            if (counts) { put_padded(n, 7); puts(" "); }
+            puts(&prev[0]);
+            var len: int = strlen(&prev[0]);
+            if (len == 0 || prev[len - 1] != '\n') { puts("\n"); }
+        }
+        if (!got) { break; }
+        strcpy(&prev[0], &cur[0]);
+        have = 1;
+        n = 1;
+    }
+    return 0;
+}

@@ -1,0 +1,64 @@
+// wc [-lwc] [file ...]: lines, words and characters.
+
+import "../lib/tlibc.tri";
+import "../lib/ctype.tri";
+import "../lib/stdlib.tri";
+import "../lib/stdio.tri";
+import "../lib/getopt.tri";
+
+var show_l: int;
+var show_w: int;
+var show_c: int;
+var tl: int;
+var tw: int;
+var tc: int;
+
+fn report(l: int, w: int, c: int, name: *char) {
+    if (show_l) { put_padded(l, 7); }
+    if (show_w) { put_padded(w, 8); }
+    if (show_c) { put_padded(c, 8); }
+    if (name != null) { puts(" "); puts(name); }
+    puts("\n");
+}
+
+fn count(f: *FILE, name: *char) {
+    var l: int = 0;
+    var w: int = 0;
+    var c: int = 0;
+    var inword: int = 0;
+    loop {
+        var ch: int = fgetc(f);
+        if (ch == EOF) { break; }
+        c += 1;
+        if (ch == '\n') { l += 1; }
+        if (isspace(ch)) { inword = 0; }
+        else if (!inword) { inword = 1; w += 1; }
+    }
+    report(l, w, c, name);
+    tl += l;
+    tw += w;
+    tc += c;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var c: int = getopt(argc, argv, "lwc");
+    while (c != -1) {
+        if (c == 'l') { show_l = 1; }
+        else if (c == 'w') { show_w = 1; }
+        else if (c == 'c') { show_c = 1; }
+        else { fputs(STDERR_FILENO, "usage: wc [-lwc] [file ...]\n"); return 1; }
+        c = getopt(argc, argv, "lwc");
+    }
+    if (!show_l && !show_w && !show_c) { show_l = 1; show_w = 1; show_c = 1; }
+    if (optind == argc) { count(stdin(), null); return 0; }
+    var status: int = 0;
+    var i: int = optind;
+    while (i < argc) {
+        var f: *FILE = fopen(argv[i], "r");
+        if (f == null) { perror2("wc", argv[i]); status = 1; }
+        else { count(f, argv[i]); fclose(f); }
+        i += 1;
+    }
+    if (argc - optind > 1) { report(tl, tw, tc, "total"); }
+    return status;
+}

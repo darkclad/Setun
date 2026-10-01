@@ -1,0 +1,176 @@
+// stdio.h for tlibc: buffered FILE streams.
+//
+// Trine has no varargs, so there is no printf: use the typed writers below
+// (fputs, fput_int, ...). stdout and stderr are unbuffered (written as you
+// go); files opened for writing are buffered and flushed on fflush/fclose.
+
+import "tlibc.tri";
+import "stdlib.tri";
+import "string.tri";
+
+const BUFSIZ: int = 2187;
+const EOF: int = -1;
+
+struct FILE {
+    fd: int;
+    writing: int;
+    unbuffered: int;
+    pos: int;                         // reading: next char; writing: chars buffered
+    len: int;                         // reading: chars in buf
+    eof: int;
+    err: int;
+    ungot: int;                       // a pushed-back character, or EOF
+    buf: [2187]char;
+}
+
+var stdin_file: FILE;
+var stdout_file: FILE;
+var stderr_file: FILE;
+var stdio_ready: int;
+
+fn stdio_init() {
+    if (stdio_ready) { return; }
+    stdio_ready = 1;
+    stdin_file.fd = 0;
+    stdin_file.ungot = EOF;
+    stdout_file.fd = 1;
+    stdout_file.writing = 1;
+    stdout_file.unbuffered = 1;
+    stdout_file.ungot = EOF;
+    stderr_file.fd = 2;
+    stderr_file.writing = 1;
+    stderr_file.unbuffered = 1;
+    stderr_file.ungot = EOF;
+}
+
+fn stdin() -> *FILE { stdio_init(); return &stdin_file; }
+fn stdout() -> *FILE { stdio_init(); return &stdout_file; }
+fn stderr() -> *FILE { stdio_init(); return &stderr_file; }
+
+// fopen modes: "r", "w" (create/truncate), "a" (create/append), "r+".
+fn fopen(path: *char, mode: *char) -> *FILE {
+    var flags: int;
+    if (mode[0] == 'r') { flags = mode[1] == '+' ? O_RDWR : O_RDONLY; }
+    else if (mode[0] == 'w') { flags = O_WRONLY + O_CREAT + O_TRUNC; }
+    else if (mode[0] == 'a') { flags = O_WRONLY + O_CREAT + O_APPEND; }
+    else { errno = EINVAL; return null; }
+    var fd: int = open(path, flags, 438);
+    if (fd < 0) { return null; }
+    return fdopen(fd, mode);
+}
+
+fn fdopen(fd: int, mode: *char) -> *FILE {
+    var f: *FILE = calloc(1, sizeof(FILE)) as *FILE;
+    if (f == null) { return null; }
+    f.fd = fd;
+    f.writing = mode[0] != 'r';
+    f.ungot = EOF;
+    return f;
+}
+
+fn fflush(f: *FILE) -> int {
+    if (!f.writing || f.pos == 0) { return 0; }
+    var done: int = 0;
+    while (done < f.pos) {
+        var r: int = write(f.fd, &f.buf[done], f.pos - done);
+        if (r <= 0) { f.err = 1; f.pos = 0; return EOF; }
+        done += r;
+    }
+    f.pos = 0;
+    return 0;
+}
+
+fn fclose(f: *FILE) -> int {
+    var r: int = fflush(f);
+    if (close(f.fd) < 0) { r = EOF; }
+    if (f != &stdin_file && f != &stdout_file && f != &stderr_file) { free(f as *tryte); }
+    return r;
+}
+
+fn fgetc(f: *FILE) -> int {
+    if (f.ungot != EOF) {
+        var u: int = f.ungot;
+        f.ungot = EOF;
+        return u;
+    }
+    if (f.pos >= f.len) {
+        if (f.eof) { return EOF; }
+        var r: int = read(f.fd, &f.buf[0], BUFSIZ);
+        if (r < 0) { f.err = 1; return EOF; }
+        if (r == 0) { f.eof = 1; return EOF; }
+        f.len = r;
+        f.pos = 0;
+    }
+    var c: int = f.buf[f.pos];
+    f.pos += 1;
+    return c;
+}
+
+fn ungetc(c: int, f: *FILE) -> int {
+    if (c == EOF) { return EOF; }
+    f.ungot = c;
+    f.eof = 0;
+    return c;
+}
+
+// fgets: up to n-1 characters, stopping after a newline. null at end of file.
+fn fgets(s: *char, n: int, f: *FILE) -> *char {
+    var i: int = 0;
+    while (i < n - 1) {
+        var c: int = fgetc(f);
+        if (c == EOF) { break; }
+        s[i] = c as char;
+        i += 1;
+        if (c == '\n') { break; }
+    }
+    s[i] = 0;
+    return i == 0 ? null : s;
+}
+
+fn feof(f: *FILE) -> int { return f.eof && f.ungot == EOF && f.pos >= f.len; }
+fn ferror(f: *FILE) -> int { return f.err; }
+
+fn fputc(c: int, f: *FILE) -> int {
+    if (f.unbuffered) {
+        var ch: [1]char;
+        ch[0] = c as char;
+        if (write(f.fd, &ch[0], 1) != 1) { f.err = 1; return EOF; }
+        return c;
+    }
+    if (f.pos == BUFSIZ && fflush(f) != 0) { return EOF; }
+    f.buf[f.pos] = c as char;
+    f.pos += 1;
+    return c;
+}
+
+fn fwrite_chars(s: *char, n: int, f: *FILE) -> int {
+    if (f.unbuffered) {
+        var r: int = write(f.fd, s, n);
+        if (r < 0) { f.err = 1; return 0; }
+        return r;
+    }
+    var i: int = 0;
+    while (i < n) {
+        if (fputc(s[i], f) == EOF) { return i; }
+        i += 1;
+    }
+    return n;
+}
+
+fn fputs_f(s: *char, f: *FILE) -> int { return fwrite_chars(s, strlen(s), f) == strlen(s) ? 0 : EOF; }
+
+fn fput_int(v: int, f: *FILE) {
+    var b: [15]char;
+    fputs_f(itoa(v, &b[0]), f);
+}
+
+// The number right-aligned in `width` columns.
+fn fput_padded(v: int, width: int, f: *FILE) {
+    var b: [15]char;
+    var s: *char = itoa(v, &b[0]);
+    var n: int = strlen(s);
+    while (n < width) { fputc(' ', f); n += 1; }
+    fputs_f(s, f);
+}
+
+fn put_padded(v: int, width: int) { fput_padded(v, width, stdout()); }

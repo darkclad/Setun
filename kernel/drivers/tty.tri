@@ -97,8 +97,94 @@ fn tty_init() {
 
 fn lflag(bit: int) -> int { return termios.c_lflag / bit % 2 != 0; }
 
+// ---- a VT100 subset on the text screen ------------------------------------------
+//
+// ESC [ row;col H (or f), ESC [ J / 2J, ESC [ K, ESC [ n A/B/C/D, and
+// ESC [ ... m with 0, 30-37 and 40-47. The serial port gets the bytes as
+// they are: a real terminal on the other end interprets them itself.
+
+var esc_state: int;                   // 0 text, 1 after ESC, 2 inside ESC [
+var esc_param: [9]int;
+var esc_count: int;
+var esc_fg: int = 7;
+var esc_bg: int = 0;
+
+fn colour_trit(c: int, bit: int) -> trit { return (c / bit % 2 != 0 ? 1 : -1) as trit; }
+
+fn screen_set_cursor(row: int, col: int) {
+    if (row < 0) { row = 0; }
+    if (row > ROWS - 1) { row = ROWS - 1; }
+    if (col < 0) { col = 0; }
+    if (col > COLS - 1) { col = COLS - 1; }
+    screen_row = row;
+    screen_col = col;
+    out(DISPLAY_CURSOR, row * COLS + col);
+}
+
+fn screen_blank(from: int, to: int) {
+    var i: int = from;
+    while (i < to) {
+        var p: *tryte = cell(i);
+        p[0] = ' ';
+        p[1] = screen_attr;
+        i += 1;
+    }
+}
+
+fn csi(final: char) {
+    var p0: int = esc_param[0];
+    var n: int = p0 == 0 ? 1 : p0;
+    switch (final) {
+        case 'H', 'f': screen_set_cursor(n - 1, (esc_count > 1 && esc_param[1] > 0 ? esc_param[1] : 1) - 1);
+        case 'A': screen_set_cursor(screen_row - n, screen_col);
+        case 'B': screen_set_cursor(screen_row + n, screen_col);
+        case 'C': screen_set_cursor(screen_row, screen_col + n);
+        case 'D': screen_set_cursor(screen_row, screen_col - n);
+        case 'J': {
+            if (p0 == 2) { screen_blank(0, COLS * ROWS); }
+            else { screen_blank(screen_row * COLS + screen_col, COLS * ROWS); }
+        }
+        case 'K': screen_blank(screen_row * COLS + screen_col, (screen_row + 1) * COLS);
+        case 'm': {
+            var k: int = 0;
+            while (k < esc_count) {
+                var v: int = esc_param[k];
+                if (v == 0) { esc_fg = 7; esc_bg = 0; }
+                else if (v >= 30 && v <= 37) { esc_fg = v - 30; }
+                else if (v >= 40 && v <= 47) { esc_bg = v - 40; }
+                k += 1;
+            }
+            screen_attr = attr(colour_trit(esc_fg, 1), colour_trit(esc_fg, 2), colour_trit(esc_fg, 4),
+                colour_trit(esc_bg, 1), colour_trit(esc_bg, 2), colour_trit(esc_bg, 4));
+        }
+    }
+}
+
+// The screen's half of the output: escape sequences, else a character.
+fn screen_output(c: char) -> int {
+    if (esc_state == 1) {
+        esc_state = c == '[' ? 2 : 0;
+        esc_count = 1;
+        esc_param[0] = 0;
+        return 1;
+    }
+    if (esc_state == 2) {
+        if (c >= '0' && c <= '9') { esc_param[esc_count - 1] = esc_param[esc_count - 1] * 10 + c - '0'; return 1; }
+        if (c == ';') {
+            if (esc_count < 9) { esc_param[esc_count] = 0; esc_count += 1; }
+            return 1;
+        }
+        esc_state = 0;
+        csi(c);
+        return 1;
+    }
+    if (c == 27) { esc_state = 1; return 1; }
+    return 0;
+}
+
 fn tty_output(c: char) {
     putc(c);
+    if (screen_output(c)) { return; }
     if (c == 8) {                                   // backspace: the screen cursor steps back
         if (screen_col > 0) {
             screen_col -= 1;

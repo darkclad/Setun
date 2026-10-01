@@ -1,0 +1,73 @@
+// cp source target | cp source ... dir: copy files.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+
+var buf: [19683]char;
+
+fn base_name(p: *char) -> *char {
+    var s: *char = strrchr(p, '/');
+    return s == null ? p : &s[1];
+}
+
+fn copy(from: *char, to: *char) -> int {
+    var st: stat_t;
+    if (stat(from, &st) < 0) { perror2("cp", from); return 1; }
+    if (S_ISDIR(st.st_mode)) {
+        fputs(STDERR_FILENO, "cp: -r not supported; omitting directory '");
+        fputs(STDERR_FILENO, from);
+        fputs(STDERR_FILENO, "'\n");
+        return 1;
+    }
+    var tst: stat_t;
+    if (stat(to, &tst) == 0 && tst.st_dev == st.st_dev && tst.st_ino == st.st_ino) {
+        fputs(STDERR_FILENO, "cp: '");
+        fputs(STDERR_FILENO, from);
+        fputs(STDERR_FILENO, "' and '");
+        fputs(STDERR_FILENO, to);
+        fputs(STDERR_FILENO, "' are the same file\n");
+        return 1;
+    }
+    var in: int = open(from, O_RDONLY, 0);
+    if (in < 0) { perror2("cp", from); return 1; }
+    var out: int = open(to, O_WRONLY + O_CREAT + O_TRUNC, st.st_mode % 512);
+    if (out < 0) { perror2("cp", to); close(in); return 1; }
+    var status: int = 0;
+    loop {
+        var n: int = read(in, &buf[0], 19683);
+        if (n < 0) { perror2("cp", from); status = 1; break; }
+        if (n == 0) { break; }
+        if (write(out, &buf[0], n) != n) { perror2("cp", to); status = 1; break; }
+    }
+    close(in);
+    close(out);
+    return status;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc < 3) { fputs(STDERR_FILENO, "usage: cp source target | cp source ... dir\n"); return 1; }
+    var dest: *char = argv[argc - 1];
+    var st: stat_t;
+    var is_dir: int = stat(dest, &st) == 0 && S_ISDIR(st.st_mode);
+    if (argc > 3 && !is_dir) {
+        fputs(STDERR_FILENO, "cp: target '");
+        fputs(STDERR_FILENO, dest);
+        fputs(STDERR_FILENO, "' is not a directory\n");
+        return 1;
+    }
+    var status: int = 0;
+    var i: int = 1;
+    while (i < argc - 1) {
+        if (is_dir) {
+            var path: [243]char;
+            strcpy(&path[0], dest);
+            strcat(&path[0], "/");
+            strcat(&path[0], base_name(argv[i]));
+            status = status | copy(argv[i], &path[0]);
+        } else {
+            status = status | copy(argv[i], dest);
+        }
+        i += 1;
+    }
+    return status;
+}

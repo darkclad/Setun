@@ -1,0 +1,9 @@
+// ln source target: a hard link (tfs only; there are no symbolic links yet).
+
+import "../lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc != 3) { fputs(STDERR_FILENO, "usage: ln source target\n"); return 1; }
+    if (link(argv[1], argv[2]) < 0) { perror2("ln", argv[2]); return 1; }
+    return 0;
+}

@@ -177,3 +177,23 @@ fn fsck_finds_unreachable_inodes_and_bad_entries() {
     fs.set_word(data_blk, 2 * DIRENT_TRYTES / 3, 5000);
     assert_finds(&fs, "has inode 5000");
 }
+
+#[test]
+fn hard_links_share_an_inode() {
+    let mut fs = Tfs::format(100, 243).unwrap();
+    let ino = fs.write_file("/bin/tool", &text("program"), 0o755).unwrap();
+    fs.link("/bin/tool", "/bin/alias").unwrap();
+    fs.link("/bin/tool", "/sbin/other").unwrap();
+    assert_eq!(fs.lookup("/bin/alias").unwrap(), ino);
+    assert_eq!(fs.lookup("/sbin/other").unwrap(), ino);
+    assert_eq!(fs.inode_word(ino, I_NLINK), 3);
+    assert_eq!(fs.read_text("/sbin/other").unwrap(), "program");
+    assert_eq!(fs.fsck(), Vec::<String>::new());
+    // refusals: directories, existing names, missing sources
+    assert!(fs.link("/bin", "/b2").unwrap_err().contains("cannot link a directory"));
+    assert!(fs.link("/bin/tool", "/bin/alias").unwrap_err().contains("exists"));
+    assert!(fs.link("/nope", "/x").unwrap_err().contains("no such file"));
+    // a wrong link count is caught
+    fs.set_inode_word(ino, I_NLINK, 2);
+    assert!(fs.fsck().iter().any(|e| e.contains("nlink 2 but 3 links")));
+}

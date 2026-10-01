@@ -1,0 +1,102 @@
+// time.h for tlibc: time, gmtime and a small strftime-like formatter (UTC only).
+
+import "tlibc.tri";
+
+struct tm {
+    tm_sec: int;
+    tm_min: int;
+    tm_hour: int;
+    tm_mday: int;                     // 1..31
+    tm_mon: int;                      // 0..11
+    tm_year: int;                     // years since 1900
+    tm_wday: int;                     // 0 = Sunday
+    tm_yday: int;                     // 0..365
+}
+
+fn time(t: *int) -> int {
+    var ts: timespec;
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0) { return -1; }
+    if (t != null) { *t = ts.tv_sec; }
+    return ts.tv_sec;
+}
+
+fn is_leap(y: int) -> int { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+fn days_in_month(m: int, y: int) -> int {
+    if (m == 1) { return is_leap(y) ? 29 : 28; }
+    if (m == 3 || m == 5 || m == 8 || m == 10) { return 30; }
+    return 31;
+}
+
+// Seconds since 1970-01-01 UTC into broken-down time.
+fn gmtime_r(t: int, out: *tm) -> *tm {
+    var days: int = t / 86400;
+    var secs: int = t % 86400;
+    if (secs < 0) { secs += 86400; days -= 1; }
+    out.tm_hour = secs / 3600;
+    out.tm_min = secs / 60 % 60;
+    out.tm_sec = secs % 60;
+    out.tm_wday = ((days % 7) + 11) % 7;               // 1970-01-01 was a Thursday
+    var y: int = 1970;
+    loop {
+        var len: int = is_leap(y) ? 366 : 365;
+        if (days >= 0 && days < len) { break; }
+        if (days < 0) { y -= 1; days += is_leap(y) ? 366 : 365; }
+        else { days -= len; y += 1; }
+    }
+    out.tm_year = y - 1900;
+    out.tm_yday = days;
+    var m: int = 0;
+    while (days >= days_in_month(m, y)) { days -= days_in_month(m, y); m += 1; }
+    out.tm_mon = m;
+    out.tm_mday = days + 1;
+    return out;
+}
+
+fn put2(buf: *char, at: int, v: int, pad: char) -> int {
+    buf[at] = v >= 10 ? ('0' + v / 10) as char : pad;
+    buf[at + 1] = ('0' + v % 10) as char;
+    return at + 2;
+}
+
+fn put_str(buf: *char, at: int, s: *char) -> int {
+    var k: int = 0;
+    while (s[k] != 0) { buf[at] = s[k]; at += 1; k += 1; }
+    return at;
+}
+
+// %Y %m %d %e %H %M %S %a %b %j %s %%; anything else is copied. Returns the length.
+fn strftime(buf: *char, max: int, fmt: *char, t: *tm) -> int {
+    var days: *char = "SunMonTueWedThuFriSat";
+    var months: *char = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    var at: int = 0;
+    var i: int = 0;
+    while (fmt[i] != 0 && at < max - 12) {
+        if (fmt[i] != '%') { buf[at] = fmt[i]; at += 1; i += 1; continue; }
+        i += 1;
+        var c: char = fmt[i];
+        if (c == 0) { break; }
+        i += 1;
+        var num: [15]char;
+        switch (c) {
+            case 'Y': at = put_str(buf, at, itoa(t.tm_year + 1900, &num[0]));
+            case 'm': at = put2(buf, at, t.tm_mon + 1, '0');
+            case 'd': at = put2(buf, at, t.tm_mday, '0');
+            case 'e': at = put2(buf, at, t.tm_mday, ' ');
+            case 'H': at = put2(buf, at, t.tm_hour, '0');
+            case 'M': at = put2(buf, at, t.tm_min, '0');
+            case 'S': at = put2(buf, at, t.tm_sec, '0');
+            case 'j': {
+                var d: int = t.tm_yday + 1;
+                buf[at] = ('0' + d / 100) as char;
+                at = put2(buf, at + 1, d % 100, '0');
+            }
+            case 'a': { var k: int = 0; while (k < 3) { buf[at] = days[3 * t.tm_wday + k]; at += 1; k += 1; } }
+            case 'b': { var k2: int = 0; while (k2 < 3) { buf[at] = months[3 * t.tm_mon + k2]; at += 1; k2 += 1; } }
+            case '%': { buf[at] = '%'; at += 1; }
+            default: { buf[at] = '%'; buf[at + 1] = c; at += 2; }
+        }
+    }
+    buf[at] = 0;
+    return at;
+}
