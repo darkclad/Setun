@@ -750,7 +750,7 @@ There is still no `printf`; the typed writers replace it (§12).
   - Left/Right, Home/End and ^A/^E move; Backspace, Delete, ^K, ^U and ^W delete; ^D on an empty line ends the input.
   - Up/Down step through the history: the last 81 lines, without repeats in a row. The `history` builtin lists them.
   - Tab completes a command (builtins, functions, aliases, `PATH`) or a file name; the second Tab in a row lists the choices.
-  - Typing at the end of the line echoes just the character, so a session looks the same as with canonical mode. Other edits redraw the line with ``, `ESC[K` and `ESC[nD`.
+  - Typing at the end of the line echoes just the character, so a session looks the same as with canonical mode. Other edits redraw the line with `\r`, `ESC[K` and `ESC[nD`.
   - The keyboard's arrows, Home, End, Insert, Delete and Page Up/Down type VT100 sequences (`ESC [ A` …; `keymap.tri`), on the console and in `trwm`'s terminal alike.
 - **Errors:**
   - syntax errors print bash's message ("syntax error near unexpected token `fi'") and set status 2;
