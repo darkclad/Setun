@@ -172,6 +172,139 @@ fn k7_shell_errors() {
 }
 
 #[test]
+fn sh_functions_eval_heredocs() {
+    let out = session(
+        &[
+            "greet() { echo \"hello $1, $# args\"; }; greet world a b",
+            "fact() {",
+            "  if [ $1 -le 1 ]; then echo 1; return; fi",
+            "  echo $(( $1 * $(fact $(( $1 - 1 ))) ))",
+            "}",
+            "fact 6",
+            "f() { return 3; echo ne\"\"ver; }; f; echo rc=$?",
+            "set -- outer1 outer2; f2() { echo in:$1; }; f2 inner; echo out:$1 $#",
+            "g() { for i in 1 2 3; do if [ $i = 2 ]; then return 7; fi; echo g$i; done; }; g; echo g-rc=$?",
+            "h() { break; }; for i in a b; do h; echo loop$i; done",
+            "show() { echo v=$V; sh -c 'echo child=$V'; }; V=temp show; echo after=[$V]",
+            "greet redirected > /tmp/fo; echo saved; cat /tmp/fo",
+            "greet() { echo redefined; }; greet; unset -f greet; greet",
+            "type fact cd eval",
+            "cmd='echo evaluated $((1+2))'; eval $cmd",
+            "eval 'x=1; y=2'; echo $x$y; v=name; eval \"$v=dyn\"; echo [$name]",
+            "eval 'f3() { echo from-eval; }'; f3; eval false; echo e=$?",
+            "cat <<EOF",
+            "line $x and $(echo sub) $((2+5))",
+            "  \"quotes\" \\$HOME",
+            "EOF",
+            "while read -r l; do echo \"got:$l\"; done <<'END'",
+            "no $x here",
+            "END",
+            "read -r s <<-EOT; echo \"[$s]\"",
+            "\tstripped",
+            "\tEOT",
+            "read -r p <<A; read -r q <<B; echo \"$q/$p\"",
+            "first",
+            "A",
+            "second",
+            "B",
+            "hf() {",
+            "cat <<EOF",
+            "in-func $1",
+            "EOF",
+            "}",
+            "hf arg",
+            "cat > /tmp/hs.sh <<'S'",
+            "cat <<E",
+            "script-heredoc $1",
+            "E",
+            "S",
+            "sh /tmp/hs.sh ok",
+            "echo 'dotvar=sourced; dotfn() { echo dotfn-ran; return 4; }' > /tmp/lib.sh; . /tmp/lib.sh; echo [$dotvar]; dotfn; echo d=$?",
+            "echo 'echo before-ret; return 0; echo after\"\"-ret' > /tmp/r.sh; . /tmp/r.sh; echo dot-done",
+            "exit",
+        ],
+        900_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "hello world, 3 args\n",
+            "$ fact 6\n720\n",
+            "rc=3\n",
+            "in:inner\nout:outer1 2\n",
+            "g1\ng-rc=7\n",
+            "loopa\nloopb\n",
+            "v=temp\nchild=temp\nafter=[]\n",
+            "saved\nhello redirected, 1 args\n",
+            "redefined\nsh: greet: not found\n",
+            "fact is a function\ncd is a shell builtin\neval is a special shell builtin\n",
+            "evaluated 3\n",
+            "12\n[dyn]\n",
+            "from-eval\ne=1\n",
+            "line 1 and sub 7\n  \"quotes\" $HOME\n",
+            "got:no $x here\n",
+            "[stripped]\n",
+            "second/first\n",
+            "in-func arg\n",
+            "script-heredoc ok\n",
+            "[sourced]\ndotfn-ran\nd=4\n",
+            "before-ret\ndot-done\n",
+        ],
+    );
+    assert_lacks(&out, &["never", "g3", "after-ret"]);
+}
+
+#[test]
+fn sh_functions_eval_heredocs_errors() {
+    let out = session(
+        &[
+            "f() echo hi",
+            "1bad() { echo; }; echo status $?",
+            "eval() { :; }",
+            "return 1; echo status $?",
+            "r() { return abc; }; r; echo status $?",
+            "inf() { inf; }; inf; echo survived $?",
+            "eval 'if true'; echo status $?",
+            "eval 'echo \"open'; echo status $?",
+            "sh -c 'cat <<NOEND'; echo status $?",
+            "cat <<",
+            ". /nope/lib.sh; echo status $?",
+            ". nosuchlib; echo status $?",
+            ".; echo status $?",
+            "unset -f nosuch; echo unset-ok",
+            "cat <<EOF; echo status $?",
+            "${undefined_var:?boom}",
+            "EOF",
+            "echo ok-after-errors",
+            "exit 5",
+        ],
+        500_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "sh: syntax error near unexpected token `echo'\n",
+            "sh: 1bad: bad function name\nstatus 2\n",
+            "sh: eval: bad function name\n",
+            "sh: return: not in a function or . file\nstatus 1\n",
+            "sh: return: numeric argument required: abc\nstatus 2\n",
+            "sh: inf: function nesting too deep\nsurvived 2\n",
+            "sh: syntax error: unexpected end of file\nstatus 2\n",
+            "sh: syntax error: unterminated quote\nstatus 2\n",
+            "sh: syntax error: unterminated here-document\nstatus 2\n",
+            "sh: syntax error near unexpected token `newline'\n",
+            "sh: .: /nope/lib.sh: No such file or directory\nstatus 1\n",
+            "sh: nosuchlib: not found\nstatus 1\n",
+            "sh: .: filename argument required\nstatus 2\n",
+            "unset-ok\n",
+            "sh: undefined_var: boom\nstatus 1\n",
+            "ok-after-errors\n",
+            "init: /bin/sh exited with 5",
+        ],
+    );
+}
+
+#[test]
 fn k7_utilities() {
     let out = session(
         &[

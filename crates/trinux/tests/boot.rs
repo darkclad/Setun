@@ -292,7 +292,8 @@ fn k5_job_control() {
             "~\u{3}",
             "echo after",
             "cat &",
-            "true",
+            "~true\n",                                     // give cat 0.5 s to reach its read
+
             "kill -9 %1",
             "true",
             "exit 3",

@@ -6,14 +6,20 @@
 //
 // Language: simple commands, pipelines (| !), lists (; & && || newline),
 // if/elif/else, while, until, for, case, ( subshells ), { groups },
+// functions (name() compound-command), here-documents (<< <<- with a quoted
+// or unquoted delimiter),
 // redirections (< > >> <& >& n>... on any command), quoting ('' "" \),
 // parameters ($name ${name} ${name:-w} ${name-w} ${name:+w} ${name:=w}
 // ${name:?w} ${#name} $? $$ $! $# $@ $* $- $0..$9), $(command substitution),
 // $((arithmetic)), ~, field splitting and globbing (* ? [...]).
 // Variables and export; prefix assignments (VAR=x cmd).
 // Builtins: : true false echo cd pwd exit export unset set shift read
-// test [ break continue jobs fg bg kill wait exec umask type.
-// Not yet: functions, eval, ., here-documents, aliases.
+// test [ break continue jobs fg bg kill wait exec umask type eval . return.
+// Not yet: aliases, local.
+//
+// Function bodies, eval text and . files are lexed and parsed into the tail
+// of src and the token and node arrays, run, and then that tail is dropped
+// (eval_text), so a function is kept as its source text.
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
@@ -41,10 +47,11 @@ const R_OUT: int = 1;                 // n>file
 const R_APPEND: int = 2;              // n>>file
 const R_DUPOUT: int = 3;              // n>&m
 const R_DUPIN: int = 4;               // n<&m
+const R_HEREDOC: int = 5;             // n<<word, n<<-word
 
 const SRC_MAX: int = 19683;
 const MAXTOK: int = 2187;
-const MAXNODE: int = 729;
+const MAXNODE: int = 2187;
 
 var src: [19684]char;
 var src_len: int;
@@ -53,8 +60,14 @@ var tstart: [2187]int;
 var tend: [2187]int;
 var tfd: [2187]int;
 var tmode: [2187]int;
+var hd_a: [2187]int;                  // a here-document's body: src[hd_a..hd_b)
+var hd_b: [2187]int;
+var hd_quoted: [2187]int;             // the delimiter was quoted: no expansion
+var hd_strip: [2187]int;              // <<-: leading tabs go
 var ntok: int;
-var lex_incomplete: int;
+var lex_incomplete: int;              // 1: inside a quote, 2: inside a here-document
+var hd_pending: [27]int;              // here-document operators waiting for their body
+var nhd_pending: int;
 
 fn err(a: *char, b: *char) {
     fputs(STDERR_FILENO, "sh: ");
@@ -145,11 +158,73 @@ fn add_tok(kind: int, a: int, b: int) -> int {
     return 1;
 }
 
-// Tokenize src. 0 = fine, 1 = the text ends inside a quote, 2 = too long.
+// The delimiter of the here-document operator at token r (the word after
+// it) with its quotes removed, into d. 1 if any part of it was quoted.
+fn hd_delim(r: int, d: *char) -> int {
+    var w: int = r + 1;
+    var quoted: int = 0;
+    var k: int = 0;
+    var i: int = tstart[w];
+    while (i < tend[w] && k < 241) {
+        var c: char = src[i];
+        if (c == '\'' || c == '"') { quoted = 1; i += 1; continue; }
+        if (c == '\\' && i + 1 < tend[w]) { quoted = 1; i += 1; c = src[i]; }
+        d[k] = c;
+        k += 1;
+        i += 1;
+    }
+    d[k] = 0;
+    return quoted;
+}
+
+// At the newline src[i], take the bodies of the pending here-documents, in
+// order. Returns the index after the last delimiter line, or -1 if the text
+// ends first.
+fn read_heredocs(i: int) -> int {
+    var pos: int = i + 1;
+    var h: int = 0;
+    while (h < nhd_pending) {
+        var r: int = hd_pending[h];
+        h += 1;
+        if (tkind[r + 1] != T_WORD) { continue; }       // the parser reports it
+        var d: [243]char;
+        hd_quoted[r] = hd_delim(r, &d[0]);
+        var dl: int = strlen(&d[0]);
+        hd_a[r] = pos;
+        loop {
+            if (pos >= src_len) { return -1; }
+            var ls: int = pos;
+            var le: int = pos;
+            while (le < src_len && src[le] != '\n') { le += 1; }
+            var cs: int = ls;
+            if (hd_strip[r]) { while (cs < le && src[cs] == '\t') { cs += 1; } }
+            var same: int = le - cs == dl;
+            var k: int = 0;
+            while (same && k < dl) { if (src[cs + k] != d[k]) { same = 0; } k += 1; }
+            if (same) {
+                hd_b[r] = ls;
+                pos = le < src_len ? le + 1 : le;
+                break;
+            }
+            if (le >= src_len) { return -1; }
+            pos = le + 1;
+        }
+    }
+    return pos;
+}
+
+// Tokenize all of src.
 fn lex() -> int {
     ntok = 0;
+    return lex_range(0);
+}
+
+// Tokenize src[i..src_len), appending to the tokens. 0 = fine, 1 = the text
+// ends inside a quote or a here-document (lex_incomplete says which), 2 =
+// too long.
+fn lex_range(i: int) -> int {
     lex_incomplete = 0;
-    var i: int = 0;
+    nhd_pending = 0;
     src[src_len] = 0;
     while (i < src_len) {
         var c: char = src[i];
@@ -160,7 +235,16 @@ fn lex() -> int {
             continue;
         }
         var a: int = i;
-        if (c == '\n') { add_tok(T_NEWLINE, a, a + 1); i += 1; continue; }
+        if (c == '\n') {
+            if (!add_tok(T_NEWLINE, a, a + 1)) { return 2; }
+            i += 1;
+            if (nhd_pending > 0) {
+                i = read_heredocs(a);
+                if (i < 0) { lex_incomplete = 2; return 1; }
+                nhd_pending = 0;
+            }
+            continue;
+        }
         if (c == ';') {
             if (src[i + 1] == ';') { add_tok(T_DSEMI, a, a + 2); i += 2; } else { add_tok(T_SEMI, a, a + 1); i += 1; }
             continue;
@@ -179,10 +263,16 @@ fn lex() -> int {
             var fd: int = -1;
             if (isdigit(c)) { fd = c - '0'; i += 1; }
             var mode: int;
+            var strip: int = 0;
             if (src[i] == '<') {
                 i += 1;
                 mode = R_IN;
                 if (src[i] == '&') { mode = R_DUPIN; i += 1; }
+                else if (src[i] == '<') {
+                    mode = R_HEREDOC;
+                    i += 1;
+                    if (src[i] == '-') { strip = 1; i += 1; }
+                }
                 if (fd < 0) { fd = 0; }
             } else {
                 i += 1;
@@ -195,6 +285,12 @@ fn lex() -> int {
             if (!add_tok(T_REDIR, a, i)) { return 2; }
             tfd[ntok - 1] = fd;
             tmode[ntok - 1] = mode;
+            hd_strip[ntok - 1] = strip;
+            if (mode == R_HEREDOC) {
+                if (nhd_pending == 27) { err("too many here-documents on one line", null); return 2; }
+                hd_pending[nhd_pending] = ntok - 1;
+                nhd_pending += 1;
+            }
             continue;
         }
         var e: int = scan_word(i);
@@ -202,8 +298,13 @@ fn lex() -> int {
         if (!add_tok(T_WORD, a, e)) { return 2; }
         i = e;
     }
-    add_tok(T_EOF, src_len, src_len);
+    if (nhd_pending > 0) { lex_incomplete = 2; return 1; }
+    if (!add_tok(T_EOF, src_len, src_len)) { return 2; }
     return 0;
+}
+
+fn lex_error_message() -> *char {
+    return lex_incomplete == 2 ? "syntax error: unterminated here-document" : "syntax error: unterminated quote";
 }
 
 fn tok_is(t: int, s: *char) -> int {
@@ -231,6 +332,7 @@ const N_CASE: int = 9;                // a: word token, b: first item
 const N_CASEITEM: int = 10;           // a..b: pattern tokens ('|' between), c: body
 const N_SUBSHELL: int = 11;           // a: list
 const N_GROUP: int = 12;              // a: list
+const N_FUNC: int = 13;               // a: name token, b: body (a compound command)
 
 var nkind: [729]int;
 var na: [729]int;
@@ -395,6 +497,7 @@ fn parse_command() -> int {
         tp += 1;
         return parse_redirs(s);
     }
+    if (tkind[tp] == T_WORD && tkind[tp + 1] == T_LPAREN && tkind[tp + 2] == T_RPAREN) { return parse_funcdef(); }
     var n: int = new_node(N_CMD, tp);
     na[n] = tp;
     while (tkind[tp] == T_WORD || tkind[tp] == T_REDIR) {
@@ -406,6 +509,21 @@ fn parse_command() -> int {
     }
     if (tp == na[n]) { return syntax(tp); }
     nb[n] = tp;
+    return end_node(n);
+}
+
+// name ( ) [newlines] compound-command [redirections]
+fn parse_funcdef() -> int {
+    var n: int = new_node(N_FUNC, tp);
+    na[n] = tp;
+    tp += 3;
+    skip_newlines();
+    if (!(tok_is(tp, "{") || tkind[tp] == T_LPAREN || tok_is(tp, "if") || tok_is(tp, "while") || tok_is(tp, "until")
+        || tok_is(tp, "for") || tok_is(tp, "case"))) {
+        return syntax(tp);
+    }
+    nb[n] = parse_command();
+    if (nb[n] < 0) { return -1; }
     return end_node(n);
 }
 
@@ -504,8 +622,13 @@ fn parse_case() -> int {
 // Parse the tokens: the program's list, or -1 (parse_incomplete says whether
 // more input could finish it).
 fn parse() -> int {
-    tp = 0;
     nnodes = 0;
+    return parse_from(0);
+}
+
+// Parse from token t, appending to the nodes.
+fn parse_from(t: int) -> int {
+    tp = t;
     parse_error = 0;
     parse_incomplete = 0;
     var n: int = parse_list();
@@ -589,6 +712,61 @@ fn var_unset(name: *char) {
     vexported[i] = 0;
 }
 
+// ---- functions --------------------------------------------------------------------------------
+//
+// A function is kept as the source text of its body.
+
+const NFUNCS: int = 81;
+const FUNC_DEPTH_MAX: int = 81;
+
+var fname: [81]*char;
+var fbody: [81]*char;
+var nfuncs: int;
+var func_depth: int;                  // function calls running
+var dot_depth: int;                   // . files running
+var return_pending: int;              // `return` ran: unwind to the call
+
+fn func_find(name: *char) -> int {
+    var i: int = 0;
+    while (i < nfuncs) {
+        if (fname[i] != null && streq(fname[i], name)) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Define (or redefine) name with the body src[a..b).
+fn func_set(name: *char, a: int, b: int) -> int {
+    var i: int = func_find(name);
+    if (i < 0) {
+        i = 0;
+        while (i < nfuncs && fname[i] != null) { i += 1; }
+        if (i == nfuncs) {
+            if (nfuncs == NFUNCS) { err("too many functions", null); return 1; }
+            nfuncs += 1;
+        }
+        fname[i] = strdup(name);
+        fbody[i] = null;
+    }
+    var text: *char = malloc(b - a + 1) as *char;
+    if (text == null) { err("out of memory", null); return 1; }
+    var k: int = 0;
+    while (k < b - a) { text[k] = src[a + k]; k += 1; }
+    text[k] = 0;
+    if (fbody[i] != null) { free(fbody[i] as *tryte); }
+    fbody[i] = text;
+    return 0;
+}
+
+fn func_unset(name: *char) {
+    var i: int = func_find(name);
+    if (i < 0) { return; }
+    free(fname[i] as *tryte);
+    free(fbody[i] as *tryte);
+    fname[i] = null;
+    fbody[i] = null;
+}
+
 fn import_environ() {
     if (environ == null) { return; }
     var i: int = 0;
@@ -642,6 +820,7 @@ var fglob: int;                       // it has unquoted glob characters
 var fsuppress: int;                   // "$@" with no parameters: no field
 var split_mode: int;                  // field splitting and globbing on
 var expand_error: int;
+var in_heredoc: int;                  // expanding a here-document body: \" stays as is
 
 fn put(c: char) {
     if (exp < SRC_MAX - 2) { ex[exp] = c; exp += 1; }
@@ -884,7 +1063,7 @@ fn expand_span(a: int, b: int, quoted: int) {
         if (c == '\\') {
             if (quoted) {
                 var n: char = src[i + 1];
-                if (n == '$' || n == '"' || n == '\\' || n == '`') { put(n); i += 2; }
+                if (n == '$' || (n == '"' && !in_heredoc) || n == '\\' || n == '`') { put(n); i += 2; }
                 else if (n == '\n') { i += 2; }
                 else { put('\\'); i += 1; }
             } else {
@@ -1185,6 +1364,7 @@ fn command_substitution(a: int, b: int, quoted: int) {
         close(p[1]);
         job_control = 0;
         interactive = 0;
+        in_heredoc = 0;
         var n: int = b - a;
         memmove(&src[0] as *tryte, &src[a] as *tryte, n);
         src_len = n;
@@ -1392,6 +1572,16 @@ var saved_fd: [10]int;                // copies made while a builtin or compound
 fn redirect(a: int, b: int, save: int) -> int {
     var t: int = a;
     while (t < b) {
+        if (tkind[t] == T_REDIR && tmode[t] == R_HEREDOC) {
+            var hw: int = tfd[t];
+            if (save && hw < 10 && saved_fd[hw] == -2) {
+                saved_fd[hw] = fcntl(hw, F_DUPFD_CLOEXEC, 10);
+                if (saved_fd[hw] < 0) { saved_fd[hw] = -1; }
+            }
+            if (heredoc_to(t, hw) < 0) { return -1; }
+            t += 2;
+            continue;
+        }
         if (tkind[t] == T_REDIR) {
             var mark: int = exp;
             var target: *char = expand_one(t + 1, tstart[t + 1]);
@@ -1435,6 +1625,75 @@ fn redirect(a: int, b: int, save: int) -> int {
     return 0;
 }
 
+// Here-document bodies: copied as they are when the delimiter was quoted,
+// otherwise expanded like a double-quoted string (but " is ordinary).
+fn heredoc_span(t: int, a: int, b: int) {
+    if (hd_quoted[t]) {
+        var k: int = a;
+        while (k < b) { put(src[k]); k += 1; }
+    } else {
+        expand_span(a, b, 1);
+    }
+}
+
+// The text of the here-document at token t, at ex[result] (NUL-terminated).
+fn heredoc_text(t: int) -> int {
+    var m: int = exp;
+    var save_split: int = split_mode;
+    var save_fs: int = fstart;
+    var save_started: int = fstarted;
+    var save_glob: int = fglob;
+    split_mode = 0;
+    fstart = exp;
+    in_heredoc = 1;
+    if (!hd_strip[t]) {
+        heredoc_span(t, hd_a[t], hd_b[t]);
+    } else {
+        var i: int = hd_a[t];
+        while (i < hd_b[t] && !expand_error) {
+            while (i < hd_b[t] && src[i] == '\t') { i += 1; }
+            var e: int = i;
+            while (e < hd_b[t] && src[e] != '\n') { e += 1; }
+            if (e < hd_b[t]) { e += 1; }
+            heredoc_span(t, i, e);
+            i = e;
+        }
+    }
+    in_heredoc = 0;
+    put(0);
+    split_mode = save_split;
+    fstart = save_fs;
+    fstarted = save_started;
+    fglob = save_glob;
+    return m;
+}
+
+// Put the here-document at token t on descriptor want, through a pipe. The
+// whole text fits in the pipe (both are 3^9 trytes), so no writer process.
+fn heredoc_to(t: int, want: int) -> int {
+    var mark: int = exp;
+    expand_error = 0;
+    var m: int = heredoc_text(t);
+    if (expand_error) { exp = mark; return -1; }
+    var len: int = exp - m - 1;
+    var p: [2]int;
+    if (pipe(&p[0]) < 0) { perror2("sh", "here-document"); exp = mark; return -1; }
+    var off: int = 0;
+    while (off < len) {
+        var w: int = write(p[1], &ex[m + off], len - off);
+        if (w < 0 && errno == EINTR) { continue; }
+        if (w <= 0) { break; }
+        off += w;
+    }
+    close(p[1]);
+    if (p[0] != want) {
+        dup2(p[0], want);
+        close(p[0]);
+    }
+    exp = mark;
+    return 0;
+}
+
 fn save_begin() {
     var k: int = 0;
     while (k < 10) { saved_fd[k] = -2; k += 1; }
@@ -1457,14 +1716,91 @@ var continue_count: int;
 var loop_depth: int;
 
 fn is_builtin(name: *char) -> int {
-    var list: [26]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
-        "test", "[", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", null, null };
+    var list: [28]*char = { ":", "true", "false", "echo", "cd", "pwd", "exit", "export", "unset", "set", "shift", "read",
+        "test", "[", "break", "continue", "jobs", "fg", "bg", "kill", "wait", "umask", "exec", "type", "eval", ".",
+        "return", null };
     var k: int = 0;
     while (list[k] != null) {
         if (streq(list[k], name)) { return 1; }
         k += 1;
     }
     return 0;
+}
+
+// POSIX special builtins: found before functions.
+fn is_special(name: *char) -> int {
+    var list: [13]*char = { ":", "break", "continue", "eval", "exec", "exit", "export", "return", "set", "shift",
+        "unset", ".", null };
+    var k: int = 0;
+    while (list[k] != null) {
+        if (streq(list[k], name)) { return 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+// eval [arg ...]: the arguments joined by spaces, run as shell text.
+fn builtin_eval(argc: int, argv: **char) -> int {
+    var n: int = 0;
+    var k: int = 1;
+    while (k < argc) { n += strlen(argv[k]) + 1; k += 1; }
+    if (n == 0) { return 0; }
+    var text: *char = malloc(n) as *char;
+    if (text == null) { err("eval: out of memory", null); return 1; }
+    var len: int = 0;
+    k = 1;
+    while (k < argc) {
+        if (k > 1) { text[len] = ' '; len += 1; }
+        strcpy(&text[len], argv[k]);
+        len += strlen(argv[k]);
+        k += 1;
+    }
+    var status: int = eval_text(text, len);
+    free(text as *tryte);
+    return status;
+}
+
+// . file: run the file's commands in this shell (a name without / is looked
+// up in PATH).
+fn builtin_dot(argc: int, argv: **char) -> int {
+    if (argc < 2) { err(".: filename argument required", null); return 2; }
+    var path: [243]char;
+    var file: *char = argv[1];
+    if (strchr(file, '/') == null) {
+        if (!find_in_path(file, &path[0])) { err(file, ": not found"); return 1; }
+        file = &path[0];
+    }
+    var fd: int = open(file, O_RDONLY, 0);
+    if (fd < 0) { perror2("sh: .", file); return 1; }
+    var text: *char = malloc(SRC_MAX) as *char;
+    if (text == null) { close(fd); err(".: out of memory", null); return 1; }
+    var len: int = 0;
+    loop {
+        var r: int = read(fd, &text[len], SRC_MAX - 1 - len);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        len += r;
+        if (len >= SRC_MAX - 1) { break; }
+    }
+    close(fd);
+    dot_depth += 1;
+    var status: int = eval_text(text, len);
+    dot_depth -= 1;
+    return_pending = 0;                                 // return in a . file ends the file
+    free(text as *tryte);
+    return status;
+}
+
+fn builtin_return(argc: int, argv: **char) -> int {
+    if (func_depth == 0 && dot_depth == 0) { err("return: not in a function or . file", null); return 1; }
+    var code: int = last_status;
+    if (argc > 1) {
+        var end: *char;
+        code = strtol(argv[1], &end, 10);
+        if (end == argv[1] || end[0] != 0) { err("return: numeric argument required: ", argv[1]); code = 2; }
+    }
+    return_pending = 1;
+    return code;
 }
 
 fn builtin_echo(argc: int, argv: **char) -> int {
@@ -1744,7 +2080,18 @@ fn builtin(argc: int, argv: **char) -> int {
         return 0;
     }
     if (streq(name, "export")) { return builtin_export(argc, argv, 0); }
-    if (streq(name, "unset")) { return builtin_export(argc, argv, 1); }
+    if (streq(name, "unset")) {
+        if (argc > 1 && streq(argv[1], "-f")) {
+            var f: int = 2;
+            while (f < argc) { func_unset(argv[f]); f += 1; }
+            return 0;
+        }
+        if (argc > 1 && streq(argv[1], "-v")) { argv[1] = argv[0]; return builtin_export(argc - 1, &argv[1], 1); }
+        return builtin_export(argc, argv, 1);
+    }
+    if (streq(name, "eval")) { return builtin_eval(argc, argv); }
+    if (streq(name, ".")) { return builtin_dot(argc, argv); }
+    if (streq(name, "return")) { return builtin_return(argc, argv); }
     if (streq(name, "set")) { return builtin_set(argc, argv); }
     if (streq(name, "shift")) { return builtin_shift(argc, argv); }
     if (streq(name, "read")) { return builtin_read(argc, argv); }
@@ -1815,7 +2162,9 @@ fn builtin(argc: int, argv: **char) -> int {
         var i: int = 1;
         while (i < argc) {
             puts(argv[i]);
-            if (is_builtin(argv[i])) { puts(" is a shell builtin\n"); }
+            if (is_special(argv[i])) { puts(" is a special shell builtin\n"); }
+            else if (func_find(argv[i]) >= 0) { puts(" is a function\n"); }
+            else if (is_builtin(argv[i])) { puts(" is a shell builtin\n"); }
             else {
                 var path: [243]char;
                 if (find_in_path(argv[i], &path[0])) { puts(" is "); puts(&path[0]); puts("\n"); }
@@ -1944,6 +2293,80 @@ fn apply_prefix_assignments(a: int, first_word: int) {
     }
 }
 
+// Call function f with argv as its positional parameters. Prefix
+// assignments (tokens a..first_word) are exported for the call only, and
+// redirections (among a..b) apply to the whole body.
+fn call_function(f: int, a: int, b: int, first_word: int, argc: int, argv: **char) -> int {
+    if (func_depth >= FUNC_DEPTH_MAX) { err(argv[0], ": function nesting too deep"); return 2; }
+    // the prefix assignments, remembering what they replace
+    var pname: [27]*char;
+    var pold: [27]*char;
+    var pexp: [27]int;
+    var np: int = 0;
+    var t: int = a;
+    while (t < first_word && np < 27) {
+        if (tkind[t] == T_REDIR) { t += 2; continue; }
+        var eq: int = assignment_eq(t);
+        var name: [81]char;
+        assignment_name(t, eq, &name[0]);
+        var old: *char = var_get(&name[0]);
+        pname[np] = strdup(&name[0]);
+        pold[np] = old == null ? null : strdup(old);
+        pexp[np] = is_exported(&name[0]);
+        np += 1;
+        var m: int = exp;
+        var value: *char = expand_one(t, eq + 1);
+        var_set(&name[0], value, 1);
+        exp = m;
+        t += 1;
+    }
+    // new positional parameters
+    var save_args: [81]*char;
+    var save_npos: int = npos;
+    var k: int = 0;
+    while (k < npos) { save_args[k] = pos_args[k]; k += 1; }
+    npos = 0;
+    while (npos < argc - 1 && npos < 81) {
+        pos_args[npos] = strdup(argv[npos + 1]);
+        npos += 1;
+    }
+    var save_loops: int = loop_depth;
+    loop_depth = 0;                                     // break/continue stay inside
+    var status: int = 1;
+    save_begin();
+    if (redirect(a, b, 1) == 0) {
+        var mine: [10]int;
+        var i: int = 0;
+        while (i < 10) { mine[i] = saved_fd[i]; saved_fd[i] = -2; i += 1; }
+        func_depth += 1;
+        status = eval_text(fbody[f], strlen(fbody[f]));   // copied first: redefining f is safe
+        func_depth -= 1;
+        return_pending = 0;
+        i = 0;
+        while (i < 10) { saved_fd[i] = mine[i]; i += 1; }
+    }
+    save_restore();
+    loop_depth = save_loops;
+    k = 0;
+    while (k < npos) { free(pos_args[k] as *tryte); k += 1; }
+    npos = save_npos;
+    k = 0;
+    while (k < npos) { pos_args[k] = save_args[k]; k += 1; }
+    k = 0;
+    while (k < np) {
+        if (pold[k] == null) {
+            var_unset(pname[k]);
+        } else {
+            var_set(pname[k], pold[k], 0);
+            vexported[var_find(pname[k])] = pexp[k];
+            free(pold[k] as *tryte);
+        }
+        free(pname[k] as *tryte);
+        k += 1;
+    }
+    return status;
+}
+
 // A simple command. in_child: we are already a forked child, so exec directly.
 fn exec_simple(n: int, in_child: int) -> int {
     var ex_mark: int = exp;
@@ -2007,6 +2430,15 @@ fn exec_simple(n: int, in_child: int) -> int {
         exp = ex_mark;
         nfields = f_mark;
         return 0;
+    }
+    if (!is_special(argv[0])) {
+        var fi: int = func_find(argv[0]);
+        if (fi >= 0) {
+            status = call_function(fi, a, b, first_word, argc, argv);
+            exp = ex_mark;
+            nfields = f_mark;
+            return status;
+        }
     }
     if (is_builtin(argv[0])) {
         save_begin();
@@ -2114,7 +2546,7 @@ fn expansion_failed() -> int {
     return 1;
 }
 
-fn loop_should_stop() -> int { return break_count > 0 || continue_count > 0 || abort_line; }
+fn loop_should_stop() -> int { return break_count > 0 || continue_count > 0 || abort_line || return_pending; }
 
 fn exec_list(n: int) -> int {
     var status: int = 0;
@@ -2137,7 +2569,7 @@ fn exec_list(n: int) -> int {
 
 // A loop body finished: 1 if the loop must stop now.
 fn loop_after_body() -> int {
-    if (abort_line) { return 1; }
+    if (abort_line || return_pending) { return 1; }
     if (break_count > 0) { break_count -= 1; return 1; }
     if (continue_count > 0) {
         continue_count -= 1;
@@ -2155,6 +2587,7 @@ fn exec_compound(n: int) -> int {
             status = exec_node(na[n]);
             in_condition -= 1;
             last_status = status;
+            if (loop_should_stop()) { return status; }
             if ((nkind[n] == N_AND) == (status == 0)) { status = exec_node(nb[n]); }
             return status;
         }
@@ -2162,6 +2595,7 @@ fn exec_compound(n: int) -> int {
             in_condition += 1;
             var c: int = exec_node(na[n]);
             in_condition -= 1;
+            if (loop_should_stop()) { return c; }
             if (c == 0) { return exec_node(nb[n]); }
             if (nc[n] >= 0) { return exec_node(nc[n]); }
             return 0;
@@ -2254,6 +2688,16 @@ fn exec_compound(n: int) -> int {
             return status_of(st);
         }
         case N_GROUP: return exec_node(na[n]);
+        case N_FUNC: {
+            var fnm: [81]char;
+            var fl: int = tend[na[n]] - tstart[na[n]];
+            if (fl > 80) { fl = 80; }
+            var fk: int = 0;
+            while (fk < fl) { fnm[fk] = src[tstart[na[n]] + fk]; fk += 1; }
+            fnm[fk] = 0;
+            if (!valid_name(&fnm[0]) || is_special(&fnm[0])) { err(&fnm[0], ": bad function name"); return 2; }
+            return func_set(&fnm[0], nsa[nb[n]], nsb[nb[n]]);
+        }
         case N_PIPELINE: return exec_pipeline(n);
         case N_CMD: return exec_simple(n, 0);
     }
@@ -2289,7 +2733,7 @@ fn exec_node(n: int) -> int {
 // Tokenize, parse and run src. Returns the status (2 for a syntax error).
 fn run_source() -> int {
     if (lex() != 0) {
-        if (lex_incomplete) { err("syntax error: unterminated quote", null); }
+        if (lex_incomplete) { err(lex_error_message(), null); }
         return 2;
     }
     var n: int = parse();
@@ -2299,6 +2743,37 @@ fn run_source() -> int {
     }
     var status: int = exec_node(n);
     last_status = status;
+    return status;
+}
+
+// Run text s[0..n) in this shell (eval, function bodies, . files): it goes
+// after the program being run (past its NUL), is lexed and parsed into new
+// tokens and nodes, runs, and is dropped again. The running program's text,
+// tokens and nodes are untouched.
+fn eval_text(s: *char, n: int) -> int {
+    var save_len: int = src_len;
+    var save_tok: int = ntok;
+    var save_nodes: int = nnodes;
+    var base: int = src_len + 1;
+    if (base + n >= SRC_MAX - 1) { err("program too large", null); return 2; }
+    var k: int = 0;
+    while (k < n) { src[base + k] = s[k]; k += 1; }
+    src_len = base + n;
+    var status: int = 2;
+    if (lex_range(base) != 0) {
+        if (lex_incomplete) { err(lex_error_message(), null); }
+    } else {
+        var root: int = parse_from(save_tok);
+        if (root < 0) {
+            if (parse_incomplete) { err("syntax error: unexpected end of file", null); }
+        } else {
+            status = exec_node(root);
+        }
+    }
+    src_len = save_len;
+    ntok = save_tok;
+    nnodes = save_nodes;
+    src[src_len] = 0;
     return status;
 }
 

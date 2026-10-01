@@ -723,7 +723,9 @@ There is still no `printf`; the typed writers replace it (§12).
   - simple commands, pipelines with `!`, lists (`;`, `&`, `&&`, `||`, newline);
   - `if`/`elif`/`else`, `while`, `until`, `for` (with or without `in`), `case` with `|` patterns;
   - `( … )` subshells and `{ … }` groups;
-  - redirections on any command, compound ones included (`while read l; do …; done < file`): `<`, `>`, `>>`, `n<&m`, `n>&m`, `n>&-`.
+  - redirections on any command, compound ones included (`while read l; do …; done < file`): `<`, `>`, `>>`, `n<&m`, `n>&m`, `n>&-`;
+  - here-documents: `<<word` and `<<-word` (leading tabs removed). With an unquoted delimiter the body gets `$` expansions; with any quoting in the delimiter it is taken as typed. Several on one line are read in order. The body goes to the command through a pipe, and since a body (at most 3^9 trytes) always fits in one pipe, no writer process is needed;
+  - functions: `name() compound-command [redirections]`. Calls get their own `$1 … $#` (`$0` stays), `return [n]` ends them, prefix assignments (`V=x f`) last for the call only, and `break`/`continue` don't reach loops outside the function. Calls nest at most 81 deep. Names are looked up as special builtins, then functions, then other builtins, then `PATH`.
 - **Expansions:**
   - quoting with `'…'`, `"…"` and `\`;
   - `$name`, `${name}`, `${name:-w}`, `${name-w}`, `${name:+w}`, `${name:=w}`, `${name:?w}`, `${#name}`;
@@ -732,7 +734,10 @@ There is still no `printf`; the typed writers replace it (§12).
   - `$((…))`: `+ - * / %`, comparisons, `&& || !`, parentheses, variables;
   - `~`, field splitting of unquoted results, and globbing (`* ? [...] [!...]`, sorted; a pattern that matches nothing stays literal).
 - **Variables:** `export`, `unset`, and prefix assignments (`VAR=x cmd` exports to that command only). The shell imports the environment at startup, and `PATH` defaults to `/bin:/sbin`.
-- **Builtins:** `: true false echo cd pwd exit export unset set shift read test [ break continue jobs fg bg kill wait exec umask type`.
+- **Builtins:** `: true false echo cd pwd exit export unset set shift read test [ break continue jobs fg bg kill wait exec umask type eval . return`.
+  - `eval args` joins its arguments with spaces and runs the result. `. file` runs a file in the current shell (a name without `/` is looked up in `PATH`), and `return` inside it ends the file;
+  - `unset -f name` removes a function, and `type` reports functions and special builtins;
+  - how it works: a function is kept as the source text of its body. Function bodies, `eval` text and `.` files are lexed and parsed after the running program's text, tokens and syntax nodes, run, and then dropped, so the running program is never disturbed;
   - `set -e`, `set -x` and `set -- args`;
   - `break n` and `continue n`;
   - `read` takes one character at a time, so it leaves the rest of its input for the next reader;
@@ -742,7 +747,7 @@ There is still no `printf`; the typed writers replace it (§12).
   - syntax errors print bash's message ("syntax error near unexpected token `fi'") and set status 2;
   - an expansion error (division by zero, `${x:?}`, a bad substitution) abandons the whole command line, and makes a non-interactive shell exit;
   - commands that are not found give 127, and ones that are not executable give 126.
-- **Not yet:** functions, `eval`, `.`, here-documents, aliases.
+- **Not yet:** aliases, `local`. A here-document's body must lie inside its function's text: if the operator is in a function body, the body text has to come before the closing `}` line.
 
 **Utilities** (`/bin`):
 - `head`, `tail`, `wc`;
