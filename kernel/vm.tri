@@ -1,13 +1,33 @@
-// vm: user address spaces.
+// vm: user address spaces, copy on write, and user page faults.
+//
+// User space is the negative half (L1 indices -9841..-1). Regions:
+//   text   read-only + execute, loaded by execve
+//   heap   from the bss start to brk, demand-zero
+//   stack  27 pages below USER_LIMIT, demand-zero
+// After fork, writable pages are shared read-only with the SW trit set
+// (copy on write); frame_ref counts the sharers.
 
 import "params.tri";
 import "mm.tri";
 import "arch.tri";
+import "sched.tri";
 
-// PTE for a user page (ring -1, read/write/execute for now).
-fn user_pte(frame: int) -> int {
-    return frame * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
+const PTE_SW: int = 27;                       // trit 24: copy-on-write marker
+const USER_BASE: int = -847288609443;         // -3^25
+const USER_LIMIT: int = -193710245;           // the highest user address
+const USER_STACK: int = -387420492;           // initial stack top (-3^18 - 3)
+const USER_STACK_PAGES: int = 27;
+const USER_STACK_LOW: int = -387420492 - 27 * 19683;
+
+fn user_pte(frame: int, writable: int, exec: int) -> int {
+    var v: int = writable ? PTE_V : -PTE_V;
+    var x: int = exec ? PTE_X : 0;
+    return frame * PTE_FRAME + v + x - PTE_RING;
 }
+
+fn pte_frame(p: int) -> int { return ext(p, 1, 18); }
+
+fn is_user_address(va: int) -> int { return va >= USER_BASE - 9841 && va <= USER_LIMIT; }
 
 // A new address space: an L1 table sharing the kernel's slots 0 and +1.
 fn new_address_space() -> int {
@@ -18,30 +38,122 @@ fn new_address_space() -> int {
     return l1;
 }
 
-// Map virtual page `page` (VA page*PAGE ± 9841) to physical frame `frame`.
-fn map_user_page(l1: int, page: int, frame: int) -> int {
-    var i1: int = divr(page, 19683);
-    var i2: int = page - i1 * 19683;
+// The L2 entry for `va`, creating the L2 table if `create`; null if absent.
+fn pte_slot(l1: int, va: int, create: int) -> *int {
+    var i1: int = divr(va, 387420489);
+    var rem: int = va - i1 * 387420489;
+    var i2: int = divr(rem, 19683);
     var e1: *int = table_entry(l1, i1);
     var l2: int;
     if (*e1 == 0) {
+        if (!create) { return null; }
         l2 = alloc_table();
-        if (l2 < 0) { return 0; }
+        if (l2 < 0) { return null; }
         *e1 = l2 * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
     } else {
-        l2 = ext(*e1, 1, 18);
+        l2 = pte_frame(*e1);
     }
-    *table_entry(l2, i2) = user_pte(frame);
+    return table_entry(l2, i2);
+}
+
+fn map_page(l1: int, va: int, frame: int, writable: int, exec: int) -> int {
+    var slot: *int = pte_slot(l1, va, 1);
+    if (slot == null) { return 0; }
+    *slot = user_pte(frame, writable, exec);
     return 1;
 }
 
-// Map `count` fresh zeroed pages from `page` upward.
-fn map_zeroed(l1: int, page: int, count: int) -> int {
-    var k: int = 0;
-    while (k < count) {
-        var f: int = alloc_frame_zeroed();
-        if (f < 0 || !map_user_page(l1, page + k, f)) { return 0; }
-        k += 1;
+// Physical address of user address `va` in address space `l1`, or 0.
+fn uva_to_phys(l1: int, va: int) -> int {
+    var slot: *int = pte_slot(l1, va, 0);
+    if (slot == null || *slot == 0) { return 0; }
+    var page: int = divr(va, 19683);
+    return pte_frame(*slot) * 19683 + (va - page * 19683);
+}
+
+// Release every user page and table, then the L1 table.
+fn free_address_space(l1: int) {
+    var i1: int = -9841;
+    while (i1 <= -1) {
+        var e1: int = *table_entry(l1, i1);
+        if (e1 != 0) {
+            var l2: int = pte_frame(e1);
+            var i2: int = -9841;
+            while (i2 <= 9841) {
+                var p: int = *table_entry(l2, i2);
+                if (p != 0) { put_page(pte_frame(p)); }
+                i2 += 1;
+            }
+            free_pages(l2, 1);
+        }
+        i1 += 1;
     }
-    return 1;
+    free_pages(l1, 1);
+}
+
+// fork: a copy of `parent` sharing every page; writable pages become
+// read-only + copy-on-write in both.
+fn copy_address_space(parent: int) -> int {
+    var child: int = new_address_space();
+    if (child < 0) { return -1; }
+    var i1: int = -9841;
+    while (i1 <= -1) {
+        var e1: int = *table_entry(parent, i1);
+        if (e1 != 0) {
+            var pl2: int = pte_frame(e1);
+            var cl2: int = alloc_table();
+            if (cl2 < 0) { free_address_space(child); return -1; }
+            *table_entry(child, i1) = cl2 * PTE_FRAME + PTE_V + PTE_X - PTE_RING;
+            var i2: int = -9841;
+            while (i2 <= 9841) {
+                var p: int = *table_entry(pl2, i2);
+                if (p != 0) {
+                    if (trit(p, 19) == 1) {                    // writable: share copy-on-write
+                        p = p - 2 * PTE_V + PTE_SW;
+                        *table_entry(pl2, i2) = p;
+                    }
+                    *table_entry(cl2, i2) = p;
+                    get_page(pte_frame(p));
+                }
+                i2 += 1;
+            }
+        }
+        i1 += 1;
+    }
+    tlbflush();
+    return child;
+}
+
+// Try to resolve a fault at `va` (access: -1 read, 0 fetch, +1 write) for
+// task `t`. Returns 1 if the access can be retried.
+fn handle_user_fault(t: *Task, va: int, access: int) -> int {
+    if (t.l1 == 0 || !is_user_address(va)) { return 0; }
+    var slot: *int = pte_slot(t.l1, va, 0);
+    if (slot == null || *slot == 0) {
+        // Not present: demand-zero in the heap or the stack.
+        var in_heap: int = va >= t.heap_start && va < t.brk;
+        var in_stack: int = va >= USER_STACK_LOW;
+        if (!in_heap && !in_stack) { return 0; }
+        var f: int = alloc_user_frame();
+        if (f < 0 || !map_page(t.l1, va, f, 1, 0)) { return 0; }
+        tlbinv(va);
+        return 1;
+    }
+    var p: int = *slot;
+    if (access == 1 && trit(p, 19) == -1 && trit(p, 24) == 1) {
+        // Copy on write.
+        var f: int = pte_frame(p);
+        if (frame_ref[f] > 1) {
+            var nf: int = alloc_pages(0);
+            if (nf < 0) { return 0; }
+            copy_frame(nf, f);
+            frame_ref[nf] = 1;
+            put_page(f);
+            f = nf;
+        }
+        *slot = user_pte(f, 1, trit(p, 20) == 1);
+        tlbinv(va);
+        return 1;
+    }
+    return 0;
 }

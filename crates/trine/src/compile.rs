@@ -570,8 +570,8 @@ impl Compiler {
         // `extern fn`s may live in assembly; the assembler reports any that are missing.
         match self.globals.get("main") {
             Some(Global::Func { defined: true, ty: Ty::Fn(ps, _) }) => {
-                if ps.len() > 2 || ps.iter().any(|p| !p.is_integer()) {
-                    return err(Pos::default(), "`main` takes at most two int parameters (boot disk, RAM pages)");
+                if ps.len() > 2 || ps.iter().any(|p| !p.is_integer() && !p.is_pointer()) {
+                    return err(Pos::default(), "`main` takes at most two parameters: (disk, ram) or (argc, argv)");
                 }
             }
             _ => return err(Pos::default(), "no `fn main()` defined"),

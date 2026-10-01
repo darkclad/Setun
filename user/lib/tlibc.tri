@@ -1,4 +1,4 @@
-// tlibc: the Trinux C library, in Trine (docs/KERNEL.md §10). K2 subset.
+// tlibc: the Trinux C library, in Trine (docs/KERNEL.md §10).
 //
 // System calls use the Linux generic numbers and return -errno on failure;
 // these wrappers set `errno` and return -1, as POSIX specifies.
@@ -9,6 +9,14 @@ const STDIN_FILENO: int = 0;
 const STDOUT_FILENO: int = 1;
 const STDERR_FILENO: int = 2;
 
+// errno values (Linux)
+const ENOENT: int = 2;
+const ECHILD: int = 10;
+const EFAULT: int = 14;
+
+const SIGCHLD: int = 17;
+const WNOHANG: int = 1;
+
 var errno: int;
 
 fn _ret(r: int) -> int {
@@ -16,12 +24,60 @@ fn _ret(r: int) -> int {
     return r;
 }
 
+// ---- unistd.h ------------------------------------------------------------------
+
 fn write(fd: int, buf: *char, n: int) -> int { return _ret(syscall(64, fd, buf, n)); }
 fn getpid() -> int { return syscall(172); }
+fn getppid() -> int { return syscall(173); }
 fn sched_yield() -> int { return _ret(syscall(124)); }
 fn _exit(code: int) { syscall(93, code); }
+fn fork() -> int { return _ret(syscall(220, SIGCHLD, 0, 0, 0, 0)); }
+fn execve(path: *char, argv: **char, envp: **char) -> int { return _ret(syscall(221, path, argv, envp)); }
+fn brk(addr: int) -> int { return syscall(214, addr); }
 
-// ---- small stdio helpers (no varargs printf: see KERNEL.md §10) -----------
+// sbrk: grow the heap by n trytes; returns the old break, or -1.
+fn sbrk(n: int) -> int {
+    var old: int = brk(0);
+    if (n == 0) { return old; }
+    if (brk(old + n) != old + n) { errno = 12; return -1; }
+    return old;
+}
+
+// ---- sys/wait.h ----------------------------------------------------------------
+
+fn waitpid(pid: int, status: *int, options: int) -> int {
+    return _ret(syscall(260, pid, status, options, 0));
+}
+fn wait(status: *int) -> int { return waitpid(-1, status, 0); }
+
+// Status encoding as on Linux: exit code * 256, or the terminating signal.
+fn WIFEXITED(s: int) -> int { return s % 256 == 0; }
+fn WEXITSTATUS(s: int) -> int { return s / 256 % 256; }
+fn WIFSIGNALED(s: int) -> int { return s % 256 != 0; }
+fn WTERMSIG(s: int) -> int { return s % 256; }
+
+// ---- sys/sysinfo.h ---------------------------------------------------------------
+
+struct sysinfo_t {
+    uptime: int;
+    load1: int;
+    load5: int;
+    load15: int;
+    totalram: int;
+    freeram: int;
+    sharedram: int;
+    bufferram: int;
+    totalswap: int;
+    freeswap: int;
+    procs: int;
+    totalhigh: int;
+    freehigh: int;
+    mem_unit: int;
+}
+
+fn sysinfo(info: *sysinfo_t) -> int { return _ret(syscall(179, info)); }
+
+// ---- small stdio helpers (no varargs printf: see KERNEL.md §10) -----------------
 
 fn puts(s: *char) -> int {
     var n: int = strlen(s);

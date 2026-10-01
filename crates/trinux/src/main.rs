@@ -28,9 +28,10 @@ fn main() {
         std::process::exit(1)
     });
     eprintln!(
-        "{}: loader + kernel ({} sector(s)), {} sectors in all",
+        "{}: loader + kernel ({} sector(s)) + initramfs ({} files), {} sectors in all",
         out.display(),
         disk.kernel_sectors,
+        disk.files,
         disk.trytes.len() / setun_core::PAGE as usize
     );
 }

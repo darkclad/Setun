@@ -1,28 +1,28 @@
-//! Trinux on the emulator: K1 (boot, paging, timer) and K2 (user processes).
+//! Trinux on the emulator: K1 (boot, paging, timer), K2 (user processes),
+//! K3 (fork, execve, wait4, copy on write, initramfs).
 
 use setun_core::isa::{cr, mode};
 use std::path::{Path, PathBuf};
 
-fn boot_log(programs: &[PathBuf], steps: u64) -> (String, setun_core::Machine) {
-    let disk = trinux::build_disk_with(&trinux::kernel_dir(), programs).unwrap_or_else(|e| panic!("{e}"));
+fn boot_log(files: &[(String, PathBuf)], steps: u64) -> (String, setun_core::Machine) {
+    let disk = trinux::build_disk_with(&trinux::kernel_dir(), files).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot(&disk, 729, steps);
     (m.dev.serial.take_output(), m)
 }
 
-/// Write a user program to a temp file next to a copy of user/lib.
-fn temp_program(name: &str, src: &str) -> PathBuf {
-    let stem = name.trim_end_matches(".tri");
-    let dir = std::env::temp_dir().join(format!("trinux-user-{}-{stem}", std::process::id()));
+/// A disk whose /sbin/init is `src` (with user/lib next to it), plus /bin/hello.
+fn with_init(test: &str, src: &str) -> Vec<(String, PathBuf)> {
+    let dir = std::env::temp_dir().join(format!("trinux-user-{}-{test}", std::process::id()));
     std::fs::create_dir_all(dir.join("lib")).unwrap();
     std::fs::copy(trinux::user_dir().join("lib/tlibc.tri"), dir.join("lib/tlibc.tri")).unwrap();
-    let p = dir.join(name);
+    let p = dir.join("init.tri");
     std::fs::write(&p, src).unwrap();
-    p
+    vec![("/sbin/init".into(), p), ("/bin/hello".into(), trinux::user_dir().join("hello.tri"))]
 }
 
 #[test]
 fn k1_kernel_boots_with_paging_and_timer() {
-    let (out, m) = boot_log(&trinux::default_programs(), 60_000_000);
+    let (out, m) = boot_log(&trinux::default_files(), 30_000_000);
     for line in [
         "Trinux loader: kernel",
         "Trinux version 0.1 (trine) on Setun-386, balanced ternary",
@@ -31,68 +31,79 @@ fn k1_kernel_boots_with_paging_and_timer() {
         "Memory: 689 pages free (frames 40..728), triddy orders 0..9",
         "mm: triddy self-test OK",
         "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 759 pages",
+        "initramfs: 3 files",
+        "init: started /sbin/init as pid 1",
         "Timer: 100 Hz",
     ] {
         assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
-    assert!(!out.contains("panic"), "{out}");
     assert!(out.contains("[    0."), "printk uptime stamps: {out}");
     assert_eq!(m.cpu.mode(mode::PG), 1);
     assert!(m.cpu.cr(cr::PTB).value() % 59_049 == 0, "PTB is a multiple of 3^10");
 }
 
 #[test]
-fn k2_two_processes_interleave_under_the_timer() {
-    let (out, m) = boot_log(&trinux::default_programs(), 60_000_000);
-    assert!(out.contains("init: started user program 0 as pid 1"), "{out}");
-    assert!(out.contains("init: started user program 1 as pid 2"), "{out}");
-    for pid in [1, 2] {
-        for step in 0..5 {
-            assert!(out.contains(&format!("pid {pid}: step {step}\n")), "pid {pid} step {step}:\n{out}");
-        }
-        assert!(out.contains(&format!("[pid {pid}] exited with code {}", 10 * pid)), "{out}");
+fn k3_init_forks_execs_and_waits() {
+    let (out, _) = boot_log(&trinux::default_files(), 200_000_000);
+    for line in [
+        "init: pid 1, argv[0] = /sbin/init",
+        "hello: pid 2, parent 1, argc 3: [/bin/hello] [first] [ternary]",
+        "init: /bin/hello exited with 3",
+        "init: child saw 43, parent still has 100",              // copy on write (555 % 256 = 43)
+        "killed by signal 11",
+        "init: child killed by signal 11",
+        "init: ECHILD ok",
+        "init: 5 fork/exec/wait cycles, no memory leaked",
+        "init: heap ok, heap[999] = 42",
+        "init: done",
+        "Kernel panic - not syncing: Attempted to kill init! exit status 0",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
     }
-    // Preemption: pid 2 printed before pid 1 finished.
-    let first_of_2 = out.find("pid 2: step 0").unwrap();
-    let last_of_1 = out.find("pid 1: step 4").unwrap();
-    assert!(first_of_2 < last_of_1, "no interleaving:\n{out}");
-    assert!(out.contains("Idle: no user processes left"), "{out}");
-    // Idle in ring +1 with interrupts on, the kernel's own page table active.
-    assert_eq!(m.cpu.ring(), 1);
-    assert_eq!(m.cpu.mode(mode::IE), 1);
+    assert!(!out.contains("LEAK"), "{out}");
 }
 
 #[test]
-fn k2_user_faults_kill_the_process_not_the_kernel() {
-    let bad = temp_program(
-        "null.tri",
-        "import \"lib/tlibc.tri\";\nfn main() -> int { puts(\"about to crash\\n\"); var p: *int = null; return *p; }\n",
-    );
-    let good = trinux::user_dir().join("k2_hello.tri");
-    let (out, _) = boot_log(&[bad, good], 60_000_000);
-    assert!(out.contains("about to crash"), "{out}");
-    assert!(out.contains("[pid 1] protection fault at"), "{out}");
-    assert!(out.contains("address 0 - killed"), "{out}");
-    assert!(out.contains("[pid 2] exited with code 20"), "the other process carries on:\n{out}");
-    assert!(!out.contains("Kernel panic"), "{out}");
+fn k2_processes_interleave_under_the_timer() {
+    let src = "import \"lib/tlibc.tri\";
+    fn work(tag: *char) {
+        var i: int = 0;
+        while (i < 4) {
+            puts(tag); put_int(i); puts(\"\\n\");
+            var spin: int = 0; while (spin < 15000) { spin += 1; }
+            i += 1;
+        }
+    }
+    fn main(argc: int, argv: **char) -> int {
+        var pid: int = fork();
+        if (pid == 0) { work(\"child \"); return 7; }
+        work(\"parent \");
+        var st: int;
+        waitpid(pid, &st, 0);
+        puts(\"child exit \"); put_int(WEXITSTATUS(st)); puts(\"\\n\");
+        return 0;
+    }";
+    let (out, _) = boot_log(&with_init("interleave", src), 100_000_000);
+    let first_child = out.find("child 0").unwrap_or_else(|| panic!("{out}"));
+    let last_parent = out.find("parent 3").unwrap_or_else(|| panic!("{out}"));
+    assert!(first_child < last_parent, "no preemption:\n{out}");
+    assert!(out.contains("child exit 7"), "{out}");
 }
 
 #[test]
 fn k2_syscall_errors_use_linux_errno() {
     let src = "import \"lib/tlibc.tri\";
-    fn main() -> int {
-        // A kernel address is not a valid user buffer: EFAULT (14).
-        var r: int = write(1, 1000 as *char, 3);
-        if (r != -1 || errno != 14) { return 1; }
-        // A bad descriptor: EBADF (9).
-        r = write(7, \"x\", 1);
-        if (r != -1 || errno != 9) { return 2; }
-        // An unknown system call: -ENOSYS (38).
-        if (syscall(9000) != -38) { return 3; }
+    fn main(argc: int, argv: **char) -> int {
+        if (write(1, 1000 as *char, 3) != -1 || errno != 14) { return 1; }   // EFAULT
+        if (write(7, \"x\", 1) != -1 || errno != 9) { return 2; }           // EBADF
+        if (syscall(9000) != -38) { return 3; }                             // ENOSYS
+        if (execve(\"/no/such\", null, null) != -1 || errno != 2) { return 4; }   // ENOENT
+        var st: int;
+        if (waitpid(-1, &st, 0) != -1 || errno != 10) { return 5; }         // ECHILD
         return 77;
     }";
-    let (out, _) = boot_log(&[temp_program("errno.tri", src)], 60_000_000);
-    assert!(out.contains("[pid 1] exited with code 77"), "{out}");
+    let (out, _) = boot_log(&with_init("errno", src), 60_000_000);
+    assert!(out.contains("Attempted to kill init! exit status 19712"), "77 * 256:\n{out}");
 }
 
 #[test]

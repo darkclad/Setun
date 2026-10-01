@@ -31,45 +31,61 @@ pub struct Disk {
     /// T1B2 trytes, whole sectors.
     pub trytes: Vec<i16>,
     pub kernel_sectors: usize,
-    pub programs: usize,
+    pub files: usize,
 }
 
-/// Sector holding the boot-module table (kernel/module.tri).
-pub const MODULE_TABLE_SECTOR: usize = 28;
-pub const MODULE_MAGIC: i64 = 31_857_270_900;
+/// The initramfs header sector (kernel/initramfs.tri); data follows it.
+pub const INITRAMFS_SECTOR: usize = 28;
+pub const INITRAMFS_MAGIC: i64 = 31_857_270_902;
+/// TEF executable magic (kernel/exec.tri).
+pub const TEF_MAGIC: i64 = 31_857_270_901;
 
 /// The repository's `user/` directory.
 pub fn user_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../user")
 }
 
-/// The user programs a default disk starts (K2: two copies of the demo).
-pub fn default_programs() -> Vec<PathBuf> {
-    vec![user_dir().join("k2_hello.tri"), user_dir().join("k2_hello.tri")]
+/// The default initramfs: (path in the file system, Trine source).
+pub fn default_files() -> Vec<(String, PathBuf)> {
+    vec![
+        ("/sbin/init".into(), user_dir().join("init.tri")),
+        ("/bin/hello".into(), user_dir().join("hello.tri")),
+        ("/bin/k2_hello".into(), user_dir().join("k2_hello.tri")),
+    ]
 }
 
-/// A user program as page images: page `first_page` onward, laid out so the
-/// image starts at `USER_BASE − 1`.
-fn program_pages(path: &Path) -> Result<Vec<i16>, String> {
-    let image = trine::build_file(path, &Options::user())?.image;
-    let page = PAGE as usize;
-    let lead = (trine::USER_BASE - 1 - (trine::USER_BASE / PAGE * PAGE - 9841)) as usize; // 9840
-    let mut pages = vec![0i16; lead];
-    pages.extend_from_slice(&image);
-    let n = pages.len().div_ceil(page);
-    if n > 9 {
-        return Err(format!("{}: {n} pages of code; at most 9 fit below the globals", path.display()));
+fn push_word(v: &mut Vec<i16>, w: i64) {
+    v.extend(word_to_trytes(Word::new(w).unwrap()).iter().map(|t| t.value() as i16));
+}
+
+/// Compile a user program into a TEF executable (header + text).
+pub fn tef(path: &Path) -> Result<Vec<i16>, String> {
+    let b = trine::build_file(path, &Options::user())?;
+    let text_end = trine::USER_BASE - 1 + b.image.len() as i64;
+    if text_end >= b.data_start - 1 {
+        return Err(format!("{}: the code overlaps the globals", path.display()));
     }
-    pages.resize(n * page, 0);
-    Ok(pages)
+    let mut v = Vec::new();
+    for w in [
+        TEF_MAGIC,
+        trine::USER_BASE,
+        trine::USER_BASE - 1,
+        b.image.len() as i64,
+        b.data_start - 1,
+        b.data_end - b.data_start,
+    ] {
+        push_word(&mut v, w);
+    }
+    v.extend_from_slice(&b.image);
+    Ok(v)
 }
 
-/// Compile the loader, the kernel and `programs`, and lay out the disk.
+/// Compile the loader, the kernel and the default initramfs; lay out the disk.
 pub fn build_disk(kernel_dir: &Path) -> Result<Disk, String> {
-    build_disk_with(kernel_dir, &default_programs())
+    build_disk_with(kernel_dir, &default_files())
 }
 
-pub fn build_disk_with(kernel_dir: &Path, programs: &[PathBuf]) -> Result<Disk, String> {
+pub fn build_disk_with(kernel_dir: &Path, files: &[(String, PathBuf)]) -> Result<Disk, String> {
     let loader = trine::build_file(&kernel_dir.join("boot/loader.tri"), &Options::boot())?.image;
     let kernel = trine::build_file(&kernel_dir.join("main.tri"), &kernel_options())?.image;
     let page = PAGE as usize;
@@ -91,26 +107,38 @@ pub fn build_disk_with(kernel_dir: &Path, programs: &[PathBuf]) -> Result<Disk, 
     trytes.extend_from_slice(&kernel);
     trytes.resize((1 + sectors) * page, 0);
 
-    // Boot modules: the table at sector 28, programs from sector 29.
-    trytes.resize((MODULE_TABLE_SECTOR + 1) * page, 0);
-    let first_page = trine::USER_BASE / PAGE;
-    let mut table = vec![MODULE_MAGIC, programs.len() as i64];
-    for p in programs {
-        let pages = program_pages(p)?;
-        let start = trytes.len() / page;
-        table.extend([start as i64, (pages.len() / page) as i64, first_page]);
-        trytes.extend_from_slice(&pages);
-    }
-    if table.len() * 3 > page {
-        return Err("too many boot programs for one table sector".into());
-    }
-    let t0 = MODULE_TABLE_SECTOR * page;
-    for (j, &w) in table.iter().enumerate() {
-        for (i, t) in word_to_trytes(Word::new(w).unwrap()).iter().enumerate() {
-            trytes[t0 + 3 * j + i] = t.value() as i16;
+    // initramfs: header at sector 28, file data from sector 29.
+    let mut data: Vec<i16> = Vec::new();
+    let mut entries: Vec<i16> = Vec::new();
+    for (name, src) in files {
+        let chars: Vec<i64> = name.chars().map(|c| c as i64).collect();
+        if chars.len() > 26 {
+            return Err(format!("initramfs path too long: {name}"));
         }
+        let file = tef(src)?;
+        let mut n: Vec<i16> = chars.iter().map(|&c| c as i16).collect();
+        n.resize(27, 0);
+        entries.extend_from_slice(&n);
+        push_word(&mut entries, file.len() as i64);
+        push_word(&mut entries, data.len() as i64);
+        data.extend_from_slice(&file);
+        data.resize(data.len().div_ceil(3) * 3, 0);
     }
-    Ok(Disk { trytes, kernel_sectors: sectors, programs: programs.len() })
+    let data_sectors = data.len().div_ceil(page).max(1);
+    let mut header = Vec::new();
+    push_word(&mut header, INITRAMFS_MAGIC);
+    push_word(&mut header, files.len() as i64);
+    push_word(&mut header, data_sectors as i64);
+    header.extend_from_slice(&entries);
+    if header.len() > page {
+        return Err("too many files for the initramfs header".into());
+    }
+    trytes.resize(INITRAMFS_SECTOR * page, 0);
+    header.resize(page, 0);
+    trytes.extend_from_slice(&header);
+    data.resize(data_sectors * page, 0);
+    trytes.extend_from_slice(&data);
+    Ok(Disk { trytes, kernel_sectors: sectors, files: files.len() })
 }
 
 /// Boot a disk on a fresh machine with the BIOS; run `steps` instructions.

@@ -1,0 +1,22 @@
+// /bin/hello: print the arguments. Exit code = argc.
+
+import "lib/tlibc.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    puts("hello: pid ");
+    put_int(getpid());
+    puts(", parent ");
+    put_int(getppid());
+    puts(", argc ");
+    put_int(argc);
+    puts(":");
+    var i: int = 0;
+    while (i < argc) {
+        puts(" [");
+        puts(argv[i]);
+        puts("]");
+        i += 1;
+    }
+    puts("\n");
+    return argc;
+}

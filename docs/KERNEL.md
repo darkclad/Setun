@@ -1,6 +1,6 @@
 # Trinux: the Setun-386 kernel
 
-**Status: v0.1, accepted. Milestones K1 and K2 are implemented** (`kernel/`, built by `mkdisk`).
+**Status: v0.1, accepted. Milestones K1–K3 are implemented** (`kernel/`, built by `mkdisk`).
 Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
 
 Trinux is a Unix kernel for Setun-386, **modelled on Linux** and providing
@@ -252,7 +252,7 @@ fmt_nl(f);
 |---|---|---|
 | K1 ✅ | loader, `start_kernel`, paging on, `printk`, frame allocator, timer interrupt | the kernel boots from a disk image and prints its banner |
 | K2 ✅ | tasks, scheduler, context switch, user mode, first system calls (`write`, `exit`, `getpid`) | two user processes print, interleaved under the timer |
-| K3 | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
+| K3 ✅ | `fork`/`execve`/`wait4`, COW, page faults, TEF loader, initramfs (ramfs) | `init` starts a program from the initramfs and waits for it |
 | K4 | VFS complete, devfs, the tty with its line discipline, pipes, `dup2` | a shell runs `echo hi \| cat` |
 | K5 | signals, job control, `^C` | `sleep 100`, then `^C` interrupts it |
 | K6 | `tfs` on disk, the buffer cache, `mkdisk`; procfs | files survive a reboot; `ps` works |
@@ -340,3 +340,62 @@ Anything else returns `−ENOSYS`.
 - A fault in user mode kills the process and prints the cause; the kernel carries on.
 
 **Known limits until K3:** exited processes stay zombies and keep their memory (there is no `wait` yet), and pages are mapped read/write/execute.
+
+## 16. K3 as built
+
+**Boot to init:** `mkdisk` packs an **initramfs** at sector 28.
+- The header is words: magic, file count, data sectors, then per file a 27-tryte path, size and offset. The data follows from sector 29.
+- The kernel loads it into one contiguous triddy block and starts **`/sbin/init` as PID 1**, with `argv = { "/sbin/init" }`.
+- If init exits, the kernel prints Linux's `Kernel panic - not syncing: Attempted to kill init!`.
+
+**TEF v1:** a 6-word header (magic, entry, text start, text size, bss start, bss size), followed by the text.
+- `execve` maps the text read-only + execute.
+- The heap runs from the bss start up to `brk` and is demand-zero.
+- The stack is 27 pages below `USER_LIMIT`, demand-zero, with its top page mapped up front. It holds the `argv` strings, `argv[]`, NULL and an empty `envp`.
+- `main(argc, argv)` gets them in `r1` and `r2`.
+
+**Copy-on-write fork:** `clone(SIGCHLD)`.
+- Writable pages become read-only with the PTE's `SW` trit set in both processes. `frame_ref` counts the sharers.
+- A write fault copies the page, or simply makes it writable again when only one sharer remains.
+
+**Page faults:**
+
+| Fault | Result |
+|---|---|
+| not present, in the heap or stack | demand-zero |
+| protection fault on a write to a COW page | copy |
+| illegal or privileged instruction | `SIGILL` |
+| misaligned access | `SIGBUS` |
+| divide by zero | `SIGFPE` |
+| breakpoint, single step | `SIGTRAP` |
+| anything else | `SIGSEGV` |
+
+Kernel-mode faults on user addresses go through the same path, so system calls can touch demand-zero and COW user memory.
+
+**`exit` and `wait4`:**
+- `exit` frees the address space at once, reparents children to init, and wakes a parent sleeping in `wait4`.
+- `wait4(pid or −1, status, WNOHANG)` reaps a zombie (freeing its kernel stack) and returns Linux-encoded status: `code·256`, or the signal number.
+- It returns `−ECHILD` when there are no children, and sleeps otherwise.
+
+**System calls:**
+
+| Call | Number |
+|---|---|
+| `write` | 64 |
+| `exit` / `exit_group` | 93 / 94 |
+| `sched_yield` | 124 |
+| `getpid` | 172 |
+| `getppid` | 173 |
+| `sysinfo` | 179 (Linux field order, `mem_unit` = 1 tryte) |
+| `brk` | 214 |
+| `clone` (fork) | 220 |
+| `execve` | 221 |
+| `wait4` | 260 |
+
+**Verified on the emulator by `/sbin/init`** ([`user/init.tri`](../user/init.tri)):
+- fork + exec + wait with `argv`;
+- COW isolation;
+- `SIGSEGV` reporting;
+- `ECHILD`;
+- no leaked pages across 5 fork/exec/wait cycles (checked with `sysinfo.freeram`);
+- the heap via `sbrk`.

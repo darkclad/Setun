@@ -4,6 +4,7 @@ import "params.tri";
 import "printk.tri";
 import "mm.tri";
 import "sched.tri";
+import "vm.tri";
 
 // ---- trap frame ---------------------------------------------------------------
 //
@@ -172,8 +173,12 @@ fn trap_handler(f: *int) {
         return;
     }
     var from_user: int = trit(f[F_EMODE], 27) == -1;
-    if (from_user) {
-        user_fault(v, f[F_EPC], mfc(FADDR), fault_name(v));
+    var addr: int = mfc(FADDR);
+    var access: int = ext(cause, 22, 1);
+    // User faults, and kernel faults on user memory (a system call touching
+    // a demand-zero or copy-on-write page), go to the VM.
+    if (from_user || ((v == -3 || v == -4) && current_task().l1 != 0 && is_user_address(addr))) {
+        user_fault(v, f[F_EPC], addr, access, fault_name(v));
         return;
     }
     printk("trap: ");
@@ -183,7 +188,7 @@ fn trap_handler(f: *int) {
     pr(") at ");
     pr_int(f[F_EPC]);
     pr(", address ");
-    pr_int(mfc(FADDR));
+    pr_int(addr);
     pr_nl();
     panic("unhandled trap in the kernel");
 }

@@ -5,7 +5,7 @@ import "printk.tri";
 import "mm.tri";
 import "arch.tri";
 import "sched.tri";
-import "module.tri";
+import "initramfs.tri";
 
 var boot_disk: int;
 
@@ -56,7 +56,18 @@ fn start_kernel(disk: int, frames: int) {
     if (!paging_enabled()) { panic("paging did not turn on"); }
 
     sched_init();
-    load_modules();
+    if (initramfs_init()) {
+        var pid: int = spawn_init("/sbin/init");
+        if (pid < 0) {
+            printk("init: cannot run /sbin/init (error ");
+            pr_int(-pid);
+            pr(")\n");
+        } else {
+            printk("init: started /sbin/init as pid ");
+            pr_int(pid);
+            pr_nl();
+        }
+    }
     time_init();
 
     // The idle task: schedule user tasks, sleep until the next interrupt.

@@ -4,24 +4,33 @@ import "params.tri";
 import "printk.tri";
 import "mm.tri";
 import "arch.tri";
+import "vm.tri";
+import "exec.tri";
 
 const NTASKS: int = 27;
 const TASK_UNUSED: int = 0;
 const TASK_RUNNABLE: int = 1;
 const TASK_ZOMBIE: int = 2;
+const TASK_SLEEPING: int = 3;
 
 // MODE for a user task: ring -1, interrupts on, paging on.
 const USER_MODE: int = -1 + MODE_IE + MODE_PG;
 
-// User address-space layout (docs/KERNEL.md §3.1), as in trine::Options::user().
-const USER_BASE: int = -847288609443;         // -3^25: code starts here
-const USER_LIMIT: int = -193710245;           // highest user address (L1 slot -1)
-const USER_STACK: int = -387420492;           // -3^18 - 3
-
 // Linux errno values
 const EBADF: int = 9;
+const ECHILD: int = 10;
+const EAGAIN: int = 11;
 const EFAULT: int = 14;
+const EINVAL: int = 22;
 const ENOSYS: int = 38;
+
+// Linux signal numbers (delivered for real in K5; here they only end processes)
+const SIGILL: int = 4;
+const SIGTRAP: int = 5;
+const SIGBUS: int = 7;
+const SIGFPE: int = 8;
+const SIGSEGV: int = 11;
+const SIGCHLD: int = 17;
 
 // Linux generic system-call numbers
 const SYS_WRITE: int = 64;
@@ -29,15 +38,27 @@ const SYS_EXIT: int = 93;
 const SYS_EXIT_GROUP: int = 94;
 const SYS_SCHED_YIELD: int = 124;
 const SYS_GETPID: int = 172;
+const SYS_GETPPID: int = 173;
+const SYS_SYSINFO: int = 179;
+const SYS_BRK: int = 214;
+const SYS_CLONE: int = 220;
+const SYS_EXECVE: int = 221;
+const SYS_WAIT4: int = 260;
+
+const WNOHANG: int = 1;
+const HEAP_MAX: int = 243 * 19683;    // brk may grow 243 pages past the bss
 
 struct Task {
     kernel_sp: int;                   // must stay first: switch_to saves it at [task]
     pid: int;
+    ppid: int;
     state: int;
-    l1: int;                          // centre frame of the L1 page table
+    l1: int;                          // centre frame of the L1 table; 0 = none
     kstack: int;                      // frame holding the kernel stack
-    exit_code: int;
+    status: int;                      // wait status: code*256, or the signal number
     ticks: int;
+    heap_start: int;                  // first tryte of the bss
+    brk: int;                         // end of the heap
 }
 
 var tasks: [27]Task;
@@ -50,7 +71,7 @@ fn current_task() -> *Task { return &tasks[current]; }
 fn sched_init() {
     tasks[0].pid = 0;
     tasks[0].state = TASK_RUNNABLE;
-    tasks[0].l1 = kernel_l1;
+    tasks[0].l1 = 0;
     current = 0;
     next_pid = 1;
 }
@@ -64,21 +85,39 @@ fn alloc_task() -> int {
     return -1;
 }
 
-// Build a new task's kernel stack so that its first switch_to "returns"
-// into trap_return, which enters user mode at `entry` with stack `user_sp`.
-fn prepare_user_stack(t: *Task, entry: int, user_sp: int) {
-    var top: int = frame_centre(t.kstack) + 9840 + 3;   // just above the top word
-    var base: int = top - 3 * FRAME_WORDS;
-    var frame: *int = base as *int;
-    var i: int = 0;
-    while (i < FRAME_WORDS) { frame[i] = 0; i += 1; }
-    frame[F_EPC] = entry;
-    frame[F_EMODE] = USER_MODE;
-    frame[F_KSP] = user_sp;
-    var sw: *int = (base - 6) as *int;                 // what switch_to pops: fp, lr
+fn find_task(pid: int) -> int {
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn task_frame(t: *Task) -> *int {
+    var top: int = frame_centre(t.kstack) + 9840 + 3;
+    return (top - 3 * FRAME_WORDS) as *int;
+}
+
+// Make `t`'s kernel stack hold `frame` as its trap frame, with a switch
+// frame on top that returns into trap_return.
+fn prepare_stack(t: *Task) {
+    var base: int = task_frame(t) as int;
+    var sw: *int = (base - 6) as *int;
     sw[0] = 0;
     sw[1] = &trap_return as int;
     t.kernel_sp = base - 6;
+}
+
+// Enter user mode at `entry` with stack `sp`, r1 = argc, r2 = argv.
+fn set_user_entry(f: *int, entry: int, sp: int, argc: int, argv: int) {
+    var i: int = 0;
+    while (i < FRAME_WORDS) { f[i] = 0; i += 1; }
+    f[F_EPC] = entry;
+    f[F_EMODE] = USER_MODE;
+    f[F_KSP] = sp;
+    f[0] = argc;
+    f[1] = argv;
 }
 
 // Pick the next runnable user task after `from` (round robin), or idle.
@@ -96,8 +135,10 @@ fn schedule() {
     var prev: int = current;
     var next: int = pick_next(prev);
     if (next == prev) { return; }
+    if (next == 0 && tasks[prev].state == TASK_RUNNABLE && prev != 0) { return; }
     current = next;
-    mtc(PTB, frame_centre(tasks[next].l1));
+    var l1: int = tasks[next].l1;
+    mtc(PTB, frame_centre(l1 != 0 ? l1 : kernel_l1));
     tlbflush();
     switch_to(&tasks[prev], &tasks[next]);
 }
@@ -107,23 +148,104 @@ fn scheduler_tick() {
     schedule();
 }
 
-fn do_exit(code: int) {
+// ---- process lifetime ---------------------------------------------------------
+
+// Start /sbin/init as pid 1.
+fn spawn_init(path: *char) -> int {
+    set_kernel_exec(path);
+    var r: int = exec_load();
+    if (r < 0) { return r; }
+    var slot: int = alloc_task();
+    var t: *Task = &tasks[slot];
+    t.kstack = alloc_pages(0);
+    t.l1 = load_l1;
+    t.pid = next_pid;
+    next_pid += 1;
+    t.ppid = 0;
+    t.heap_start = load_heap;
+    t.brk = load_brk;
+    set_user_entry(task_frame(t), load_entry, load_sp, exec_argc, load_argv);
+    prepare_stack(t);
+    t.state = TASK_RUNNABLE;
+    user_tasks_alive += 1;
+    return t.pid;
+}
+
+fn do_fork(f: *int) -> int {
+    var slot: int = alloc_task();
+    if (slot < 0) { return -EAGAIN; }
+    var parent: *Task = current_task();
+    var child: *Task = &tasks[slot];
+    var l1: int = copy_address_space(parent.l1);
+    if (l1 < 0) { return -12; }
+    child.kstack = alloc_pages(0);
+    if (child.kstack < 0) { free_address_space(l1); return -12; }
+    child.l1 = l1;
+    child.pid = next_pid;
+    next_pid += 1;
+    child.ppid = parent.pid;
+    child.ticks = 0;
+    child.status = 0;
+    child.heap_start = parent.heap_start;
+    child.brk = parent.brk;
+    var cf: *int = task_frame(child);
+    var i: int = 0;
+    while (i < FRAME_WORDS) { cf[i] = f[i]; i += 1; }
+    cf[F_R1] = 0;                                     // fork returns 0 in the child
+    prepare_stack(child);
+    child.state = TASK_RUNNABLE;
+    user_tasks_alive += 1;
+    return child.pid;
+}
+
+fn do_execve(f: *int) -> int {
+    var r: int = collect_exec_args(f[0], f[1]);
+    if (r < 0) { return r; }
+    r = exec_load();
+    if (r < 0) { return r; }
     var t: *Task = current_task();
+    var old: int = t.l1;
+    t.l1 = load_l1;
+    t.heap_start = load_heap;
+    t.brk = load_brk;
+    mtc(PTB, frame_centre(load_l1));
+    tlbflush();
+    if (old != 0) { free_address_space(old); }
+    set_user_entry(f, load_entry, load_sp, exec_argc, load_argv);
+    return exec_argc;                                 // r1 = argc (set_user_entry already wrote it)
+}
+
+fn do_exit(status: int) {
+    var t: *Task = current_task();
+    if (t.l1 != 0) {
+        mtc(PTB, frame_centre(kernel_l1));
+        free_address_space(t.l1);
+        t.l1 = 0;
+    }
+    t.status = status;
     t.state = TASK_ZOMBIE;
-    t.exit_code = code;
     user_tasks_alive -= 1;
-    printk("[pid ");
-    pr_int(t.pid);
-    pr("] exited with code ");
-    pr_int(code);
-    pr(" after ");
-    pr_int(t.ticks);
-    pr(" ticks\n");
-    schedule();                                  // never comes back
+    if (t.pid == 1) {
+        printk("Kernel panic - not syncing: Attempted to kill init! exit status ");
+        pr_int(status);
+        pr(", ");
+        pr_int(free_frames);
+        pr(" pages free\n");
+        panic("init exited");
+    }
+    // Orphans go to init; a waiting parent wakes up.
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state != TASK_UNUSED && tasks[i].ppid == t.pid) { tasks[i].ppid = 1; }
+        i += 1;
+    }
+    var p: int = find_task(t.ppid);
+    if (p >= 0 && tasks[p].state == TASK_SLEEPING) { tasks[p].state = TASK_RUNNABLE; }
+    schedule();                                       // never comes back
     panic("a zombie was scheduled");
 }
 
-fn user_fault(v: int, epc: int, addr: int, what: *char) {
+fn kill_current(sig: int, what: *char, epc: int, addr: int) {
     printk("[pid ");
     pr_int(current_task().pid);
     pr("] ");
@@ -132,14 +254,62 @@ fn user_fault(v: int, epc: int, addr: int, what: *char) {
     pr_int(epc);
     pr(", address ");
     pr_int(addr);
-    pr(" - killed\n");
-    do_exit(-128 + v);
+    pr(" - killed by signal ");
+    pr_int(sig);
+    pr_nl();
+    do_exit(sig);
+}
+
+fn fault_signal(v: int) -> int {
+    switch (v) {
+        case -1, -2: return SIGILL;
+        case -5: return SIGBUS;
+        case -6: return SIGFPE;
+        case -7, -8: return SIGTRAP;
+    }
+    return SIGSEGV;
+}
+
+// A fault in user mode, or in the kernel touching user memory.
+fn user_fault(v: int, epc: int, addr: int, access: int, what: *char) {
+    if ((v == -3 || v == -4) && handle_user_fault(current_task(), addr, access)) { return; }
+    kill_current(fault_signal(v), what, epc, addr);
+}
+
+fn do_wait4(pid: int, status_ptr: int, options: int) -> int {
+    var me: int = current_task().pid;
+    loop {
+        var children: int = 0;
+        var i: int = 1;
+        while (i < NTASKS) {
+            var c: *Task = &tasks[i];
+            if (c.state != TASK_UNUSED && c.ppid == me && (pid == -1 || c.pid == pid)) {
+                children += 1;
+                if (c.state == TASK_ZOMBIE) {
+                    var cpid: int = c.pid;
+                    if (status_ptr != 0) {
+                        if (!is_user_address(status_ptr)) { return -EFAULT; }
+                        *(status_ptr as *int) = c.status;
+                    }
+                    free_pages(c.kstack, 0);
+                    c.state = TASK_UNUSED;
+                    c.pid = 0;
+                    return cpid;
+                }
+            }
+            i += 1;
+        }
+        if (children == 0) { return -ECHILD; }
+        if (options % 2 == WNOHANG) { return 0; }
+        current_task().state = TASK_SLEEPING;
+        schedule();
+    }
 }
 
 // ---- system calls ---------------------------------------------------------------
 
 fn user_range_ok(addr: int, n: int) -> int {
-    return n >= 0 && addr <= USER_LIMIT && addr + n <= USER_LIMIT + 1 && addr >= USER_BASE - 9841;
+    return n >= 0 && is_user_address(addr) && is_user_address(addr + n - 1 + (n == 0));
 }
 
 fn sys_write(fd: int, buf: int, n: int) -> int {
@@ -156,13 +326,53 @@ fn sys_write(fd: int, buf: int, n: int) -> int {
     return n;
 }
 
+fn sys_brk(addr: int) -> int {
+    var t: *Task = current_task();
+    if (addr >= t.heap_start && addr <= t.heap_start + HEAP_MAX) { t.brk = addr; }
+    return t.brk;
+}
+
+// struct sysinfo, in Linux's field order, one word per field.
+fn sys_sysinfo(info: int) -> int {
+    if (!user_range_ok(info, 3 * 14)) { return -EFAULT; }
+    var w: *int = info as *int;
+    var procs: int = 0;
+    var i: int = 1;
+    while (i < NTASKS) {
+        if (tasks[i].state != TASK_UNUSED) { procs += 1; }
+        i += 1;
+    }
+    w[0] = jiffies / HZ;                 // uptime (s)
+    w[1] = 0; w[2] = 0; w[3] = 0;        // loads
+    w[4] = ram_frames * PAGE;            // totalram
+    w[5] = free_frames * PAGE;           // freeram
+    w[6] = 0; w[7] = 0;                  // sharedram, bufferram
+    w[8] = 0; w[9] = 0;                  // totalswap, freeswap
+    w[10] = procs;
+    w[11] = 0; w[12] = 0;                // totalhigh, freehigh
+    w[13] = 1;                           // mem_unit: 1 tryte
+    return 0;
+}
+
 // Arguments are r1..r6 in the frame; the result goes back in r1.
 fn do_syscall(f: *int, n: int) {
     switch (n) {
         case SYS_WRITE: f[F_R1] = sys_write(f[0], f[1], f[2]);
-        case SYS_EXIT, SYS_EXIT_GROUP: do_exit(f[0]);
+        case SYS_EXIT, SYS_EXIT_GROUP: do_exit((f[0] % 256 + 256) % 256 * 256);
         case SYS_GETPID: f[F_R1] = current_task().pid;
+        case SYS_GETPPID: f[F_R1] = current_task().ppid;
         case SYS_SCHED_YIELD: { f[F_R1] = 0; schedule(); }
+        case SYS_BRK: f[F_R1] = sys_brk(f[0]);
+        case SYS_SYSINFO: f[F_R1] = sys_sysinfo(f[0]);
+        case SYS_CLONE: {
+            if (f[0] != SIGCHLD) { f[F_R1] = -EINVAL; }      // only fork-style clone in v1
+            else { f[F_R1] = do_fork(f); }
+        }
+        case SYS_EXECVE: {
+            var r: int = do_execve(f);
+            if (r < 0) { f[F_R1] = r; }
+        }
+        case SYS_WAIT4: f[F_R1] = do_wait4(f[0], f[1], f[2]);
         default: f[F_R1] = -ENOSYS;
     }
 }

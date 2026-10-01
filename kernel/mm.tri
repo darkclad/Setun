@@ -136,6 +136,36 @@ fn alloc_table() -> int {
     return c;
 }
 
+// ---- user page reference counts (shared after fork, copy on write) ------------
+
+var frame_ref: [59049]tryte;
+
+// A fresh zeroed frame for user memory, with one reference.
+fn alloc_user_frame() -> int {
+    var f: int = alloc_frame_zeroed();
+    if (f >= 0) { frame_ref[f] = 1; }
+    return f;
+}
+
+fn get_page(f: int) { frame_ref[f] += 1; }
+
+// Drop a reference; the frame is freed when the last one goes.
+fn put_page(f: int) {
+    frame_ref[f] -= 1;
+    if (frame_ref[f] <= 0) {
+        frame_ref[f] = 0;
+        free_pages(f, 0);
+    }
+}
+
+// Copy a whole frame (6561 words).
+fn copy_frame(dst: int, src: int) {
+    var d: *int = (frame_start(dst) + 1) as *int;
+    var s: *int = (frame_start(src) + 1) as *int;
+    var i: int = 0;
+    while (i < 6561) { d[i] = s[i]; i += 1; }
+}
+
 // Allocate and free a mix of blocks; everything must come back.
 fn mm_self_test() -> int {
     var before: int = free_frames;
