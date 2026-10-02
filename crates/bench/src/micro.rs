@@ -11,6 +11,8 @@ const CASES: &[(&str, &str)] = &[
     ("cmp", "cmp r1, r2"),
     ("li", "li r3, 100"),
     ("mul", "mul r1, r2, r2"),
+    ("div k", "div r1, r3, 19683"),
+    ("div chain", "div r1, r1, 7"),
     ("ldw", "ldw r1, [sp+3]"),
     ("stw", "stw r1, [sp+3]"),
     ("ldt", "ldt r1, [sp+1]"),
