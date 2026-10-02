@@ -102,6 +102,8 @@ pub struct Cpu {
 #[derive(Clone, Copy)]
 struct Dec {
     op: Op,
+    /// Major opcode (for `Generic`).
+    a: i16,
     x: i8,
     y: i8,
     z: i8,
@@ -139,7 +141,7 @@ enum Op {
     Generic,
 }
 
-const DEC_EMPTY: Dec = Dec { op: Op::Generic, x: 0, y: 0, z: 0, len: 0, f: 0, imm: 0, imm2: 0 };
+const DEC_EMPTY: Dec = Dec { op: Op::Generic, a: 0, x: 0, y: 0, z: 0, len: 0, f: 0, imm: 0, imm2: 0 };
 const WORDS_PER_FRAME: usize = (PAGE / 3) as usize;
 
 #[derive(Clone, Copy)]
@@ -197,23 +199,22 @@ fn ww(v: i64) -> Word {
 }
 
 /// Split a product of two words into (high word, low word), without the
-/// slow 128-bit division: the quotient estimate from f64 is off by at most
-/// one, then exact integer steps fix it.
+/// slow 128-bit arithmetic: the quotient estimate from f64 is off by at most
+/// one; the remainder is small, so wrapping 64-bit arithmetic gets it
+/// exactly, and the high half always fits in a word (|hi| < W_MAX / 2 + 1).
 #[inline(always)]
-fn split_product27(p: i128) -> (i64, i64) {
-    let q = (p as f64 / W_MOD as f64).round() as i128;
-    let mut hi = q;
-    let mut lo = p - q * W_MOD as i128;
-    while lo > W_MAX as i128 {
-        lo -= W_MOD as i128;
+fn split_product27(x: i64, y: i64) -> (i64, i64) {
+    let mut hi = (x as f64 * y as f64 / W_MOD as f64).round() as i64;
+    let mut lo = x.wrapping_mul(y).wrapping_sub(hi.wrapping_mul(W_MOD));
+    while lo > W_MAX {
+        lo -= W_MOD;
         hi += 1;
     }
-    while lo < -(W_MAX as i128) {
-        lo += W_MOD as i128;
+    while lo < -W_MAX {
+        lo += W_MOD;
         hi -= 1;
     }
-    // hi itself wraps to a word (it always fits; MULH keeps the low 27 trits)
-    (wrap_trits(hi, 27) as i64, lo as i64)
+    (hi, lo)
 }
 
 impl Default for Cpu {
@@ -622,7 +623,8 @@ impl Cpu {
         let len_trit = bal_split(a, 6561).0;
         let len = if len_trit == 1 { 6 } else { 3 };
         let imm = if len_trit == 1 { w2 } else { 0 };
-        let mut d = Dec { op: Op::Generic, x: x as i8, y: y as i8, z: z as i8, len, f: b as i16, imm: 0, imm2: 0 };
+        // `imm` starts as the raw second word, as `exec_major` wants it
+        let mut d = Dec { op: Op::Generic, a: a as i16, x: x as i8, y: y as i8, z: z as i8, len, f: b as i16, imm, imm2: 0 };
         if len_trit == -1 {
             return d; // the FPU
         }
@@ -840,8 +842,11 @@ impl Cpu {
                 _ => {}
             },
             Op::Generic => {
-                let _ = z;
-                return self.execute(m, io);
+                let a = d.a as i64;
+                if bal_split(a, 6561).0 == -1 {
+                    return self.exec_fpu(m, a, d.f as i64, x, y, z, pc);
+                }
+                return self.exec_major(m, io, pc, a, d.f as i64, x, y, z, d.imm, next);
             }
         }
         self.pc = ww(next);
@@ -859,8 +864,6 @@ impl Cpu {
         let (a, b) = bal_split(ab, 19_683);
         let (xy, z) = bal_split(opnd, 27);
         let (x, y) = bal_split(xy, 27);
-        let imm6 = y * 27 + z;
-        let ill = || Fault::new(vector::ILLEGAL);
 
         // A[1], the length trit, is the leading trit of A.
         let len_trit = bal_split(a, 6561).0;
@@ -869,6 +872,27 @@ impl Cpu {
             1 => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
             _ => return self.exec_fpu(m, a, b, x, y, z, pc),
         };
+        self.exec_major(m, io, pc, a, b, x, y, z, imm, next)
+    }
+
+    /// Execute a decoded non-FPU instruction: major `a`, function `b`,
+    /// operands, the second word `imm` (0 for 1-word forms), `next` = its end.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_major(
+        &mut self,
+        m: &mut Memory,
+        io: &mut dyn Io,
+        pc: i64,
+        a: i64,
+        b: i64,
+        x: i64,
+        y: i64,
+        z: i64,
+        imm: i64,
+        next: i64,
+    ) -> Result<(), Fault> {
+        let imm6 = y * 27 + z;
+        let ill = || Fault::new(vector::ILLEGAL);
         let next_w = w(next as i128);
         let rel = |off: i64| w(pc as i128 + 3 * off as i128);
 
@@ -1236,11 +1260,11 @@ impl Cpu {
             alu::ADC => self.arith(x + y + self.c()),
             alu::SBC => self.arith(x - y - self.c()),
             alu::MUL => {
-                let (hi, lo) = split_product27(x as i128 * y as i128);
+                let (hi, lo) = split_product27(x, y);
                 self.set_c(hi.signum());
                 Word::new(lo).expect("wrapped")
             }
-            alu::MULH => Word::new(split_product27(x as i128 * y as i128).0).expect("wrapped"),
+            alu::MULH => Word::new(split_product27(x, y).0).expect("wrapped"),
             alu::DIV | alu::MOD => {
                 if y == 0 {
                     return Err(div0());
@@ -1349,7 +1373,7 @@ mod tests {
         for (k, &a) in vals.iter().enumerate() {
             let b = vals[(k * 7919 + 13) % vals.len()];
             for (x, y) in [(a, b), (a, a), (a, -b), (W_MAX, b)] {
-                let (hi, lo) = split_product27(x as i128 * y as i128);
+                let (hi, lo) = split_product27(x, y);
                 let (ehi, elo) = ternary::split_product::<27>(x as i128 * y as i128);
                 assert_eq!((hi, lo), (ehi.value(), elo.value()), "{x} * {y}");
             }
