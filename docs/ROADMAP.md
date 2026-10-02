@@ -14,11 +14,11 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
 2. **ISA spec** ✅ v0.4, with v0.5 (FPU) in draft
 3. **Emulator core** (`setun-core`, Rust) ✅
    - CPU: decode, ALU, branches, traps, rings, `MODE`/control registers
-   - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages (TLB cache: later, as an optimization)
+   - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages
    - devices: SYSCTL, TPIC, timer, RTC, keyboard, mouse, serial, disk (T1B2 image, DMA), display (text + 3^9-colour framebuffer)
 4. **Front ends** ✅: native (`setun`: minifb window, stdio serial, headless PNG screenshots) and **WASM** (`web/`: canvas, keyboard/mouse, serial console, front-panel lamps; boots Trinux from a disk built into the module)
 5. **Assembler and disassembler** ✅: text syntax with form selection and branch relaxation, round-trip-safe disassembler, `setun-asm` CLI
-6. **Compiler** for **Trine** ✅ ([`LANGUAGE.md`](LANGUAGE.md)): `trine build/run`, stdlib (ports, rt, console, keymap, real, math); `examples/mandel.tri` renders the Mandelbrot set
+6. **Compiler** for **Trine** ✅ ([`LANGUAGE.md`](LANGUAGE.md)): `trine build/run`, stdlib (ports, rt, console, keymap, real, math), an optimizer (§16); `examples/mandel.tri` renders the Mandelbrot set
 7. **BIOS** ✅ ([`bios/bios.tri`](../bios/bios.tri), [`BOOT.md`](BOOT.md)): machine check, RTC date, disk boot with the signature `0zB007AB13`, monitor shell
 8. **Kernel: Trinux**, modelled on Linux with POSIX interfaces ([`KERNEL.md`](KERNEL.md)) ✅
    - K1 boot, paging, triddy allocator, timer; K2 preemptive user processes; K3 COW fork, execve (TEF), wait4, page faults, initramfs
@@ -28,8 +28,28 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
    - users and groups: login, su, passwd, useradd/userdel, permission checks, modular password hashing
 9. **Floating-point unit** ✅ (ISA §14): real27/real81 balanced-ternary floating point with ±∞, NaN and gradual underflow, 27 registers; emulator (`setun-real`), assembler, Trine's `real` type, lazy FPU switching in Trinux, `math.tri`, and `/bin/calc`
 
+10. **Performance** ([`PERFORMANCE.md`](PERFORMANCE.md)): every step keeps the machine state bit-identical to the reference interpreter (golden state hashes, a fast-vs-reference fuzz test, directed tests each shown to catch its bug)
+    - **Emulator** ✅: batched execution up to the next device event, an invisible software TLB, a basic-block interpreter with chaining, RAM stored as words, a Cranelift JIT for hot regions (compiled on background threads, registers in host registers), and fixed-width FPU arithmetic
+    - **Trine optimizer** ✅: register locals, direct operands, a liveness-driven peephole pass; optimized and plain builds must give the same results
+    - Result so far: the Mandelbrot benchmark went from 312× slower than the same code compiled natively to about 19×; the Trinux shell workload from 77 s to 0.5 s
+
+## Next: performance
+
+In rough order of payoff for effort (estimates from the benchmarks):
+
+| # | Work | Where | Expected |
+|---|---|---|---|
+| P1 | Word-at-a-time `memcpy`, `memset`, `strlen`, `strcmp` in the runtime (today one tryte per step) | Trine runtime | 2–3× on string-heavy code (int benchmark, shell tools, kernel copies) |
+| P2 | Division by a constant as a multiplication by its reciprocal (fixed-point code divides by 19683 all the time) | JIT | about 1.5× on mandel; md5sum too |
+| P3 | `char` and tryte locals in registers (with a wrap on narrowing) | Trine | 10–20% on string and parser code |
+| P4 | Frameless leaf functions using the caller-saved registers, which also lifts the nine-register limit | Trine | 5–15% |
+| P5 | Staying native across calls and returns (compile call targets, predict returns) | JIT | 1.5–2× on call-heavy code (kernel, shell) |
+| P6 | Inline tryte loads and stores, and FPU instructions, in compiled code | JIT | strings and floating point |
+| P7 | Branch inversion, constants on the left of `*`/`+`, inlining tiny functions | Trine | 5–10% |
+| P8 | Lower compile latency: small first-tier regions, hot ones recompiled bigger | JIT | short workloads (boot, one-shot commands) |
+| P9 | A WebAssembly JIT for the browser build, which only interprets | Web | several times in the artifact |
+
 ## Later
 
 - A Setun-70 emulator as a Trinux user program
-- Emulator speed ([`PERFORMANCE.md`](PERFORMANCE.md)): a block interpreter, a Cranelift JIT and fixed-width FPU arithmetic (11–69× faster, bit-identical)
 - More of POSIX where it is cheap: `SIGTTOU`/`TOSTOP`, `select`, more `/proc`
