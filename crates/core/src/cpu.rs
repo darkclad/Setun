@@ -81,7 +81,48 @@ pub struct Cpu {
     /// entry changes (see `Memory::pt_dirty`), so every access behaves
     /// exactly like a full walk.
     tlb: Box<[TlbEntry]>,
+    /// Decoded instructions per code slot (see `Memory::code_slot`), one
+    /// per word; dropped when the frame is written.
+    icache: Vec<Option<Box<[Dec]>>>,
 }
+
+/// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
+#[derive(Clone, Copy)]
+struct Dec {
+    op: Op,
+    x: i8,
+    y: i8,
+    z: i8,
+    /// 3 or 6 trytes; 0 = slot not decoded yet.
+    len: u8,
+    /// ALU function, or the branch condition's flag (1 = S, 2 = C).
+    f: i16,
+    /// Immediate, offset or second operand, depending on `op`.
+    imm: i64,
+    /// BR3's positive offset; a branch's taken-mask (bit k: flag = k - 1).
+    imm2: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    AluR,
+    AluK,
+    Ldt,
+    Ldw,
+    Stt,
+    Stw,
+    Swap,
+    Jalr,
+    Li,
+    Lea,
+    Jal,
+    Br,
+    Br3,
+    Generic,
+}
+
+const DEC_EMPTY: Dec = Dec { op: Op::Generic, x: 0, y: 0, z: 0, len: 0, f: 0, imm: 0, imm2: 0 };
+const WORDS_PER_FRAME: usize = (PAGE / 3) as usize;
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -135,6 +176,7 @@ impl Cpu {
             batch: false,
             stop_batch: false,
             tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
+            icache: Vec::new(),
         };
         c.reset();
         c
@@ -437,7 +479,7 @@ impl Cpu {
             }
             self.inst_pc = self.pc;
             self.cycle = self.cycle.wrapping_add(1);
-            match self.execute(m, io) {
+            match self.execute_fast(m, io) {
                 Ok(()) => {
                     n += 1;
                     if self.stop_batch {
@@ -458,6 +500,192 @@ impl Cpu {
         }
         self.batch = false;
         n
+    }
+
+    /// Decode the instruction with words `w1`, `w2` (the second only matters
+    /// for 2-word forms).
+    fn decode(w1: i64, w2: i64) -> Dec {
+        let (ab, opnd) = bal_split(w1, 19_683);
+        let (a, b) = bal_split(ab, 19_683);
+        let (xy, z) = bal_split(opnd, 27);
+        let (x, y) = bal_split(xy, 27);
+        let imm6 = y * 27 + z;
+        let len_trit = bal_split(a, 6561).0;
+        let len = if len_trit == 1 { 6 } else { 3 };
+        let imm = if len_trit == 1 { w2 } else { 0 };
+        let mut d = Dec { op: Op::Generic, x: x as i8, y: y as i8, z: z as i8, len, f: b as i16, imm: 0, imm2: 0 };
+        if len_trit == -1 {
+            return d; // the FPU
+        }
+        match a {
+            op::ALU => d.op = Op::AluR,
+            op::ALUQ => (d.op, d.imm) = (Op::AluK, z),
+            op::ALUI => (d.op, d.imm) = (Op::AluK, imm),
+            op::MEM | op::MEMD => {
+                let size = if matches!(b, mem::LDT | mem::STT) { 1 } else { 3 };
+                d.imm = if a == op::MEM { size * z } else { imm };
+                d.op = match b {
+                    mem::LDT => Op::Ldt,
+                    mem::LDW => Op::Ldw,
+                    mem::STT => Op::Stt,
+                    mem::STW => Op::Stw,
+                    mem::SWAP => Op::Swap,
+                    _ => Op::Generic,
+                };
+            }
+            op::JALR => (d.op, d.imm) = (Op::Jalr, 3 * z),
+            op::LIQ => (d.op, d.imm) = (Op::Li, imm6),
+            op::LI => (d.op, d.imm) = (Op::Li, imm),
+            op::LEA => (d.op, d.imm) = (Op::Lea, imm),
+            op::JAL => (d.op, d.imm) = (Op::Jal, imm),
+            op::BRQ | op::BR => {
+                let off = if a == op::BRQ { imm6 } else { imm };
+                let t = Word::new(x).unwrap().resize::<3>().trits();
+                let (pos, neg) = (t.contains(&Trit::P), t.contains(&Trit::N));
+                if x == cond::NEVER || !(pos && neg) {
+                    let want = if pos { Trit::P } else { Trit::N };
+                    let mut mask = 0;
+                    if x != cond::NEVER {
+                        for (k, &tk) in t.iter().enumerate() {
+                            if tk == want {
+                                mask |= 1 << k;
+                            }
+                        }
+                    }
+                    d.op = Op::Br;
+                    d.f = if pos { 1 } else { 2 };
+                    d.imm = off;
+                    d.imm2 = mask;
+                }
+            }
+            op::BR3 => {
+                let w = Word::new(imm).unwrap();
+                d.op = Op::Br3;
+                d.imm = w.field(1..=9);
+                d.imm2 = w.field(10..=18) as i32;
+            }
+            _ => {}
+        }
+        d
+    }
+
+    /// Drop decoded instructions of frames that have been written.
+    #[cold]
+    fn drop_written_code(&mut self, m: &mut Memory) {
+        for s in m.code_dirty.drain(..) {
+            if let Some(c) = self.icache.get_mut(s) {
+                *c = None;
+            }
+        }
+    }
+
+    /// [`Cpu::execute`] through the decoded-instruction cache.
+    #[inline]
+    fn execute_fast(&mut self, m: &mut Memory, io: &mut dyn Io) -> Result<(), Fault> {
+        if !m.code_dirty.is_empty() {
+            self.drop_written_code(m);
+        }
+        let pc = self.pc.value();
+        if pc.rem_euclid(3) != 0 {
+            return self.execute(m, io);
+        }
+        let pa = self.xlate(m, pc, Access::Fetch)?;
+        let frame = (pa + HALF_PAGE).div_euclid(PAGE);
+        let Some(slot) = m.code_slot(frame) else { return self.execute(m, io) };
+        let i = ((pa - frame * PAGE + HALF_PAGE - 1) / 3) as usize;
+        if self.icache.len() != m.code_slots() {
+            self.icache = (0..m.code_slots()).map(|_| None).collect();
+        }
+        let d = match &self.icache[slot] {
+            Some(c) if c[i].len != 0 => c[i],
+            _ => {
+                let w1 = m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, pc, Access::Fetch))?.value();
+                let last = i + 1 == WORDS_PER_FRAME;
+                let two = bal_split(bal_split(bal_split(w1, 19_683).0, 19_683).0, 6561).0 == 1;
+                if two && last {
+                    return self.execute(m, io); // the second word is in the next frame
+                }
+                let w2 = if two { m.read_word(pa + 3).map(|w| w.value()).unwrap_or(0) } else { 0 };
+                let d = Self::decode(w1, w2);
+                let c = self.icache[slot].get_or_insert_with(|| vec![DEC_EMPTY; WORDS_PER_FRAME].into_boxed_slice());
+                c[i] = d;
+                m.watch_code(slot);
+                d
+            }
+        };
+        let next = pc + d.len as i64;
+        let (x, y, z) = (d.x as i64, d.y as i64, d.z as i64);
+        match d.op {
+            Op::AluR => {
+                let (va, vb) = (self.reg(y), self.reg(z));
+                self.alu_to(d.f as i64, x, va, vb)?;
+            }
+            Op::AluK => {
+                let va = self.reg(y);
+                self.alu_to(d.f as i64, x, va, Word::new(d.imm).unwrap())?;
+            }
+            Op::Ldt => {
+                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let t = self.load_tryte(m, va)?;
+                self.set_reg(x, t.resize());
+            }
+            Op::Ldw => {
+                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let v = self.load_word_as(m, va, Access::Read)?;
+                self.set_reg(x, v);
+            }
+            Op::Stt => {
+                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                self.store_tryte(m, va, self.reg(x).resize())?;
+            }
+            Op::Stw => {
+                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                self.store_word(m, va, self.reg(x))?;
+            }
+            Op::Swap => {
+                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let old = self.load_word_as(m, va, Access::Read)?;
+                self.store_word(m, va, self.reg(x))?;
+                self.set_reg(x, old);
+            }
+            Op::Jalr => {
+                let target = w(self.reg(y).value() as i128 + d.imm as i128);
+                self.set_reg(x, w(next as i128));
+                self.pc = target;
+                return Ok(());
+            }
+            Op::Li => self.set_reg(x, Word::new(d.imm).unwrap()),
+            Op::Lea => self.set_reg(x, w(pc as i128 + d.imm as i128)),
+            Op::Jal => {
+                self.set_reg(x, w(next as i128));
+                self.pc = w(pc as i128 + 3 * d.imm as i128);
+                return Ok(());
+            }
+            Op::Br => {
+                let flag = if d.f == 1 { self.s() } else { self.c() };
+                if d.imm2 >> (flag + 1) & 1 != 0 {
+                    self.pc = w(pc as i128 + 3 * d.imm as i128);
+                    return Ok(());
+                }
+            }
+            Op::Br3 => match self.s() {
+                -1 => {
+                    self.pc = w(pc as i128 + 3 * d.imm as i128);
+                    return Ok(());
+                }
+                1 => {
+                    self.pc = w(pc as i128 + 3 * d.imm2 as i128);
+                    return Ok(());
+                }
+                _ => {}
+            },
+            Op::Generic => {
+                let _ = z;
+                return self.execute(m, io);
+            }
+        }
+        self.pc = w(next as i128);
+        Ok(())
     }
 
     /// Fetch, decode and execute the instruction at `PC`. On success `PC`
