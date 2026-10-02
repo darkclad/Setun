@@ -103,31 +103,30 @@ instruction 42, FADD 300, FDIV 485, FSQRT 925.
 
 ## Numbers
 
-`cargo run --release -p setun-bench` on a Ryzen 9 5950X core (MIPS = guest
-steps per second; the compiler thread runs alongside):
+`cargo run --release -p setun-bench` on a Ryzen 9 5950X core. Since the Trine
+optimizer the guest runs far fewer instructions, so the fair measure is the
+time for the same work:
 
-| Workload | Start | Interpreter | With the JIT | |
+| Workload | Instructions at start | Now | Time at start | Now |
 |---|---:|---:|---:|---:|
-| int (sieve, sort, strings) | 21.8 | 233 | 245 | 11× |
-| mandel (fixed point, framebuffer) | 19.4 | 250 | 716 | 37× |
-| boot (Trinux to the shell) | 13.1 | 222 | 226 | 17× |
-| shell (md5sum, sort, calc, ls with paging) | 6.3 | 223 | 365–432 | 58–69× |
-| idle (at the prompt) | 20.6 | 3900 | 5500 | 270× |
-| fpu (math.tri) | 7.8 | 39 | 38 | 4.9× |
+| int (sieve, sort, strings) | 49.0M | 30.0M | 2.25 s | 0.09 s |
+| mandel (fixed point, framebuffer) | 312.6M | 96.5M | 16.1 s | 0.18 s |
+| boot (Trinux to the shell) | 11.9M | 9.6M | 1.07 s | 0.07 s |
+| shell (md5sum, sort, calc, ls with paging) | 486M | 162M | 76.9 s | 0.53 s |
+| fpu (math.tri) | 3.38M | 2.66M | 0.43 s | 0.09 s |
 
-int and boot are short runs: most of their time passes before compiled
-code arrives. The browser build (WebAssembly, no JIT) boots Trinux at about
-125 MIPS, up from 11.
+The JIT compiles on four background threads (short workloads otherwise wait
+for code); `SETUN_JIT_OFF=1` measures the interpreter alone. The browser
+build (WebAssembly, no JIT) boots Trinux at about 125 MIPS, up from 11.
 
-Against native code on the same core, the same Mandelbrot algorithm now runs
-about 45× slower on the Setun (312× at the start). What is left is mostly
-Trine's code: about 7× more guest instructions than native code needs.
+Against native code on the same core, the same Mandelbrot algorithm runs
+about 19× slower on the Setun (312× at the start).
 
 ## Next
 
-- **Trine optimizer:** register allocation would remove most of the stack
-  traffic (40–45% of all instructions are loads and stores) — the largest
-  remaining factor.
+- **Trine:** more locals in registers (tryte and `char` locals, more than
+  nine), word-at-a-time `memcpy`/`strlen` in the runtime, and branch
+  inversion (`if (c) break;` still costs a branch around a branch).
 - **JIT coverage:** tryte loads and stores, FPU instructions and JALR (call
   returns) still leave or call out; inlining them and following returns
   would keep more code native.

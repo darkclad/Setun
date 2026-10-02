@@ -17,7 +17,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 - **Enough for an OS:** pointers, structs, arrays, function pointers, interrupt handlers, port I/O, control registers and inline assembly.
 - **Honest about ternary:** there are no unsigned types, comparisons can be three-way, operators are tritwise, and shifts count trits.
 - **Simple to compile:** one compilation unit, no preprocessor, and a declaration syntax that parses without C's declarator puzzles.
-- **Predictable:** every memory access in the source happens in the output. The v1 compiler does no optimisation that could reorder or drop them, so there is no need for `volatile`.
+- **Predictable:** every access to memory that has an address (globals, anything through a pointer, locals whose address is taken) happens in the output as written, in order, so there is no need for `volatile`. The optimizer (§16) only keeps other locals in registers and tidies register moves.
 
 **Not in v1:** 81-trit `long`, generics, a preprocessor or macros, variadic functions, and passing or returning structs by value.
 
@@ -244,7 +244,7 @@ import "console.tri";
 | Real arguments | `f1`–`f9`, in order among the reals (the integer arguments still take `r1`–`r6` in order among themselves); a function with reals takes at most 9 reals and 6 others |
 | FPU | `f1`–`f13`, `f−1`–`f−13` are caller-saved |
 | Caller-saved | `r1`–`r10`, `r-10`–`r-13` |
-| Callee-saved | `r-1`–`r-9`, `r11` (`fp`), `r13` (`sp`) |
+| Callee-saved | `r-1`–`r-9`, `r11` (`fp`), `r13` (`sp`). Compiled code keeps locals in `r-1`–`r-9`, so assembly called from Trine must preserve them (the kernel's `switch_to` saves them with the stack). |
 | Return address | `r12` (`lr`), set by `CALL`/`JAL` |
 | Stack | grows toward negative addresses, always word-aligned |
 | Frame | `fp` points at the saved `fp`; locals sit below it |
@@ -322,7 +322,7 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 5. **The `sign` statement** as the language's 3-way branch.
 6. **C division semantics** for `/` and `%`, with rounding division available through builtins.
 7. **One compilation unit** with textual `import`, and `_` for private names.
-8. **No optimiser in v1**, so every memory access happens as written and there is no `volatile`.
+8. **No `volatile`:** every access to addressable memory happens as written; the optimizer (§16) never removes or reorders one.
 9. **What v1 leaves out:** floats, `long`, struct values, varargs, generics and macros.
 
 ## 15. Changes from v0.1
@@ -333,6 +333,16 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 - **Globals live in RAM** and are filled in by generated start-up code (§9).
 - **`trit(x, i)` parses as the builtin** even though `trit` is a type keyword.
 - **Compound assignment narrows implicitly:** `t += 1` on a `tryte` wraps, while `t = t + 1` still needs `as tryte`.
+
+## 16. Optimization
+
+`trine` optimizes by default (`Options::optimize`; off gives the plain code, for comparisons):
+
+- **Register locals:** word scalars (`int`, pointers) declared in a function, and its parameters, live in the callee-saved registers `r-1`–`r-9` when their address is never taken (`&x` anywhere in the function keeps every `x` in memory). Registers are handed out at the declaration and freed at the end of the block; a function saves the ones it uses in its prologue. Functions with inline assembly keep all locals in memory.
+- **Direct operands:** arithmetic and comparisons take register locals, constants and simple loads as operands (`mul r1, r-6, r-6`) instead of pushing and popping intermediates.
+- **Peephole:** a pass over each function's assembly, driven by register liveness (the S/C flags count as a register), forwards copies into their uses, computes results straight into their final register and removes dead side-effect-free instructions. Loads, stores, calls and anything it does not recognize are left alone.
+
+The effect on the benchmarks (`crates/bench`): the Mandelbrot inner loop went from about 70 instructions to 22; across whole programs 39–69% fewer instructions run (`docs/PERFORMANCE.md`). `crates/trine/tests/optimizer.rs` compiles programs both ways and requires the same results.
 
 ## Appendix: grammar (EBNF)
 

@@ -310,7 +310,7 @@ BIOS → disk 0 sector 0 (kernel/boot/loader.tri)
 - System calls read `r1`–`r6` from the frame and write the result back into the frame's `r1`.
 
 **Context switch:**
-- `switch_to(prev, next)` pushes `lr` and `fp`, saves `sp` in `prev`'s first field, loads `next`'s, pops and returns.
+- `switch_to(prev, next)` pushes `lr`, `fp` and the callee-saved `r-1`–`r-9` (compiled code keeps locals there across `schedule()`), saves `sp` in `prev`'s first field, loads `next`'s, restores and returns; `prepare_stack` builds the same frame for a new task.
 - A new task's kernel stack is pre-built (a frame with `EPC` = entry, `EMODE` = ring −1 + IE + PG, `KSP` = user stack, under a fake switch frame whose `lr` is `trap_return`). So its first switch "returns" into user mode.
 - Kernel code runs with interrupts off (as in early single-CPU Linux). The idle task, task 0 (the `start_kernel` loop), schedules with interrupts off, then sleeps in `hlt` with them on.
 
