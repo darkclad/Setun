@@ -514,13 +514,14 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
   | handler | any caught signal | a signal frame is pushed (below) |
 
   `SIGKILL` and `SIGSTOP` can be neither caught nor blocked.
-- **Signal frame:** 30 words, pushed below an 81-tryte red zone under the user `sp`:
+- **Signal frame:** 113 words, pushed below an 81-tryte red zone under the user `sp`:
   - the whole 28-word trap frame;
   - the old blocked mask;
-  - a magic word.
+  - a magic word;
+  - a flag and the 82-word FPU state (§23), when the process has used the FPU.
 
   The handler starts with `r1` = the signal number and `lr` = `sa_restorer` (tlibc's `__restore_rt`: `sys 139`). While it runs, the signal itself and `sa_mask` are blocked.
-- **`rt_sigreturn`** restores the frame. It checks the magic word, and that the saved `MODE` trits 23–27 (IOPL, PG, IE, ring) match user mode, so a forged frame cannot raise privileges.
+- **`rt_sigreturn`** restores the frame. It checks the magic word, and that the saved `MODE` trits 23–27 (IOPL, PG, IE, ring) match user mode, so a forged frame cannot raise privileges. `FE` (trit 24) is left out of the check: the kernel sets it on every return.
 - **CPU faults** go to a handler when one is installed and the signal is not blocked; otherwise the process is killed with the message as before. A fault inside a system call always kills, since retrying would fault again.
 - **System-call restart:**
   - Interrupted sleeps return `ERESTARTSYS` (pipes, tty, `wait4`), `ERESTARTNOHAND` (`sigsuspend`) or `ERESTART_RESTARTBLOCK` (`nanosleep`).
@@ -930,3 +931,16 @@ The server keeps every window's pixels (server-side rendering), so clients never
 - **useradd** `[-u uid] [-G groups] [-d home] [-s shell] [-c comment] name` gives the new user a private group (same number, from 1000 up), a home directory and a locked password. **userdel** `[-r] name` removes the user, its group and its memberships. Both are root only.
 - **id, whoami, groups, chown, chgrp** are applets of `misc`. **ls -l** shows owner and group names, and `s`/`t` for the set-ID and sticky bits.
 - **Tests:** they log in as root at the first prompt. `tests/users.rs` covers accounts, set-ID `passwd`, `su`, login failures and every permission refusal.
+
+## 23. The Setun-387 FPU
+
+[`kernel/fpu.tri`](../kernel/fpu.tri) switches the FPU registers (ISA §14) **lazily**, as Linux did on the 386 with `CR0.TS`:
+
+- **One owner.** The hardware holds one task's 27 registers and FSR at a time: `fpu_owner`'s. Every other task's state is in its `Task.fpu`: 82 words, the FSR and then `f−13`…`f13` as real81.
+- **Trapping the first use.** `trap_return` calls `fpu_fixup`, which sets `MODE.FE` in the frame of every return to user mode: +1 for the owner, 0 for everyone else. A task that is not the owner traps (vector −12) on its first FPU instruction. The handler saves the owner's registers, loads the current task's and makes it the owner, then retries the instruction. A task that never touches the FPU never pays for it, and switching between two FPU users costs one trap per time slice.
+- **A fresh state** (a new program, or a signal handler): all registers zero and the reset FSR, with every exception masked. `Task.fpu_used` stays 0 until the first FPU instruction, so the kernel neither saves nor loads anything for such tasks.
+- **fork** copies the parent's state (it is flushed first if it is live). **execve** and **exit** drop it.
+- **Signals:** the interrupted state goes into the signal frame and the handler starts fresh; `rt_sigreturn` restores the state from the frame and discards the handler's.
+- **Exceptions:** an unmasked FPU exception (vector −11) is `SIGFPE`, like an integer divide by zero. Vector −12 in the kernel is a panic, since the kernel itself only touches the FPU in `fpu_save` and `fpu_load` (with its own `MODE.FE` turned on first).
+- **`/proc/<pid>/status`** has an `FPU:` line: `unused`, `live` (the owner) or `saved`.
+- **Tests:** `/bin/fputest` (`tests/boot.rs`) keeps values in `f12` and `f−12`, which compiled Trine code never uses, so only the kernel can preserve them. It checks two processes trading the FPU, fork, execve, a signal handler, and two refusals: unmasked divide by zero and an unmasked invalid `sqrt` kill only the offending child with `SIGFPE`. With switching turned off, five of its checks fail.

@@ -5,6 +5,7 @@ import "printk.tri";
 import "mm.tri";
 import "sched.tri";
 import "vm.tri";
+import "fpu.tri";
 import "drivers/tty.tri";
 import "drivers/input.tri";
 
@@ -68,6 +69,8 @@ fn _arch_asm() {
         "        mov   r1, sp"
         "        call  trap_handler"
         "trap_return:"
+        "        mov   r1, sp"
+        "        call  fpu_fixup"
         "        ldw   r1, [sp+81]"
         "        mtc   ksp, r1"
         "        ldw   r1, [sp+78]"
@@ -135,6 +138,8 @@ fn fault_name(v: int) -> *char {
         case -8: return "single step";
         case -9: return "double fault";
         case -10: return "bus error";
+        case -11: return "floating-point exception";
+        case -12: return "FPU not available";
     }
     return "unknown trap";
 }
@@ -181,6 +186,11 @@ fn trap_handler(f: *int) {
         return;
     }
     var from_user: int = trit(f[F_EMODE], 27) == -1;
+    if (v == -12 && from_user) {
+        fpu_unavailable();
+        do_signal(f);
+        return;
+    }
     var addr: int = mfc(FADDR);
     var access: int = ext(cause, 22, 1);
     // User faults, and kernel faults on user memory (a system call touching

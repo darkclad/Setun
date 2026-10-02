@@ -343,3 +343,28 @@ fn k5_job_control() {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
 }
+
+#[test]
+fn fpu_lazy_switching() {
+    let out = shell(&["fputest", "echo st=$?", "grep FPU /proc/1/status", "exit"], 400_000_000);
+    for check in [
+        "first use",
+        "inexact sets IX",
+        "registers survive switching (parent)",
+        "registers survive switching (child)",
+        "fork copies the FPU state",
+        "execve resets the FPU",
+        "handler starts with a clean FPU",
+        "interrupted FPU state restored",
+        "unmasked divide by zero is SIGFPE",
+        "masked divide by zero is infinity",
+        "unmasked invalid sqrt is SIGFPE",
+        "parent unaffected",
+    ] {
+        assert!(out.contains(&format!("fputest: {check} ok\n")), "missing {check:?} in:\n{out}");
+    }
+    assert!(out.contains("fputest: pi = 3.14159265359\nfputest: done\n"), "{out}");
+    assert!(out.contains("st=0\n"), "{out}");
+    assert!(out.contains("FPU:\tunused\n"), "init never touched the FPU:\n{out}");
+    assert!(!out.contains("FAILED") && !out.contains("Kernel panic"), "{out}");
+}

@@ -56,7 +56,9 @@ const SYS_INSN_TRYTES: int = 3;
 const EINTR: int = 4;
 const ESRCH: int = 3;
 
-const SIGFRAME_WORDS: int = 30;       // trap frame (28), old mask, magic
+const SIGFRAME_WORDS: int = 113;      // trap frame (28), old mask, magic, FPU flag + state (82)
+const SF_FPU: int = 30;               // 1 if the FPU state follows
+
 const SIGFRAME_MAGIC: int = 0zB007AB17;
 const RED_ZONE: int = 81;             // trytes left untouched below the user sp
 
@@ -307,6 +309,12 @@ fn setup_frame(f: *int, sig: int, t: *Task) -> int {
     while (i < FRAME_WORDS) { w[i] = f[i]; i += 1; }
     w[FRAME_WORDS] = t.has_saved_mask ? t.saved_mask : t.sig_blocked;
     w[FRAME_WORDS + 1] = SIGFRAME_MAGIC;
+    // The interrupted FPU state goes into the frame; the handler starts fresh.
+    fpu_sync(t);
+    w[SF_FPU] = t.fpu_used;
+    i = 0;
+    while (i < FPU_WORDS) { w[SF_FPU + 1 + i] = t.fpu_used ? t.fpu[i] : 0; i += 1; }
+    fpu_drop(t);
     t.has_saved_mask = 0;
     // Block the signal itself and sa_mask while the handler runs.
     var m: int = t.sig_blocked;
@@ -328,12 +336,19 @@ fn sys_rt_sigreturn(f: *int) -> int {
     var sp: int = f[F_KSP];
     if (!user_range_ok(sp - 1, 3 * SIGFRAME_WORDS)) { kill_current(SIGSEGV, "bad signal frame", f[F_EPC], sp); }
     var w: *int = sp as *int;
-    if (w[FRAME_WORDS + 1] != SIGFRAME_MAGIC || ext(w[F_EMODE], 23, 5) != ext(f[F_EMODE], 23, 5)) {
+    // RING, IE, PG and IOPL must match (FE is the kernel's business)
+    if (w[FRAME_WORDS + 1] != SIGFRAME_MAGIC || ext(ins(w[F_EMODE], 0, 24, 1), 23, 5) != ext(ins(f[F_EMODE], 0, 24, 1), 23, 5)) {
         kill_current(SIGSEGV, "bad signal frame", f[F_EPC], sp);
     }
     var i: int = 0;
     while (i < FRAME_WORDS) { f[i] = w[i]; i += 1; }
     t.sig_blocked = sanitize_mask(w[FRAME_WORDS]);
+    fpu_drop(t);                                    // the handler's registers are discarded
+    if (w[SF_FPU] != 0) {
+        i = 0;
+        while (i < FPU_WORDS) { t.fpu[i] = w[SF_FPU + 1 + i]; i += 1; }
+        t.fpu_used = 1;
+    }
     return f[F_R1];                                 // the interrupted r1 goes back unchanged
 }
 

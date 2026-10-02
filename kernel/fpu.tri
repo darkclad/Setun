@@ -1,0 +1,157 @@
+// fpu: lazy switching of the Setun-387 registers (ISA §14, docs/KERNEL.md).
+//
+// Only one task's FPU state lives in the hardware at a time: fpu_owner's.
+// Every return to user mode sets MODE.FE in the frame to 1 for the owner and
+// 0 for everyone else, so a task that is not the owner traps (vector -12) on
+// its first FPU instruction. The trap saves the owner's registers into its
+// Task, loads the current task's, makes it the owner and retries the
+// instruction. Tasks that never touch the FPU never pay for it.
+//
+// A save area is 82 words: [0] = FSR, then f-13..f13 as real81 (3 words
+// each) from word 1. A task that has not used the FPU yet (fpu_used = 0)
+// starts with all registers zero and the reset FSR (all exceptions masked).
+
+import "params.tri";
+import "sched.tri";
+
+const FPU_WORDS: int = 82;
+const FSR_RESET: int = 19683 * 121;   // flags clear, masks IV DZ OF UF IX on
+const MODE_FE_TRIT: int = 24;
+
+var fpu_owner: int;                   // the task whose registers are live; 0 = nobody
+var fpu_switches: int;                // -12 traps that loaded a task's state (procfs)
+
+extern fn fpu_save(area: *int);
+extern fn fpu_load(area: *int);
+
+fn _fpu_asm() {
+    asm {
+        "        b     _fpu_asm_end"
+        "fpu_save:"
+        "        fmfs  r2"
+        "        stw   r2, [r1]"
+        "        fstd  f-13, [r1+3]"
+        "        fstd  f-12, [r1+12]"
+        "        fstd  f-11, [r1+21]"
+        "        fstd  f-10, [r1+30]"
+        "        fstd  f-9, [r1+39]"
+        "        fstd  f-8, [r1+48]"
+        "        fstd  f-7, [r1+57]"
+        "        fstd  f-6, [r1+66]"
+        "        fstd  f-5, [r1+75]"
+        "        fstd  f-4, [r1+84]"
+        "        fstd  f-3, [r1+93]"
+        "        fstd  f-2, [r1+102]"
+        "        fstd  f-1, [r1+111]"
+        "        fstd  f0, [r1+120]"
+        "        fstd  f1, [r1+129]"
+        "        fstd  f2, [r1+138]"
+        "        fstd  f3, [r1+147]"
+        "        fstd  f4, [r1+156]"
+        "        fstd  f5, [r1+165]"
+        "        fstd  f6, [r1+174]"
+        "        fstd  f7, [r1+183]"
+        "        fstd  f8, [r1+192]"
+        "        fstd  f9, [r1+201]"
+        "        fstd  f10, [r1+210]"
+        "        fstd  f11, [r1+219]"
+        "        fstd  f12, [r1+228]"
+        "        fstd  f13, [r1+237]"
+        "        ret"
+        "fpu_load:"
+        "        fldd  f-13, [r1+3]"
+        "        fldd  f-12, [r1+12]"
+        "        fldd  f-11, [r1+21]"
+        "        fldd  f-10, [r1+30]"
+        "        fldd  f-9, [r1+39]"
+        "        fldd  f-8, [r1+48]"
+        "        fldd  f-7, [r1+57]"
+        "        fldd  f-6, [r1+66]"
+        "        fldd  f-5, [r1+75]"
+        "        fldd  f-4, [r1+84]"
+        "        fldd  f-3, [r1+93]"
+        "        fldd  f-2, [r1+102]"
+        "        fldd  f-1, [r1+111]"
+        "        fldd  f1, [r1+129]"
+        "        fldd  f2, [r1+138]"
+        "        fldd  f3, [r1+147]"
+        "        fldd  f4, [r1+156]"
+        "        fldd  f5, [r1+165]"
+        "        fldd  f6, [r1+174]"
+        "        fldd  f7, [r1+183]"
+        "        fldd  f8, [r1+192]"
+        "        fldd  f9, [r1+201]"
+        "        fldd  f10, [r1+210]"
+        "        fldd  f11, [r1+219]"
+        "        fldd  f12, [r1+228]"
+        "        fldd  f13, [r1+237]"
+        "        ldw   r2, [r1]"
+        "        fmts  r2"
+        "        ret"
+        "_fpu_asm_end:"
+    }
+}
+
+// The kernel's own MODE.FE is whatever the interrupted task had; turn it on
+// before the kernel itself touches the registers.
+fn fpu_kernel_enable() {
+    var m: int = mfc(MODE);
+    if (trit(m, 24) != 1) { mtc(MODE, ins(m, 1, 24, 1)); }
+}
+
+fn fpu_area(t: *Task) -> *int { return &t.fpu[0]; }
+
+// The live registers go back into the owner's Task; nobody owns them after.
+fn fpu_flush() {
+    if (fpu_owner == 0) { return; }
+    fpu_kernel_enable();
+    fpu_save(fpu_area(&tasks[fpu_owner]));
+    fpu_owner = 0;
+}
+
+// Make `t`'s saved state current: flush it if it is live (a fork or signal
+// frame about to copy it, or an exec about to drop it).
+fn fpu_sync(t: *Task) {
+    if (fpu_owner != 0 && &tasks[fpu_owner] == t) { fpu_flush(); }
+}
+
+fn fpu_reset_area(t: *Task) {
+    var i: int = 0;
+    while (i < FPU_WORDS) { t.fpu[i] = 0; i += 1; }
+    t.fpu[0] = FSR_RESET;
+}
+
+// Vector -12 from user mode: give the FPU to the current task.
+fn fpu_unavailable() {
+    var t: *Task = current_task();
+    if (fpu_owner == current) { return; }           // stale FE; trap_return fixes it
+    fpu_flush();
+    if (!t.fpu_used) {
+        fpu_reset_area(t);
+        t.fpu_used = 1;
+    }
+    fpu_kernel_enable();
+    fpu_load(fpu_area(t));
+    fpu_owner = current;
+    fpu_switches += 1;
+}
+
+// Called by trap_return with the frame about to be restored.
+fn fpu_fixup(f: *int) {
+    if (trit(f[F_EMODE], 27) != -1) { return; }
+    f[F_EMODE] = ins(f[F_EMODE], fpu_owner != 0 && fpu_owner == current, 24, 1);
+}
+
+// fork: the child starts with a copy of the parent's registers.
+fn fpu_fork(parent: *Task, child: *Task) {
+    fpu_sync(parent);
+    child.fpu_used = parent.fpu_used;
+    var i: int = 0;
+    while (i < FPU_WORDS) { child.fpu[i] = parent.fpu[i]; i += 1; }
+}
+
+// execve and exit: the old program's registers are gone.
+fn fpu_drop(t: *Task) {
+    if (fpu_owner != 0 && &tasks[fpu_owner] == t) { fpu_owner = 0; }
+    t.fpu_used = 0;
+}

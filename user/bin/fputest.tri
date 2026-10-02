@@ -1,0 +1,179 @@
+// /bin/fputest: the kernel's lazy FPU switching (docs/KERNEL.md), one line
+// per check. `fputest fresh` is the program exec'd by the exec check: it
+// exits 0 if it starts with a clean FPU.
+//
+// The checks keep values in f12 and f-12, which compiled Trine code never
+// uses, so only the kernel can preserve (or break) them.
+
+import "../lib/tlibc.tri";
+import "real.tri";
+
+const FSR_RESET: int = 19683 * 121;
+const FSR_DZ_UNMASKED: int = 19683 * (81 + 9 + 3 + 1);   // masks IV OF UF IX
+const FLAG_IX: int = 1;               // fsr() trit 27
+const FLAG_DZ: int = 27;              // fsr() trit 24
+
+extern fn put12(p: *real);            // f12 := *p
+extern fn get12(p: *real);            // *p := f12
+extern fn putm12(p: *real);           // f-12 := *p
+extern fn getm12(p: *real);           // *p := f-12
+
+fn _fputest_asm() {
+    asm {
+        "        b     _fputest_asm_end"
+        "put12:  fldd  f12, [r1]"
+        "        ret"
+        "get12:  fstd  f12, [r1]"
+        "        ret"
+        "putm12: fldd  f-12, [r1]"
+        "        ret"
+        "getm12: fstd  f-12, [r1]"
+        "        ret"
+        "_fputest_asm_end:"
+    }
+}
+
+var tmp: real;
+
+fn set12(x: real) { tmp = x; put12(&tmp); }
+fn reg12() -> real { get12(&tmp); return tmp; }
+fn setm12(x: real) { tmp = x; putm12(&tmp); }
+fn regm12() -> real { getm12(&tmp); return tmp; }
+
+var failures: int;
+
+fn ok(what: *char, cond: int) {
+    puts("fputest: ");
+    puts(what);
+    puts(cond ? " ok\n" : " FAILED\n");
+    if (!cond) { failures += 1; }
+}
+
+// Keep f12/f-12 and the FSR set while another process does the same with
+// other values; yield and spin so the two keep taking the FPU from each
+// other. Returns 1 if everything survived.
+fn hold(a: real, b: real, fsr_set: int, rounds: int) -> int {
+    set_fsr(fsr_set);
+    set12(a);
+    setm12(b);
+    var good: int = 1;
+    var r: int = 0;
+    while (r < rounds) {
+        var x: real = 0.0;
+        var k: int = 0;
+        while (k < 200) { x = x + a / 10; k += 1; }       // FPU work in f1/f2, and IX
+        sched_yield();
+        if (reg12() != a || regm12() != b) { good = 0; }
+        r += 1;
+    }
+    // the masks stay as set; this process's own arithmetic raised IX only
+    return good && fsr() == fsr_set + FLAG_IX;
+}
+
+var in_handler_f12: real;
+var in_handler_fsr: int;
+
+fn on_usr1(sig: int) {
+    in_handler_f12 = reg12();
+    in_handler_fsr = fsr();
+    set12(99.0);                                         // clobbered, and thrown away
+    set_fsr(FSR_DZ_UNMASKED);
+}
+
+fn status_of(pid: int) -> int {
+    var st: int = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 1 && strcmp(argv[1], "fresh") == 0) {
+        // after execve: zero registers, the reset FSR
+        return reg12() == 0.0 && regm12() == 0.0 && fsr() == FSR_RESET ? 0 : 1;
+    }
+
+    // a first FPU instruction just works (vector -12 is invisible)
+    // (1/3 is exact in balanced ternary; 1/10 is not)
+    var third: real = 1.0 / 3;
+    ok("first use", third * 3 == 1.0 && fsr() == FSR_RESET);
+    var tenth: real = 1.0 / 10;
+    ok("inexact sets IX", tenth > 0.0 && fsr() == FSR_RESET + FLAG_IX);
+    set_fsr(FSR_RESET);
+
+    // two processes keep their registers and FSR across switches
+    var pid: int = fork();
+    if (pid == 0) {
+        _exit(hold(-2.5e300, 1.0e-300, FSR_RESET - 19683 * 27, 40) ? 0 : 1);   // DZ unmasked
+    }
+    var mine: int = hold(3.25, -7.0, FSR_RESET, 40);
+    var st: int = status_of(pid);
+    ok("registers survive switching (parent)", mine);
+    ok("registers survive switching (child)", st == 0);
+
+    // fork copies the registers and the FSR
+    set_fsr(FSR_RESET - 19683 * 81);                     // IV unmasked, for the child to see
+    set12(42.5);
+    pid = fork();
+    if (pid == 0) {
+        _exit(reg12() == 42.5 && fsr() == FSR_RESET - 19683 * 81 ? 0 : 1);
+    }
+    ok("fork copies the FPU state", status_of(pid) == 0);
+    set_fsr(FSR_RESET);
+
+    // execve starts the new program clean
+    set12(5.0);
+    setm12(6.0);
+    set_fsr(FSR_DZ_UNMASKED + FLAG_DZ);                  // a sticky flag, too
+    pid = fork();
+    if (pid == 0) {
+        var args: [3]*char;
+        args[0] = "fputest";
+        args[1] = "fresh";
+        args[2] = null;
+        execv("/bin/fputest", &args[0]);
+        _exit(2);
+    }
+    ok("execve resets the FPU", status_of(pid) == 0);
+    set_fsr(FSR_RESET);
+
+    // a signal handler starts clean, and the interrupted state comes back
+    set12(7.25);
+    set_fsr(FSR_RESET + FLAG_DZ);                        // DZ flag set
+    signal(SIGUSR1, &on_usr1 as int);
+    raise(SIGUSR1);
+    ok("handler starts with a clean FPU", in_handler_f12 == 0.0 && in_handler_fsr == FSR_RESET);
+    ok("interrupted FPU state restored", reg12() == 7.25 && fsr() == FSR_RESET + FLAG_DZ);
+    set_fsr(FSR_RESET);
+
+    // negative: an unmasked exception is SIGFPE, and only for that process
+    pid = fork();
+    if (pid == 0) {
+        set_fsr(FSR_DZ_UNMASKED);
+        var zero: real = 0.0;
+        var q: real = 1.0 / zero;
+        _exit(q == q ? 3 : 4);                           // never gets here
+    }
+    st = status_of(pid);
+    ok("unmasked divide by zero is SIGFPE", st % 128 == SIGFPE);
+    var z: real = 0.0;
+    ok("masked divide by zero is infinity", fclass(1.0 / z) == 3 && fsr() == FSR_RESET + FLAG_DZ);
+    set_fsr(FSR_RESET);
+
+    // negative: an invalid operation, unmasked, while the FPU is not even ours
+    pid = fork();
+    if (pid == 0) {
+        set_fsr(FSR_RESET - 19683 * 81);
+        sched_yield();
+        var m1: real = -1.0;
+        var r: real = sqrt(m1);
+        _exit(r == r ? 3 : 4);
+    }
+    ok("unmasked invalid sqrt is SIGFPE", status_of(pid) % 128 == SIGFPE);
+    ok("parent unaffected", reg12() == 7.25 && fsr() == FSR_RESET);
+
+    var buf: [24]char;
+    puts("fputest: pi = ");
+    puts(rtoa(fconst(2), 12, &buf[0]));
+    puts(failures == 0 ? "\nfputest: done\n" : "\nfputest: FAILED\n");
+    return failures != 0;
+}

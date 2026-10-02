@@ -2,9 +2,9 @@
 //! kernel's permission checks, each with the ways it must refuse.
 
 /// Boot the default disk, log in as root at the first prompt, and type each
-/// line at a "$ " prompt. A line starting with `~` is sent as it is, once
-/// the machine has been idle for 3 M steps (for password prompts and later
-/// logins). Stops when the lines are used up and login asks again.
+/// line at a "$ " prompt. A line starting with `~` is sent as it is at the
+/// next prompt ending in ": " (login, password), once the output has been quiet
+/// for 3 M steps. Stops when the lines are used up and login asks again.
 fn session(lines: &[&str], max_steps: u64) -> String {
     let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
@@ -15,7 +15,11 @@ fn session(lines: &[&str], max_steps: u64) -> String {
         m.run(1_000_000);
         steps += 1_000_000;
         idle += 1_000_000;
-        out.push_str(&m.dev.serial.take_output());
+        let fresh = m.dev.serial.take_output();
+        if !fresh.is_empty() {
+            idle = 0;
+        }
+        out.push_str(&fresh);
         if out.contains("Kernel panic") {
             break;
         }
@@ -35,7 +39,7 @@ fn session(lines: &[&str], max_steps: u64) -> String {
             continue;
         };
         if let Some(raw) = line.strip_prefix('~') {
-            if idle >= 3_000_000 {
+            if idle >= 3_000_000 && out.ends_with(": ") {
                 m.dev.serial_input(raw);
                 next += 1;
                 idle = 0;

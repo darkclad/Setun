@@ -233,6 +233,7 @@ fn proc_generate(i: int) -> int {
         ps("Uid:\t"); pi(t.uid); pc('\t'); pi(t.euid); pc('\t'); pi(t.suid); pc('\n');
         ps("Gid:\t"); pi(t.gid); pc('\t'); pi(t.egid); pc('\t'); pi(t.sgid); pc('\n');
         ps("WChan:\t"); pi(t.state == TASK_SLEEPING ? t.wchan : 0); pc('\n');
+        ps("FPU:\t"); ps(!t.fpu_used ? "unused" : fpu_owner == ti ? "live" : "saved"); pc('\n');
         return 0;
     }
     // cmdline
