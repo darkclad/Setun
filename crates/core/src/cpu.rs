@@ -85,9 +85,12 @@ pub struct Cpu {
     /// the index into `blocks` of the block starting at that word of code
     /// slot `slot` (see `Memory::code_slot`), or 0. A slot's table is
     /// dropped when its frame is written; everything is cleared when the
-    /// arena grows too big. `blocks` holds (first op, count) into `ops`.
+    /// arena grows too big.
     block_at: Vec<Option<Box<[u32]>>>,
-    blocks: Vec<(u32, u32)>,
+    blocks: Vec<Block>,
+    /// Bumped by anything that may make a chain link stale: a change of
+    /// translation or ring, dropped code, a cleared arena.
+    epoch: u64,
     ops: Vec<Dec>,
     /// The page the last instruction was fetched from: virtual addresses
     /// `fw_lo..=fw_lo + PAGE - 1` map to physical `va + fw_delta`, code slot
@@ -154,6 +157,24 @@ const WORDS_PER_FRAME: usize = (PAGE / 3) as usize;
 const MAX_BLOCK: usize = 256;
 /// Past this many decoded instructions, all blocks are thrown away.
 const MAX_OPS: usize = 1 << 22;
+
+/// A basic block: `count` decoded instructions from `ops[first]`, and the
+/// blocks it last went on to (looked up by target address, valid only in
+/// the epoch they were made in).
+#[derive(Clone, Copy)]
+struct Block {
+    first: u32,
+    count: u32,
+    links: [Link; 2],
+    next_link: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Link {
+    target: i64,
+    id: u32,
+    epoch: u64,
+}
 
 /// What an instruction in a block did.
 enum Ctl {
@@ -261,6 +282,7 @@ impl Cpu {
             tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
             block_at: Vec::new(),
             blocks: Vec::new(),
+            epoch: 1,
             ops: Vec::new(),
             fw_lo: i64::MIN,
             fw_delta: 0,
@@ -300,6 +322,7 @@ impl Cpu {
     /// Forget the fetch and data windows.
     #[inline]
     fn windows_off(&mut self) {
+        self.epoch += 1;
         self.fw_lo = i64::MIN;
         self.rw_lo = i64::MIN;
         self.ww_lo = i64::MIN;
@@ -637,6 +660,8 @@ impl Cpu {
         }
         let mut n = 0;
         self.batch = true;
+        // the block just left cleanly, and the epoch then (for chaining)
+        let (mut from, mut from_epoch) = (0u32, 0u64);
         while n < budget {
             if self.halted {
                 n = budget;
@@ -646,19 +671,38 @@ impl Cpu {
                 self.drop_written_code(m);
             }
             let pc = self.pc.value();
-            let off = pc.wrapping_sub(self.fw_lo);
-            let found = if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty {
-                Some((self.fw_slot, (off / 3) as usize))
-            } else {
-                self.fetch_slot(m, pc)
-            };
-            let id = match found {
-                Some((slot, i)) => match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[i]) {
-                    Some(id) if id != 0 => id,
-                    _ => self.build_block(m, pc + self.fw_delta, slot, i),
-                },
-                None => 0,
-            };
+            let chained = from != 0 && from_epoch == self.epoch && !m.pt_dirty;
+            let mut id = 0;
+            if chained {
+                for l in &self.blocks[from as usize - 1].links {
+                    if l.target == pc && l.epoch == self.epoch {
+                        id = l.id;
+                        break;
+                    }
+                }
+            }
+            if id == 0 {
+                let off = pc.wrapping_sub(self.fw_lo);
+                let found = if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty {
+                    Some((self.fw_slot, (off / 3) as usize))
+                } else {
+                    self.fetch_slot(m, pc)
+                };
+                id = match found {
+                    Some((slot, i)) => match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[i]) {
+                        Some(id) if id != 0 => id,
+                        _ => self.build_block(m, pc + self.fw_delta, slot, i),
+                    },
+                    None => 0,
+                };
+                if id != 0 && chained && from_epoch == self.epoch {
+                    let epoch = self.epoch;
+                    let b = &mut self.blocks[from as usize - 1];
+                    b.links[b.next_link as usize] = Link { target: pc, id, epoch };
+                    b.next_link ^= 1;
+                }
+            }
+            from = 0;
             if id == 0 {
                 // misaligned, a fetch fault, no code slot, or an instruction
                 // whose second word is in the next frame: the reference path
@@ -669,7 +713,7 @@ impl Cpu {
                 }
                 continue;
             }
-            let (first, count) = self.blocks[id as usize - 1];
+            let Block { first, count, .. } = self.blocks[id as usize - 1];
             let limit = (count as u64).min(budget - n) as usize;
             let cycle0 = self.cycle;
             let mut pc = pc;
@@ -736,6 +780,7 @@ impl Cpu {
             if !pc_done {
                 self.pc = ww(pc);
                 self.cycle = cycle0.wrapping_add(k as u64);
+                (from, from_epoch) = (id, self.epoch);
             }
             n += k as u64;
             if stop {
@@ -789,6 +834,7 @@ impl Cpu {
             self.block_at = (0..m.code_slots()).map(|_| None).collect();
         }
         if self.ops.len() > MAX_OPS {
+            self.epoch += 1;
             self.ops.clear();
             self.blocks.clear();
             self.block_at.iter_mut().for_each(|t| *t = None);
@@ -814,7 +860,7 @@ impl Cpu {
         if count == 0 {
             return 0;
         }
-        self.blocks.push((first as u32, count as u32));
+        self.blocks.push(Block { first: first as u32, count: count as u32, links: [Link::default(); 2], next_link: 0 });
         let id = self.blocks.len() as u32;
         self.block_at[slot].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice())[i] = id;
         m.watch_code(slot);
@@ -906,6 +952,7 @@ impl Cpu {
     /// Drop the blocks of frames that have been written.
     #[cold]
     fn drop_written_code(&mut self, m: &mut Memory) {
+        self.epoch += 1;
         for s in m.code_dirty.drain(..) {
             if let Some(t) = self.block_at.get_mut(s) {
                 *t = None;
