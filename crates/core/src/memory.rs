@@ -30,7 +30,9 @@ pub const fn frame_start(frame: i64) -> i64 {
 pub struct BusError;
 
 pub struct Memory {
-    ram: Vec<Option<Box<[i16]>>>,
+    /// RAM frames as words (6561 per frame, values of the words centred at
+    /// `frame_start + 1 + 3k`): words are what the CPU mostly moves.
+    ram: Vec<Option<Box<[i64]>>>,
     rom: Vec<i16>,
     fb: Vec<i16>,
     /// RAM frames holding page tables the CPU's TLB has cached entries
@@ -45,7 +47,7 @@ pub struct Memory {
 }
 
 enum Region {
-    Ram(usize),
+    Ram,
     Rom,
     Fb,
 }
@@ -121,7 +123,7 @@ impl Memory {
         let frame = (pa + HALF_PAGE).div_euclid(PAGE);
         let idx = (pa - frame * PAGE + HALF_PAGE) as usize;
         if (0..self.ram_frames()).contains(&frame) {
-            Ok((Region::Ram(frame as usize), idx))
+            Ok((Region::Ram, idx))
         } else if (ROM_FIRST_FRAME..ROM_FIRST_FRAME + ROM_FRAMES).contains(&frame) {
             Ok((Region::Rom, (frame - ROM_FIRST_FRAME) as usize * PAGE as usize + idx))
         } else if (FB_FIRST_FRAME..FB_FIRST_FRAME + FB_FRAMES).contains(&frame) {
@@ -144,11 +146,11 @@ impl Memory {
 
     pub fn read_tryte(&self, pa: i64) -> Result<Tryte, BusError> {
         if let Some((f, i)) = self.ram_at(pa) {
-            let v = self.ram[f].as_ref().map_or(0, |fr| fr[i]);
-            return Ok(Tryte::new(v as i64).expect("stored tryte in range"));
+            let w = self.ram[f].as_ref().map_or(0, |fr| fr[i / 3]);
+            return Ok(Tryte::new(split_word(w)[i % 3] as i64).expect("a tryte"));
         }
         let v = match self.locate(pa)? {
-            (Region::Ram(f), i) => self.ram[f].as_ref().map_or(0, |fr| fr[i]),
+            (Region::Ram, _) => unreachable!("RAM is handled above"),
             (Region::Rom, i) => self.rom[i],
             (Region::Fb, i) => self.fb[i],
         };
@@ -156,27 +158,21 @@ impl Memory {
     }
 
     pub fn write_tryte(&mut self, pa: i64, t: Tryte) -> Result<(), BusError> {
-        let v = t.value() as i16;
         if let Some((f, i)) = self.ram_at(pa) {
             if self.pt_watch[f] {
                 self.pt_dirty = true;
             }
             self.code_written(f);
-            let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
-            fr[i] = v;
+            let fr = self.ram[f].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice());
+            let w = fr[i / 3];
+            let old = split_word(w)[i % 3] as i64;
+            fr[i / 3] = w + (t.value() - old) * TRYTE_WEIGHT[i % 3];
             return Ok(());
         }
         match self.locate(pa)? {
-            (Region::Ram(f), i) => {
-                if self.pt_watch[f] {
-                    self.pt_dirty = true;
-                }
-                self.code_written(f);
-                let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
-                fr[i] = v;
-            }
+            (Region::Ram, _) => unreachable!("RAM is handled above"),
             (Region::Rom, _) => return Err(BusError),
-            (Region::Fb, i) => self.fb[i] = v,
+            (Region::Fb, i) => self.fb[i] = t.value() as i16,
         }
         Ok(())
     }
@@ -184,24 +180,18 @@ impl Memory {
     /// Word at centre address `pa` (trytes `pa−1, pa, pa+1`, big-endian).
     /// Alignment is the caller's business.
     pub fn read_word(&self, pa: i64) -> Result<Word, BusError> {
-        // RAM, all three trytes in one frame (always true for aligned words)
         if let Some((f, i)) = self.ram_at(pa) {
-            if i >= 1 && i + 1 < PAGE as usize {
-                let Some(fr) = &self.ram[f] else { return Ok(Word::ZERO) };
-                let v = fr[i - 1] as i64 * 387_420_489 + fr[i] as i64 * 19_683 + fr[i + 1] as i64;
-                return Ok(Word::new(v).expect("word from trytes"));
+            if i % 3 == 1 {
+                // an aligned word: one load
+                let v = self.ram[f].as_ref().map_or(0, |fr| fr[i / 3]);
+                return Ok(Word::new(v).expect("a word"));
             }
-        }
-        // Fast path: when all three trytes are in one frame, a single lookup
-        // covers them (always true for aligned words).
-        if let Ok((region, i)) = self.locate(pa) {
+        } else if let Ok((region, i)) = self.locate(pa) {
+            // ROM or framebuffer, all three trytes in one frame
             let off = i % PAGE as usize;
             if off >= 1 && off + 1 < PAGE as usize {
                 let s: &[i16] = match region {
-                    Region::Ram(f) => match &self.ram[f] {
-                        Some(fr) => fr,
-                        None => return Ok(Word::ZERO),
-                    },
+                    Region::Ram => unreachable!("RAM is handled above"),
                     Region::Rom => &self.rom,
                     Region::Fb => &self.fb,
                 };
@@ -217,16 +207,13 @@ impl Memory {
 
     pub fn write_word(&mut self, pa: i64, w: Word) -> Result<(), BusError> {
         if let Some((f, i)) = self.ram_at(pa) {
-            if i >= 1 && i + 1 < PAGE as usize {
+            if i % 3 == 1 {
                 if self.pt_watch[f] {
                     self.pt_dirty = true;
                 }
                 self.code_written(f);
-                let [t0, t1, t2] = split_word(w.value());
-                let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
-                fr[i - 1] = t0;
-                fr[i] = t1;
-                fr[i + 1] = t2;
+                let fr = self.ram[f].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice());
+                fr[i / 3] = w.value();
                 return Ok(());
             }
         }
@@ -238,6 +225,30 @@ impl Memory {
         self.write_tryte(pa - 1, t0)?;
         self.write_tryte(pa, t1)?;
         self.write_tryte(pa + 1, t2)
+    }
+
+    /// The RAM frame of physical address `pa`, if it is RAM.
+    #[inline]
+    pub fn ram_frame(&self, pa: i64) -> Option<usize> {
+        self.ram_at(pa).map(|(f, _)| f)
+    }
+
+    /// Word `k` of RAM frame `f` (both in range).
+    #[inline(always)]
+    pub fn ram_word(&self, f: usize, k: usize) -> i64 {
+        self.ram[f].as_ref().map_or(0, |fr| fr[k])
+    }
+
+    /// Store word `k` of RAM frame `f`, with the same bookkeeping as
+    /// `write_word`.
+    #[inline(always)]
+    pub fn set_ram_word(&mut self, f: usize, k: usize, v: i64) {
+        if self.pt_watch[f] {
+            self.pt_dirty = true;
+        }
+        self.code_written(f);
+        let fr = self.ram[f].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice());
+        fr[k] = v;
     }
 
     /// A word write that does not count as a page-table change: the CPU's
@@ -277,6 +288,10 @@ impl Memory {
         &self.fb
     }
 }
+
+const WORDS_PER_FRAME: usize = (PAGE / 3) as usize;
+/// Weights of a word's trytes, most significant first.
+const TRYTE_WEIGHT: [i64; 3] = [387_420_489, 19_683, 1];
 
 /// Split a word value into its three tryte values, most significant first.
 #[inline(always)]

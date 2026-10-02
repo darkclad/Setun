@@ -101,6 +101,9 @@ pub struct Cpu {
     rw_delta: i64,
     ww_lo: i64,
     ww_delta: i64,
+    /// The RAM frame behind each data window (`usize::MAX`: not RAM).
+    rw_frame: usize,
+    ww_frame: usize,
 }
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
@@ -266,6 +269,8 @@ impl Cpu {
             rw_delta: 0,
             ww_lo: i64::MIN,
             ww_delta: 0,
+            rw_frame: usize::MAX,
+            ww_frame: usize::MAX,
         };
         c.reset();
         c
@@ -320,12 +325,37 @@ impl Cpu {
         let pa = self.xlate(m, va, acc)?;
         let start = (pa + HALF_PAGE).div_euclid(PAGE) * PAGE - HALF_PAGE;
         let lo = va - (pa - start);
+        let frame = m.ram_frame(pa).unwrap_or(usize::MAX);
         if acc == Access::Write {
-            (self.ww_lo, self.ww_delta) = (lo, pa - va);
+            (self.ww_lo, self.ww_delta, self.ww_frame) = (lo, pa - va, frame);
         } else {
-            (self.rw_lo, self.rw_delta) = (lo, pa - va);
+            (self.rw_lo, self.rw_delta, self.rw_frame) = (lo, pa - va, frame);
         }
         Ok(pa)
+    }
+
+    /// A word load: straight from the RAM frame through the read window,
+    /// else the general path.
+    #[inline(always)]
+    fn load_word_fast(&mut self, m: &mut Memory, va: i64) -> Result<Word, Fault> {
+        let off = va.wrapping_sub(self.rw_lo);
+        if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty && self.rw_frame != usize::MAX {
+            return Ok(Word::new(m.ram_word(self.rw_frame, (off / 3) as usize)).expect("a word"));
+        }
+        let pa = self.data_pa_slow(m, va, Access::Read, true)?;
+        m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read))
+    }
+
+    /// A word store, likewise.
+    #[inline(always)]
+    fn store_word_fast(&mut self, m: &mut Memory, va: i64, v: Word) -> Result<(), Fault> {
+        let off = va.wrapping_sub(self.ww_lo);
+        if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty && self.ww_frame != usize::MAX {
+            m.set_ram_word(self.ww_frame, (off / 3) as usize, v.value());
+            return Ok(());
+        }
+        let pa = self.data_pa_slow(m, va, Access::Write, true)?;
+        m.write_word(pa, v).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))
     }
 
     // ---- register access -------------------------------------------------
@@ -929,8 +959,7 @@ impl Cpu {
             }
             Op::Ldw => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                let pa = self.data_pa(m, va, Access::Read, true)?;
-                let v = m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read))?;
+                let v = self.load_word_fast(m, va)?;
                 self.set_reg(x, v);
             }
             Op::Stt => {
@@ -940,8 +969,7 @@ impl Cpu {
             }
             Op::Stw => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                let pa = self.data_pa(m, va, Access::Write, true)?;
-                m.write_word(pa, self.reg(x)).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))?;
+                self.store_word_fast(m, va, self.reg(x))?;
             }
             Op::Swap => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
