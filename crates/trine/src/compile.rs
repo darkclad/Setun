@@ -124,6 +124,12 @@ struct Local {
 /// Registers for local variables: the callee-saved r-1..r-9 (ABI).
 const LOCAL_REGS: [&str; 9] = ["r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8", "r-9"];
 
+/// More for a leaf function (one that makes no real call): caller-saved
+/// registers the code generator never uses itself (it uses r1-r3 for
+/// expressions, r1-r6 for system call arguments and r7, r8 for calls), so
+/// they need no saving at all.
+const LEAF_REGS: [&str; 6] = ["r9", "r10", "r-10", "r-11", "r-12", "r-13"];
+
 /// Names whose address is taken (`&x`) anywhere in `stmts`, and whether
 /// there is inline assembly (which may use any register).
 fn scan_body(stmts: &[Stmt], taken: &mut HashSet<String>, asm: &mut bool) {
@@ -447,6 +453,8 @@ pub struct Compiler {
     local_floor: usize,
     /// What this function has grown by through inlining.
     inlined: usize,
+    /// It makes no real call: every call in it is inlined.
+    leaf: bool,
     // output
     code: Vec<String>,
     strings: Vec<(String, String)>,
@@ -486,6 +494,7 @@ impl Compiler {
             inlining: Vec::new(),
             local_floor: 0,
             inlined: 0,
+            leaf: false,
             code: Vec::new(),
             strings: Vec::new(),
             reals: Vec::new(),
@@ -1053,6 +1062,7 @@ impl Compiler {
         self.used_regs.clear();
         self.local_floor = 0;
         self.inlined = 0;
+        self.leaf = false;
         self.locals.clear();
         self.scopes = vec![0];
         self.next_slot = -3;
@@ -1069,6 +1079,18 @@ impl Compiler {
         let mut has_asm = false;
         scan_body(f.body.as_ref().unwrap(), &mut self.addr_taken, &mut has_asm);
         self.no_regs = !self.optimize || has_asm;
+        // a leaf: every call is a builtin or inlinable (and then inlined)
+        if !self.no_regs {
+            let mut callees = Vec::new();
+            calls_in(f.body.as_ref().unwrap(), &mut callees);
+            self.leaf = callees.iter().all(|c| {
+                (BUILTINS.contains(&c.as_str()) && !self.fns.contains_key(c)) || self.inlinable(c)
+            });
+            if self.leaf {
+                // the free caller-saved registers go first: no saving
+                self.free_regs.extend(LEAF_REGS.iter().rev().copied());
+            }
+        }
         let fn_start = self.code.len();
         self.label(&f.name);
         const SAVED: &[&str] = &["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r-10", "r-11", "r-12", "r-13"];
@@ -1117,8 +1139,13 @@ impl Compiler {
         }
         // the frame, and below it the callee-saved registers this uses
         let frame = -self.lowest_slot;
-        let saves: Vec<(&str, i64)> =
-            self.used_regs.iter().enumerate().map(|(k, r)| (*r, -frame - 3 * (k as i64 + 1))).collect();
+        let saves: Vec<(&str, i64)> = self
+            .used_regs
+            .iter()
+            .filter(|r| LOCAL_REGS.contains(r))
+            .enumerate()
+            .map(|(k, r)| (*r, -frame - 3 * (k as i64 + 1)))
+            .collect();
         let total = frame + 3 * saves.len() as i64;
         let mut prologue = Vec::new();
         if total > 0 {
@@ -2587,10 +2614,33 @@ impl Compiler {
         cost
     }
 
+    /// Can calls to `name` be inlined at all (small, no real calls, plain
+    /// parameter and result types, and the same for what it inlines)?
+    fn inlinable(&self, name: &str) -> bool {
+        if self.inline_cost.get(name).copied().flatten().is_none() {
+            return false;
+        }
+        let plain = match self.globals.get(name) {
+            Some(Global::Func { ty: Ty::Fn(ps, ret), .. }) => ps.len() <= 6 && !ps.iter().any(|p| p.is_real()) && !ret.is_real(),
+            _ => false,
+        };
+        let mut callees = Vec::new();
+        calls_in(self.fns[name].body.as_ref().unwrap(), &mut callees);
+        plain
+            && callees
+                .iter()
+                .all(|c| (BUILTINS.contains(&c.as_str()) && !self.fns.contains_key(c)) || (c != name && self.inlinable(c)))
+    }
+
     /// The body of `name` if a call to it may be inlined here.
     fn inline_candidate(&self, name: &str, params: &[Ty], ret: &Ty) -> Option<FnDecl> {
         if !self.optimize || self.no_regs || self.inlining.iter().any(|n| n == name) {
             return None;
+        }
+        // a leaf function inlines all its calls (it has registers to spare,
+        // and none of them needs saving)
+        if self.leaf {
+            return self.fns.get(name).cloned();
         }
         let cost = (*self.inline_cost.get(name)?)?;
         // the outermost inlining pays for the whole tree
