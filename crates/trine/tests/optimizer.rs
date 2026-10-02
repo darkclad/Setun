@@ -119,3 +119,41 @@ fn register_allocation_torture() {
     let out = same_both_ways_src("torture.tri", src, 50_000_000);
     assert_eq!(out, Outcome::Exit(12 + 45), "the program ran to the end");
 }
+
+#[test]
+fn conditions_short_circuit_the_same_way() {
+    let src = r#"
+        import "console.tri";
+        var calls: int;
+        fn t(v: int) -> int { calls = calls * 3 + 1; return v; }   // records the order
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn main() -> int {
+            var hits: int = 0;
+            var i: int = -3;
+            while (i <= 3) {
+                if (t(i) > 0 && t(i * 2) < 5 || !t(i + 3)) { hits += 1; }
+                if (!(i < 0 || i == 2) && (t(i) != 1 || i > 2)) { hits += 10; }
+                if (i != 0 && !(i > 1 && i < 3)) { hits += 100; }
+                i += 1;
+            }
+            put(hits);
+            put(calls);
+            var n: int = 0;
+            var k: int = 0;
+            while (k < 20 && (n < 7 || k % 2 == 0) && !(k == 13)) { n += 1; k += 1; }
+            put(n);
+            // reals: a NaN makes every comparison false except !=
+            var z: real = 0.0;
+            var nan: real = z / z;
+            var one: real = 1.0;
+            var r: int = 0;
+            if (nan < one || nan > one || nan == one) { r += 1; }
+            if (nan != one && !(nan == nan)) { r += 10; }
+            if (!(nan < one) && one < 2.0) { r += 100; }
+            if (one == one && (nan >= one || one > 0.5)) { r += 1000; }
+            put(r);
+            return hits % 1000;
+        }
+    "#;
+    same_both_ways_src("conditions.tri", src, 50_000_000);
+}

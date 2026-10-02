@@ -1191,6 +1191,24 @@ impl Compiler {
 
     /// Jump to `target` when `c` is false (zero).
     fn cond_jump_false(&mut self, c: &Expr, target: &str) -> R<()> {
+        // && || ! jump straight to where they lead (no 0/1 is built)
+        if self.optimize {
+            match &c.kind {
+                ExprKind::Binary(BinOp::And, a, b) => {
+                    self.cond_jump_false(a, target)?;
+                    return self.cond_jump_false(b, target);
+                }
+                ExprKind::Binary(BinOp::Or, a, b) => {
+                    let ok = self.new_label();
+                    self.cond_jump_true(a, &ok)?;
+                    self.cond_jump_false(b, target)?;
+                    self.label(&ok);
+                    return Ok(());
+                }
+                ExprKind::Unary(UnOp::Not, a) => return self.cond_jump_true(a, target),
+                _ => {}
+            }
+        }
         // Comparisons branch directly on the flags.
         if let ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne), a, b) = &c.kind {
             let real = self.compare(a, b)?;
@@ -1219,6 +1237,53 @@ impl Compiler {
         self.condition_value(c)?;
         self.emit("cmp r1, 0");
         self.emit(format!("beq {target}"));
+        Ok(())
+    }
+
+    /// Jump to `target` if `c` holds (the mirror of `cond_jump_false`).
+    fn cond_jump_true(&mut self, c: &Expr, target: &str) -> R<()> {
+        match &c.kind {
+            ExprKind::Binary(BinOp::And, a, b) => {
+                let skip = self.new_label();
+                self.cond_jump_false(a, &skip)?;
+                self.cond_jump_true(b, target)?;
+                self.label(&skip);
+                return Ok(());
+            }
+            ExprKind::Binary(BinOp::Or, a, b) => {
+                self.cond_jump_true(a, target)?;
+                return self.cond_jump_true(b, target);
+            }
+            ExprKind::Unary(UnOp::Not, a) => return self.cond_jump_false(a, target),
+            ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne), a, b) => {
+                let real = self.compare(a, b)?;
+                let br = match op {
+                    BinOp::Lt => "blt",
+                    BinOp::Le => "ble",
+                    BinOp::Gt => "bgt",
+                    BinOp::Ge => "bge",
+                    BinOp::Eq => "beq",
+                    _ => "bne",
+                };
+                if real && *op == BinOp::Ne {
+                    self.emit(format!("bov {target}")); // unordered: != holds
+                    self.emit(format!("{br} {target}"));
+                } else if real {
+                    // unordered: the comparison is false, so do not jump
+                    let skip = self.new_label();
+                    self.emit(format!("bov {skip}"));
+                    self.emit(format!("{br} {target}"));
+                    self.label(&skip);
+                } else {
+                    self.emit(format!("{br} {target}"));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.condition_value(c)?;
+        self.emit("cmp r1, 0");
+        self.emit(format!("bne {target}"));
         Ok(())
     }
 

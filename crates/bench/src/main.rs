@@ -5,6 +5,8 @@
 //!   setun-bench --record   run them and write golden.txt
 //!   setun-bench NAME...    run only these workloads
 //!
+//!   setun-bench --profile FILE.tri   where a ROM program spends its time
+//!
 //! SETUN_JIT_OFF=1 runs the Trinux workloads on the interpreter alone.
 //!
 //! The emulator is deterministic (time is counted in instructions), so an
@@ -12,6 +14,7 @@
 //! and step count exactly.
 
 mod micro;
+mod profile;
 
 use setun_core::Machine;
 use std::path::{Path, PathBuf};
@@ -216,6 +219,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--resolve") {
         resolve(&args[1..]);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--profile") {
+        profile::run(Path::new(&args[1]));
         return;
     }
     if args.iter().any(|a| a == "--micro") {
