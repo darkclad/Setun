@@ -156,7 +156,6 @@ fn font_glyph(c: int) -> int {
     return '?';
 }
 
-// One character with its top-left at (x, y), each font pixel scale x scale.
 // Row r of the glyph for character c. A negative c is the character -c
 // overlined (how the machine writes a negative digit): its glyph one row
 // lower, under a bar across columns 0-6.
@@ -165,6 +164,7 @@ fn glyph_row(g: int, over: int, r: int) -> int {
     return r == 0 ? 127 : font[g * 8 + r - 1];
 }
 
+// One character with its top-left at (x, y), each font pixel scale x scale.
 fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) {
     var over: int = c < -32;
     c = font_glyph(over ? -c : c);

@@ -62,7 +62,7 @@ fn start_kernel(disk: int, frames: int) {
     screen_clear();
     printk("Trinux version ");
     pr(TRINUX_VERSION);
-    pr(" (trine) on Setun-386, balanced ternary\n");
+    pr(" (trine) on Setun-11̅, balanced ternary\n");
     printk("Booted from disk ");
     pr_int(disk);
     pr(", RAM ");

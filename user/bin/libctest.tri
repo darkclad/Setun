@@ -41,6 +41,7 @@ fn strings() {
     ok("memmove overlapping", m[2] == 0 && m[6] == 4 && m[0] == 0);
     ok("memcmp", memcmp(&m[0], &m[0], 9) == 0);
     ok("ctype", isdigit('7') && !isdigit('x') && isalpha('Q') && isspace('\t') && toupper('a') == 'A' && tolower('Z') == 'z' && ispunct('!'));
+    ok("ctype overlined", isprint('1̅') && '1̅' == -'1' && !ispunct('1̅') && ispunct('!̅') && !isprint(-' ') && !isprint(-31));
 }
 
 fn numbers() {
@@ -201,7 +202,7 @@ fn options() {
 
 fn system_calls() {
     var u: utsname;
-    ok("uname", uname(&u) == 0 && streq(&u.sysname[0], "Trinux") && streq(&u.machine[0], "setun386"));
+    ok("uname", uname(&u) == 0 && streq(&u.sysname[0], "Trinux") && streq(&u.machine[0], "setun26"));
     ok("EFAULT: uname into the kernel", fails(uname(1000 as *utsname), EFAULT));
     var ts: timespec;
     ok("clock_gettime realtime", clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec > 1700000000);

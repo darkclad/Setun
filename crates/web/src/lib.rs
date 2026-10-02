@@ -1,4 +1,4 @@
-//! Setun-386 browser front end: plain `extern "C"` WebAssembly exports, driven
+//! Setun-26 browser front end: plain `extern "C"` WebAssembly exports, driven
 //! by `web/index.html` (no wasm-bindgen needed).
 //!
 //! The page calls `setun_boot`, then once per animation frame: input calls,
@@ -237,6 +237,20 @@ pub extern "C" fn setun_display_mode() -> i32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn web_page_and_module_carry_the_new_name() {
+        let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+        let page = std::fs::read_to_string(web.join("index.html")).unwrap();
+        assert!(page.contains("<title>Setun-11\u{305}</title>"), "page title");
+        // the heading draws the bar with CSS over the second 1, and names the machine for screen readers
+        assert!(page.contains(r#"aria-label="Setun-11̅">SETUN<span aria-hidden="true">-1<span class="ov">1</span>"#), "heading");
+        let wasm = std::fs::read(web.join("setun.wasm")).unwrap();
+        for old in ["Setun-386", "SETUN-386", "Setun-387", "SETUN-387", "setun386"] {
+            assert!(!page.contains(old), "{old} in index.html");
+            assert!(!wasm.windows(old.len()).any(|w| w == old.as_bytes()), "{old} in setun.wasm");
+        }
+    }
+
     fn output() -> String {
         setun_serial_take();
         with(|e| String::from_utf8(e.serial.clone()).unwrap())
@@ -303,7 +317,7 @@ mod tests {
         let ptr = setun_render();
         assert!(!ptr.is_null());
         assert_eq!((setun_width(), setun_height()), (640, 480));
-        assert!(output().starts_with("Setun-386 demo ROM ready"));
+        assert!(output().starts_with("Setun-11̅ demo ROM ready"));
         for c in "Привет".chars() {
             setun_serial_char(c as u32);
         }

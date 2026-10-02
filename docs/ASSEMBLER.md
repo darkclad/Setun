@@ -1,4 +1,4 @@
-# Setun-386 assembly language
+# Setun-11̅ assembly language
 
 The assembler lives in `crates/asm` (`setun_asm::text`), along with the
 disassembler (`setun_asm::disasm`) and the `setun-asm` command-line tool. The demo

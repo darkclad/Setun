@@ -2,11 +2,11 @@
 
 The goal is to get as close as possible to one bare core of the host. There
 are three layers: a block interpreter, a JIT compiler for hot code (native
-builds), and fast fixed-width arithmetic for the Setun-387.
+builds), and fast fixed-width arithmetic for the FPU.
 
 ## Rule: the fast path changes nothing
 
-Time on the Setun-386 is counted in instructions (100 ns each by default),
+Time on the Setun-11̅ is counted in instructions (100 ns each by default),
 so the emulator is deterministic: the same disk and the same input always
 give the same machine state after the same number of steps. Every
 optimisation must keep that state **identical**, not just "working":
@@ -70,7 +70,7 @@ Native builds compile hot code with [Cranelift](https://cranelift.dev/)
   inside compiled code, and a misaligned load through an open window. Each
   was shown to catch a deliberately broken JIT.
 
-## The Setun-387
+## The FPU
 
 `setun-real` computes every result exactly and rounds once. The big-integer
 path stays as the reference; fast paths in 256-bit integers (`ethnum`, with

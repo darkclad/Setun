@@ -1,4 +1,4 @@
-//! Type checking and code generation: Trine AST → Setun-386 assembly text.
+//! Type checking and code generation: Trine AST → Setun-26 assembly text.
 //!
 //! Code generation is deliberately simple (v1): every expression leaves its
 //! value in `r1` (a `real` in `f1`); intermediate values live on the stack
@@ -18,7 +18,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Int,
-    /// The Setun-387 real81: three words, held in f registers.
+    /// The FPU's real81: three words, held in f registers.
     Real,
     Tryte,
     Trit,
@@ -159,7 +159,7 @@ const CREGS: &[&str] = &["MODE", "PTB", "FADDR", "FCAUSE", "ITB", "EPC", "EMODE"
 const BUILTINS: &[&str] = &[
     "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "bytes", "in", "out",
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
-    // the Setun-387
+    // the FPU
     "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
 ];
 
@@ -1100,7 +1100,7 @@ impl Compiler {
     fn init_object(&mut self, place: Place, ty: &Ty, init: &Expr) -> R<()> {
         match (ty, &init.kind) {
             (Ty::Array(n, e), ExprKind::Str(s)) if **e == Ty::Tryte => {
-                let chars: Vec<i64> = s.chars().map(|c| c as i64).collect();
+                let chars = ternary::code_points(s).map_err(|m| Error { pos: init.pos, msg: m })?;
                 if chars.len() as i64 > *n {
                     return err(init.pos, format!("string of {} characters does not fit in [{n}]char", chars.len()));
                 }

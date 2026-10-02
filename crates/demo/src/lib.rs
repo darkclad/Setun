@@ -1,4 +1,4 @@
-//! Demo ROM for the Setun-386 front ends, written in assembly (`demo.s`).
+//! Demo ROM for the Setun-26 front ends, written in assembly (`demo.s`).
 //!
 //! Boots from the reset vector (paging off, ring +1) and shows:
 //! * a text-mode screen with machine facts, the 27 text colours, the RAM size
@@ -33,6 +33,7 @@ pub fn machine(ram_frames: i64, unix_time_s: i64) -> Machine {
 }
 
 /// Read the text screen as strings (one per row), for tests and headless runs.
+/// An overlined character comes out as the character and U+0305, as on serial.
 pub fn screen_text(m: &Machine) -> Vec<String> {
     let fb = m.mem.framebuffer();
     (0..30)
@@ -40,7 +41,11 @@ pub fn screen_text(m: &Machine) -> Vec<String> {
             (0..80)
                 .map(|col| {
                     let c = fb[3 * (row * 80 + col)] as i64;
-                    u32::try_from(c).ok().and_then(char::from_u32).filter(|c| *c >= ' ').unwrap_or(' ')
+                    let ch = |c: i64| u32::try_from(c).ok().and_then(char::from_u32).filter(|c| *c > ' ');
+                    match c {
+                        c if c < 0 => ch(-c).map_or(" ".into(), |ch| format!("{ch}\u{305}")),
+                        c => ch(c).unwrap_or(' ').to_string(),
+                    }
                 })
                 .collect::<String>()
                 .trim_end()
@@ -74,11 +79,11 @@ mod tests {
     fn boots_to_the_text_screen() {
         let mut m = booted();
         let s = screen_text(&m);
-        assert!(s[0].contains("SETUN-386"), "{:?}", s[0]);
+        assert!(s[0].contains("SETUN-11̅"), "{:?}", s[0]);
         assert!(s[7].contains("RAM: 729 pages"), "{:?}", s[7]);
         assert!(s[8].starts_with("  Unix time: 17900000"), "{:?}", s[8]);
         assert_eq!(s[14], ">");
-        assert_eq!(m.dev.serial.take_output(), "Setun-386 demo ROM ready. Type here or in the window.\n");
+        assert_eq!(m.dev.serial.take_output(), "Setun-11̅ demo ROM ready. Type here or in the window.\n");
         assert_eq!(m.dev.display.mode(), -1);
     }
 
@@ -126,7 +131,7 @@ mod tests {
         m.dev.key(44, true);
         m.run(200_000);
         assert_eq!(m.dev.display.mode(), -1);
-        assert!(screen_text(&m)[0].contains("SETUN-386"));
+        assert!(screen_text(&m)[0].contains("SETUN-11̅"));
     }
 
     #[test]

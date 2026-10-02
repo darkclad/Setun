@@ -180,9 +180,9 @@ pub fn initramfs_file(src: &Path) -> Result<Vec<i16>, String> {
         return tef(src);
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    text.chars()
-        .map(|c| i16::try_from(c as u32).ok().filter(|&t| t <= 9841).ok_or(format!("{}: {c:?} does not fit a tryte", src.display())))
-        .collect()
+    // a character followed by U+0305 is stored overlined (negated)
+    let cps = ternary::code_points(&text).map_err(|m| format!("{}: {m}", src.display()))?;
+    Ok(cps.into_iter().map(|t| t as i16).collect())
 }
 
 fn push_word(v: &mut Vec<i16>, w: i64) {

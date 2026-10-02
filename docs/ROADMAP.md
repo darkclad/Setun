@@ -1,12 +1,12 @@
 # Roadmap
 
-Target: **Setun-386**, a balanced-ternary machine sized like a 386, where every
+Target: **Setun-11̅** (Setun-26), a balanced-ternary machine sized like a 386, where every
 size is a power of 3: 9-trit trytes, 27-trit words, a 3^27 address space,
 9|9|9 paging, 3 rings, 3^18 default RAM, and a 640×480 framebuffer with 3^9
 colours. Then come a compiler, a kernel and a window system, all written for
 the machine itself.
 
-ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4 accepted; v0.5 draft adds the Setun-387 FPU).
+ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating-point instructions, §14).
 
 ## Milestones
 
@@ -26,7 +26,7 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4 accepted; v0.5 draft adds the Se
    - K7 tlibc, a POSIX-style sh (functions, eval, here-documents, local, aliases, line editing), core and text utilities, an editor
    - K8 window system: trwm display server, ptys, poll, framebuffer mmap, terminal/clock/colors/paint; Cyrillic font and a Russian layout
    - users and groups: login, su, passwd, useradd/userdel, permission checks, modular password hashing
-9. **Setun-387 FPU** ✅ (ISA §14): real27/real81 balanced-ternary floating point with ±∞, NaN and gradual underflow, 27 registers; emulator (`setun-real`), assembler, Trine's `real` type, lazy FPU switching in Trinux, `math.tri`, and `/bin/calc`
+9. **Floating-point unit** ✅ (ISA §14): real27/real81 balanced-ternary floating point with ±∞, NaN and gradual underflow, 27 registers; emulator (`setun-real`), assembler, Trine's `real` type, lazy FPU switching in Trinux, `math.tri`, and `/bin/calc`
 
 ## Later
 

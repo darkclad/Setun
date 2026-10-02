@@ -51,7 +51,7 @@ pub mod irq {
 }
 
 /// Value of `SYSCTL.SYSID`: the machine number.
-pub const SYSID: i64 = 386;
+pub const SYSID: i64 = 26; // 0t100T, "11̅" in balanced base 27
 
 /// Power request written to `SYSCTL.POWER`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

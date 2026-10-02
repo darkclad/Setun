@@ -5,7 +5,7 @@
 //! a plain `i64` and derive trits on demand. That keeps arithmetic cheap while
 //! still letting the emulator address individual trits and trit fields.
 //!
-//! Conventions (see `docs/SETUN386_ISA.md` §1):
+//! Conventions (see `docs/SETUN26_ISA.md` §1):
 //! * trit positions are **1-based and most-significant first**: in a tryte
 //!   `x[1:9]`, `x[1]` has weight 3^8 and `x[9]` has weight 3^0;
 //! * **base 3** writes trits as `1`, `0` and `1̅` (a `1` with U+0305
@@ -357,6 +357,34 @@ impl<const N: usize> Tern<N> {
 /// U+0305 COMBINING OVERLINE: the mark of a negative digit.
 pub const OVERLINE: char = '\u{305}';
 
+/// Host text as the machine's code points, one per tryte: a character
+/// followed by U+0305 is the character overlined, written as its negated
+/// code point (`1` + U+0305 is −`'1'` = −49; docs/NOTATION.md). An overline
+/// with nothing before it, two overlines, an overline on a control
+/// character or a space, and a character above 9841 are errors.
+pub fn code_points(s: &str) -> Result<Vec<i64>, String> {
+    let mut out: Vec<i64> = Vec::new();
+    let mut barred = false;
+    for c in s.chars() {
+        if c == OVERLINE {
+            match out.last_mut() {
+                None => return Err("an overline with no character before it".into()),
+                Some(_) if barred => return Err("two overlines on one character".into()),
+                Some(&mut p) if p <= 32 => return Err(format!("U+{p:04X} cannot be overlined")),
+                Some(p) => *p = -*p,
+            }
+            barred = true;
+        } else {
+            if c as i64 > 9841 {
+                return Err(format!("character U+{:X} does not fit in one tryte", c as i64));
+            }
+            out.push(c as i64);
+            barred = false;
+        }
+    }
+    Ok(out)
+}
+
 /// The value of a prefixed literal's digits, as the assembler and the Trine
 /// compiler read them: `t` balanced ternary, `z` balanced base 27, `x` plain
 /// hexadecimal (for values from binary systems; a sign is written with unary
@@ -524,6 +552,17 @@ mod tests {
 
     fn t<const N: usize>(s: &str) -> Tern<N> {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn code_points_fold_overlines() {
+        assert_eq!(code_points("Setun-11\u{305}").unwrap().last(), Some(&-49));
+        assert_eq!(code_points("1\u{305}1").unwrap(), [-49, 49]);
+        assert_eq!(code_points("Ж").unwrap(), [0x416]);
+        assert!(code_points("\u{305}1").unwrap_err().contains("no character before"));
+        assert!(code_points("1\u{305}\u{305}").unwrap_err().contains("two overlines"));
+        assert!(code_points(" \u{305}").unwrap_err().contains("cannot be overlined"));
+        assert!(code_points("\u{1F600}").unwrap_err().contains("does not fit"));
     }
 
     #[test]

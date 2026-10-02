@@ -1,4 +1,4 @@
-// real.tri: decimal text for the Setun-387's `real` (real81).
+// real.tri: decimal text for the FPU's `real` (real81).
 //
 //   rtoa(x, digits, buf)  x as decimal text with up to `digits` significant
 //                         digits (1..12), like C's %g: "3.14159", "1e+100",

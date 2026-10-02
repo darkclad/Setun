@@ -1,12 +1,12 @@
-# Trine: a C-like language for Setun-386
+# Trine: a C-like language for Setun-11̅
 
 **Status: v0.2, implemented by the v1 compiler (`crates/trine`, binary `trine`).**
 §14 records the design decisions; §15 lists the changes from v0.1.
 
-Trine is the systems language for Setun-386: the language of the BIOS,
+Trine is the systems language for Setun-11̅: the language of the BIOS,
 kernel, drivers, window system and applications. It is a small language in
 the spirit of C: statically typed, with pointers and manual memory, compiled
-ahead of time to Setun-386 assembly, and suited to bare metal. Its
+ahead of time to Setun-11̅ assembly, and suited to bare metal. Its
 arithmetic is balanced ternary all the way down.
 
 The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
@@ -19,7 +19,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 - **Simple to compile:** one compilation unit, no preprocessor, and a declaration syntax that parses without C's declarator puzzles.
 - **Predictable:** every memory access in the source happens in the output. The v1 compiler does no optimisation that could reorder or drop them, so there is no need for `volatile`.
 
-**Not in v1:** floating point (it waits for a "Setun-387"), 81-trit `long`, generics, a preprocessor or macros, variadic functions, and passing or returning structs by value.
+**Not in v1:** 81-trit `long`, generics, a preprocessor or macros, variadic functions, and passing or returning structs by value.
 
 ## 2. Lexical structure
 
@@ -44,7 +44,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 | `trit` | 1 | −1, 0, +1 | three-state flags, signs. Stored in a tryte. |
 | `tryte`, alias `char` | 1 | −9 841 … 9 841 | a `char` holds one Unicode code point |
 | `int` | 3 | ±3 812 798 742 493 | the machine word: 27 trits |
-| `real` | 9 | ±3^9840, 71-trit precision, ±∞, NaN | the Setun-387's real81 (ISA §14): about 34 decimal digits |
+| `real` | 9 | ±3^9840, 71-trit precision, ±∞, NaN | the FPU's real81 (ISA §14): about 34 decimal digits |
 | `*T` | 3 | an address | a pointer is a word |
 | `[N]T` | N·sizeof(T), rounded up (§4) | | fixed-size array |
 | `struct S` | a multiple of 3 | | §4 |
@@ -62,7 +62,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 
 ## 4. Memory layout and addresses ⚠ REVIEW
 
-Setun-386 addresses a multi-tryte value by its **centre tryte**: the word at address `A` occupies `A−1, A, A+1`. Trine keeps this rule, so **a pointer is always the hardware address used to access the object**.
+Setun-11̅ addresses a multi-tryte value by its **centre tryte**: the word at address `A` occupies `A−1, A, A+1`. Trine keeps this rule, so **a pointer is always the hardware address used to access the object**.
 
 | Object | Its address | Alignment |
 |---|---|---|

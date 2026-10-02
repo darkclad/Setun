@@ -26,7 +26,7 @@ pub mod op {
     pub const BR3: i64 = 6567;
     pub const IOI: i64 = 6568;
     pub const FLD: i64 = 6569;
-    // the Setun-387 FPU (A[1] = −; A[2] = 0: 1-word, + : 2-word; ISA §14.5)
+    // the FPU (A[1] = −; A[2] = 0: 1-word, + : 2-word; ISA §14.5)
     pub const FALU: i64 = -6561;
     pub const FCVT: i64 = -6560;
     pub const FMEM: i64 = -6559;

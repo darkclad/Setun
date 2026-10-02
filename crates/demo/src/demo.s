@@ -1,4 +1,4 @@
-; Setun-386 demo ROM.
+; Setun-26 demo ROM.
 ;
 ; Boots from the reset vector (ring +1, paging off) and shows a text screen
 ; with machine facts, the RAM size, a live Unix clock and the 27 text colours;
@@ -411,8 +411,8 @@ fault_halt:
         b     fault_halt
 
 ; ---- data -----------------------------------------------------------------------------
-s_banner: .string "Setun-386 demo ROM ready. Type here or in the window.\n"
-s_title:  .string "SETUN-386 · balanced ternary computer"
+s_banner: .string "Setun-11̅ demo ROM ready. Type here or in the window.\n"
+s_title:  .string "SETUN-11̅ · balanced ternary computer"
 s_sub:    .string "Every size is a power of 3.  After Brusentsov's Setun, MSU 1958/1970."
 s_l4:     .string "tryte = 9 trits    word = 27 trits    address space = 3^27 trytes"
 s_l5:     .string "page = 3^9 trytes  27 registers       rings: -1 user, 0 drivers, +1 kernel"

@@ -187,10 +187,11 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                     s.push(ch);
                 }
             }
+            // a character followed by U+0305 is overlined: its negated code point
+            let cps = ternary::code_points(&s).map_err(err)?;
             if q == '\'' {
-                let mut it = s.chars();
-                match (it.next(), it.next()) {
-                    (Some(ch), None) => out.push(Token { tok: Tok::Char(ch as i64), pos }),
+                match cps[..] {
+                    [ch] => out.push(Token { tok: Tok::Char(ch), pos }),
                     _ => return Err(err("a character literal holds exactly one character".into())),
                 }
             } else {

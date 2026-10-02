@@ -1,4 +1,4 @@
-// The Mandelbrot set in 3^9 colours, in fixed point (no floats on Setun-386).
+// The Mandelbrot set in 3^9 colours, in fixed point (no floats on Setun-26).
 //
 //   trine build examples/mandel.tri -o mandel.t1b2
 //   setun --rom mandel.t1b2

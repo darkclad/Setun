@@ -1,4 +1,4 @@
-//! A complete Setun-386: CPU + memory + devices + emulated time.
+//! A complete Setun-26: CPU + memory + devices + emulated time.
 
 use crate::cpu::{Cpu, Step};
 use crate::devices::{Devices, Power};

@@ -1,6 +1,6 @@
 # Number notation
 
-How Setun-386 numbers are written: in source code, on the screen, in dumps and over the serial port. The normative digit tables are in ISA §1.1 ([`SETUN386_ISA.md`](SETUN386_ISA.md)). This page gives the summary and the reasons behind it.
+How Setun-11̅ numbers are written: in source code, on the screen, in dumps and over the serial port. The normative digit tables are in ISA §1.1 ([`SETUN26_ISA.md`](SETUN26_ISA.md)). This page gives the summary and the reasons behind it.
 
 ## Summary
 

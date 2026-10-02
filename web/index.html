@@ -1,5 +1,5 @@
 <meta charset="utf-8">
-<title>Setun-386</title>
+<title>Setun-11̅</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;600;800&family=IBM+Plex+Sans:wght@400;500&display=swap">
@@ -28,6 +28,8 @@ body { font: 15px/1.5 var(--font-body); padding-inline: 16px; padding-block: 20p
 header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
 .mark { font: 800 clamp(26px, 4vw, 38px)/1 var(--font-display); letter-spacing: 0.02em; margin: 0; }
 .mark span { color: var(--plus); }
+/* An overlined digit; the display font has no usable U+0305, so the bar is drawn here. */
+.mark .ov { text-decoration: overline; text-decoration-thickness: 0.09em; }
 .tag { color: var(--dim); margin: 0; }
 .facts { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px/1.4 var(--font-display); color: var(--dim); }
 .facts b { color: var(--ink); font-weight: 600; }
@@ -76,7 +78,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
 
 <div class="wrap">
   <header>
-    <h1 class="mark">SETUN<span>-386</span></h1>
+    <h1 class="mark" aria-label="Setun-11̅">SETUN<span aria-hidden="true">-1<span class="ov">1</span></span></h1>
     <p class="tag">A balanced-ternary computer booting Trinux, its POSIX-style OS, in your browser.</p>
     <div class="facts" aria-label="Machine facts">
       <span>tryte <b>3² trits</b></span>
@@ -88,7 +90,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
 
   <div class="deck">
     <div class="bezel">
-      <canvas id="screen" width="640" height="480" tabindex="0" aria-label="Setun-386 display. Click to type."></canvas>
+      <canvas id="screen" width="640" height="480" tabindex="0" aria-label="Setun-11̅ display. Click to type."></canvas>
       <div class="hint" id="hint">Click the screen to type</div>
     </div>
 

@@ -498,7 +498,7 @@ fn sysctl_ignores_bogus_power_values() {
     }
     assert!(m.dev.take_power().is_none());
     out(&mut m, block::SYSCTL, 0, 999); // SYSID is read-only
-    assert_eq!(inp(&mut m, block::SYSCTL, 0), 386);
+    assert_eq!(inp(&mut m, block::SYSCTL, 0), 26);
 }
 
 #[test]
@@ -678,10 +678,10 @@ fn disk_ignores_commands_while_busy() {
 
 #[test]
 fn file_disk_failures() {
-    let missing = std::env::temp_dir().join("setun386-definitely-missing.t1b2");
+    let missing = std::env::temp_dir().join("setun26-definitely-missing.t1b2");
     assert!(FileDisk::open(&missing).is_err());
     // A truncated image only exposes whole sectors.
-    let path = std::env::temp_dir().join(format!("setun386-trunc-{}.t1b2", std::process::id()));
+    let path = std::env::temp_dir().join(format!("setun26-trunc-{}.t1b2", std::process::id()));
     std::fs::write(&path, vec![0u8; 2 * PAGE as usize + 100]).unwrap();
     let d = FileDisk::open(&path).unwrap();
     assert_eq!(d.sectors(), 1);

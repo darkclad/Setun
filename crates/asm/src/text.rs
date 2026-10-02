@@ -1,4 +1,4 @@
-//! Setun-386 assembly language.
+//! Setun-26 assembly language.
 //!
 //! ```text
 //! ; comment                        NAME = expr   /   .equ NAME, expr
@@ -423,7 +423,8 @@ enum Kind {
     /// `.real27` (one word each) or `.real81` (three words each)
     Reals(Vec<setun_real::Real>, bool),
     Trytes(Vec<Expr>),
-    Str(String),
+    /// Code points (`ternary::code_points`), without the NUL.
+    Str(Vec<i64>),
     Zero(Expr),
     Fill(Expr, Expr),
     Align(Expr),
@@ -497,7 +498,7 @@ fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
                 Kind::Reals(v, m == ".real81")
             }
             ".tryte" => Kind::Trytes(exprs(&ops)?),
-            ".string" => Kind::Str(parse_string(rest).map_err(e)?),
+            ".string" => Kind::Str(parse_string(rest).and_then(|t| ternary::code_points(&t)).map_err(e)?),
             ".zero" => Kind::Zero(one(&exprs(&ops)?, line)?),
             ".align" => Kind::Align(one(&exprs(&ops)?, line)?),
             ".fill" => match exprs(&ops)?.as_slice() {
@@ -966,7 +967,7 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                 Kind::Words(v) => v.len(),
                 Kind::Reals(v, wide) => v.len() * if *wide { 3 } else { 1 },
                 Kind::Trytes(v) => v.len().div_ceil(3),
-                Kind::Str(t) => (t.chars().count() + 1).div_ceil(3),
+                Kind::Str(t) => (t.len() + 1).div_ceil(3),
                 Kind::Align(e) => {
                     let n = e.constant(&consts).ok_or_else(|| Error { line: s.line, msg: ".align needs a constant".into() })?;
                     if n <= 0 || n % 3 != 0 {
@@ -1035,10 +1036,7 @@ pub fn assemble(src: &str) -> Result<Program, Error> {
                     pack_trytes(&t)
                 }
                 Kind::Str(t) => {
-                    let mut t: Vec<i64> = t.chars().map(|c| c as i64).collect();
-                    if let Some(c) = t.iter().find(|&&c| c > 9841) {
-                        return err(s.line, format!("character U+{c:X} does not fit in one tryte"));
-                    }
+                    let mut t = t.clone();
                     t.push(0);
                     pack_trytes(&t)
                 }

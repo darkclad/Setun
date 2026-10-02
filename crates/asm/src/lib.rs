@@ -1,4 +1,4 @@
-//! Setun-386 assembler back end: a two-pass program builder with labels.
+//! Setun-26 assembler back end: a two-pass program builder with labels.
 //!
 //! Every item has a size known when it is added, so pass 1 assigns
 //! addresses and pass 2 encodes, resolving label references. Addresses are
@@ -178,9 +178,13 @@ impl Asm {
         self
     }
 
-    /// A NUL-terminated string, one character (Unicode code point) per tryte.
+    /// A NUL-terminated string, one character (Unicode code point) per tryte;
+    /// a character followed by U+0305 is overlined (`ternary::code_points`).
+    ///
+    /// # Panics
+    /// If the text is not valid for the machine (see `ternary::code_points`).
     pub fn string(&mut self, s: &str) -> &mut Self {
-        let mut t: Vec<i64> = s.chars().map(|c| c as i64).collect();
+        let mut t = ternary::code_points(s).expect("string for the machine");
         t.push(0);
         self.trytes(&t)
     }

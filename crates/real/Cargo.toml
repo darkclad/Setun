@@ -1,6 +1,6 @@
 [package]
 name = "setun-real"
-description = "Setun-387 floating point: real27 and real81 balanced-ternary arithmetic, correctly rounded"
+description = "Setun-26 floating point: real27 and real81 balanced-ternary arithmetic, correctly rounded"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

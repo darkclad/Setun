@@ -7,7 +7,7 @@ import "console.tri";
 
 fn main() -> int {
     screen_clear();
-    print("Привет, Setun-386!\n");
+    print("Привет, Setun-11̅!\n");
     print("A tryte holds 3^9 = ");
     print_int(3 * 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3);
     print(" values; a word holds 3^27.\n");

@@ -1,4 +1,4 @@
-//! Setun-387 floating point (ISA §14): real27 and real81.
+//! Setun-26 floating point (ISA §14): real27 and real81.
 //!
 //! A value is `m · 3^E` with a balanced fraction `m = M · 3^−n`: the
 //! significand M carries the sign, so there is no sign trit and no −0. Both
@@ -67,7 +67,7 @@ pub enum Kind {
     NaN,
 }
 
-/// A Setun-387 value: the exponent and 72-trit significand of a real81.
+/// An FPU value: the exponent and 72-trit significand of a real81.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Real {
     pub e: i64,

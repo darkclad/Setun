@@ -1,6 +1,6 @@
 [package]
 name = "setun-web"
-description = "Setun-386 browser front end: WebAssembly exports for a canvas page"
+description = "Setun-26 browser front end: WebAssembly exports for a canvas page"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

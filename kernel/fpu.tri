@@ -1,4 +1,4 @@
-// fpu: lazy switching of the Setun-387 registers (ISA §14, docs/KERNEL.md).
+// fpu: lazy switching of the FPU registers (ISA §14, docs/KERNEL.md).
 //
 // Only one task's FPU state lives in the hardware at a time: fpu_owner's.
 // Every return to user mode sets MODE.FE in the frame to 1 for the owner and

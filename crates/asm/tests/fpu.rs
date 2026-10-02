@@ -1,4 +1,4 @@
-//! The Setun-387 in the emulator (ISA §14), driven by assembly programs.
+//! The FPU in the emulator (ISA §14), driven by assembly programs.
 
 use setun_asm::{disasm, text};
 use setun_core::{Machine, Step};

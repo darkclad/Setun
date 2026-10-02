@@ -1,8 +1,10 @@
-# Setun-386 Instruction Set Architecture
+# Setun-11̅ Instruction Set Architecture
 
-**Status: v0.5 draft (2026-10-01): v0.4 (accepted 2026-09-30) plus the Setun-387 floating-point unit, §14.** §13 records the decisions.
+Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
-The Setun-386 is a balanced-ternary machine sized like an Intel 386: rich
+**Status: v0.5 draft (2026-10-01): v0.4 (accepted 2026-09-30) plus floating-point instructions, §14.** §13 records the decisions.
+
+Setun-11̅ is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
 designed from scratch. From the Setun lineage it keeps balanced arithmetic, the
 tritwise multiply and threshold-add operations, and the 3-way branch. It has no
@@ -32,7 +34,7 @@ Version history:
 - v0.2: 6-trit trytes and 18-trit words.
 - v0.3: the pure-ternary revision.
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
-- v0.5: the Setun-387 floating-point unit (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
+- v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 
 ---
 
@@ -150,7 +152,7 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 | 6 | `EMODE` | MODE saved on trap entry |
 | 7 | `KSP` | the other stack pointer, swapped with `r13` on a ring change |
 | 8 | `SCRATCH` | free for the kernel |
-| 9 | `CPUID` | read-only: the ISA version in trits 19–27, and feature trits; trit 1 = +1: the Setun-387 FPU is present |
+| 9 | `CPUID` | read-only: the ISA version in trits 19–27, and feature trits; trit 1 = +1: the FPU is present (always +1 on Setun-11̅; not reused) |
 | 10 | `CYCLE` | read-only instruction counter |
 | others | – | reserved: reads return 0. Writes to these, and to the read-only `CPUID`/`CYCLE`, raise `ILL` (vector −1). |
 
@@ -167,7 +169,7 @@ Control registers are `cr-13..cr13`. They are accessed with `MFC`/`MTC` and **re
 |---|---|---|
 | 0 | −3280..3280 | 1-word instruction |
 | + | 3281..9841 | 2-word instruction (majors are numbered `6561 + n`) |
-| − | −9841..−3281 | the **Setun-387 floating-point unit** (§14) |
+| − | −9841..−3281 | **floating-point instructions** (§14) |
 
 **An all-zero word is `ILL`**, so running into zeroed memory traps at once.
 
@@ -488,7 +490,7 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `SYSID` (read-only): 386 |
+| 0 | `SYSID` (read-only): 26 (`0t100T`) |
 | 1 | `RAM_FRAMES` (read-only) |
 | 2 | `POWER`: write +1 to reset, −1 to power off |
 | 3 | `DEBUG`: write a tryte and it appears in the host log |
@@ -666,9 +668,9 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
         RET
 ```
 
-## 12. Setun-386 vs 386 at a glance
+## 12. Setun-11̅ vs i386 at a glance
 
-| | i386 | Setun-386 |
+| | i386 | Setun-11̅ |
 |---|---|---|
 | smallest unit | byte = 2³ bits | tryte = 3² trits (≈ 14.3 bits) |
 | register / pointer | 32 = 2^5 bits | 27 = 3³ trits (≈ 42.8 bits) |
@@ -694,11 +696,11 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
 8. **Colours: 3^9, with 27 levels per channel.** A pixel's three base-27 digits are R, G, B (§8.3).
 9. **No Setun-70 compatibility mode**: a new CPU from scratch that resets straight into native mode (§9). **Default RAM is 3^18 = 9^9 trytes** (§4).
 10. A **carry trit C**, **two kinds of division**, **every trap enters ring +1**, and **text mode**. These carry over from v0.2.
-11. **The Setun-387 floating-point unit** (§14): real27 and real81 with one shared 9-trit exponent, a signed balanced significand (no sign trit, no −0), 27 flat registers, ±∞/NaN/subnormals, round to nearest with ties to even, and a "not available" trap for lazy context switching.
+11. **Floating-point instructions** (§14): real27 and real81 with one shared 9-trit exponent, a signed balanced significand (no sign trit, no −0), 27 flat registers, ±∞/NaN/subnormals, round to nearest with ties to even, and a "not available" trap for lazy context switching.
 
-## 14. The Setun-387 floating-point unit
+## 14. The floating-point unit
 
-The 387 was the 386's coprocessor, and the Setun-387 is the Setun-386's. It is part of the CPU here: `CPUID` trit 1 says it is present. It owns the third of the opcode space whose first trit is −.
+The i386 needed a separate 387 coprocessor; the 486DX built it in, and so does this machine. The FPU is part of the CPU and of this ISA, not an option: `CPUID` trit 1 is always +1. It owns the third of the opcode space whose first trit is −.
 
 ### 14.1 Formats
 

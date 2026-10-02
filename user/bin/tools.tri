@@ -785,7 +785,7 @@ fn od_char(v: int) {
     if (v == '\t') { puts("  \\t"); return; }
     if (v == 0) { puts("  \\0"); return; }
     if (v == '\\') { puts("  \\\\"); return; }
-    if (v >= 32 && v != 127) {
+    if ((v >= 32 && v != 127) || v <= -33) { // an overlined character is printable too
         var c: [2]char;
         c[0] = v as char;
         c[1] = 0;

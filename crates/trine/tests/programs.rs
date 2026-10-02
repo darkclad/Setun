@@ -353,13 +353,20 @@ fn serial_console_and_stdlib() {
 #[test]
 fn text_screen_output() {
     let src = "import \"console.tri\";
-    fn main() -> int { screen_clear(); screen_puts(\"Trine on Setun-386\"); return screen_col; }";
+    fn main() -> int { screen_clear(); screen_puts(\"Trine on Setun-11̅\"); return screen_col; }";
     let b = build_source("t.tri", src, None, &Options::rom()).unwrap();
     let r = run_rom(&b.image, 5_000_000, "");
-    assert_eq!(r.outcome, Outcome::Exit(18));
+    assert_eq!(r.outcome, Outcome::Exit(17), "17 cells: the overlined 1 is one");
     let fb = r.machine.mem.framebuffer();
-    let line: String = (0..18).map(|i| char::from_u32(fb[3 * i] as u32).unwrap()).collect();
-    assert_eq!(line, "Trine on Setun-386");
+    // an overlined character is its negated code point, one cell
+    let line: String = (0..17)
+        .map(|i| match fb[3 * i] as i64 {
+            c if c < 0 => format!("{}\u{305}", char::from_u32(-c as u32).unwrap()),
+            c => char::from_u32(c as u32).unwrap().to_string(),
+        })
+        .collect();
+    assert_eq!(line, "Trine on Setun-11\u{305}");
+    assert_eq!(fb[3 * 16], -('1' as i16), "the last 1 is overlined, not 1 + a stray U+0305");
 }
 
 #[test]

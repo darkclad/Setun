@@ -1,4 +1,4 @@
-//! Device tests against docs/SETUN386_ISA.md §8.
+//! Device tests against docs/SETUN26_ISA.md §8.
 
 use setun_core::devices::{self, block, decode_port, irq, BlockStore, Display, MemDisk};
 use setun_core::isa::{self, alu, cond, cr, op, sys};
@@ -246,7 +246,7 @@ fn disk_dma_read_write_and_errors() {
 #[test]
 fn file_disk_roundtrip() {
     use setun_core::devices::FileDisk;
-    let path = std::env::temp_dir().join(format!("setun386-test-{}.t1b2", std::process::id()));
+    let path = std::env::temp_dir().join(format!("setun26-test-{}.t1b2", std::process::id()));
     {
         let mut d = FileDisk::create(&path, 2).unwrap();
         let mut buf = vec![0i16; PAGE as usize];

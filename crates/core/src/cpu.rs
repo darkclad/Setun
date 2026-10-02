@@ -1,4 +1,4 @@
-//! Setun-386 CPU: registers, decode/execute, traps and the MMU.
+//! Setun-26 CPU: registers, decode/execute, traps and the MMU.
 
 use crate::io::Io;
 use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, mode, op, sys, vector};
@@ -15,7 +15,7 @@ mod jit;
 pub const RESET_PC: i64 = -59_049;
 
 /// `CPUID` value: ISA version (v0.5) in the low trits, and trit 1 (+1):
-/// the Setun-387 FPU is present.
+/// the FPU is present (always +1 on Setun-26).
 pub const CPUID_VERSION: i64 = 5;
 pub const CPUID: i64 = CPUID_VERSION + 2_541_865_828_329; // + 3^26
 
@@ -73,7 +73,7 @@ pub struct Cpu {
     pub halted: bool,
     /// Current instruction's address, for fault reporting.
     inst_pc: Word,
-    /// The Setun-387: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
+    /// The FPU: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
     fregs: [Real; 27],
     fsr: Word,
     /// Inside [`Cpu::run_batch`]: port I/O is deferred to a single step.
@@ -1435,7 +1435,7 @@ impl Cpu {
         Ok(())
     }
 
-    // ---- the Setun-387 (ISA §14) ------------------------------------------
+    // ---- the FPU (ISA §14) -------------------------------------------------
 
     /// Record exception flags: set the sticky FSR flags, and trap (vector
     /// −11, before any result is written) on the first unmasked one.

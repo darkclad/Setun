@@ -1,6 +1,6 @@
 [package]
 name = "setun-demo"
-description = "Setun-386 demo ROM: text screen, keyboard/serial echo, 3^9-colour graphics"
+description = "Setun-26 demo ROM: text screen, keyboard/serial echo, 3^9-colour graphics"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -1,4 +1,6 @@
-# Setun-386
+# Setun-11̅
+
+Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
 A balanced-ternary computer sized like an Intel 386, with an emulator, BIOS,
 compiler, kernel and window system. It is a new CPU designed from scratch and
@@ -13,7 +15,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - 3^27-tryte address space (3^3^3), paged 9|9|9 with 3^9-tryte pages
 - default RAM 3^18 = 9^9 trytes (≈ 691 MB equivalent)
 - 27 general registers, a load/store 3-operand ISA, a sign trit and a carry trit
-- the Setun-387 FPU: 27 real registers, real27 (9-trit exponent, 18-trit mantissa) and real81 (72-trit mantissa), where 1/3 is exact and 1/10 is not
+- the floating-point unit (ISA §14): 27 real registers, real27 (9-trit exponent, 18-trit mantissa) and real81 (72-trit mantissa), where 1/3 is exact and 1/10 is not
 - 3 privilege rings on one trit, 243 interrupt vectors, 3^9 I/O ports (a port number is one tryte)
 - 640×480 framebuffer, one tryte per pixel = 3^9 colours (27 levels per channel)
 - a tryte holds a Unicode code point directly
@@ -26,7 +28,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 
 ## Docs
 
-- [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4 accepted; v0.5 draft adds the Setun-387 floating-point unit)
+- [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the ISA (v0.4 accepted; v0.5 draft adds floating-point instructions, §14)
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
@@ -65,7 +67,7 @@ cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
 sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
-python -m http.server 8386 --directory web     # then open http://localhost:8386
+python -m http.server 8026 --directory web     # then open http://localhost:8026
 ```
 
 The browser page boots Trinux from the built-in disk (3^7 pages of RAM). Log in

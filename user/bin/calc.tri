@@ -1,4 +1,4 @@
-// calc [expression ...]: a calculator on the Setun-387 FPU.
+// calc [expression ...]: a calculator on the FPU.
 //
 //   calc '2^0.5'          evaluate the arguments and print the result
 //   calc                  read expressions line by line (a prompt on a tty)

@@ -1,4 +1,4 @@
-// Setun-386 BIOS.
+// Setun-26 BIOS.
 //
 // Runs from ROM at reset (ring +1, paging off). Checks the machine, shows
 // what it found, then boots disk 0 (docs/BOOT.md). Without a bootable disk
@@ -53,7 +53,7 @@ fn title_bar() {
     }
     colour(A_TITLE);
     screen_col = 1;
-    print("SETUN-386 BIOS ");
+    print("SETUN-11̅ BIOS ");
     print(VERSION);
     screen_puts("                balanced ternary · every size a power of 3");
     colour(A_TEXT);
@@ -64,8 +64,8 @@ fn title_bar() {
 
 fn print_cpu() {
     label("  CPU     ");
-    print("Setun-386, ISA v0.");
-    print_int(mfc(CPUID));
+    print("Setun-11̅, ISA v0.");
+    print_int(modr(mfc(CPUID), 19683)); // the version: trits 19–27
     print(", ring +1, 27 registers of 27 trits\n");
 }
 

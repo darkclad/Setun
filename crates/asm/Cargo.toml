@@ -1,6 +1,6 @@
 [package]
 name = "setun-asm"
-description = "Setun-386 assembler back end: a label-resolving program builder"
+description = "Setun-26 assembler back end: a label-resolving program builder"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

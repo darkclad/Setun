@@ -1,4 +1,4 @@
-//! Instruction-level tests against docs/SETUN386_ISA.md v0.4.
+//! Instruction-level tests against docs/SETUN26_ISA.md v0.4.
 
 use setun_core::cpu::{Access, Cpu, Step};
 use setun_core::isa::{self, alu, cond, cr, fld, mem, mode, op, sys, vector};

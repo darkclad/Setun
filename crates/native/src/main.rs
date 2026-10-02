@@ -1,4 +1,4 @@
-//! Setun-386 native front end.
+//! Setun-26 native front end.
 //!
 //! A window showing the display (text or graphics mode), keyboard and mouse
 //! input, and the serial console on stdin/stdout. Without `--rom` it boots
@@ -231,7 +231,7 @@ fn main() {
         _ => Scale::X2,
     };
     let mut window = Window::new(
-        "Setun-386",
+        "Setun-11̅",
         640,
         480,
         WindowOptions { scale, ..WindowOptions::default() },
@@ -300,7 +300,7 @@ fn main() {
         frames += 1;
         if frames.is_multiple_of(60) {
             let fps = 60.0 / t0.elapsed().as_secs_f64();
-            window.set_title(&format!("Setun-386 — {:.0} fps, {:.1} MIPS", fps, fps * per_frame as f64 / 1e6));
+            window.set_title(&format!("Setun-11̅ — {:.0} fps, {:.1} MIPS", fps, fps * per_frame as f64 / 1e6));
             t0 = std::time::Instant::now();
         }
     }

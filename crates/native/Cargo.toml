@@ -1,6 +1,6 @@
 [package]
 name = "setun-native"
-description = "Setun-386 native front end: window, keyboard/mouse, serial console on stdio"
+description = "Setun-26 native front end: window, keyboard/mouse, serial console on stdio"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

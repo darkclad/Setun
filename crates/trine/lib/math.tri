@@ -1,4 +1,4 @@
-// math.tri: elementary functions on the Setun-387's `real`, from its +-*/
+// math.tri: elementary functions on the FPU's `real`, from its +-*/
 // and sqrt. Accurate to about 30 significant digits for ordinary arguments.
 //
 //   exp(x)  ln(x)  log3(x)  log10(x)  pow(x, y)

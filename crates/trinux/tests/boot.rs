@@ -86,7 +86,7 @@ fn k1_kernel_boots_with_paging_and_timer() {
     let (out, m) = boot_log(&trinux::default_files(), 30_000_000);
     for line in [
         "Trinux loader: kernel",
-        "Trinux version 0.1 (trine) on Setun-386, balanced ternary",
+        "Trinux version 0.1 (trine) on Setun-11̅, balanced ternary",
         "Booted from disk 0, RAM 729 pages",
         "Traps: 243 vectors",
         "Memory: 671 pages free (frames 58..728), triddy orders 0..9",
@@ -229,9 +229,9 @@ fn k4_shell_files_dirs_and_status() {
         "$ ls /\nbin\ndev\netc\nhome\nmnt\nproc\nroot\nsbin\ntmp\n",
         "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root     root    ",
         "/etc:\n-rw-r--r-- 1 root     root          44 group\n",
-        "-rw-r--r-- 1 root     root          65 motd\n",
+        "-rw-r--r-- 1 root     root          64 motd\n",
         "-rw------- 1 root     root         134 shadow\n",
-        "Welcome to Trinux on Setun-386.\nEverything here is a power of 3.\n",
+        "Welcome to Trinux on Setun-11̅.\nEverything here is a power of 3.\n",
         "status 1\n",
         "or-ran\nand-ran\n",
         "echo never; echo $?\n1\n",

@@ -1,4 +1,4 @@
-//! Setun-386 disassembler.
+//! Setun-26 disassembler.
 //!
 //! Output uses the assembly syntax of [`crate::text`], and every line is
 //! checked by reassembling it: if the text would not produce the identical
@@ -229,7 +229,7 @@ fn fr(n: i64) -> String {
     format!("f{n}")
 }
 
-/// The Setun-387 instructions (ISA §14.5).
+/// The floating-point instructions (ISA §14.5).
 fn decode_fpu(f: Fields, w1: Word, w2: Option<Word>) -> Option<(String, usize)> {
     let long = w1.trit(2) as i64 == 1;
     let imm = if long { w2?.value() } else { 0 };

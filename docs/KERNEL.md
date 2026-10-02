@@ -1,16 +1,16 @@
-# Trinux: the Setun-386 kernel
+# Trinux: the Setun-11̅ kernel
 
 **Status: v0.1, accepted. Milestones K1–K3 are implemented** (`kernel/`, built by `mkdisk`).
 Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
 
-Trinux is a Unix kernel for Setun-386, **modelled on Linux** and providing
+Trinux is a Unix kernel for Setun-11̅, **modelled on Linux** and providing
 **POSIX.1-2017 interfaces**. It is written in Trine and boots through the BIOS
 ([`BOOT.md`](BOOT.md)).
 
 ## 0. What "POSIX" can mean on a ternary machine
 
 POSIX.1-2001 and later require 8-bit bytes (`CHAR_BIT == 8`) and a C compiler
-(`c99`). Setun-386 has 9-trit trytes, and its language is Trine. So Trinux
+(`c99`). Setun-11̅ has 9-trit trytes, and its language is Trine. So Trinux
 cannot be *certified*. It aims at the next best thing:
 
 - **Interfaces:** the POSIX system interfaces with POSIX semantics, adapted so that **the tryte plays the role of the byte**.
@@ -235,7 +235,7 @@ fmt_nl(f);
   - `if`/`while`/`for`;
   - builtins: `cd`, `exit`, `export`, `jobs`, `fg`/`bg`.
 - **Core utilities:** `ls cat echo pwd mkdir rmdir rm cp mv ln touch chmod ps kill sleep date uname true false head tail wc grep sort env clear`.
-- **`/bin/calc`:** a calculator on the Setun-387 (`math.tri`): `+ − * / % ^`, functions, variables, `0t`/`0z` integers, and `:t` to show results in balanced ternary as well (`1/3` → `0t0.1`).
+- **`/bin/calc`:** a calculator on the FPU (`math.tri`): `+ − * / % ^`, functions, variables, `0t`/`0z` integers, and `:t` to show results in balanced ternary as well (`1/3` → `0t0.1`).
 
 ## 12. Known departures from POSIX
 
@@ -933,7 +933,7 @@ The server keeps every window's pixels (server-side rendering), so clients never
 - **id, whoami, groups, chown, chgrp** are applets of `misc`. **ls -l** shows owner and group names, and `s`/`t` for the set-ID and sticky bits.
 - **Tests:** they log in as root at the first prompt. `tests/users.rs` covers accounts, set-ID `passwd`, `su`, login failures and every permission refusal.
 
-## 23. The Setun-387 FPU
+## 23. The FPU
 
 [`kernel/fpu.tri`](../kernel/fpu.tri) switches the FPU registers (ISA §14) **lazily**, as Linux did on the 386 with `CR0.TS`:
 

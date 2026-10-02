@@ -7,7 +7,9 @@ fn isalpha(c: int) -> int { return isupper(c) || islower(c); }
 fn isalnum(c: int) -> int { return isalpha(c) || isdigit(c); }
 fn isspace(c: int) -> int { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12; }
 fn isxdigit(c: int) -> int { return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
-fn isprint(c: int) -> int { return c >= 32 && c < 127; }
-fn ispunct(c: int) -> int { return isprint(c) && !isalnum(c) && c != ' '; }
+// An overlined character (code point -33..-126, the negated character) is
+// printable; it is a letter or digit when the character is.
+fn isprint(c: int) -> int { return (c >= 32 && c < 127) || (c <= -33 && c >= -126); }
+fn ispunct(c: int) -> int { return isprint(c) && !isalnum(c < 0 ? -c : c) && c != ' '; }
 fn toupper(c: int) -> int { return islower(c) ? c - 32 : c; }
 fn tolower(c: int) -> int { return isupper(c) ? c + 32 : c; }

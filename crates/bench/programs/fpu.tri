@@ -1,4 +1,4 @@
-// Benchmark: the Setun-387 through math.tri; exits with a checksum.
+// Benchmark: the FPU through math.tri; exits with a checksum.
 
 import "math.tri";
 

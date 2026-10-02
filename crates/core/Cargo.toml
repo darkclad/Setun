@@ -1,6 +1,6 @@
 [package]
 name = "setun-core"
-description = "Setun-386 emulator core: CPU, MMU, memory and devices"
+description = "Setun-26 emulator core: CPU, MMU, memory and devices"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

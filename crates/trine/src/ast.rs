@@ -5,7 +5,7 @@ use crate::lexer::Pos;
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     Int,
-    /// The Setun-387 real81.
+    /// The FPU's real81.
     Real,
     Tryte,
     Trit,
