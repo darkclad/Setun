@@ -1,0 +1,349 @@
+//! A peephole pass over one function's assembly, driven by register
+//! liveness (the S/C flags count as a register: `mov`, `push`, `pop` and
+//! ALU instructions set them, branches read them).
+//!
+//! - **Forward a copy:** `mov r1, X` then an instruction reading r1 reads X
+//!   instead, when r1 is dead afterwards (or rewritten by it).
+//! - **Retarget a result:** an instruction computing r1 followed by
+//!   `mov Y, r1` computes Y directly, when r1 is dead after the move.
+//! - **Drop dead code:** a side-effect-free instruction whose results are
+//!   all dead.
+//!
+//! Anything it does not understand (inline assembly, an unknown mnemonic,
+//! a jump it cannot follow) makes it leave the function alone.
+
+use std::collections::HashMap;
+
+const FLAGS: u32 = 1 << 27;
+
+fn reg_num(s: &str) -> Option<i64> {
+    match s {
+        "sp" => Some(13),
+        "fp" => Some(11),
+        "lr" => Some(12),
+        "zero" => Some(0),
+        _ => s.strip_prefix('r')?.parse::<i64>().ok().filter(|n| (-13..=13).contains(n)),
+    }
+}
+
+fn bit(r: i64) -> u32 {
+    1 << (r + 13)
+}
+
+/// Registers named in an operand: a register, or a memory operand's base.
+fn regs_of(op: &str) -> u32 {
+    if let Some(r) = reg_num(op) {
+        return bit(r);
+    }
+    if let Some(inner) = op.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        // "[r-3+6]": the base may itself contain a minus
+        let base = match inner.strip_prefix("r-") {
+            Some(rest) => &inner[..rest.find(['+', '-']).map_or(inner.len(), |k| k + 2)],
+            None => inner.split(['+', '-']).next().unwrap_or(""),
+        };
+        if let Some(r) = reg_num(base) {
+            return bit(r);
+        }
+    }
+    0
+}
+
+/// r1..r6: the argument registers.
+fn args() -> u32 {
+    (1..=6).map(bit).fold(0, |a, b| a | b)
+}
+
+/// What a call may change: the caller-saved registers, lr and the flags.
+fn clobbered() -> u32 {
+    let mut m = FLAGS | bit(12);
+    for r in (1..=10).chain(-13..=-10) {
+        m |= bit(r);
+    }
+    m
+}
+
+#[derive(Clone)]
+struct Ins {
+    op: String,
+    args: Vec<String>,
+}
+
+impl Ins {
+    fn parse(line: &str) -> Ins {
+        let t = line.trim();
+        let (op, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
+        let args = if rest.trim().is_empty() { Vec::new() } else { rest.split(',').map(|a| a.trim().to_string()).collect() };
+        Ins { op: op.to_string(), args }
+    }
+
+    fn text(&self) -> String {
+        if self.args.is_empty() {
+            format!("        {}", self.op)
+        } else {
+            format!("        {} {}", self.op, self.args.join(", "))
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum Ctl {
+    Next,
+    Jump(String),
+    Branch(Vec<String>),
+    Exit,
+}
+
+/// How an instruction behaves.
+struct Info {
+    uses: u32,
+    defs: u32,
+    /// Only writes `defs`: safe to delete when they are dead.
+    pure: bool,
+    /// The destination is operand 0, which can be renamed.
+    dst0: bool,
+    ctl: Ctl,
+}
+
+const ALU3: &[&str] = &[
+    "add", "sub", "adc", "sbc", "mul", "mulh", "div", "mod", "divr", "modr", "min", "max", "tmul", "tsat", "cons", "sh", "trit",
+];
+const ALU2: &[&str] = &["neg", "sgn", "abs", "tlz"];
+const BRANCHES: &[&str] = &["blt", "beq", "bgt", "ble", "bge", "bne", "bov", "bnov", "bnever"];
+
+fn info(i: &Ins) -> Option<Info> {
+    let a = &i.args;
+    let reg0 = || a.first().and_then(|x| reg_num(x)).map(bit).unwrap_or(0);
+    let src = |from: usize| a.iter().skip(from).fold(0, |m, x| m | regs_of(x));
+    let op = i.op.as_str();
+    let inf = |uses, defs, pure, dst0| Some(Info { uses, defs, pure, dst0, ctl: Ctl::Next });
+    match op {
+        _ if ALU3.contains(&op) && a.len() == 3 => {
+            let carry_in = if matches!(op, "adc" | "sbc") { FLAGS } else { 0 };
+            let faults = matches!(op, "div" | "mod" | "divr" | "modr");
+            inf(src(1) | carry_in, reg0() | FLAGS, !faults, true)
+        }
+        _ if ALU2.contains(&op) && a.len() == 2 => inf(src(1), reg0() | FLAGS, true, true),
+        "mov" if a.len() == 2 => {
+            if reg_num(&a[1]).is_some() {
+                inf(src(1), reg0() | FLAGS, true, true)
+            } else {
+                inf(0, reg0(), true, true) // a constant: LI, no flags
+            }
+        }
+        "li" | "la" | "lea" if a.len() == 2 => inf(0, reg0(), true, true),
+        "cmp" if a.len() == 2 => inf(src(0), FLAGS, true, false),
+        "ldw" | "ldt" if a.len() == 2 => inf(src(1), reg0(), false, true),
+        "stw" | "stt" if a.len() == 2 => inf(src(0), 0, false, false),
+        "push" if a.len() == 1 => inf(src(0) | bit(13), bit(13) | FLAGS, false, false),
+        "pop" if a.len() == 1 => inf(bit(13), reg0() | bit(13) | FLAGS, false, false),
+        "ext" if a.len() == 4 => inf(src(1), reg0() | FLAGS, true, true),
+        "ins" if a.len() == 4 => inf(src(0), reg0() | FLAGS, true, false),
+        "in" if a.len() == 2 => inf(src(1), reg0(), false, false),
+        "out" if a.len() == 2 => inf(src(0), 0, false, false),
+        "mfc" if a.len() == 2 => inf(0, reg0(), false, false),
+        "mtc" if a.len() == 2 => inf(src(1), 0, false, false),
+        "nop" => inf(0, 0, false, false),
+        "hlt" | "fence" | "tlbflush" => inf(0, 0, false, false),
+        "tlbinv" => inf(src(0), 0, false, false),
+        "sys" => inf(args() | bit(13), bit(1) | FLAGS, false, false),
+        "call" if a.len() == 1 => inf(args() | bit(13), clobbered(), false, false),
+        "jal" if a.len() == 2 => inf(args() | bit(13), clobbered() | reg0(), false, false),
+        "jalr" if a.len() >= 2 && reg0() != bit(0) => inf(src(1) | args() | bit(13), clobbered() | reg0(), false, false),
+        "ret" if a.is_empty() => {
+            let mut uses = bit(1) | bit(11) | bit(12) | bit(13);
+            for r in -9..=-1 {
+                uses |= bit(r);
+            }
+            Some(Info { uses, defs: 0, pure: false, dst0: false, ctl: Ctl::Exit })
+        }
+        "b" if a.len() == 1 => Some(Info { uses: 0, defs: 0, pure: false, dst0: false, ctl: Ctl::Jump(a[0].clone()) }),
+        _ if BRANCHES.contains(&op) && a.len() == 1 => {
+            Some(Info { uses: FLAGS, defs: 0, pure: false, dst0: false, ctl: Ctl::Branch(vec![a[0].clone()]) })
+        }
+        "br3" if a.len() == 2 => Some(Info { uses: FLAGS, defs: 0, pure: false, dst0: false, ctl: Ctl::Branch(a.clone()) }),
+        // the FPU: integer registers by position; every instruction may trap
+        "fldd" | "flds" | "fstd" | "fsts" if a.len() == 2 => inf(src(1), 0, false, false),
+        "fcvtif" | "ffrw" if a.len() == 2 => inf(src(1), 0, false, false),
+        "fcvtfi" | "ftow" | "fexp" | "fclass" | "fmfs" if !a.is_empty() => inf(0, reg0(), false, false),
+        "fmts" if a.len() == 1 => inf(src(0), 0, false, false),
+        "fscl" if a.len() == 3 => inf(src(2), 0, false, false),
+        "fcmp" => inf(0, FLAGS, false, false),
+        _ if op.starts_with('f') => inf(0, 0, false, false), // f-register-only arithmetic
+        _ => None,
+    }
+}
+
+enum Line {
+    Label(String),
+    Ins(Ins),
+    Other,
+}
+
+fn classify(l: &str) -> Line {
+    if l.starts_with(char::is_whitespace) {
+        if l.trim().is_empty() {
+            Line::Other
+        } else {
+            Line::Ins(Ins::parse(l))
+        }
+    } else if let Some(name) = l.trim().strip_suffix(':') {
+        Line::Label(name.to_string())
+    } else {
+        Line::Other
+    }
+}
+
+/// Liveness after each line (indexes into `lines`); None if the function
+/// cannot be analysed.
+fn liveness(lines: &[String]) -> Option<Vec<u32>> {
+    let parsed: Vec<Line> = lines.iter().map(|l| classify(l)).collect();
+    let mut labels = HashMap::new();
+    for (k, l) in parsed.iter().enumerate() {
+        if let Line::Label(n) = l {
+            labels.insert(n.clone(), k);
+        }
+    }
+    let mut infos = Vec::with_capacity(lines.len());
+    for l in &parsed {
+        infos.push(match l {
+            Line::Ins(i) => Some(info(i)?),
+            Line::Label(_) => None,
+            Line::Other => return None,
+        });
+    }
+    // successors of each line
+    let n = lines.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for k in 0..n {
+        let next = if k + 1 < n { vec![k + 1] } else { vec![] };
+        succ[k] = match &infos[k] {
+            None => next,
+            Some(inf) => match &inf.ctl {
+                Ctl::Next => next,
+                Ctl::Exit => vec![],
+                Ctl::Jump(t) => vec![*labels.get(t)?],
+                Ctl::Branch(ts) => {
+                    let mut v = next;
+                    for t in ts {
+                        v.push(*labels.get(t)?);
+                    }
+                    v
+                }
+            },
+        };
+    }
+    // iterate to a fixpoint: live_in[k] = uses ∪ (live_out[k] − defs)
+    let mut live_in = vec![0u32; n];
+    let mut live_out = vec![0u32; n];
+    loop {
+        let mut changed = false;
+        for k in (0..n).rev() {
+            let out = succ[k].iter().fold(0, |m, &s| m | live_in[s]);
+            let inn = match &infos[k] {
+                Some(inf) => inf.uses | (out & !inf.defs),
+                None => out,
+            };
+            if out != live_out[k] || inn != live_in[k] {
+                live_out[k] = out;
+                live_in[k] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(live_out)
+}
+
+/// Replace register `from` by `to` in the source operands of `i`.
+fn substitute(i: &mut Ins, first_src: usize, from: &str, to: &str) {
+    for a in i.args.iter_mut().skip(first_src) {
+        if a == from {
+            *a = to.to_string();
+        } else if let Some(inner) = a.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if let Some(rest) = inner.strip_prefix(from) {
+                if rest.is_empty() || rest.starts_with(['+', '-']) {
+                    *a = format!("[{to}{rest}]");
+                }
+            }
+        }
+    }
+}
+
+/// Optimize one function's lines in place.
+pub fn run(lines: &mut Vec<String>) {
+    // every change removes a line, so this ends
+    loop {
+        let Some(live) = liveness(lines) else { return };
+        let mut changed = false;
+        let mut k = 0;
+        while k < lines.len() {
+            let Line::Ins(a) = classify(&lines[k]) else {
+                k += 1;
+                continue;
+            };
+            let Some(ia) = info(&a) else { return };
+            // drop dead code
+            if ia.pure && ia.defs & live[k] == 0 {
+                lines.remove(k);
+                changed = true;
+                break; // liveness is stale now
+            }
+            if a.op == "mov" && a.args.len() == 2 && a.args[0] == a.args[1] && live[k] & FLAGS == 0 {
+                lines.remove(k);
+                changed = true;
+                break;
+            }
+            let next = k + 1;
+            if next < lines.len() {
+                if let Line::Ins(b) = classify(&lines[next]) {
+                    let Some(ib) = info(&b) else { return };
+                    // forward a copy: mov r1, X ; I(r1) -> I(X)
+                    if a.op == "mov" && a.args.len() == 2 && reg_num(&a.args[1]).is_some() && a.args[0] != a.args[1] {
+                        let (t, x) = (a.args[0].clone(), a.args[1].clone());
+                        let tb = bit(reg_num(&t).unwrap());
+                        let first_src = usize::from(ib.dst0);
+                        let reads = b.args.iter().skip(first_src).any(|o| regs_of(o) & tb != 0);
+                        let dead_after = live[next] & tb == 0 || (ib.defs & tb != 0 && ib.dst0 && b.args[0] == t);
+                        let only_src = !ib.dst0 || b.args[0] != t || ib.defs & tb != 0;
+                        let simple = ALU3.contains(&b.op.as_str())
+                            || ALU2.contains(&b.op.as_str())
+                            || matches!(b.op.as_str(), "mov" | "cmp" | "stw" | "stt" | "ldw" | "ldt" | "out");
+                        if reads && dead_after && only_src && simple && live[k] & FLAGS == 0 {
+                            let mut nb = b.clone();
+                            substitute(&mut nb, first_src, &t, &x);
+                            lines[next] = nb.text();
+                            lines.remove(k);
+                            changed = true;
+                            break;
+                        }
+                    }
+                    // retarget a result: I -> r1 ; mov Y, r1 -> I -> Y
+                    if ia.dst0
+                        && ia.pure | matches!(a.op.as_str(), "ldw" | "ldt" | "div" | "mod" | "divr" | "modr")
+                        && b.op == "mov"
+                        && b.args.len() == 2
+                        && b.args[1] == a.args[0]
+                        && reg_num(&b.args[0]).is_some()
+                        && b.args[0] != b.args[1]
+                    {
+                        let t = bit(reg_num(&a.args[0]).unwrap());
+                        if live[next] & (t | FLAGS) == 0 {
+                            let mut na = a.clone();
+                            na.args[0] = b.args[0].clone();
+                            lines[k] = na.text();
+                            lines.remove(next);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            k += 1;
+        }
+        if !changed {
+            return;
+        }
+    }
+}

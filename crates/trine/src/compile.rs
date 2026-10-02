@@ -893,6 +893,7 @@ impl Compiler {
         let mut has_asm = false;
         scan_body(f.body.as_ref().unwrap(), &mut self.addr_taken, &mut has_asm);
         self.no_regs = !self.optimize || has_asm;
+        let fn_start = self.code.len();
         self.label(&f.name);
         const SAVED: &[&str] = &["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r-10", "r-11", "r-12", "r-13"];
         if f.interrupt {
@@ -968,6 +969,11 @@ impl Compiler {
             self.emit("iret");
         } else {
             self.emit("ret");
+        }
+        if self.optimize && !has_asm {
+            let mut lines = self.code.split_off(fn_start);
+            crate::peephole::run(&mut lines);
+            self.code.extend(lines);
         }
         Ok(())
     }

@@ -5,6 +5,8 @@
 //!   setun-bench --record   run them and write golden.txt
 //!   setun-bench NAME...    run only these workloads
 //!
+//! SETUN_JIT_OFF=1 runs the Trinux workloads on the interpreter alone.
+//!
 //! The emulator is deterministic (time is counted in instructions), so an
 //! optimisation that does not change behaviour must reproduce every hash
 //! and step count exactly.
@@ -124,6 +126,9 @@ fn trinux() -> Vec<Outcome> {
     let disk = trinux::build_disk(&trinux::kernel_dir()).expect("disk builds");
     let bios = trine::bios_rom().expect("BIOS builds");
     let mut m = Machine::new(729, 1_790_000_000);
+    if std::env::var_os("SETUN_JIT_OFF").is_some() {
+        m.cpu.set_jit_threshold(u32::MAX);
+    }
     m.load_rom(&bios);
     m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
     let mut serial = String::new();

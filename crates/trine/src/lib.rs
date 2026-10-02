@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod compile;
+mod peephole;
 pub mod lexer;
 pub mod parser;
 

@@ -665,40 +665,55 @@ pub(super) struct Done {
 /// Cranelift on its own thread: the CPU keeps running while regions
 /// compile, and installs the code when it arrives.
 pub(super) struct JitThread {
-    tx: std::sync::mpsc::Sender<Request>,
+    /// One request channel per compiler thread, used in turn.
+    tx: Vec<std::sync::mpsc::Sender<Request>>,
+    next: std::cell::Cell<usize>,
     rx: std::sync::mpsc::Receiver<Done>,
 }
 
+/// Compiler threads: regions compile in parallel, so hot code waits less.
+const JIT_THREADS: usize = 4;
+
 impl JitThread {
     pub(super) fn spawn() -> Option<JitThread> {
-        let (tx, req_rx) = std::sync::mpsc::channel::<Request>();
         let (done_tx, rx) = std::sync::mpsc::channel::<Done>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
-        std::thread::Builder::new()
-            .name("setun-jit".into())
-            .spawn(move || {
-                let Some(mut jit) = Jit::new() else {
-                    let _ = ready_tx.send(false);
-                    return;
-                };
-                let _ = ready_tx.send(true);
-                // decoded instructions the code points at live here, with it
-                let mut keep = Vec::new();
-                for req in req_rx {
-                    let t0 = std::time::Instant::now();
-                    let code = jit.compile(&req.region, &mut keep).map_or(0, |f| f as usize);
-                    let done = Done { id: req.id, code, micros: t0.elapsed().as_micros() as u64 };
-                    if done_tx.send(done).is_err() {
-                        break;
+        let mut tx = Vec::new();
+        for k in 0..JIT_THREADS {
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+            let done_tx = done_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("setun-jit-{k}"))
+                .spawn(move || {
+                    let Some(mut jit) = Jit::new() else {
+                        let _ = ready_tx.send(false);
+                        return;
+                    };
+                    let _ = ready_tx.send(true);
+                    // decoded instructions the code points at live here, with it
+                    let mut keep = Vec::new();
+                    for req in req_rx {
+                        let t0 = std::time::Instant::now();
+                        let code = jit.compile(&req.region, &mut keep).map_or(0, |f| f as usize);
+                        let done = Done { id: req.id, code, micros: t0.elapsed().as_micros() as u64 };
+                        if done_tx.send(done).is_err() {
+                            break;
+                        }
                     }
-                }
-            })
-            .ok()?;
-        ready_rx.recv().ok()?.then_some(JitThread { tx, rx })
+                })
+                .ok()?;
+            if !ready_rx.recv().ok()? {
+                return None;
+            }
+            tx.push(req_tx);
+        }
+        Some(JitThread { tx, next: std::cell::Cell::new(0), rx })
     }
 
     pub(super) fn send(&self, r: Request) -> bool {
-        self.tx.send(r).is_ok()
+        let k = self.next.get();
+        self.next.set((k + 1) % self.tx.len());
+        self.tx[k].send(r).is_ok()
     }
 
     pub(super) fn try_recv(&self) -> Option<Done> {
