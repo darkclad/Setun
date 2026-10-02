@@ -123,9 +123,7 @@ fn trinux() -> Vec<Outcome> {
         loop {
             steps += m.run(CHUNK);
             serial.push_str(&m.dev.serial.take_output());
-            if serial.ends_with("login: ") {
-                m.dev.serial_input("root\n");
-            } else if serial.ends_with("Password: ") {
+            if serial.ends_with("login: ") || serial.ends_with("Password: ") {
                 m.dev.serial_input("root\n");
             } else if serial.ends_with("$ ") || steps >= cap {
                 break;

@@ -11,7 +11,7 @@
 //! | other       | bus error                         |
 
 use crate::{HALF_PAGE, PAGE};
-use ternary::{pow3, wrap_trits, Tryte, Word};
+use ternary::{pow3, Tryte, Word};
 
 pub const ROM_FIRST_FRAME: i64 = -3;
 pub const ROM_FRAMES: i64 = 3;
@@ -131,7 +131,22 @@ impl Memory {
         }
     }
 
+    /// RAM frame and in-frame index of `pa`, if it is RAM.
+    #[inline(always)]
+    fn ram_at(&self, pa: i64) -> Option<(usize, usize)> {
+        let frame = (pa + HALF_PAGE).div_euclid(PAGE);
+        if (0..self.ram.len() as i64).contains(&frame) {
+            Some((frame as usize, (pa - frame * PAGE + HALF_PAGE) as usize))
+        } else {
+            None
+        }
+    }
+
     pub fn read_tryte(&self, pa: i64) -> Result<Tryte, BusError> {
+        if let Some((f, i)) = self.ram_at(pa) {
+            let v = self.ram[f].as_ref().map_or(0, |fr| fr[i]);
+            return Ok(Tryte::new(v as i64).expect("stored tryte in range"));
+        }
         let v = match self.locate(pa)? {
             (Region::Ram(f), i) => self.ram[f].as_ref().map_or(0, |fr| fr[i]),
             (Region::Rom, i) => self.rom[i],
@@ -142,6 +157,15 @@ impl Memory {
 
     pub fn write_tryte(&mut self, pa: i64, t: Tryte) -> Result<(), BusError> {
         let v = t.value() as i16;
+        if let Some((f, i)) = self.ram_at(pa) {
+            if self.pt_watch[f] {
+                self.pt_dirty = true;
+            }
+            self.code_written(f);
+            let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
+            fr[i] = v;
+            return Ok(());
+        }
         match self.locate(pa)? {
             (Region::Ram(f), i) => {
                 if self.pt_watch[f] {
@@ -160,6 +184,14 @@ impl Memory {
     /// Word at centre address `pa` (trytes `pa−1, pa, pa+1`, big-endian).
     /// Alignment is the caller's business.
     pub fn read_word(&self, pa: i64) -> Result<Word, BusError> {
+        // RAM, all three trytes in one frame (always true for aligned words)
+        if let Some((f, i)) = self.ram_at(pa) {
+            if i >= 1 && i + 1 < PAGE as usize {
+                let Some(fr) = &self.ram[f] else { return Ok(Word::ZERO) };
+                let v = fr[i - 1] as i64 * 387_420_489 + fr[i] as i64 * 19_683 + fr[i + 1] as i64;
+                return Ok(Word::new(v).expect("word from trytes"));
+            }
+        }
         // Fast path: when all three trytes are in one frame, a single lookup
         // covers them (always true for aligned words).
         if let Ok((region, i)) = self.locate(pa) {
@@ -184,6 +216,20 @@ impl Memory {
     }
 
     pub fn write_word(&mut self, pa: i64, w: Word) -> Result<(), BusError> {
+        if let Some((f, i)) = self.ram_at(pa) {
+            if i >= 1 && i + 1 < PAGE as usize {
+                if self.pt_watch[f] {
+                    self.pt_dirty = true;
+                }
+                self.code_written(f);
+                let [t0, t1, t2] = split_word(w.value());
+                let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
+                fr[i - 1] = t0;
+                fr[i] = t1;
+                fr[i + 1] = t2;
+                return Ok(());
+            }
+        }
         let [t0, t1, t2] = word_to_trytes(w);
         // Check all three first so a failing word write has no effect.
         for a in [pa - 1, pa, pa + 1] {
@@ -232,14 +278,19 @@ impl Memory {
     }
 }
 
+/// Split a word value into its three tryte values, most significant first.
+#[inline(always)]
+fn split_word(v: i64) -> [i16; 3] {
+    let t2 = (v + 9841).rem_euclid(19_683) - 9841;
+    let v1 = (v - t2) / 19_683;
+    let t1 = (v1 + 9841).rem_euclid(19_683) - 9841;
+    let t0 = (v1 - t1) / 19_683;
+    [t0 as i16, t1 as i16, t2 as i16]
+}
+
 /// Split a word into its three trytes, most significant first.
 pub fn word_to_trytes(w: Word) -> [Tryte; 3] {
-    let v = w.value() as i128;
-    let t2 = wrap_trits(v, 9);
-    let v1 = (v - t2) / pow3(9);
-    let t1 = wrap_trits(v1, 9);
-    let t0 = (v1 - t1) / pow3(9);
-    [t0, t1, t2].map(|t| Tryte::new(t as i64).unwrap())
+    split_word(w.value()).map(|t| Tryte::new(t as i64).unwrap())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, mode, op,
 use crate::memory::Memory;
 use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
-use ternary::{pow3, split_product, wrap_trits, Trit, Tryte, Word};
+use ternary::{wrap_trits, Trit, Tryte, Word};
 
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
 pub const RESET_PC: i64 = -59_049;
@@ -84,6 +84,12 @@ pub struct Cpu {
     /// Decoded instructions per code slot (see `Memory::code_slot`), one
     /// per word; dropped when the frame is written.
     icache: Vec<Option<Box<[Dec]>>>,
+    /// The page the last instruction was fetched from: virtual addresses
+    /// `fw_lo..=fw_lo + PAGE - 1` map to physical `va + fw_delta`, code slot
+    /// `fw_slot`. Cleared whenever translation or the ring may change.
+    fw_lo: i64,
+    fw_delta: i64,
+    fw_slot: usize,
 }
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
@@ -155,6 +161,49 @@ fn w(v: i128) -> Word {
     Word::wrap(v)
 }
 
+/// 3^27 and the largest word.
+const W_MOD: i64 = 7_625_597_484_987;
+const W_MAX: i64 = 3_812_798_742_493;
+
+/// Wrap a sum of at most a few words into a word: one correction suffices
+/// while |v| <= 3·W_MAX + 1. Returns (word value, carry trit).
+#[inline(always)]
+fn wrap_carry(v: i64) -> (i64, i64) {
+    if v > W_MAX {
+        (v - W_MOD, 1)
+    } else if v < -W_MAX {
+        (v + W_MOD, -1)
+    } else {
+        (v, 0)
+    }
+}
+
+/// A word from a sum of at most a few words (addresses, PC-relative).
+#[inline(always)]
+fn ww(v: i64) -> Word {
+    Word::new(wrap_carry(v).0).expect("wrapped")
+}
+
+/// Split a product of two words into (high word, low word), without the
+/// slow 128-bit division: the quotient estimate from f64 is off by at most
+/// one, then exact integer steps fix it.
+#[inline(always)]
+fn split_product27(p: i128) -> (i64, i64) {
+    let q = (p as f64 / W_MOD as f64).round() as i128;
+    let mut hi = q;
+    let mut lo = p - q * W_MOD as i128;
+    while lo > W_MAX as i128 {
+        lo -= W_MOD as i128;
+        hi += 1;
+    }
+    while lo < -(W_MAX as i128) {
+        lo += W_MOD as i128;
+        hi -= 1;
+    }
+    // hi itself wraps to a word (it always fits; MULH keeps the low 27 trits)
+    (wrap_trits(hi, 27) as i64, lo as i64)
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
@@ -177,6 +226,9 @@ impl Cpu {
             stop_batch: false,
             tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
             icache: Vec::new(),
+            fw_lo: i64::MIN,
+            fw_delta: 0,
+            fw_slot: 0,
         };
         c.reset();
         c
@@ -200,6 +252,7 @@ impl Cpu {
 
     fn tlb_flush(&mut self) {
         self.tlb.fill(TLB_EMPTY);
+        self.fw_lo = i64::MIN;
     }
 
     // ---- register access -------------------------------------------------
@@ -241,6 +294,7 @@ impl Cpu {
     }
 
     pub fn set_cr(&mut self, n: i64, v: Word) {
+        self.fw_lo = i64::MIN;
         if n == cr::PTB {
             self.tlb_flush();
         }
@@ -260,6 +314,9 @@ impl Cpu {
 
     #[inline]
     pub fn set_mode(&mut self, pos: usize, v: i64) {
+        if pos == mode::RING || pos == mode::PG {
+            self.fw_lo = i64::MIN;
+        }
         self.mode_trits[pos] = v.signum() as i8;
     }
 
@@ -586,16 +643,25 @@ impl Cpu {
             self.drop_written_code(m);
         }
         let pc = self.pc.value();
-        if pc.rem_euclid(3) != 0 {
-            return self.execute(m, io);
-        }
-        let pa = self.xlate(m, pc, Access::Fetch)?;
-        let frame = (pa + HALF_PAGE).div_euclid(PAGE);
-        let Some(slot) = m.code_slot(frame) else { return self.execute(m, io) };
-        let i = ((pa - frame * PAGE + HALF_PAGE - 1) / 3) as usize;
-        if self.icache.len() != m.code_slots() {
-            self.icache = (0..m.code_slots()).map(|_| None).collect();
-        }
+        let off = pc.wrapping_sub(self.fw_lo);
+        let (pa, slot, i) = if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty {
+            (pc + self.fw_delta, self.fw_slot, (off / 3) as usize)
+        } else {
+            if pc.rem_euclid(3) != 0 {
+                return self.execute(m, io);
+            }
+            let pa = self.xlate(m, pc, Access::Fetch)?;
+            let frame = (pa + HALF_PAGE).div_euclid(PAGE);
+            let Some(slot) = m.code_slot(frame) else { return self.execute(m, io) };
+            if self.icache.len() != m.code_slots() {
+                self.icache = (0..m.code_slots()).map(|_| None).collect();
+            }
+            let i = ((pa - frame * PAGE + HALF_PAGE - 1) / 3) as usize;
+            self.fw_lo = pc - (pa - (frame * PAGE - HALF_PAGE));
+            self.fw_delta = pa - pc;
+            self.fw_slot = slot;
+            (pa, slot, i)
+        };
         let d = match &self.icache[slot] {
             Some(c) if c[i].len != 0 => c[i],
             _ => {
@@ -625,56 +691,56 @@ impl Cpu {
                 self.alu_to(d.f as i64, x, va, Word::new(d.imm).unwrap())?;
             }
             Op::Ldt => {
-                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let va = wrap_carry(self.reg(y).value() + d.imm).0;
                 let t = self.load_tryte(m, va)?;
                 self.set_reg(x, t.resize());
             }
             Op::Ldw => {
-                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let va = wrap_carry(self.reg(y).value() + d.imm).0;
                 let v = self.load_word_as(m, va, Access::Read)?;
                 self.set_reg(x, v);
             }
             Op::Stt => {
-                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let va = wrap_carry(self.reg(y).value() + d.imm).0;
                 self.store_tryte(m, va, self.reg(x).resize())?;
             }
             Op::Stw => {
-                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let va = wrap_carry(self.reg(y).value() + d.imm).0;
                 self.store_word(m, va, self.reg(x))?;
             }
             Op::Swap => {
-                let va = w(self.reg(y).value() as i128 + d.imm as i128).value();
+                let va = wrap_carry(self.reg(y).value() + d.imm).0;
                 let old = self.load_word_as(m, va, Access::Read)?;
                 self.store_word(m, va, self.reg(x))?;
                 self.set_reg(x, old);
             }
             Op::Jalr => {
-                let target = w(self.reg(y).value() as i128 + d.imm as i128);
-                self.set_reg(x, w(next as i128));
+                let target = ww(self.reg(y).value() + d.imm);
+                self.set_reg(x, ww(next));
                 self.pc = target;
                 return Ok(());
             }
             Op::Li => self.set_reg(x, Word::new(d.imm).unwrap()),
-            Op::Lea => self.set_reg(x, w(pc as i128 + d.imm as i128)),
+            Op::Lea => self.set_reg(x, ww(pc + d.imm)),
             Op::Jal => {
-                self.set_reg(x, w(next as i128));
-                self.pc = w(pc as i128 + 3 * d.imm as i128);
+                self.set_reg(x, ww(next));
+                self.pc = ww(pc + 3 * d.imm);
                 return Ok(());
             }
             Op::Br => {
                 let flag = if d.f == 1 { self.s() } else { self.c() };
                 if d.imm2 >> (flag + 1) & 1 != 0 {
-                    self.pc = w(pc as i128 + 3 * d.imm as i128);
+                    self.pc = ww(pc + 3 * d.imm);
                     return Ok(());
                 }
             }
             Op::Br3 => match self.s() {
                 -1 => {
-                    self.pc = w(pc as i128 + 3 * d.imm as i128);
+                    self.pc = ww(pc + 3 * d.imm);
                     return Ok(());
                 }
                 1 => {
-                    self.pc = w(pc as i128 + 3 * d.imm2 as i128);
+                    self.pc = ww(pc + 3 * d.imm2 as i64);
                     return Ok(());
                 }
                 _ => {}
@@ -684,7 +750,7 @@ impl Cpu {
                 return self.execute(m, io);
             }
         }
-        self.pc = w(next as i128);
+        self.pc = ww(next);
         Ok(())
     }
 
@@ -1049,11 +1115,13 @@ impl Cpu {
         self.set_mode(mode::C, c);
     }
 
-    /// Wrap an exact arithmetic result and record its carry trit.
-    fn arith(&mut self, v: i128) -> Word {
-        let lo = wrap_trits(v, 27);
-        self.set_c(((v - lo) / pow3(27)) as i64);
-        Word::wrap(lo)
+    /// Wrap an exact arithmetic result (at most a few words) and record its
+    /// carry trit.
+    #[inline(always)]
+    fn arith(&mut self, v: i64) -> Word {
+        let (lo, c) = wrap_carry(v);
+        self.set_c(c);
+        Word::new(lo).expect("wrapped")
     }
 
     fn alu_to(&mut self, f: i64, rd: i64, a: Word, b: Word) -> Result<(), Fault> {
@@ -1066,37 +1134,35 @@ impl Cpu {
     /// ALU operation (ISA §3.3). Sets S always and C for arithmetic.
     /// Returns `None` for `CMP`, which writes no register.
     fn alu(&mut self, f: i64, a: Word, b: Word) -> Result<Option<Word>, Fault> {
-        let (x, y) = (a.value() as i128, b.value() as i128);
+        let (x, y) = (a.value(), b.value());
         let div0 = || Fault::new(vector::DIVIDE);
         let r = match f {
             alu::ADD => self.arith(x + y),
             alu::SUB => self.arith(x - y),
-            alu::ADC => self.arith(x + y + self.c() as i128),
-            alu::SBC => self.arith(x - y - self.c() as i128),
+            alu::ADC => self.arith(x + y + self.c()),
+            alu::SBC => self.arith(x - y - self.c()),
             alu::MUL => {
-                let (hi, lo) = split_product::<27>(x * y);
-                self.set_c(hi.sign() as i64);
-                lo
+                let (hi, lo) = split_product27(x as i128 * y as i128);
+                self.set_c(hi.signum());
+                Word::new(lo).expect("wrapped")
             }
-            alu::MULH => split_product::<27>(x * y).0,
+            alu::MULH => Word::new(split_product27(x as i128 * y as i128).0).expect("wrapped"),
             alu::DIV | alu::MOD => {
                 if y == 0 {
                     return Err(div0());
                 }
-                let (x, y) = (x as i64, y as i64); // 64-bit: much faster than i128
-                w((if f == alu::DIV { x / y } else { x % y }) as i128)
+                ww(if f == alu::DIV { x / y } else { x % y })
             }
             alu::DIVR | alu::MODR => {
                 if y == 0 {
                     return Err(div0());
                 }
-                let (x, y) = (x as i64, y as i64);
                 let md = y.abs();
                 let mut r = x.rem_euclid(md);
                 if 2 * r > md {
                     r -= md;
                 }
-                w((if f == alu::DIVR { (x - r) / y } else { r }) as i128)
+                ww(if f == alu::DIVR { (x - r) / y } else { r })
             }
             alu::MIN => a.tritwise_min(b),
             alu::MAX => a.tritwise_max(b),
@@ -1105,7 +1171,7 @@ impl Cpu {
             alu::CONS => a.tritwise_cons(b),
             alu::SH => a.shift(y.clamp(-40, 40) as i32),
             alu::CMP => {
-                self.set_s(Trit::from_i64((x - y).signum() as i64));
+                self.set_s(Trit::from_i64((x - y).signum()));
                 return Ok(None);
             }
             alu::TRIT => {
@@ -1117,7 +1183,7 @@ impl Cpu {
             }
             alu::NEG => -a,
             alu::SGN => Word::new(a.sign() as i64).unwrap(),
-            alu::ABS => w(x.abs()),
+            alu::ABS => ww(x.abs()),
             alu::TLZ => Word::new(a.leading_zero_trits() as i64).unwrap(),
             _ => return Err(Fault::new(vector::ILLEGAL)),
         };
@@ -1142,5 +1208,31 @@ fn check_pte(e: Word, acc: Access, ring: i64, va: i64) -> Result<(), Fault> {
         Ok(())
     } else {
         Err(Fault::mem(vector::PROTECTION, va, acc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_product27_matches_the_exact_split() {
+        let edge = [0, 1, -1, 2, W_MAX, -W_MAX, W_MAX - 1, 3_812_798_742_492 / 3, 1_162_261_467, -1_162_261_467];
+        let mut vals: Vec<i64> = edge.to_vec();
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            vals.push((s % (2 * W_MAX as u64 + 1)) as i64 - W_MAX);
+        }
+        for (k, &a) in vals.iter().enumerate() {
+            let b = vals[(k * 7919 + 13) % vals.len()];
+            for (x, y) in [(a, b), (a, a), (a, -b), (W_MAX, b)] {
+                let (hi, lo) = split_product27(x as i128 * y as i128);
+                let (ehi, elo) = ternary::split_product::<27>(x as i128 * y as i128);
+                assert_eq!((hi, lo), (ehi.value(), elo.value()), "{x} * {y}");
+            }
+        }
     }
 }
