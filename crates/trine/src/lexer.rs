@@ -98,8 +98,13 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                     bump!();
                 }
                 let digits: String = chars[ds..i].iter().collect();
-                if digits.is_empty() && base == 't' && matches!(chars.get(i), Some('+' | '-')) {
-                    return Err(err("0t digits are 1, 0 and T (the old + and - are gone)".into()));
+                if base == 't' && matches!(chars.get(i), Some('+' | '-')) {
+                    // `0t0+0` was once the digits 0, +, 0 (= 3); refuse it rather than read 0 + 0
+                    return Err(err(if digits.is_empty() {
+                        "0t digits are 1, 0 and T (the old + and - are gone)".into()
+                    } else {
+                        "a 0t literal followed by + or -: put a space before the operator (the old + and - digits are gone)".into()
+                    }));
                 }
                 let v = ternary::parse_prefixed(base, &digits).map_err(|e| err(format!("bad 0{base} literal: {e}")))?;
                 out.push(Token { tok: Tok::Int(v), pos });

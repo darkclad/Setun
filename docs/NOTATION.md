@@ -35,6 +35,7 @@ Each of these is a compile or assembly error with a specific message:
 - a bar on `0` (there is no −0), on `T`, on a letter beyond `D`, or on a separator;
 - two bars on one digit, or a bar with no digit before it;
 - `E`–`Z` as `0z` digits, `2` as a `0t` digit, and the old `+`/`-` base-3 digits;
+- a `0t` literal directly followed by `+` or `-`: `0t0+0` was 3 in the old notation, so it is refused rather than read as `0 + 0`. Write `0t1 - 1`;
 - an overlined hex digit, or a non-hex character after `0x`;
 - an empty literal (`0t`, `0z`, `0x`);
 - a value that does not fit the target type.

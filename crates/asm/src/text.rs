@@ -195,10 +195,15 @@ impl Lexer<'_> {
                     self.i += 1;
                 }
                 let digits: String = self.s[ds..self.i].iter().collect();
+                if base == 't' && matches!(self.peek(), Some('+' | '-')) {
+                    // `0t0+0` was once the digits 0, +, 0 (= 3); refuse it rather than read 0 + 0
+                    return Err(if digits.is_empty() {
+                        "0t digits are 1, 0 and T (the old + and - are gone)".into()
+                    } else {
+                        "a 0t literal followed by + or -: put a space before the operator (the old + and - digits are gone)".into()
+                    });
+                }
                 if digits.is_empty() {
-                    if base == 't' && matches!(self.peek(), Some('+' | '-')) {
-                        return Err("0t digits are 1, 0 and T (the old + and - are gone)".into());
-                    }
                     return Err(format!("empty 0{base} literal"));
                 }
                 return ternary::parse_prefixed(base, &digits).map(Expr::Num).map_err(|e| format!("bad 0{base} literal: {e}"));
@@ -1229,6 +1234,11 @@ mod tests {
         assert!(e(".word 0t1x").msg.contains("invalid ternary digit 'x'"));
         // the new notation's refusals
         assert!(e(".word 0t+-0").msg.contains("the old + and - are gone"));
+        // 0t0+0 was 3 in the old notation: refused, not read as 0 + 0
+        for src in [".word 0t0+0", ".word 0t0+-", ".word 0t1-1", "li r1, 0t1T+3"] {
+            assert!(e(src).msg.contains("put a space before the operator"), "{src}");
+        }
+        assert_eq!(asm1(".word 0t1 - 1, 0t1T + 3")[..], [Word::new(0).unwrap(), Word::new(5).unwrap()]);
         assert!(e(".word 0zMMM").msg.contains("invalid ternary digit 'M'"), "the old letters are gone");
         assert!(e(".word 0zE").msg.contains("invalid ternary digit 'E'"));
         assert!(e(".word 0z10\u{305}").msg.contains("'0' cannot be overlined"));

@@ -34,13 +34,19 @@ fn ternary_literals() {
     assert_eq!(exit("fn main() -> int { var t: tryte = 0zD\u{305}D\u{305}D\u{305}; return t; }"), -9841);
     assert_eq!(exit("fn main() -> int { return 0x1F + -0x10; }"), 15);
     assert_eq!(exit("fn main() -> int { return 0zB007AB13 % 1000; }"), 199);
-    assert_eq!(exit("fn main() -> int { return 0t1-1; }"), 0, "0t1 minus 1, not a digit");
+    assert_eq!(exit("fn main() -> int { return 0t1 - 1; }"), 0, "0t1 minus 1, with a space");
+    assert_eq!(exit("fn main() -> int { return 0t1 -1; }"), 0, "a space before the operator is enough");
 }
 
 #[test]
 fn ternary_literals_refused() {
     let e = compile_err("fn main() -> int { return 0t+-0; }");
     assert!(e.contains("0t digits are 1, 0 and T (the old + and - are gone)"), "{e}");
+    // old-notation digits after a valid prefix: 0t0+0 was 3, never 0 + 0
+    for src in ["0t0+-", "0t0+0", "0t1-1", "0t1T+x"] {
+        let e = compile_err(&format!("fn main() -> int {{ var x: int = 1; return {src}; }}"));
+        assert!(e.contains("put a space before the operator"), "{src}: {e}");
+    }
     let e = compile_err("fn main() -> int { return 0zMMm; }");
     assert!(e.contains("bad 0z literal: invalid ternary digit 'M'"), "{e}");
     let e = compile_err("fn main() -> int { return 0zE; }");
