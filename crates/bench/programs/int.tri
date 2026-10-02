@@ -1,0 +1,65 @@
+// Benchmark: integer and memory work. A sieve, an insertion sort, string
+// copies and a hash loop; exits with a checksum.
+
+import "rt.tri";
+
+var sieve: [20000]tryte;
+var nums: [1500]int;
+var text: [729]char;
+var copy: [729]char;
+
+fn primes(n: int) -> int {
+    var i: int = 2;
+    while (i < n) { sieve[i] = 1; i += 1; }
+    var count: int = 0;
+    i = 2;
+    while (i < n) {
+        if (sieve[i] != 0) {
+            count += 1;
+            var j: int = i * i;
+            while (j < n) { sieve[j] = 0; j += i; }
+        }
+        i += 1;
+    }
+    return count;
+}
+
+fn sort_check() -> int {
+    var seed: int = 12345;
+    var i: int = 0;
+    while (i < 1500) { seed = modr(seed * 1103 + 12345, 1000003); nums[i] = seed; i += 1; }
+    i = 1;
+    while (i < 1500) {
+        var v: int = nums[i];
+        var j: int = i - 1;
+        while (j >= 0 && nums[j] > v) { nums[j + 1] = nums[j]; j -= 1; }
+        nums[j + 1] = v;
+        i += 1;
+    }
+    var bad: int = 0;
+    i = 1;
+    while (i < 1500) { if (nums[i - 1] > nums[i]) { bad += 1; } i += 1; }
+    return bad;
+}
+
+fn strings() -> int {
+    var i: int = 0;
+    while (i < 728) { text[i] = ('a' + i % 26) as char; i += 1; }
+    text[728] = 0;
+    var h: int = 0;
+    var round: int = 0;
+    while (round < 60) {
+        memcpy(&copy[0], &text[0], 729);
+        h = h * 3 + strlen(&copy[0]) + strcmp(&copy[0], &text[0]);
+        h = tmul(h, 0t1T1T1T1T1T1T1T1T1T1T1T1T1) + (h >> 4);
+        round += 1;
+    }
+    return h;
+}
+
+fn main() -> int {
+    var p: int = primes(20000);
+    var s: int = sort_check();
+    var h: int = strings();
+    return modr(p * 1000 + s + h, 9841);
+}

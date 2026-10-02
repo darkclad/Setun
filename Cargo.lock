@@ -590,6 +590,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "setun-bench"
+version = "0.1.0"
+dependencies = [
+ "setun-core",
+ "ternary",
+ "trine",
+ "trinux",
+]
+
+[[package]]
 name = "setun-core"
 version = "0.1.0"
 dependencies = [

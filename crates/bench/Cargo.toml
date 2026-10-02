@@ -1,0 +1,17 @@
+[package]
+name = "setun-bench"
+description = "Emulator benchmarks with whole-machine state hashes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "setun-bench"
+path = "src/main.rs"
+
+[dependencies]
+setun-core = { path = "../core" }
+trine = { path = "../trine" }
+trinux = { path = "../trinux" }
+ternary = { path = "../ternary" }
