@@ -18,11 +18,19 @@ const CASES: &[(&str, &str)] = &[
     ("b (taken)", "b $+3"),
     ("bne untaken", "beq $+3"),
     ("nop (generic)", "nop"),
+    ("fadd", "fadd f1, f1, f2"),
+    ("fmul", "fmul f1, f1, f3"),
+    ("fdiv", "fdiv f1, f1, f3"),
+    ("fsqrt", "fsqrt f4, f2"),
+    ("fldd", "fldd f4, [sp+9]"),
+    ("fstd", "fstd f2, [sp+9]"),
+    ("fcvtif", "fcvtif f4, r2"),
+    ("fcmp", "fcmp f1, f2"),
 ];
 
 fn program(body: &str) -> String {
     let mut s = String::from(
-        "        .org -59049\n        li sp, 6000\n        li r2, 7\n        li r9, 400000\nloop:\n",
+        "        .org -59049\n        li sp, 6000\n        li r2, 7\n        li r9, 400000\n        fli f1, 1.5\n        fli f2, 1.25\n        fli f3, 0.999\nloop:\n",
     );
     for _ in 0..27 {
         s.push_str("        ");

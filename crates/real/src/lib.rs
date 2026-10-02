@@ -16,6 +16,8 @@
 // operator traits.
 #![allow(clippy::should_implement_trait)]
 
+mod fast;
+
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -228,7 +230,7 @@ impl Real {
 
     /// Integers are exact (a word has 27 trits, a real81 72).
     pub fn from_i64(v: i64) -> Real {
-        Real::round81(&BigInt::from(v), &BigInt::one(), 0, false).0
+        fast::from_i64(v).unwrap_or_else(|| Real::round81(&BigInt::from(v), &BigInt::one(), 0, false).0)
     }
 
     /// Round to the nearest integer word, ties to even. NaN gives 0 and IV;
@@ -239,6 +241,12 @@ impl Real {
             Kind::Inf => return (WORD_MAX * self.m.signum() as i64, IV),
             Kind::Zero => return (0, 0),
             _ => {}
+        }
+        if let Some((v, inexact)) = fast::to_int(self, WORD_MAX) {
+            return match v {
+                Some(v) => (v, if inexact { IX } else { 0 }),
+                None => (WORD_MAX * self.m.signum() as i64, IV),
+            };
         }
         let (m, p) = self.exact();
         let (q, inexact) =
@@ -278,6 +286,11 @@ impl Real {
     }
 
     pub fn add(self, b: Real) -> (Real, u8) {
+        self.add_with(b, true)
+    }
+
+    /// `add`, optionally without the fixed-width fast path (for tests).
+    pub fn add_with(self, b: Real, use_fast: bool) -> (Real, u8) {
         if let Some(n) = Real::nan_of(self, b) {
             return (n, 0);
         }
@@ -291,6 +304,11 @@ impl Real {
             (Kind::Zero, _) => return Real::renorm(b),
             (_, Kind::Zero) => return Real::renorm(self),
             _ => {}
+        }
+        if use_fast {
+            if let Some(r) = fast::add(self, b) {
+                return r;
+            }
         }
         let (ma, pa) = self.exact();
         let (mb, pb) = b.exact();
@@ -309,6 +327,9 @@ impl Real {
     }
 
     fn renorm(a: Real) -> (Real, u8) {
+        if let Some(r) = fast::scale(a, 0) {
+            return r;
+        }
         let (m, p) = a.exact();
         Real::round81(&m, &BigInt::one(), p, false)
     }
@@ -321,6 +342,11 @@ impl Real {
     }
 
     pub fn mul(self, b: Real) -> (Real, u8) {
+        self.mul_with(b, true)
+    }
+
+    /// `mul`, optionally without the fast path.
+    pub fn mul_with(self, b: Real, use_fast: bool) -> (Real, u8) {
         if let Some(n) = Real::nan_of(self, b) {
             return (n, 0);
         }
@@ -331,12 +357,22 @@ impl Real {
             (Kind::Zero, _) | (_, Kind::Zero) => return (Real::ZERO, 0),
             _ => {}
         }
+        if use_fast {
+            if let Some(r) = fast::mul(self, b) {
+                return r;
+            }
+        }
         let (ma, pa) = self.exact();
         let (mb, pb) = b.exact();
         Real::round81(&(ma * mb), &BigInt::one(), pa + pb, false)
     }
 
     pub fn div(self, b: Real) -> (Real, u8) {
+        self.div_with(b, true)
+    }
+
+    /// `div`, optionally without the fast path.
+    pub fn div_with(self, b: Real, use_fast: bool) -> (Real, u8) {
         if let Some(n) = Real::nan_of(self, b) {
             return (n, 0);
         }
@@ -348,6 +384,11 @@ impl Real {
             (Kind::Zero, _) => return (Real::ZERO, 0),
             (_, Kind::Zero) => return (if self.m < 0 { Real::NEG_INF } else { Real::INF }, DZ),
             _ => {}
+        }
+        if use_fast {
+            if let Some(r) = fast::div(self, b) {
+                return r;
+            }
         }
         let (ma, pa) = self.exact();
         let (mb, pb) = b.exact();
@@ -380,6 +421,11 @@ impl Real {
     }
 
     pub fn sqrt(self) -> (Real, u8) {
+        self.sqrt_with(true)
+    }
+
+    /// `sqrt`, optionally without the fast path.
+    pub fn sqrt_with(self, use_fast: bool) -> (Real, u8) {
         match self.kind() {
             Kind::NaN | Kind::Zero => return (self, 0),
             Kind::Inf => return if self.m > 0 { (self, 0) } else { (Real::NAN, IV) },
@@ -387,6 +433,11 @@ impl Real {
         }
         if self.m < 0 {
             return (Real::NAN, IV);
+        }
+        if use_fast {
+            if let Some(r) = fast::sqrt(self) {
+                return r;
+            }
         }
         let (mut m, mut p) = self.exact();
         // normalize subnormals so the root has enough trits
@@ -421,6 +472,9 @@ impl Real {
             if x != y || x.abs() != 1 {
                 return Some(x.cmp(&y));
             }
+        }
+        if let Some(o) = fast::cmp(self, b) {
+            return Some(o);
         }
         let (ma, pa) = self.exact();
         let (mb, pb) = b.exact();
@@ -458,6 +512,9 @@ impl Real {
         if matches!(self.kind(), Kind::NaN | Kind::Inf | Kind::Zero) {
             return (self, 0);
         }
+        if let Some(r) = fast::round_to_int(self, toward_zero) {
+            return r;
+        }
         let (m, p) = self.exact();
         if p >= 0 {
             return Real::renorm(self);
@@ -478,8 +535,11 @@ impl Real {
         if matches!(self.kind(), Kind::NaN | Kind::Inf | Kind::Zero) {
             return (self, 0);
         }
-        let (m, p) = self.exact();
         let k = k.clamp(-3 * E_MAX, 3 * E_MAX);
+        if let Some(r) = fast::scale(self, k) {
+            return r;
+        }
+        let (m, p) = self.exact();
         Real::round81(&m, &BigInt::one(), p + k, false)
     }
 
@@ -489,10 +549,7 @@ impl Real {
         match self.kind() {
             Kind::Zero => (0, 0),
             Kind::Inf | Kind::NaN => (E_MAX, IV),
-            _ => {
-                let (m, p) = self.exact();
-                (p + trit_len(&m) as i64, 0)
-            }
+            _ => (fast::exponent(self), 0),
         }
     }
 
@@ -522,6 +579,9 @@ impl Real {
             }
             _ => {}
         }
+        if let Some(r) = fast::narrow(self, N27) {
+            return r;
+        }
         let (m, p) = self.exact();
         Real::round(&m, &BigInt::one(), p, false, N27)
     }
@@ -530,14 +590,16 @@ impl Real {
 
     /// The three words of a real81, most significant first.
     pub fn to_words(self) -> [i64; 3] {
-        let (rest, lo) = bal_split(self.m, pow3(27));
-        let (hi, mid) = bal_split(rest, pow3(27));
-        [(self.e as i128 * pow3(18) + hi) as i64, mid as i64, lo as i64]
+        let (rest, lo) = split27(self.m);
+        let (hi, mid) = split27(rest);
+        [(self.e as i128 * pow3(18) + hi) as i64, mid, lo]
     }
 
     pub fn from_words(w: [i64; 3]) -> Real {
-        let (e, hi) = bal_split(w[0] as i128, pow3(18));
-        Real { e: e as i64, m: (hi * pow3(27) + w[1] as i128) * pow3(27) + w[2] as i128 }
+        let h = 193_710_244; // (3^18 − 1) / 2
+        let hi = (w[0] + h).rem_euclid(387_420_489) - h;
+        let e = (w[0] - hi) / 387_420_489;
+        Real { e, m: (hi as i128 * pow3(27) + w[1] as i128) * pow3(27) + w[2] as i128 }
     }
 
     /// The real27 word for this value (rounded to 18 trits).
@@ -703,6 +765,34 @@ impl Real {
 }
 
 /// Balanced (v div m, v mod m).
+/// 3^27, and its inverse modulo 2^128 (it is odd).
+const C27: i128 = pow3(27);
+const C27_INV: i128 = {
+    let mut x: i128 = C27; // correct to 3 bits; each step doubles that
+    let mut k = 0;
+    while k < 7 {
+        x = x.wrapping_mul(2i128.wrapping_sub(C27.wrapping_mul(x)));
+        k += 1;
+    }
+    x
+};
+
+/// Split v into (v div 3^27, balanced remainder) without 128-bit division:
+/// fold the bits down 62 at a time for the remainder (2^62 mod 3^27 is
+/// small), then divide exactly by multiplying with 3^27's inverse.
+fn split27(v: i128) -> (i128, i64) {
+    const R62: i128 = (1i128 << 62) % C27;
+    let mut t = v;
+    while !(-(1i128 << 62)..(1i128 << 62)).contains(&t) {
+        t = (t >> 62) * R62 + (t & ((1i128 << 62) - 1));
+    }
+    let h = (C27 as i64 - 1) / 2;
+    let lo = ((t as i64) % C27 as i64 + C27 as i64 + h) % C27 as i64 - h;
+    let q = (v - lo as i128).wrapping_mul(C27_INV);
+    (q, lo)
+}
+
+#[allow(dead_code)]
 fn bal_split(v: i128, m: i128) -> (i128, i128) {
     let h = (m - 1) / 2;
     let lo = (v + h).rem_euclid(m) - h;

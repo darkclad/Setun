@@ -261,3 +261,174 @@ fn constants() {
     let one = c(4).mul(c(5)).0;
     assert!(one.sub(i(1)).0.abs().cmp(r("1e-33")) == Some(Ordering::Less));
 }
+
+/// Random values over the whole range: normal, short significands,
+/// unnormalized encodings, subnormals at E_MIN, exponents near E_MAX.
+fn wide_values(seed: u64, count: usize) -> Vec<Real> {
+    let mut x = seed | 1;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let r = next();
+        let e = match r % 8 {
+            0 => E_MIN,
+            1 => E_MAX - 1 - (next() % 5) as i64,
+            2 => E_MIN + (next() % 5) as i64,
+            3 => (next() % 400) as i64 - 200,
+            _ => (next() % 40) as i64 - 20,
+        };
+        let full = (next() as i128) << 50 ^ next() as i128;
+        let m = match (r >> 8) % 4 {
+            0 => full % M_MAX,                       // anything, maybe unnormalized
+            1 => (full % (M_MAX - M_NORM)).abs() + M_NORM + 1, // normalized
+            2 => (next() % 1000) as i128 - 500,      // tiny significand
+            _ => -((full % (M_MAX - M_NORM)).abs() + M_NORM + 1),
+        };
+        if m != 0 {
+            out.push(Real { e, m });
+        }
+    }
+    out
+}
+
+#[test]
+fn fixed_width_fast_paths_agree_with_big_integers() {
+    let vals = wide_values(0x51ed_270b_57a1_0c05, 1500);
+    let mut fast_hits = 0;
+    for (k, &a) in vals.iter().enumerate() {
+        let b = vals[(k * 7919 + 1) % vals.len()];
+        for (x, y) in [(a, b), (a, a), (a, a.neg()), (a, Real { e: a.e - 1, m: b.m })] {
+            assert_eq!(x.add_with(y, true), x.add_with(y, false), "add {x:?} {y:?}");
+            assert_eq!(x.mul_with(y, true), x.mul_with(y, false), "mul {x:?} {y:?}");
+            assert_eq!(x.div_with(y, true), x.div_with(y, false), "div {x:?} {y:?}");
+            if fast::add(x, y).is_some() {
+                fast_hits += 1;
+            }
+        }
+        let p = a.abs();
+        assert_eq!(p.sqrt_with(true), p.sqrt_with(false), "sqrt {p:?}");
+    }
+    for v in [0, 1, -1, 2, WORD_MAX, -WORD_MAX, 123_456_789, -42] {
+        assert_eq!(Some(Real::from_i64(v)), Some(Real::round81(&BigInt::from(v), &BigInt::one(), 0, false).0));
+    }
+    // ordinary values really do take the fast path
+    assert!(fast_hits > 3000, "fast path used {fast_hits} times");
+    let one = Real::from_i64(1);
+    let three = Real::from_i64(3);
+    assert!(fast::add(one, three).is_some() && fast::mul(one, three).is_some());
+    assert!(fast::div(one, three).is_some() && fast::sqrt(three).is_some());
+}
+
+#[test]
+fn fixed_width_conversions_agree_with_big_integers() {
+    for a in wide_values(0x2bd7_a6a6_e99c_2ddc, 3000) {
+        let (m, p) = a.exact();
+        // scaling and narrowing
+        for k in [-7, 0, 5, 100, -3000] {
+            if let Some(r) = fast::scale(a, k) {
+                assert_eq!(r, Real::round81(&m, &BigInt::one(), p + k, false), "scale {a:?} {k}");
+            }
+        }
+        if let Some(r) = fast::narrow(a, N27) {
+            assert_eq!(r, Real::round(&m, &BigInt::one(), p, false, N27), "real27 {a:?}");
+        }
+        assert_eq!(fast::exponent(a), p + trit_len(&m) as i64, "exponent {a:?}");
+        // rounding to integers
+        for tz in [false, true] {
+            if let Some(r) = fast::round_to_int(a, tz) {
+                let expect = if p >= 0 {
+                    Real::round81(&m, &BigInt::one(), p, false)
+                } else {
+                    let den = big_pow3((-p) as u32);
+                    let (q, inexact) = if tz {
+                        let (q, rm) = m.div_rem(&den);
+                        (q, !rm.is_zero())
+                    } else {
+                        round_div(&m, &den, false)
+                    };
+                    (Real::round81(&q, &BigInt::one(), 0, false).0, if inexact { IX } else { 0 })
+                };
+                assert_eq!(r, expect, "round_int {a:?} {tz}");
+            }
+        }
+        if let Some((v, inexact)) = fast::to_int(a, WORD_MAX) {
+            let (q, ix) = if p >= 0 { (m.clone() * big_pow3(p as u32), false) } else { round_div(&m, &big_pow3((-p) as u32), false) };
+            match q.to_i64() {
+                Some(w) if w.abs() <= WORD_MAX => assert_eq!((v, inexact), (Some(w), ix), "to_int {a:?}"),
+                _ => assert_eq!(v, None, "to_int out of range {a:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn word_split_matches_division() {
+    let mut vals: Vec<i128> = vec![0, 1, -1, M_MAX, -M_MAX, TOP, -TOP, C27, -C27, C27 / 2, -(C27 / 2), C27 / 2 + 1];
+    for a in wide_values(0x7f4a_7c15_9e37_79b9, 4000) {
+        vals.push(a.m);
+        vals.push(a.m / 7 + 1);
+    }
+    for v in vals {
+        let (q, lo) = split27(v);
+        assert_eq!((q, lo as i128), bal_split(v, C27), "{v}");
+        let r = Real { e: 17, m: v.clamp(-M_MAX, M_MAX) };
+        assert_eq!(Real::from_words(r.to_words()), r);
+    }
+    for e in [E_MIN, -1, 0, 1, E_MAX] {
+        let r = Real { e, m: -M_MAX };
+        assert_eq!(Real::from_words(r.to_words()), r);
+    }
+}
+
+#[test]
+#[ignore]
+fn time_ops() {
+    use std::time::Instant;
+    let a = Real::from_i64(123_456_789).div(Real::from_i64(7)).0;
+    let b = Real::from_i64(987_654_321).div(Real::from_i64(13)).0;
+    let n = 200_000;
+    let t = Instant::now();
+    let mut x = a;
+    for _ in 0..n { x = std::hint::black_box(x.add(b).0); }
+    println!("add  {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+    let t = Instant::now();
+    for _ in 0..n { x = std::hint::black_box(a.mul(b).0); }
+    println!("mul  {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+    let t = Instant::now();
+    for _ in 0..n { x = std::hint::black_box(a.div(b).0); }
+    println!("div  {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+    let t = Instant::now();
+    for _ in 0..n { std::hint::black_box(a.cmp(b)); }
+    println!("cmp  {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+    let big = ethnum::U256::from(u128::MAX) * 12345u128;
+    let t = Instant::now();
+    let mut acc = ethnum::U256::ZERO;
+    for k in 0..n { acc += std::hint::black_box(big + k as u128) / ethnum::U256::from(3u32); }
+    println!("u256/3 {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+    let t = Instant::now();
+    for k in 0..n { acc += std::hint::black_box(big + k as u128) / ethnum::U256::from(pow3(72) as u128); }
+    println!("u256/3^72 {:.1} ns {}", t.elapsed().as_nanos() as f64 / n as f64, acc & ethnum::U256::ONE);
+    let _ = x;
+}
+
+#[test]
+fn fast_comparison_agrees_with_big_integers() {
+    let vals = wide_values(0x1234_5678_9abc_def1, 2000);
+    for (k, &a) in vals.iter().enumerate() {
+        let b = vals[(k * 31 + 7) % vals.len()];
+        for (x, y) in [(a, b), (a, a), (a, Real { e: a.e + 1, m: a.m / 3 }), (a, a.neg())] {
+            if let Some(o) = fast::cmp(x, y) {
+                let (mx, px) = x.exact();
+                let (my, py) = y.exact();
+                let p = px.min(py);
+                let big = (mx * big_pow3((px - p) as u32)).cmp(&(my * big_pow3((py - p) as u32)));
+                assert_eq!(o, big, "{x:?} {y:?}");
+            }
+        }
+    }
+}
