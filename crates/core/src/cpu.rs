@@ -81,9 +81,14 @@ pub struct Cpu {
     /// entry changes (see `Memory::pt_dirty`), so every access behaves
     /// exactly like a full walk.
     tlb: Box<[TlbEntry]>,
-    /// Decoded instructions per code slot (see `Memory::code_slot`), one
-    /// per word; dropped when the frame is written.
-    icache: Vec<Option<Box<[Dec]>>>,
+    /// Basic blocks of decoded instructions. `block_at[slot][word]` is 1 +
+    /// the index into `blocks` of the block starting at that word of code
+    /// slot `slot` (see `Memory::code_slot`), or 0. A slot's table is
+    /// dropped when its frame is written; everything is cleared when the
+    /// arena grows too big. `blocks` holds (first op, count) into `ops`.
+    block_at: Vec<Option<Box<[u32]>>>,
+    blocks: Vec<(u32, u32)>,
+    ops: Vec<Dec>,
     /// The page the last instruction was fetched from: virtual addresses
     /// `fw_lo..=fw_lo + PAGE - 1` map to physical `va + fw_delta`, code slot
     /// `fw_slot`. Cleared whenever translation or the ring may change.
@@ -141,8 +146,21 @@ enum Op {
     Generic,
 }
 
-const DEC_EMPTY: Dec = Dec { op: Op::Generic, a: 0, x: 0, y: 0, z: 0, len: 0, f: 0, imm: 0, imm2: 0 };
 const WORDS_PER_FRAME: usize = (PAGE / 3) as usize;
+/// The longest block, in instructions.
+const MAX_BLOCK: usize = 256;
+/// Past this many decoded instructions, all blocks are thrown away.
+const MAX_OPS: usize = 1 << 22;
+
+/// What an instruction in a block did.
+enum Ctl {
+    /// Fall through to the next instruction.
+    Next,
+    /// Control went to this address (the block ends).
+    Jump(i64),
+    /// Run it through `exec_major` / `exec_fpu` (the block ends).
+    Generic,
+}
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -238,7 +256,9 @@ impl Cpu {
             batch: false,
             stop_batch: false,
             tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
-            icache: Vec::new(),
+            block_at: Vec::new(),
+            blocks: Vec::new(),
+            ops: Vec::new(),
             fw_lo: i64::MIN,
             fw_delta: 0,
             fw_slot: 0,
@@ -576,7 +596,15 @@ impl Cpu {
     /// change `IE`/`TF` (`IRET`, `MTC`); and when `TF` is set. A halted CPU
     /// uses up the whole budget at once. Returns the steps taken, each one
     /// exactly what [`Cpu::step`] would have done.
+    ///
+    /// Code runs a basic block at a time: the PC, `CYCLE` and the faulting
+    /// PC are only brought up to date at the block's end, on a fault (where
+    /// they are recomputed exactly) and before an instruction that is not
+    /// handled inline.
     pub fn run_batch(&mut self, m: &mut Memory, io: &mut dyn Io, budget: u64) -> u64 {
+        if self.mode(mode::TF) == 1 {
+            return 0;
+        }
         let mut n = 0;
         self.batch = true;
         while n < budget {
@@ -584,32 +612,183 @@ impl Cpu {
                 n = budget;
                 break;
             }
-            if self.mode(mode::TF) == 1 {
-                break;
+            if !m.code_dirty.is_empty() {
+                self.drop_written_code(m);
             }
-            self.inst_pc = self.pc;
-            self.cycle = self.cycle.wrapping_add(1);
-            match self.execute_fast(m, io) {
-                Ok(()) => {
-                    n += 1;
-                    if self.stop_batch {
-                        self.stop_batch = false;
+            let pc = self.pc.value();
+            let off = pc.wrapping_sub(self.fw_lo);
+            let found = if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty {
+                Some((self.fw_slot, (off / 3) as usize))
+            } else {
+                self.fetch_slot(m, pc)
+            };
+            let id = match found {
+                Some((slot, i)) => match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[i]) {
+                    Some(id) if id != 0 => id,
+                    _ => self.build_block(m, pc + self.fw_delta, slot, i),
+                },
+                None => 0,
+            };
+            if id == 0 {
+                // misaligned, a fetch fault, no code slot, or an instruction
+                // whose second word is in the next frame: the reference path
+                let (counted, stop) = self.single(m, io);
+                n += counted as u64;
+                if stop {
+                    break;
+                }
+                continue;
+            }
+            let (first, count) = self.blocks[id as usize - 1];
+            let limit = (count as u64).min(budget - n) as usize;
+            let cycle0 = self.cycle;
+            let mut pc = pc;
+            let mut k = 0usize;
+            let mut stop = false;
+            let mut pc_done = false;
+            while k < limit {
+                let d = self.ops[first as usize + k];
+                match self.exec_op(m, &d, pc) {
+                    Ok(Ctl::Next) => {
+                        pc += d.len as i64;
+                        k += 1;
+                        if matches!(d.op, Op::Stt | Op::Stw | Op::Swap) && (!m.code_dirty.is_empty() || m.pt_dirty) {
+                            break; // it wrote code or a page table: look again
+                        }
+                    }
+                    Ok(Ctl::Jump(target)) => {
+                        pc = target;
+                        k += 1;
+                        break;
+                    }
+                    Ok(Ctl::Generic) => {
+                        self.pc = ww(pc);
+                        self.inst_pc = self.pc;
+                        self.cycle = cycle0.wrapping_add(k as u64 + 1);
+                        pc_done = true;
+                        let (a, b) = (d.a as i64, d.f as i64);
+                        let (x, y, z) = (d.x as i64, d.y as i64, d.z as i64);
+                        let r = if bal_split(a, 6561).0 == -1 {
+                            self.exec_fpu(m, a, b, x, y, z, pc)
+                        } else {
+                            self.exec_major(m, io, pc, a, b, x, y, z, d.imm, pc + d.len as i64)
+                        };
+                        match r {
+                            Ok(()) => {
+                                k += 1;
+                                stop = std::mem::take(&mut self.stop_batch);
+                            }
+                            Err(f) if f.vector == DEFER => {
+                                self.cycle = self.cycle.wrapping_sub(1);
+                                stop = true;
+                            }
+                            Err(f) => {
+                                let epc = if f.resume_next { self.pc } else { self.inst_pc };
+                                self.deliver(m, f, epc, 0);
+                                k += 1;
+                            }
+                        }
+                        break;
+                    }
+                    Err(f) => {
+                        // nothing of the instruction happened but the trap
+                        self.pc = ww(pc);
+                        self.inst_pc = self.pc;
+                        self.cycle = cycle0.wrapping_add(k as u64 + 1);
+                        pc_done = true;
+                        let epc = self.inst_pc;
+                        self.deliver(m, f, epc, 0);
+                        k += 1;
                         break;
                     }
                 }
-                Err(f) if f.vector == DEFER => {
-                    self.cycle = self.cycle.wrapping_sub(1);
-                    break;
-                }
-                Err(f) => {
-                    let epc = if f.resume_next { self.pc } else { self.inst_pc };
-                    self.deliver(m, f, epc, 0);
-                    n += 1;
-                }
+            }
+            if !pc_done {
+                self.pc = ww(pc);
+                self.cycle = cycle0.wrapping_add(k as u64);
+            }
+            n += k as u64;
+            if stop {
+                break;
             }
         }
         self.batch = false;
         n
+    }
+
+    /// One step on the reference path (no interrupt check): returns whether
+    /// it counted as a step, and whether the batch must end.
+    fn single(&mut self, m: &mut Memory, io: &mut dyn Io) -> (bool, bool) {
+        self.inst_pc = self.pc;
+        self.cycle = self.cycle.wrapping_add(1);
+        match self.execute(m, io) {
+            Ok(()) => (true, std::mem::take(&mut self.stop_batch)),
+            Err(f) if f.vector == DEFER => {
+                self.cycle = self.cycle.wrapping_sub(1);
+                (false, true)
+            }
+            Err(f) => {
+                let epc = if f.resume_next { self.pc } else { self.inst_pc };
+                self.deliver(m, f, epc, 0);
+                (true, false)
+            }
+        }
+    }
+
+    /// Translate a fetch from `pc` and open the fetch window on its page.
+    /// `None` when the reference path must handle it (misaligned, faulting,
+    /// or not in RAM or ROM).
+    fn fetch_slot(&mut self, m: &mut Memory, pc: i64) -> Option<(usize, usize)> {
+        if pc.rem_euclid(3) != 0 {
+            return None;
+        }
+        let pa = self.xlate(m, pc, Access::Fetch).ok()?;
+        let frame = (pa + HALF_PAGE).div_euclid(PAGE);
+        let slot = m.code_slot(frame)?;
+        self.fw_lo = pc - (pa - (frame * PAGE - HALF_PAGE));
+        self.fw_delta = pa - pc;
+        self.fw_slot = slot;
+        Some((slot, ((pa - frame * PAGE + HALF_PAGE - 1) / 3) as usize))
+    }
+
+    /// Decode the block starting at physical `pa` (word `i` of code slot
+    /// `slot`); returns its id, or 0 if not even its first instruction fits.
+    #[cold]
+    fn build_block(&mut self, m: &mut Memory, pa: i64, slot: usize, i: usize) -> u32 {
+        if self.block_at.len() != m.code_slots() {
+            self.block_at = (0..m.code_slots()).map(|_| None).collect();
+        }
+        if self.ops.len() > MAX_OPS {
+            self.ops.clear();
+            self.blocks.clear();
+            self.block_at.iter_mut().for_each(|t| *t = None);
+        }
+        let first = self.ops.len();
+        let mut k = i;
+        while k < WORDS_PER_FRAME && self.ops.len() - first < MAX_BLOCK {
+            let at = pa + 3 * (k - i) as i64;
+            let Ok(w1) = m.read_word(at).map(|w| w.value()) else { break };
+            let two = bal_split(bal_split(bal_split(w1, 19_683).0, 19_683).0, 6561).0 == 1;
+            if two && k + 1 >= WORDS_PER_FRAME {
+                break; // the second word is in the next frame
+            }
+            let w2 = if two { m.read_word(at + 3).map(|w| w.value()).unwrap_or(0) } else { 0 };
+            let d = Self::decode(w1, w2);
+            self.ops.push(d);
+            k += if two { 2 } else { 1 };
+            if matches!(d.op, Op::Jal | Op::Jalr | Op::Br | Op::Br3 | Op::Generic) {
+                break;
+            }
+        }
+        let count = self.ops.len() - first;
+        if count == 0 {
+            return 0;
+        }
+        self.blocks.push((first as u32, count as u32));
+        let id = self.blocks.len() as u32;
+        self.block_at[slot].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice())[i] = id;
+        m.watch_code(slot);
+        id
     }
 
     /// Decode the instruction with words `w1`, `w2` (the second only matters
@@ -694,61 +873,21 @@ impl Cpu {
         d
     }
 
-    /// Drop decoded instructions of frames that have been written.
+    /// Drop the blocks of frames that have been written.
     #[cold]
     fn drop_written_code(&mut self, m: &mut Memory) {
         for s in m.code_dirty.drain(..) {
-            if let Some(c) = self.icache.get_mut(s) {
-                *c = None;
+            if let Some(t) = self.block_at.get_mut(s) {
+                *t = None;
             }
         }
     }
 
-    /// [`Cpu::execute`] through the decoded-instruction cache.
-    #[inline]
-    fn execute_fast(&mut self, m: &mut Memory, io: &mut dyn Io) -> Result<(), Fault> {
-        if !m.code_dirty.is_empty() {
-            self.drop_written_code(m);
-        }
-        let pc = self.pc.value();
-        let off = pc.wrapping_sub(self.fw_lo);
-        let (pa, slot, i) = if (0..PAGE).contains(&off) && off % 3 == 1 && !m.pt_dirty {
-            (pc + self.fw_delta, self.fw_slot, (off / 3) as usize)
-        } else {
-            if pc.rem_euclid(3) != 0 {
-                return self.execute(m, io);
-            }
-            let pa = self.xlate(m, pc, Access::Fetch)?;
-            let frame = (pa + HALF_PAGE).div_euclid(PAGE);
-            let Some(slot) = m.code_slot(frame) else { return self.execute(m, io) };
-            if self.icache.len() != m.code_slots() {
-                self.icache = (0..m.code_slots()).map(|_| None).collect();
-            }
-            let i = ((pa - frame * PAGE + HALF_PAGE - 1) / 3) as usize;
-            self.fw_lo = pc - (pa - (frame * PAGE - HALF_PAGE));
-            self.fw_delta = pa - pc;
-            self.fw_slot = slot;
-            (pa, slot, i)
-        };
-        let d = match &self.icache[slot] {
-            Some(c) if c[i].len != 0 => c[i],
-            _ => {
-                let w1 = m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, pc, Access::Fetch))?.value();
-                let last = i + 1 == WORDS_PER_FRAME;
-                let two = bal_split(bal_split(bal_split(w1, 19_683).0, 19_683).0, 6561).0 == 1;
-                if two && last {
-                    return self.execute(m, io); // the second word is in the next frame
-                }
-                let w2 = if two { m.read_word(pa + 3).map(|w| w.value()).unwrap_or(0) } else { 0 };
-                let d = Self::decode(w1, w2);
-                let c = self.icache[slot].get_or_insert_with(|| vec![DEC_EMPTY; WORDS_PER_FRAME].into_boxed_slice());
-                c[i] = d;
-                m.watch_code(slot);
-                d
-            }
-        };
+    /// Execute one decoded instruction at `pc` (all but the generic ones).
+    #[inline(always)]
+    fn exec_op(&mut self, m: &mut Memory, d: &Dec, pc: i64) -> Result<Ctl, Fault> {
         #[cfg(feature = "opstats")]
-        opstats::count(&d);
+        opstats::count(d);
         let next = pc + d.len as i64;
         let (x, y, z) = (d.x as i64, d.y as i64, d.z as i64);
         match d.op {
@@ -813,44 +952,34 @@ impl Cpu {
             Op::Jalr => {
                 let target = ww(self.reg(y).value() + d.imm);
                 self.set_reg(x, ww(next));
-                self.pc = target;
-                return Ok(());
+                return Ok(Ctl::Jump(target.value()));
             }
             Op::Li => self.set_reg(x, Word::new(d.imm).unwrap()),
             Op::Lea => self.set_reg(x, ww(pc + d.imm)),
             Op::Jal => {
                 self.set_reg(x, ww(next));
-                self.pc = ww(pc + 3 * d.imm);
-                return Ok(());
+                return Ok(Ctl::Jump(ww(pc + 3 * d.imm).value()));
             }
             Op::Br => {
                 let flag = if d.f == 1 { self.s() } else { self.c() };
                 if d.imm2 >> (flag + 1) & 1 != 0 {
-                    self.pc = ww(pc + 3 * d.imm);
-                    return Ok(());
+                    return Ok(Ctl::Jump(ww(pc + 3 * d.imm).value()));
                 }
+                return Ok(Ctl::Jump(ww(next).value()));
             }
-            Op::Br3 => match self.s() {
-                -1 => {
-                    self.pc = ww(pc + 3 * d.imm);
-                    return Ok(());
-                }
-                1 => {
-                    self.pc = ww(pc + 3 * d.imm2 as i64);
-                    return Ok(());
-                }
-                _ => {}
-            },
+            Op::Br3 => {
+                return Ok(Ctl::Jump(match self.s() {
+                    -1 => ww(pc + 3 * d.imm).value(),
+                    1 => ww(pc + 3 * d.imm2 as i64).value(),
+                    _ => ww(next).value(),
+                }))
+            }
             Op::Generic => {
-                let a = d.a as i64;
-                if bal_split(a, 6561).0 == -1 {
-                    return self.exec_fpu(m, a, d.f as i64, x, y, z, pc);
-                }
-                return self.exec_major(m, io, pc, a, d.f as i64, x, y, z, d.imm, next);
+                let _ = z;
+                return Ok(Ctl::Generic);
             }
         }
-        self.pc = ww(next);
-        Ok(())
+        Ok(Ctl::Next)
     }
 
     /// Fetch, decode and execute the instruction at `PC`. On success `PC`
