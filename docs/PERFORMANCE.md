@@ -1,7 +1,8 @@
 # Emulator performance
 
-The goal is to get as close as possible to one bare core of the host. The
-first step, a fast interpreter, is done; a JIT compiler is the next one.
+The goal is to get as close as possible to one bare core of the host. There
+are three layers: a block interpreter, a JIT compiler for hot code (native
+builds), and fast fixed-width arithmetic for the Setun-387.
 
 ## Rule: the fast path changes nothing
 
@@ -31,10 +32,55 @@ optimisation must keep that state **identical**, not just "working":
 |---|---|
 | **Batches** (`Machine::run`, `Cpu::run_batch`) | Devices report how many steps remain until their next event (timer, RTC alarm, vsync interrupt). The CPU runs that many steps without touching them, then time advances once. A halted CPU skips straight to the event. Port I/O, `IRET`, `MTC` and single-stepping take the exact single-step path. |
 | **Basic blocks** | Instructions are decoded once into blocks that end at a branch, jump, generic instruction, 256 instructions or the frame end. A block runs in a tight loop with the PC in a local; the PC, `CYCLE` and the faulting PC are written back only at the block's end, on a fault (recomputed exactly) or before a generic instruction. ADD/SUB/CMP, the other ALU ops, loads and stores, branches, jumps, `LI` and `LEA` are handled inline; SYS, I/O, FPU and field ops go through `exec_major`/`exec_fpu`. Frames with decoded code are watched by `Memory`, so self-modifying code, program loading and DMA drop the stale blocks, and a store that hits code or a page table ends its block. |
+| **Chaining** | Each block remembers the last two blocks it went on to, by target address; a link is used only in the epoch it was made in (bumped by any change of translation or ring, dropped code or a cleared arena). |
 | **Software TLB** | 1024 entries per access kind. Entries are cached only once the accessed (or dirty) trit is set, so hits never update page tables. Frames holding page-table entries the TLB has used are watched; any write to one (a CPU store or disk DMA) flushes the TLB, as does writing `PTB`. The TLB is therefore invisible. |
 | **Fetch and data windows** | The current code page and the last read and written data pages keep their translation (and, for data, the RAM frame itself), so most accesses skip the TLB and index the frame directly. They are cleared on any change of translation or ring. |
 | **RAM as words** | Each RAM frame holds 6561 word values, so aligned word loads and stores are single machine accesses; tryte access extracts or replaces one tryte. ROM and the framebuffer stay tryte arrays. |
 | **Arithmetic** | Word sums wrap with one compare in `i64`; `MUL` takes its quotient estimate from `f64` operands and the low half from wrapping 64-bit arithmetic, with no 128-bit helpers. |
+
+## The JIT
+
+Native builds compile hot code with [Cranelift](https://cranelift.dev/)
+(`crates/core/src/jit.rs`):
+
+- **Regions.** A block run 1000 times becomes the root of a region: the
+  blocks reachable from it by static jumps and branches within the same
+  page (up to 32). Only regions with a loop or a long run of inline work
+  are compiled; entering and leaving native code costs a load and a store
+  per register, which short stretches do not repay.
+- **Registers in host registers.** Guest registers and the flags are
+  Cranelift variables, loaded at entry and written back at every exit. S
+  is kept lazily, as a value whose sign it is; C as the trit.
+- **Inline:** ADD/SUB/CMP, MUL/MULH/DIV/MOD, LI, LEA, branches, BR3, JAL, and
+  word loads and stores through the CPU's read and write windows (raw frame
+  pointers; a write pointer is only handed out for frames nothing watches,
+  and every window is dropped when a frame becomes watched, so a direct
+  store can never miss an invalidation). Everything else calls the
+  interpreter's own code for that one instruction.
+- **Exits.** JALR, generic instructions, faults, a store into code or a page
+  table, and too little budget for the next block return to the block
+  engine with the exact step count, PC and fault.
+- **Background compilation.** Cranelift runs on its own thread; the CPU
+  keeps interpreting and installs the code when it arrives, if the block is
+  still current. Since native and interpreted execution give identical
+  state, when code arrives does not change behaviour.
+- **Tests.** The random-program test compiles every block at once
+  (`set_jit_threshold(1)`) and must match the reference path; directed
+  tests cover carries in both directions, MUL/DIV with a zero-divisor fault
+  inside compiled code, and a misaligned load through an open window. Each
+  was shown to catch a deliberately broken JIT.
+
+## The Setun-387
+
+`setun-real` computes every result exactly and rounds once. The big-integer
+path stays as the reference; fast paths in 256-bit integers (`ethnum`, with
+a hand-written 128×128 multiply) cover add/sub (exponents within 80 trits),
+mul, div, sqrt, comparisons, integer conversions, scaling, rounding to
+integers and narrowing to real27, and fall back near the ends of the
+exponent range. `sqrt` is rounded exactly by an integer test on the halfway
+points. Differential tests require identical values and flags against the
+big-integer path over the whole range, subnormals and unnormalized
+encodings included.
 
 The instruction mix explains the choices: loads and stores are 40–45% of
 all instructions (Trine's code generator keeps values on the stack), ADD,
@@ -50,37 +96,40 @@ SUB and CMP about 35%, branches about 8%. Build with
   -o p.json.gz target/release/setun-bench ...` (needs Administrator), then
   `setun-bench --resolve <RVA>...` maps hot addresses to source lines.
 
-Per guest instruction now (TSC cycles): CMP/LI 8, ADD 11–13, LDW 13, STW
-19, MUL 31, a generic instruction 42, a block boundary about 20.
+Per guest instruction now (TSC cycles at 3.4 GHz), interpreted / compiled:
+CMP and LI 8 / 0.4, ADD 11–13 / 3–4, MUL 31 / 0.7, LDW 13 / 4.3, STW 19 /
+4.5, a taken branch 24 / 1.1. Interpreted only: LDT 33, a generic
+instruction 42, FADD 300, FDIV 485, FSQRT 925.
 
 ## Numbers
 
 `cargo run --release -p setun-bench` on a Ryzen 9 5950X core (MIPS = guest
-steps per second):
+steps per second; the compiler thread runs alongside):
 
-| Workload | Start | Now | |
-|---|---:|---:|---:|
-| int (sieve, sort, strings) | 21.8 | 222 | 10× |
-| mandel (fixed point, framebuffer) | 19.4 | 239 | 12× |
-| boot (Trinux to the shell) | 13.1 | 198 | 15× |
-| shell (md5sum, sort, calc, ls with paging) | 6.3 | 216 | 34× |
-| idle (at the prompt) | 20.6 | 3660 | 178× |
-| fpu (math.tri) | 7.8 | 12 | 1.6× |
+| Workload | Start | Interpreter | With the JIT | |
+|---|---:|---:|---:|---:|
+| int (sieve, sort, strings) | 21.8 | 233 | 245 | 11× |
+| mandel (fixed point, framebuffer) | 19.4 | 250 | 716 | 37× |
+| boot (Trinux to the shell) | 13.1 | 222 | 226 | 17× |
+| shell (md5sum, sort, calc, ls with paging) | 6.3 | 223 | 365–432 | 58–69× |
+| idle (at the prompt) | 20.6 | 3900 | 5500 | 270× |
+| fpu (math.tri) | 7.8 | 39 | 38 | 4.9× |
 
-The browser build (WebAssembly, measured in Node) boots Trinux at 134
-MIPS, up from 11.
+int and boot are short runs: most of their time passes before compiled
+code arrives. The browser build (WebAssembly, no JIT) boots Trinux at about
+125 MIPS, up from 11.
 
-Against native code on the same core, the same Mandelbrot algorithm runs
-about 138× slower on the Setun (312× at the start). That gap is two
-factors: about 19 host cycles per guest instruction, and about 7× more
-guest instructions than native code needs (Trine's stack-based code).
+Against native code on the same core, the same Mandelbrot algorithm now runs
+about 45× slower on the Setun (312× at the start). What is left is mostly
+Trine's code: about 7× more guest instructions than native code needs.
 
 ## Next
 
-- **FPU:** `setun-real` does every operation with big integers. Fixed-width
-  128/256-bit arithmetic would make FPU-heavy code several times faster.
-- **JIT:** translate hot code to native x86-64 with Cranelift. Guest
-  registers live in a context struct, the TLB lookup is inlined, and faults
-  return to the interpreter. The same equivalence tests apply.
-- **Guest code:** a register-allocating optimiser in Trine would remove most
-  of the stack traffic, which makes up nearly half of all instructions.
+- **Trine optimizer:** register allocation would remove most of the stack
+  traffic (40–45% of all instructions are loads and stores) — the largest
+  remaining factor.
+- **JIT coverage:** tryte loads and stores, FPU instructions and JALR (call
+  returns) still leave or call out; inlining them and following returns
+  would keep more code native.
+- **A WebAssembly JIT** for the browser build, which has only the
+  interpreter.
