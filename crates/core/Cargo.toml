@@ -10,3 +10,6 @@ authors.workspace = true
 font8x8 = "0.3.1"
 ternary = { path = "../ternary" }
 setun-real = { path = "../real" }
+
+[features]
+opstats = []

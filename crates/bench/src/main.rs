@@ -215,6 +215,14 @@ fn main() {
     if record {
         std::fs::write(golden_path(), lines).expect("write golden.txt");
     }
+    #[cfg(feature = "opstats")]
+    {
+        let c = setun_core::cpu::opstats::report();
+        let total: u64 = c.iter().map(|e| e.1).sum();
+        for (k, n) in c.iter().take(30) {
+            println!("{:>6.2}%  {k}", 100.0 * *n as f64 / total as f64);
+        }
+    }
     if bad > 0 {
         std::process::exit(1);
     }

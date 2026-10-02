@@ -15,3 +15,6 @@ setun-core = { path = "../core" }
 trine = { path = "../trine" }
 trinux = { path = "../trinux" }
 ternary = { path = "../ternary" }
+
+[features]
+opstats = ["setun-core/opstats"]

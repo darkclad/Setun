@@ -90,6 +90,12 @@ pub struct Cpu {
     fw_lo: i64,
     fw_delta: i64,
     fw_slot: usize,
+    /// The same for the last page read (`rw_*`) and written (`ww_*`); a
+    /// write window only exists once the page is dirty, like a TLB entry.
+    rw_lo: i64,
+    rw_delta: i64,
+    ww_lo: i64,
+    ww_delta: i64,
 }
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
@@ -109,8 +115,14 @@ struct Dec {
     imm2: i32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
+    AddR,
+    SubR,
+    CmpR,
+    AddK,
+    SubK,
+    CmpK,
     AluR,
     AluK,
     Ldt,
@@ -229,6 +241,10 @@ impl Cpu {
             fw_lo: i64::MIN,
             fw_delta: 0,
             fw_slot: 0,
+            rw_lo: i64::MIN,
+            rw_delta: 0,
+            ww_lo: i64::MIN,
+            ww_delta: 0,
         };
         c.reset();
         c
@@ -252,7 +268,43 @@ impl Cpu {
 
     fn tlb_flush(&mut self) {
         self.tlb.fill(TLB_EMPTY);
+        self.windows_off();
+    }
+
+    /// Forget the fetch and data windows.
+    #[inline]
+    fn windows_off(&mut self) {
         self.fw_lo = i64::MIN;
+        self.rw_lo = i64::MIN;
+        self.ww_lo = i64::MIN;
+    }
+
+    /// Physical address of `va` for `acc` through a window, or the full
+    /// path (alignment check for words, TLB, walk) and a new window.
+    #[inline(always)]
+    fn data_pa(&mut self, m: &mut Memory, va: i64, acc: Access, word: bool) -> Result<i64, Fault> {
+        let (lo, delta) = if acc == Access::Write { (self.ww_lo, self.ww_delta) } else { (self.rw_lo, self.rw_delta) };
+        let off = va.wrapping_sub(lo);
+        if (0..PAGE).contains(&off) && (!word || off % 3 == 1) && !m.pt_dirty {
+            return Ok(va + delta);
+        }
+        self.data_pa_slow(m, va, acc, word)
+    }
+
+    #[cold]
+    fn data_pa_slow(&mut self, m: &mut Memory, va: i64, acc: Access, word: bool) -> Result<i64, Fault> {
+        if word && va.rem_euclid(3) != 0 {
+            return Err(Fault::mem(vector::MISALIGNED, va, acc));
+        }
+        let pa = self.xlate(m, va, acc)?;
+        let start = (pa + HALF_PAGE).div_euclid(PAGE) * PAGE - HALF_PAGE;
+        let lo = va - (pa - start);
+        if acc == Access::Write {
+            (self.ww_lo, self.ww_delta) = (lo, pa - va);
+        } else {
+            (self.rw_lo, self.rw_delta) = (lo, pa - va);
+        }
+        Ok(pa)
     }
 
     // ---- register access -------------------------------------------------
@@ -294,7 +346,7 @@ impl Cpu {
     }
 
     pub fn set_cr(&mut self, n: i64, v: Word) {
-        self.fw_lo = i64::MIN;
+        self.windows_off();
         if n == cr::PTB {
             self.tlb_flush();
         }
@@ -315,7 +367,7 @@ impl Cpu {
     #[inline]
     pub fn set_mode(&mut self, pos: usize, v: i64) {
         if pos == mode::RING || pos == mode::PG {
-            self.fw_lo = i64::MIN;
+            self.windows_off();
         }
         self.mode_trits[pos] = v.signum() as i8;
     }
@@ -575,9 +627,23 @@ impl Cpu {
             return d; // the FPU
         }
         match a {
-            op::ALU => d.op = Op::AluR,
-            op::ALUQ => (d.op, d.imm) = (Op::AluK, z),
-            op::ALUI => (d.op, d.imm) = (Op::AluK, imm),
+            op::ALU => {
+                d.op = match b {
+                    alu::ADD => Op::AddR,
+                    alu::SUB => Op::SubR,
+                    alu::CMP => Op::CmpR,
+                    _ => Op::AluR,
+                }
+            }
+            op::ALUQ | op::ALUI => {
+                d.imm = if a == op::ALUQ { z } else { imm };
+                d.op = match b {
+                    alu::ADD => Op::AddK,
+                    alu::SUB => Op::SubK,
+                    alu::CMP => Op::CmpK,
+                    _ => Op::AluK,
+                }
+            }
             op::MEM | op::MEMD => {
                 let size = if matches!(b, mem::LDT | mem::STT) { 1 } else { 3 };
                 d.imm = if a == op::MEM { size * z } else { imm };
@@ -679,9 +745,33 @@ impl Cpu {
                 d
             }
         };
+        #[cfg(feature = "opstats")]
+        opstats::count(&d);
         let next = pc + d.len as i64;
         let (x, y, z) = (d.x as i64, d.y as i64, d.z as i64);
         match d.op {
+            Op::AddR => {
+                let r = self.arith(self.reg(y).value() + self.reg(z).value());
+                self.set_s(r.sign());
+                self.set_reg(x, r);
+            }
+            Op::SubR => {
+                let r = self.arith(self.reg(y).value() - self.reg(z).value());
+                self.set_s(r.sign());
+                self.set_reg(x, r);
+            }
+            Op::CmpR => self.set_s(Trit::from_i64(self.reg(y).value() - self.reg(z).value())),
+            Op::AddK => {
+                let r = self.arith(self.reg(y).value() + d.imm);
+                self.set_s(r.sign());
+                self.set_reg(x, r);
+            }
+            Op::SubK => {
+                let r = self.arith(self.reg(y).value() - d.imm);
+                self.set_s(r.sign());
+                self.set_reg(x, r);
+            }
+            Op::CmpK => self.set_s(Trit::from_i64(self.reg(y).value() - d.imm)),
             Op::AluR => {
                 let (va, vb) = (self.reg(y), self.reg(z));
                 self.alu_to(d.f as i64, x, va, vb)?;
@@ -692,21 +782,25 @@ impl Cpu {
             }
             Op::Ldt => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                let t = self.load_tryte(m, va)?;
-                self.set_reg(x, t.resize());
+                let pa = self.data_pa(m, va, Access::Read, false)?;
+                let t = m.read_tryte(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read))?;
+                self.set_reg(x, Word::new(t.value()).expect("a tryte fits"));
             }
             Op::Ldw => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                let v = self.load_word_as(m, va, Access::Read)?;
+                let pa = self.data_pa(m, va, Access::Read, true)?;
+                let v = m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read))?;
                 self.set_reg(x, v);
             }
             Op::Stt => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                self.store_tryte(m, va, self.reg(x).resize())?;
+                let pa = self.data_pa(m, va, Access::Write, false)?;
+                m.write_tryte(pa, self.reg(x).resize()).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))?;
             }
             Op::Stw => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
-                self.store_word(m, va, self.reg(x))?;
+                let pa = self.data_pa(m, va, Access::Write, true)?;
+                m.write_word(pa, self.reg(x)).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))?;
             }
             Op::Swap => {
                 let va = wrap_carry(self.reg(y).value() + d.imm).0;
@@ -1208,6 +1302,32 @@ fn check_pte(e: Word, acc: Access, ring: i64, va: i64) -> Result<(), Fault> {
         Ok(())
     } else {
         Err(Fault::mem(vector::PROTECTION, va, acc))
+    }
+}
+
+/// Dynamic instruction mix (feature `opstats`): counts per decoded kind,
+/// ALU function and, for the generic path, major opcode.
+#[cfg(feature = "opstats")]
+pub mod opstats {
+    use std::sync::Mutex;
+    pub static COUNTS: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+    pub(super) fn count(d: &super::Dec) {
+        let key = match d.op {
+            super::Op::AluR | super::Op::AluK => format!("{:?} f{}", d.op, d.f),
+            o => format!("{o:?}"),
+        };
+        let mut c = COUNTS.lock().unwrap();
+        match c.iter_mut().find(|(k, _)| *k == key) {
+            Some(e) => e.1 += 1,
+            None => c.push((key, 1)),
+        }
+    }
+
+    pub fn report() -> Vec<(String, u64)> {
+        let mut c = COUNTS.lock().unwrap().clone();
+        c.sort_by(|a, b| b.1.cmp(&a.1));
+        c
     }
 }
 

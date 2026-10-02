@@ -27,6 +27,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 ## Docs
 
 - [`docs/SETUN386_ISA.md`](docs/SETUN386_ISA.md): the ISA (v0.4 accepted; v0.5 draft adds the Setun-387 floating-point unit)
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
 - [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K8 running: a POSIX-like system with a scripting shell, core utilities and a window system with a terminal)

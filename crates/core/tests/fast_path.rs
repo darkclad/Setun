@@ -264,3 +264,24 @@ fn switching_page_tables_takes_effect_at_once() {
     assert_eq!(reg_in(&st, 5), 9, "fetched through the new tables");
     let _ = alu::ADD;
 }
+
+#[test]
+fn remapping_a_data_page_takes_effect_at_once() {
+    // load from page 1 (frame 1), remap page 1 to frame 2, load again
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300)); // r2 = an address in page 1
+    prog.push(isa::rrr(op::MEM, mem::LDW, 5, 2, 0)); // r5 = [r2]
+    prog.extend(isa::wide(op::LI, 0, 3, 0, 4 * PAGE + 3)); // r3 = the PTE of page 1
+    prog.extend(isa::wide(op::LI, 0, 1, 0, pte(2, 1, 1, -1)));
+    prog.push(isa::rrr(op::MEM, mem::STW, 1, 3, 0)); // page 1 -> frame 2
+    prog.push(isa::rrr(op::MEM, mem::LDW, 6, 2, 0)); // r6 = [r2], now frame 2
+    prog.push(isa::rrr(op::MEM, mem::STW, 6, 2, 1)); // and a store through it
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(PAGE + 300, w(111)).unwrap();
+        m.mem.write_word(2 * PAGE + 300, w(222)).unwrap();
+    };
+    let st = both_ways(setup, &prog, 12);
+    assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (111, 222));
+}

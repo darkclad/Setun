@@ -31,5 +31,5 @@ ISA: [`SETUN386_ISA.md`](SETUN386_ISA.md) (v0.4 accepted; v0.5 draft adds the Se
 ## Later
 
 - A Setun-70 emulator as a Trinux user program
-- A TLB cache in the emulator
+- Emulator speed ([`PERFORMANCE.md`](PERFORMANCE.md)): the fast interpreter is done (5–17× faster, bit-identical); next a faster FPU and a JIT compiler
 - More of POSIX where it is cheap: `SIGTTOU`/`TOSTOP`, `select`, more `/proc`
