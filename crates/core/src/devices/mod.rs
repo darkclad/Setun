@@ -132,6 +132,31 @@ impl Devices {
         }
     }
 
+    /// How many steps of `ns` each can pass before a device event (timer,
+    /// RTC alarm, vsync interrupt): the event happens during the advance of
+    /// the returned step, never earlier. At least 1; `u64::MAX` for none.
+    pub fn steps_until_event(&self, ns: u64) -> u64 {
+        if ns == 0 {
+            return u64::MAX; // time stands still
+        }
+        let soonest = [
+            self.timer.us_until_fire(),
+            self.rtc.us_until_alarm(self.now_us),
+            self.display.us_until_vsync_irq(self.now_us),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        match soonest {
+            None => u64::MAX,
+            Some(us) => {
+                // the first k with ns_carry + k·ns >= 1000·us
+                let need = (us as u64).saturating_mul(1000).saturating_sub(self.ns_carry);
+                need.div_ceil(ns.max(1)).max(1)
+            }
+        }
+    }
+
     pub fn advance_us(&mut self, us: i64) {
         self.now_us += us;
         if self.timer.advance(us) {

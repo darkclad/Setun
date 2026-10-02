@@ -64,6 +64,12 @@ impl Display {
     }
 
     /// Advance to `now_us`; true on a vsync with the IRQ enabled.
+    /// Microseconds of advance until the next vsync interrupt, if enabled.
+    /// (Without the interrupt, frames are counted the same in one go.)
+    pub fn us_until_vsync_irq(&self, now_us: i64) -> Option<i64> {
+        self.irq_on.then(|| (self.next_vsync_us - now_us).max(1))
+    }
+
     pub fn advance(&mut self, now_us: i64) -> bool {
         let mut fire = false;
         while now_us >= self.next_vsync_us {

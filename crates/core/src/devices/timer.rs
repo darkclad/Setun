@@ -29,6 +29,11 @@ impl Timer {
         true
     }
 
+    /// Microseconds of advance until the timer next fires, if it is running.
+    pub fn us_until_fire(&self) -> Option<i64> {
+        (self.ctrl != 0 && self.period > 0).then(|| self.count.max(1))
+    }
+
     pub fn read(&self, r: i64, now_us: i64) -> i64 {
         match r {
             0 => self.ctrl,
@@ -70,6 +75,11 @@ impl Rtc {
     }
 
     /// True (once) when a set alarm time has been reached.
+    /// Microseconds of advance until the alarm fires, if one is set.
+    pub fn us_until_alarm(&self, now_us: i64) -> Option<i64> {
+        (self.alarm != 0).then(|| (self.alarm * 1_000_000 - self.unix_us(now_us)).max(1))
+    }
+
     pub fn check_alarm(&mut self, now_us: i64) -> bool {
         if self.alarm != 0 && self.unix_us(now_us).div_euclid(1_000_000) >= self.alarm {
             self.alarm = 0;

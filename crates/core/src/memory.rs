@@ -11,7 +11,7 @@
 //! | other       | bus error                         |
 
 use crate::{HALF_PAGE, PAGE};
-use ternary::{div_pow3_round, pow3, wrap_trits, Tryte, Word};
+use ternary::{pow3, wrap_trits, Tryte, Word};
 
 pub const ROM_FIRST_FRAME: i64 = -3;
 pub const ROM_FRAMES: i64 = 3;
@@ -33,6 +33,15 @@ pub struct Memory {
     ram: Vec<Option<Box<[i16]>>>,
     rom: Vec<i16>,
     fb: Vec<i16>,
+    /// RAM frames holding page tables the CPU's TLB has cached entries
+    /// from; any write to one sets `pt_dirty` (the TLB must be flushed).
+    pt_watch: Vec<bool>,
+    pt_watched: Vec<usize>,
+    pub pt_dirty: bool,
+    /// Code slots (RAM frames, then the 3 ROM frames) the CPU has decoded
+    /// instructions from; a write moves the slot to `code_dirty`.
+    code_watch: Vec<bool>,
+    pub code_dirty: Vec<usize>,
 }
 
 enum Region {
@@ -49,7 +58,59 @@ impl Memory {
             ram: (0..ram_frames).map(|_| None).collect(),
             rom: vec![0; (ROM_FRAMES * PAGE) as usize],
             fb: vec![0; (FB_FRAMES * PAGE) as usize],
+            pt_watch: vec![false; ram_frames as usize],
+            pt_watched: Vec::new(),
+            pt_dirty: false,
+            code_watch: vec![false; ram_frames as usize + ROM_FRAMES as usize],
+            code_dirty: Vec::new(),
         }
+    }
+
+    /// The code slot of physical frame `f`: RAM frames are 0.., the ROM
+    /// frames follow; anything else holds no cacheable code.
+    pub fn code_slot(&self, f: i64) -> Option<usize> {
+        let n = self.ram_frames();
+        if (0..n).contains(&f) {
+            Some(f as usize)
+        } else if (ROM_FIRST_FRAME..ROM_FIRST_FRAME + ROM_FRAMES).contains(&f) {
+            Some((n + f - ROM_FIRST_FRAME) as usize)
+        } else {
+            None
+        }
+    }
+
+    pub fn code_slots(&self) -> usize {
+        self.code_watch.len()
+    }
+
+    /// Report the next write to code slot `s` (through `code_dirty`).
+    pub fn watch_code(&mut self, s: usize) {
+        self.code_watch[s] = true;
+    }
+
+    fn code_written(&mut self, s: usize) {
+        if self.code_watch[s] {
+            self.code_watch[s] = false;
+            self.code_dirty.push(s);
+        }
+    }
+
+    /// Watch the RAM frame holding physical address `pa` for writes (it
+    /// holds a page-table entry the TLB has cached).
+    pub fn watch_page_table(&mut self, pa: i64) {
+        let f = (pa + HALF_PAGE).div_euclid(PAGE);
+        if (0..self.ram_frames()).contains(&f) && !self.pt_watch[f as usize] {
+            self.pt_watch[f as usize] = true;
+            self.pt_watched.push(f as usize);
+        }
+    }
+
+    /// The TLB was flushed: stop watching.
+    pub fn clear_page_table_watch(&mut self) {
+        for f in self.pt_watched.drain(..) {
+            self.pt_watch[f] = false;
+        }
+        self.pt_dirty = false;
     }
 
     pub fn ram_frames(&self) -> i64 {
@@ -57,7 +118,7 @@ impl Memory {
     }
 
     fn locate(&self, pa: i64) -> Result<(Region, usize), BusError> {
-        let frame = div_pow3_round(pa as i128, 9) as i64;
+        let frame = (pa + HALF_PAGE).div_euclid(PAGE);
         let idx = (pa - frame * PAGE + HALF_PAGE) as usize;
         if (0..self.ram_frames()).contains(&frame) {
             Ok((Region::Ram(frame as usize), idx))
@@ -83,6 +144,10 @@ impl Memory {
         let v = t.value() as i16;
         match self.locate(pa)? {
             (Region::Ram(f), i) => {
+                if self.pt_watch[f] {
+                    self.pt_dirty = true;
+                }
+                self.code_written(f);
                 let fr = self.ram[f].get_or_insert_with(|| vec![0; PAGE as usize].into_boxed_slice());
                 fr[i] = v;
             }
@@ -129,6 +194,15 @@ impl Memory {
         self.write_tryte(pa + 1, t2)
     }
 
+    /// A word write that does not count as a page-table change: the CPU's
+    /// own accessed/dirty update, which cached TLB entries already allow for.
+    pub fn write_word_quiet(&mut self, pa: i64, w: Word) -> Result<(), BusError> {
+        let dirty = self.pt_dirty;
+        let r = self.write_word(pa, w);
+        self.pt_dirty = dirty;
+        r
+    }
+
     /// Store words at consecutive word addresses starting at `pa` (host-side
     /// loading, may target ROM).
     pub fn load_words(&mut self, pa: i64, words: &[Word]) {
@@ -143,7 +217,11 @@ impl Memory {
     /// Host-side write that ignores ROM protection (used to load the BIOS).
     pub fn poke(&mut self, pa: i64, t: Tryte) {
         match self.locate(pa).expect("poke outside the memory map") {
-            (Region::Rom, i) => self.rom[i] = t.value() as i16,
+            (Region::Rom, i) => {
+                self.rom[i] = t.value() as i16;
+                let s = self.ram_frames() as usize + i / PAGE as usize;
+                self.code_written(s);
+            }
             _ => self.write_tryte(pa, t).unwrap(),
         }
     }

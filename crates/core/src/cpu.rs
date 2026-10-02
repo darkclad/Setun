@@ -3,7 +3,7 @@
 use crate::io::Io;
 use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, mode, op, sys, vector};
 use crate::memory::Memory;
-use crate::PAGE;
+use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
 use ternary::{pow3, split_product, wrap_trits, Trit, Tryte, Word};
 
@@ -72,7 +72,30 @@ pub struct Cpu {
     /// The Setun-387: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
     fregs: [Real; 27],
     fsr: Word,
+    /// Inside [`Cpu::run_batch`]: port I/O is deferred to a single step.
+    batch: bool,
+    /// End the batch after this instruction (it may have changed IE or TF).
+    stop_batch: bool,
+    /// Software TLB, one direct-mapped table per access kind. It is never
+    /// visible: entries are flushed whenever PTB or a cached page-table
+    /// entry changes (see `Memory::pt_dirty`), so every access behaves
+    /// exactly like a full walk.
+    tlb: Box<[TlbEntry]>,
 }
+
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    vpage: i64,
+    frame: i64,
+    /// The access is allowed from this ring up (both levels' RING trits).
+    min_ring: i64,
+}
+
+const TLB_SIZE: usize = 1024;
+const TLB_EMPTY: TlbEntry = TlbEntry { vpage: i64::MIN, frame: 0, min_ring: 2 };
+
+/// Pseudo-vector: "this instruction needs a single step" (port I/O in a batch).
+const DEFER: i64 = i64::MIN;
 
 /// Split `v` into `(v div m, v mod m)` with a balanced remainder. Called with
 /// constant `m` so the divisions compile to multiplications.
@@ -109,6 +132,9 @@ impl Cpu {
             inst_pc: Word::ZERO,
             fregs: [Real::ZERO; 27],
             fsr: Word::ZERO,
+            batch: false,
+            stop_batch: false,
+            tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
         };
         c.reset();
         c
@@ -127,6 +153,11 @@ impl Cpu {
         self.fsr = Word::new(fsr::RESET).unwrap();
         self.pc = Word::new(RESET_PC).unwrap();
         self.halted = false;
+        self.tlb_flush();
+    }
+
+    fn tlb_flush(&mut self) {
+        self.tlb.fill(TLB_EMPTY);
     }
 
     // ---- register access -------------------------------------------------
@@ -168,6 +199,9 @@ impl Cpu {
     }
 
     pub fn set_cr(&mut self, n: i64, v: Word) {
+        if n == cr::PTB {
+            self.tlb_flush();
+        }
         if n == cr::MODE {
             for (i, t) in v.trits().iter().enumerate() {
                 self.mode_trits[i + 1] = *t as i8;
@@ -230,29 +264,78 @@ impl Cpu {
         Ok(PAGE * e2.field(1..=18) + a.field(19..=27))
     }
 
-    fn load_tryte(&self, m: &mut Memory, va: i64) -> Result<Tryte, Fault> {
-        let pa = self.translate(m, va, Access::Read)?;
+    /// [`Cpu::translate`] through the TLB.
+    #[inline]
+    fn xlate(&mut self, m: &mut Memory, va: i64, acc: Access) -> Result<i64, Fault> {
+        if self.mode_trits[mode::PG] != 1 {
+            return Ok(va);
+        }
+        if m.pt_dirty {
+            self.tlb_flush();
+            m.clear_page_table_watch();
+        }
+        let vpage = (va + HALF_PAGE).div_euclid(PAGE);
+        let i = (acc as i64 + 1) as usize * TLB_SIZE + (vpage as usize & (TLB_SIZE - 1));
+        let e = self.tlb[i];
+        if e.vpage == vpage && self.mode_trits[mode::RING] as i64 >= e.min_ring {
+            return Ok(e.frame * PAGE + (va - vpage * PAGE));
+        }
+        self.walk_and_fill(m, va, acc, vpage, i)
+    }
+
+    /// A TLB miss: the full walk of [`Cpu::translate`], then cache the result.
+    /// The entry is only cached once the accessed (or, for writes, dirty)
+    /// trit is set, so hits never need to update it.
+    #[cold]
+    fn walk_and_fill(&mut self, m: &mut Memory, va: i64, acc: Access, vpage: i64, i: usize) -> Result<i64, Fault> {
+        let a = Word::new(va).expect("virtual address is a word");
+        let bus = |_| Fault::mem(vector::BUS_ERROR, va, acc);
+        let ring = self.ring();
+
+        let e1_addr = self.cr(cr::PTB).value() + 3 * a.field(1..=9);
+        let e1 = m.read_word(e1_addr).map_err(bus)?;
+        check_pte(e1, acc, ring, va)?;
+
+        let e2_addr = PAGE * e1.field(1..=18) + 3 * a.field(10..=18);
+        let e2 = m.read_word(e2_addr).map_err(bus)?;
+        check_pte(e2, acc, ring, va)?;
+
+        let ad = e2.trit(22) as i64;
+        let new_ad = if acc == Access::Write { 1 } else if ad == 0 { -1 } else { ad };
+        if new_ad != ad {
+            m.write_word_quiet(e2_addr, e2.with_field(22..=22, new_ad)).map_err(bus)?;
+        }
+        let frame = e2.field(1..=18);
+        m.watch_page_table(e1_addr);
+        m.watch_page_table(e2_addr);
+        let min_ring = (e1.trit(21) as i64).max(e2.trit(21) as i64);
+        self.tlb[i] = TlbEntry { vpage, frame, min_ring };
+        Ok(PAGE * frame + (va - vpage * PAGE))
+    }
+
+    fn load_tryte(&mut self, m: &mut Memory, va: i64) -> Result<Tryte, Fault> {
+        let pa = self.xlate(m, va, Access::Read)?;
         m.read_tryte(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read))
     }
 
-    fn store_tryte(&self, m: &mut Memory, va: i64, t: Tryte) -> Result<(), Fault> {
-        let pa = self.translate(m, va, Access::Write)?;
+    fn store_tryte(&mut self, m: &mut Memory, va: i64, t: Tryte) -> Result<(), Fault> {
+        let pa = self.xlate(m, va, Access::Write)?;
         m.write_tryte(pa, t).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))
     }
 
-    fn load_word_as(&self, m: &mut Memory, va: i64, acc: Access) -> Result<Word, Fault> {
+    fn load_word_as(&mut self, m: &mut Memory, va: i64, acc: Access) -> Result<Word, Fault> {
         if va.rem_euclid(3) != 0 {
             return Err(Fault::mem(vector::MISALIGNED, va, acc));
         }
-        let pa = self.translate(m, va, acc)?;
+        let pa = self.xlate(m, va, acc)?;
         m.read_word(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, acc))
     }
 
-    fn store_word(&self, m: &mut Memory, va: i64, v: Word) -> Result<(), Fault> {
+    fn store_word(&mut self, m: &mut Memory, va: i64, v: Word) -> Result<(), Fault> {
         if va.rem_euclid(3) != 0 {
             return Err(Fault::mem(vector::MISALIGNED, va, Access::Write));
         }
-        let pa = self.translate(m, va, Access::Write)?;
+        let pa = self.xlate(m, va, Access::Write)?;
         m.write_word(pa, v).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))
     }
 
@@ -334,6 +417,49 @@ impl Cpu {
         }
     }
 
+    /// Run up to `budget` steps with no device activity in between: the
+    /// caller guarantees no interrupt can become pending during the batch
+    /// and none is deliverable at its start. Stops early, without executing
+    /// it, before an instruction that does port I/O; after one that may
+    /// change `IE`/`TF` (`IRET`, `MTC`); and when `TF` is set. A halted CPU
+    /// uses up the whole budget at once. Returns the steps taken, each one
+    /// exactly what [`Cpu::step`] would have done.
+    pub fn run_batch(&mut self, m: &mut Memory, io: &mut dyn Io, budget: u64) -> u64 {
+        let mut n = 0;
+        self.batch = true;
+        while n < budget {
+            if self.halted {
+                n = budget;
+                break;
+            }
+            if self.mode(mode::TF) == 1 {
+                break;
+            }
+            self.inst_pc = self.pc;
+            self.cycle = self.cycle.wrapping_add(1);
+            match self.execute(m, io) {
+                Ok(()) => {
+                    n += 1;
+                    if self.stop_batch {
+                        self.stop_batch = false;
+                        break;
+                    }
+                }
+                Err(f) if f.vector == DEFER => {
+                    self.cycle = self.cycle.wrapping_sub(1);
+                    break;
+                }
+                Err(f) => {
+                    let epc = if f.resume_next { self.pc } else { self.inst_pc };
+                    self.deliver(m, f, epc, 0);
+                    n += 1;
+                }
+            }
+        }
+        self.batch = false;
+        n
+    }
+
     /// Fetch, decode and execute the instruction at `PC`. On success `PC`
     /// points at the next instruction; on a fault nothing but `PC` (and, for
     /// `resume_next` faults, the advanced `PC`) has changed.
@@ -397,6 +523,9 @@ impl Cpu {
                 }
             }
             op::IO | op::IOI => {
+                if self.batch {
+                    return Err(Fault::new(DEFER));
+                }
                 if self.ring() < self.mode(mode::IOPL) {
                     return Err(Fault::new(vector::PRIVILEGE));
                 }
@@ -609,7 +738,7 @@ impl Cpu {
                         if at.rem_euclid(3) != 0 {
                             return Err(Fault::mem(vector::MISALIGNED, at, Access::Write));
                         }
-                        self.translate(m, at, Access::Write)?;
+                        self.xlate(m, at, Access::Write)?;
                     }
                     for (k, v) in ws.iter().enumerate().take(n) {
                         self.store_word(m, va + 3 * k as i64, Word::new(*v).unwrap())?;
@@ -632,7 +761,8 @@ impl Cpu {
             return Err(Fault::new(vector::PRIVILEGE));
         }
         match b {
-            sys::NOP | sys::FENCE | sys::TLBINV | sys::TLBFLUSH => {}
+            sys::NOP | sys::FENCE => {}
+            sys::TLBINV | sys::TLBFLUSH => self.tlb_flush(),
             sys::HLT => self.halted = true,
             sys::BRK => {
                 self.pc = next;
@@ -644,6 +774,7 @@ impl Cpu {
                 return Err(Fault { info: n, resume_next: true, ..Fault::new(vector::SYSCALL) });
             }
             sys::IRET => {
+                self.stop_batch = self.batch;
                 self.set_cr(cr::MODE, self.cr(cr::EMODE));
                 self.pc = self.cr(cr::EPC);
                 if self.ring() < 1 {
@@ -660,6 +791,7 @@ impl Cpu {
                     return Err(Fault::new(vector::ILLEGAL));
                 }
                 self.set_cr(x, self.reg(y));
+                self.stop_batch = self.batch;
             }
             _ => return Err(Fault::new(vector::ILLEGAL)),
         }
