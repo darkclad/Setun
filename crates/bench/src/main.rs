@@ -75,6 +75,7 @@ fn state_hash(m: &Machine, serial: &str) -> u64 {
 }
 
 struct Outcome {
+    jit: [u64; 4],
     name: &'static str,
     steps: u64,
     instructions: u64,
@@ -99,7 +100,7 @@ fn rom(name: &'static str, path: &Path, cap: u64) -> Outcome {
     }
     let secs = t.elapsed().as_secs_f64();
     let serial = m.dev.serial.take_output();
-    let mut out = Outcome { name, steps, instructions: instructions(&m), secs, hash: 0 };
+    let mut out = Outcome { jit: m.cpu.jit_stats(), name, steps, instructions: instructions(&m), secs, hash: 0 };
     out.hash = state_hash(&m, &serial);
     out
 }
@@ -133,6 +134,7 @@ fn trinux() -> Vec<Outcome> {
         }
         let secs = t.elapsed().as_secs_f64();
         Outcome {
+            jit: m.cpu.jit_stats(),
             name,
             steps,
             instructions: instructions(m) - start_steps_instr,
@@ -157,6 +159,7 @@ fn trinux() -> Vec<Outcome> {
     }
     serial.push_str(&m.dev.serial.take_output());
     results.push(Outcome {
+        jit: m.cpu.jit_stats(),
         name: "idle",
         steps,
         instructions: instructions(&m) - i0,
@@ -239,8 +242,8 @@ fn main() {
             None => "no golden",
         };
         println!(
-            "{:<8} {:>12} {:>12} {:>8.2} {:>9.1}  {:016x} {check}",
-            o.name, o.steps, o.instructions, o.secs, mips, o.hash
+            "{:<8} {:>12} {:>12} {:>8.2} {:>9.1}  {:016x} {check}   jit {:?}",
+            o.name, o.steps, o.instructions, o.secs, mips, o.hash, o.jit
         );
         lines.push_str(&format!("{} {} {:016x}\n", o.name, o.steps, o.hash));
     }

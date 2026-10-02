@@ -7,6 +7,10 @@ use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
 use ternary::{wrap_trits, Trit, Tryte, Word};
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "jit.rs"]
+mod jit;
+
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
 pub const RESET_PC: i64 = -59_049;
 
@@ -104,10 +108,42 @@ pub struct Cpu {
     rw_delta: i64,
     ww_lo: i64,
     ww_delta: i64,
-    /// The RAM frame behind each data window (`usize::MAX`: not RAM).
+    /// The RAM frame behind each data window (`usize::MAX`: not RAM), and
+    /// its words' address for compiled code (0: none). The write pointer is
+    /// only given for frames nothing watches, and every window is dropped
+    /// when a frame starts being watched.
     rw_frame: usize,
     ww_frame: usize,
+    rw_ptr: usize,
+    ww_ptr: usize,
+    /// Bumped when the block arena is cleared.
+    arena_gen: u64,
+    /// The JIT (native builds): created on first use; `jit_off` once it
+    /// could not be. A block is compiled after `jit_threshold` runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    jit: Option<jit::JitThread>,
+    jit_off: bool,
+    jit_threshold: u32,
+    /// Regions being compiled: request id → (root block, slot, word, arena
+    /// generation), to check the block is still current when code arrives.
+    jit_pending: Vec<(u64, u32, usize, usize, u64)>,
+    jit_next: u64,
+    /// A fault raised inside compiled code, for the block engine to deliver.
+    jit_fault: Option<Fault>,
+    /// Regions compiled, entries into compiled code, steps run there.
+    jit_stats: [u64; 4],
 }
+
+/// Field offsets for compiled code.
+const OFF_REGS: usize = std::mem::offset_of!(Cpu, regs);
+const OFF_MODE: usize = std::mem::offset_of!(Cpu, mode_trits);
+const OFF_PC: usize = std::mem::offset_of!(Cpu, pc);
+const OFF_RW_LO: usize = std::mem::offset_of!(Cpu, rw_lo);
+const OFF_RW_PTR: usize = std::mem::offset_of!(Cpu, rw_ptr);
+const OFF_WW_LO: usize = std::mem::offset_of!(Cpu, ww_lo);
+const OFF_WW_PTR: usize = std::mem::offset_of!(Cpu, ww_ptr);
+const OFF_PT_DIRTY: usize = std::mem::offset_of!(Memory, pt_dirty);
+const _: () = assert!(std::mem::size_of::<Word>() == 8);
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
 #[derive(Clone, Copy)]
@@ -167,6 +203,9 @@ struct Block {
     count: u32,
     links: [Link; 2],
     next_link: u8,
+    /// Times run by the interpreter; compiled code (a `NativeFn`), or 0.
+    heat: u32,
+    native: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -293,6 +332,17 @@ impl Cpu {
             ww_delta: 0,
             rw_frame: usize::MAX,
             ww_frame: usize::MAX,
+            rw_ptr: 0,
+            ww_ptr: 0,
+            arena_gen: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            jit: None,
+            jit_off: cfg!(target_arch = "wasm32"),
+            jit_threshold: 1000,
+            jit_pending: Vec::new(),
+            jit_next: 0,
+            jit_fault: None,
+            jit_stats: [0; 4],
         };
         c.reset();
         c
@@ -326,6 +376,8 @@ impl Cpu {
         self.fw_lo = i64::MIN;
         self.rw_lo = i64::MIN;
         self.ww_lo = i64::MIN;
+        self.rw_ptr = 0;
+        self.ww_ptr = 0;
     }
 
     /// Physical address of `va` for `acc` through a window, or the full
@@ -350,9 +402,11 @@ impl Cpu {
         let lo = va - (pa - start);
         let frame = m.ram_frame(pa).unwrap_or(usize::MAX);
         if acc == Access::Write {
-            (self.ww_lo, self.ww_delta, self.ww_frame) = (lo, pa - va, frame);
+            let ptr = if frame != usize::MAX && m.frame_unwatched(frame) { m.frame_ptr(frame, true) } else { 0 };
+            (self.ww_lo, self.ww_delta, self.ww_frame, self.ww_ptr) = (lo, pa - va, frame, ptr);
         } else {
-            (self.rw_lo, self.rw_delta, self.rw_frame) = (lo, pa - va, frame);
+            let ptr = if frame != usize::MAX { m.frame_ptr(frame, true) } else { 0 };
+            (self.rw_lo, self.rw_delta, self.rw_frame, self.rw_ptr) = (lo, pa - va, frame, ptr);
         }
         Ok(pa)
     }
@@ -531,8 +585,9 @@ impl Cpu {
             m.write_word_quiet(e2_addr, e2.with_field(22..=22, new_ad)).map_err(bus)?;
         }
         let frame = e2.field(1..=18);
-        m.watch_page_table(e1_addr);
-        m.watch_page_table(e2_addr);
+        if m.watch_page_table(e1_addr) | m.watch_page_table(e2_addr) {
+            self.windows_off(); // a write window may point into it
+        }
         let min_ring = (e1.trit(21) as i64).max(e2.trit(21) as i64);
         self.tlb[i] = TlbEntry { vpage, frame, min_ring };
         Ok(PAGE * frame + (va - vpage * PAGE))
@@ -654,15 +709,24 @@ impl Cpu {
     /// PC are only brought up to date at the block's end, on a fault (where
     /// they are recomputed exactly) and before an instruction that is not
     /// handled inline.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables, unused_assignments))]
     pub fn run_batch(&mut self, m: &mut Memory, io: &mut dyn Io, budget: u64) -> u64 {
         if self.mode(mode::TF) == 1 {
             return 0;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.jit_install(false);
         let mut n = 0;
         self.batch = true;
         // the block just left cleanly, and the epoch then (for chaining)
         let (mut from, mut from_epoch) = (0u32, 0u64);
+        let mut blocks_run = 0u32;
         while n < budget {
+            blocks_run = blocks_run.wrapping_add(1);
+            #[cfg(not(target_arch = "wasm32"))]
+            if blocks_run.is_multiple_of(1024) && !self.jit_pending.is_empty() {
+                self.jit_install(false);
+            }
             if self.halted {
                 n = budget;
                 break;
@@ -673,6 +737,7 @@ impl Cpu {
             let pc = self.pc.value();
             let chained = from != 0 && from_epoch == self.epoch && !m.pt_dirty;
             let mut id = 0;
+            let mut at = None;
             if chained {
                 for l in &self.blocks[from as usize - 1].links {
                     if l.target == pc && l.epoch == self.epoch {
@@ -688,6 +753,7 @@ impl Cpu {
                 } else {
                     self.fetch_slot(m, pc)
                 };
+                at = found;
                 id = match found {
                     Some((slot, i)) => match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[i]) {
                         Some(id) if id != 0 => id,
@@ -712,6 +778,44 @@ impl Cpu {
                     break;
                 }
                 continue;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let native = self.blocks[id as usize - 1].native;
+                if native != 0 {
+                    // SAFETY: compiled for this block, which is still current;
+                    // the code only touches the CPU and memory it is given
+                    let f: jit::NativeFn = unsafe { std::mem::transmute::<usize, jit::NativeFn>(native) };
+                    let ran = unsafe { f(self as *mut Cpu, m as *mut Memory, pc, (budget - n) as i64) } as u64;
+                    self.jit_stats[1] += 1;
+                    self.jit_stats[2] += ran;
+                    if let Some(f) = self.jit_fault.take() {
+                        // the PC is on the faulting instruction
+                        self.cycle = self.cycle.wrapping_add(ran + 1);
+                        self.inst_pc = self.pc;
+                        let epc = self.inst_pc;
+                        self.deliver(m, f, epc, 0);
+                        n += ran + 1;
+                        continue;
+                    }
+                    if ran > 0 || self.pc.value() != pc {
+                        self.cycle = self.cycle.wrapping_add(ran);
+                        n += ran;
+                        continue;
+                    }
+                    // nothing ran (too little budget, or a generic first
+                    // instruction): the interpreter takes this block
+                } else if !self.jit_off {
+                    let b = &mut self.blocks[id as usize - 1];
+                    b.heat = b.heat.saturating_add(1);
+                    if b.heat == self.jit_threshold {
+                        // reached by a chain link: find it in its frame
+                        let at = at.or_else(|| self.fetch_slot(m, pc));
+                        if let Some((slot, i)) = at {
+                            self.compile_region(m, id, slot, i, pc + self.fw_delta);
+                        }
+                    }
+                }
             }
             let Block { first, count, .. } = self.blocks[id as usize - 1];
             let limit = (count as u64).min(budget - n) as usize;
@@ -791,6 +895,123 @@ impl Cpu {
         n
     }
 
+    /// Compile the region rooted at block `root` (word `i` of code slot
+    /// `slot`, physical address `pa`): the blocks reachable by static jumps
+    /// and branches within the frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cold]
+    fn compile_region(&mut self, m: &mut Memory, root: u32, slot: usize, i: usize, pa: i64) {
+        const MAX_REGION: usize = 32;
+        if self.jit.is_none() {
+            match jit::JitThread::spawn() {
+                Some(j) => self.jit = Some(j),
+                None => {
+                    self.jit_off = true;
+                    return;
+                }
+            }
+        }
+        let gen = self.arena_gen;
+        let mut region = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![0i64];
+        while let Some(off) = todo.pop() {
+            if region.len() >= MAX_REGION || !seen.insert(off) {
+                continue;
+            }
+            let k = i as i64 + off / 3;
+            if !(0..WORDS_PER_FRAME as i64).contains(&k) {
+                continue;
+            }
+            let k = k as usize;
+            let id = match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[k]) {
+                Some(id) if id != 0 => id,
+                _ => self.build_block(m, pa + off, slot, k),
+            };
+            if self.arena_gen != gen {
+                return; // the arena was cleared under us
+            }
+            if id == 0 {
+                continue;
+            }
+            let Block { first, count, .. } = self.blocks[id as usize - 1];
+            let ops = self.ops[first as usize..(first + count) as usize].to_vec();
+            let last_off = off + ops[..ops.len() - 1].iter().map(|d| d.len as i64).sum::<i64>();
+            let end = last_off + ops[ops.len() - 1].len as i64;
+            let d = ops[ops.len() - 1];
+            match d.op {
+                Op::Br => todo.extend([last_off + 3 * d.imm, end]),
+                Op::Br3 => todo.extend([last_off + 3 * d.imm, last_off + 3 * d.imm2 as i64, end]),
+                Op::Jal => todo.push(last_off + 3 * d.imm),
+                Op::Jalr | Op::Generic => {}
+                _ => todo.push(end),
+            }
+            region.push(jit::RegionBlock { off, ops });
+        }
+        // only worth it with a loop inside, or a long run of inline work:
+        // entering and leaving compiled code costs a load and a store per
+        // register
+        let inline = |rb: &jit::RegionBlock| rb.ops.iter().take_while(|d| d.op != Op::Generic).count();
+        let offs: std::collections::HashSet<i64> = region.iter().map(|rb| rb.off).collect();
+        let has_loop = region.iter().any(|rb| {
+            let mut o = rb.off;
+            rb.ops.iter().any(|d| {
+                let at = o;
+                o += d.len as i64;
+                match d.op {
+                    Op::Br | Op::Jal => d.imm <= 0 && offs.contains(&(at + 3 * d.imm)),
+                    Op::Br3 => (d.imm <= 0 && offs.contains(&(at + 3 * d.imm))) || (d.imm2 <= 0 && offs.contains(&(at + 3 * d.imm2 as i64))),
+                    _ => false,
+                }
+            })
+        });
+        let eager = self.jit_threshold <= 1; // tests: compile everything
+        if inline(&region[0]) == 0 || !(eager || has_loop || inline(&region[0]) >= 16) {
+            return; // heat stays past the threshold: not tried again
+        }
+        let id = self.jit_next;
+        self.jit_next += 1;
+        if !self.jit.as_ref().expect("created above").send(jit::Request { id, region }) {
+            self.jit_off = true;
+            return;
+        }
+        self.jit_pending.push((id, root, slot, i, gen));
+        if eager {
+            self.jit_install(true); // tests: run the code from the next entry
+        }
+    }
+
+    /// Install compiled regions that have arrived (`wait`: until none is
+    /// pending), if their blocks are still current.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn jit_install(&mut self, wait: bool) {
+        let Some(j) = &self.jit else { return };
+        while !self.jit_pending.is_empty() {
+            let Some(done) = (if wait { j.recv() } else { j.try_recv() }) else { break };
+            let Some(k) = self.jit_pending.iter().position(|p| p.0 == done.id) else { continue };
+            let (_, root, slot, i, gen) = self.jit_pending.swap_remove(k);
+            self.jit_stats[3] += done.micros;
+            let current = gen == self.arena_gen
+                && self.block_at.get(slot).and_then(|t| t.as_ref()).is_some_and(|t| t[i] == root);
+            if done.code != 0 && current {
+                self.blocks[root as usize - 1].native = done.code;
+                self.jit_stats[0] += 1;
+            }
+        }
+    }
+
+    /// JIT counters: regions compiled, entries into compiled code, steps
+    /// run in compiled code, and microseconds spent compiling.
+    pub fn jit_stats(&self) -> [u64; 4] {
+        self.jit_stats
+    }
+
+    /// Compile blocks after this many runs. 0 or 1 compiles every block at
+    /// its first run, whether or not it looks worth it (for tests).
+    pub fn set_jit_threshold(&mut self, runs: u32) {
+        self.jit_threshold = runs.max(1);
+    }
+
     /// One step on the reference path (no interrupt check): returns whether
     /// it counted as a step, and whether the batch must end.
     fn single(&mut self, m: &mut Memory, io: &mut dyn Io) -> (bool, bool) {
@@ -835,6 +1056,7 @@ impl Cpu {
         }
         if self.ops.len() > MAX_OPS {
             self.epoch += 1;
+            self.arena_gen += 1;
             self.ops.clear();
             self.blocks.clear();
             self.block_at.iter_mut().for_each(|t| *t = None);
@@ -860,10 +1082,12 @@ impl Cpu {
         if count == 0 {
             return 0;
         }
-        self.blocks.push(Block { first: first as u32, count: count as u32, links: [Link::default(); 2], next_link: 0 });
+        self.blocks.push(Block { first: first as u32, count: count as u32, links: [Link::default(); 2], next_link: 0, heat: 0, native: 0 });
         let id = self.blocks.len() as u32;
         self.block_at[slot].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice())[i] = id;
-        m.watch_code(slot);
+        if m.watch_code(slot) {
+            self.windows_off(); // a write window may point into it
+        }
         id
     }
 

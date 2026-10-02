@@ -145,9 +145,12 @@ fn digest(m: &mut Machine) -> Vec<i64> {
 #[test]
 fn random_programs_agree_with_the_reference_path() {
     let mut steps_total = 0;
+    let mut jit = [0u64; 4];
     for seed in 1..=300u64 {
         let mut fast = machine(seed);
         let mut slow = machine(seed);
+        // compile everything at once (odd seeds), or only what gets hot
+        fast.cpu.set_jit_threshold(if seed % 2 == 1 { 1 } else { 3 });
         for chunk in 0..40 {
             let n = 1 + (seed * 7 + chunk) % 113;
             let ran = fast.run(n);
@@ -167,8 +170,14 @@ fn random_programs_agree_with_the_reference_path() {
                 break;
             }
         }
+        for (t, v) in jit.iter_mut().zip(fast.cpu.jit_stats()) {
+            *t += v;
+        }
     }
     assert!(steps_total > 100_000, "the programs ran ({steps_total} steps)");
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(jit[0] > 100 && jit[2] > 30_000, "compiled code ran: {jit:?}");
+    eprintln!("jit regions, entries, steps: {jit:?} of {steps_total}");
 }
 
 // ---- directed: the caches must notice changes right away ------------------
@@ -188,6 +197,7 @@ fn both_ways(setup: impl Fn(&mut Machine), prog: &[Word], steps: u64) -> Vec<i64
         m.cpu.pc = Word::ZERO;
         setup(m);
     }
+    fast.cpu.set_jit_threshold(1);
     fast.run(steps);
     for _ in 0..steps {
         slow.step();
@@ -284,4 +294,89 @@ fn remapping_a_data_page_takes_effect_at_once() {
     };
     let st = both_ways(setup, &prog, 12);
     assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (111, 222));
+}
+
+#[test]
+fn carries_both_ways_in_a_compiled_loop() {
+    // r1 = the smallest word, r2 = the largest; each round: r3 = r1 + r6
+    // (r6 = -5: underflows, C = -1), r4 = C via ADC, r5 = r2 + 7
+    // (overflows, C = +1), r7 += C via ADC, r8 counts rounds with C = +1
+    // seen by a branch; 40 rounds
+    let w_max = 3_812_798_742_493;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 1, 0, -w_max));
+    prog.extend(isa::wide(op::LI, 0, 2, 0, w_max));
+    prog.push(isa::s6(op::LIQ, 0, 6, -5));
+    prog.push(isa::s6(op::LIQ, 0, 9, 40));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::ALU, alu::ADD, 3, 1, 6)); // C = -1
+    prog.push(isa::rrr(op::ALU, alu::ADC, 4, 0, 0)); // r4 = C (-1)
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 2, 7)); // C = +1
+    prog.push(isa::rrr(op::ALU, alu::ADC, 7, 7, 0)); // r7 += C (+1)
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 2, 7)); // C = +1 again
+    prog.push(isa::s6(op::BRQ, 0, cond::NOV, 2)); // C = 0? skip the count
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 8, 8, 1));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let st = both_ways(|_| {}, &prog, 2000);
+    assert_eq!(reg_in(&st, 4), -1, "a negative carry");
+    assert_eq!((reg_in(&st, 7), reg_in(&st, 8)), (40, 40), "positive carries, counted");
+    assert_eq!(reg_in(&st, 3), w_max - 4, "the wrapped sum");
+}
+
+#[test]
+fn a_misaligned_load_through_an_open_window_faults() {
+    // a compiled loop of aligned loads opens the read window on the page;
+    // then a load one tryte off a word centre must fault (vector -5)
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, 1500)); // a word centre
+    prog.extend(isa::wide(op::LI, 0, 4, 0, 1501)); // not one
+    prog.push(isa::s6(op::LIQ, 0, 9, 5));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDW, 1, 2, 0));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::MEM, mem::LDW, 3, 4, 0)); // misaligned
+    prog.push(isa::s6(op::LIQ, 0, 5, 77)); // never reached
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    for setup in [(|_: &mut Machine| {}) as fn(&mut Machine), paged] {
+        let st = both_ways(setup, &prog, 60);
+        assert_ne!(reg_in(&st, 5), 77, "the misaligned load faulted");
+    }
+}
+
+#[test]
+fn multiply_and_divide_in_a_compiled_loop() {
+    // each round: r3 = r1 * r2 (large: overflows, C = sign of the high
+    // half), r4 = MULH, r5 = r1 / r6, r7 = r1 % r6, r8 += C via ADC;
+    // r1 and r2 grow and change sign; then a division by zero faults
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 1, 0, 123_456_789_012));
+    prog.extend(isa::wide(op::LI, 0, 2, 0, -987_654_321));
+    prog.extend(isa::wide(op::LI, 0, 6, 0, -97));
+    prog.push(isa::s6(op::LIQ, 0, 9, 30));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::ALU, alu::MUL, 3, 1, 2));
+    prog.push(isa::rrr(op::ALU, alu::ADC, 8, 8, 0));
+    prog.push(isa::rrr(op::ALU, alu::MULH, 4, 1, 2));
+    prog.push(isa::rrr(op::ALU, alu::DIV, 5, 1, 6));
+    prog.push(isa::rrr(op::ALU, alu::MOD, 7, 1, 6));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 3)); // fold everything in
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 4));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 5));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 7));
+    prog.push(isa::rrr(op::ALUQ, alu::MUL, 1, 1, -7)); // grow, flip sign
+    prog.push(isa::rrr(op::ALU, alu::SUB, 2, 2, 3));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::ALU, alu::DIV, 11, 1, 0)); // by zero: faults
+    prog.push(isa::s6(op::LIQ, 0, 12, 77)); // never reached
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let st = both_ways(|_| {}, &prog, 1000);
+    assert_ne!(reg_in(&st, 12), 77, "the division by zero faulted");
+    assert_ne!(reg_in(&st, 8), 0, "products carried");
 }

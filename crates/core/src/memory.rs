@@ -86,8 +86,25 @@ impl Memory {
     }
 
     /// Report the next write to code slot `s` (through `code_dirty`).
-    pub fn watch_code(&mut self, s: usize) {
-        self.code_watch[s] = true;
+    /// Returns true if the slot was not watched before.
+    pub fn watch_code(&mut self, s: usize) -> bool {
+        !std::mem::replace(&mut self.code_watch[s], true)
+    }
+
+    /// Neither code nor a cached page table lives in RAM frame `f`: a write
+    /// to it needs no bookkeeping.
+    pub fn frame_unwatched(&self, f: usize) -> bool {
+        !self.pt_watch[f] && !self.code_watch[f]
+    }
+
+    /// The address of RAM frame `f`'s words (allocating it if `alloc`), or
+    /// 0 if it has none. Frames are never freed or moved.
+    pub fn frame_ptr(&mut self, f: usize, alloc: bool) -> usize {
+        if alloc {
+            self.ram[f].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice()).as_mut_ptr() as usize
+        } else {
+            self.ram[f].as_mut().map_or(0, |fr| fr.as_mut_ptr() as usize)
+        }
     }
 
     fn code_written(&mut self, s: usize) {
@@ -99,12 +116,15 @@ impl Memory {
 
     /// Watch the RAM frame holding physical address `pa` for writes (it
     /// holds a page-table entry the TLB has cached).
-    pub fn watch_page_table(&mut self, pa: i64) {
+    /// Returns true if the frame was not watched before.
+    pub fn watch_page_table(&mut self, pa: i64) -> bool {
         let f = (pa + HALF_PAGE).div_euclid(PAGE);
         if (0..self.ram_frames()).contains(&f) && !self.pt_watch[f as usize] {
             self.pt_watch[f as usize] = true;
             self.pt_watched.push(f as usize);
+            return true;
         }
+        false
     }
 
     /// The TLB was flushed: stop watching.

@@ -11,5 +11,12 @@ font8x8 = "0.3.1"
 ternary = { path = "../ternary" }
 setun-real = { path = "../real" }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cranelift-codegen = "0.135"
+cranelift-frontend = "0.135"
+cranelift-jit = "0.135"
+cranelift-module = "0.135"
+cranelift-native = "0.135"
+
 [features]
 opstats = []

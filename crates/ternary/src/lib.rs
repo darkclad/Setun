@@ -136,6 +136,7 @@ pub fn wrap_trits(v: i128, n: u32) -> i128 {
 
 /// An `N`-trit balanced-ternary integer (`N` ≤ 39 so it fits in an `i64`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[repr(transparent)]
 pub struct Tern<const N: usize>(i64);
 
 /// 3-trit field: a register index or one base-27 digit, −13..=13.

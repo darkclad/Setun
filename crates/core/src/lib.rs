@@ -8,6 +8,9 @@
 //! * [`devices`]: the standard devices (ISA §8).
 //! * [`machine`]: CPU + memory + devices + emulated time.
 
+// The JIT is not built for WebAssembly; its bookkeeping goes unused there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 pub mod cpu;
 pub mod devices;
 pub mod io;
