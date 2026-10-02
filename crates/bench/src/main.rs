@@ -75,6 +75,10 @@ fn state_hash(m: &Machine, serial: &str) -> u64 {
 }
 
 struct Outcome {
+    /// For ROM programs: a hash of what they produce (debug log with the
+    /// exit code, serial output, framebuffer), which must not change when
+    /// only the compiler's code generation does. 0 for Trinux workloads.
+    result: u64,
     jit: [u64; 4],
     name: &'static str,
     steps: u64,
@@ -100,7 +104,17 @@ fn rom(name: &'static str, path: &Path, cap: u64) -> Outcome {
     }
     let secs = t.elapsed().as_secs_f64();
     let serial = m.dev.serial.take_output();
-    let mut out = Outcome { jit: m.cpu.jit_stats(), name, steps, instructions: instructions(&m), secs, hash: 0 };
+    let mut r = Hash(0xcbf2_9ce4_8422_2325);
+    for &v in &m.dev.debug_log {
+        r.add(v);
+    }
+    for c in serial.chars() {
+        r.add(c as i64);
+    }
+    for &t in m.mem.framebuffer() {
+        r.add(t as i64);
+    }
+    let mut out = Outcome { result: r.0, jit: m.cpu.jit_stats(), name, steps, instructions: instructions(&m), secs, hash: 0 };
     out.hash = state_hash(&m, &serial);
     out
 }
@@ -134,6 +148,7 @@ fn trinux() -> Vec<Outcome> {
         }
         let secs = t.elapsed().as_secs_f64();
         Outcome {
+            result: 0,
             jit: m.cpu.jit_stats(),
             name,
             steps,
@@ -159,6 +174,7 @@ fn trinux() -> Vec<Outcome> {
     }
     serial.push_str(&m.dev.serial.take_output());
     results.push(Outcome {
+        result: 0,
         jit: m.cpu.jit_stats(),
         name: "idle",
         steps,
@@ -249,6 +265,27 @@ fn main() {
     }
     if record {
         std::fs::write(golden_path(), lines).expect("write golden.txt");
+    }
+    // what the ROM programs produce: independent of code generation
+    let outcomes_path = golden_path().with_file_name("outcomes.txt");
+    let known = std::fs::read_to_string(&outcomes_path).unwrap_or_default();
+    let mut out_lines = String::new();
+    for o in all.iter().filter(|o| o.result != 0) {
+        let line = format!("{} {:016x}", o.name, o.result);
+        let status = match known.lines().find(|l| l.starts_with(&format!("{} ", o.name))) {
+            Some(l) if l == line => "result ok",
+            Some(_) => {
+                bad += 1;
+                "RESULT MISMATCH"
+            }
+            None => "result: none recorded",
+        };
+        println!("{line}  {status}");
+        out_lines.push_str(&line);
+        out_lines.push(char::from(10));
+    }
+    if args.iter().any(|a| a == "--record-outcomes") {
+        std::fs::write(&outcomes_path, out_lines).expect("write outcomes.txt");
     }
     #[cfg(feature = "opstats")]
     {
