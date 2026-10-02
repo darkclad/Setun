@@ -10,7 +10,7 @@
 use crate::ast::*;
 use crate::lexer::Pos;
 use crate::Error;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 // ---- types --------------------------------------------------------------------
@@ -115,8 +115,98 @@ enum Global {
 struct Local {
     name: String,
     ty: Ty,
-    /// Object address relative to `fp`.
+    /// Object address relative to `fp` (unused for a register local).
     off: i64,
+    /// A word scalar kept in a callee-saved register.
+    reg: Option<&'static str>,
+}
+
+/// Registers for local variables: the callee-saved r-1..r-9 (ABI).
+const LOCAL_REGS: [&str; 9] = ["r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8", "r-9"];
+
+/// Names whose address is taken (`&x`) anywhere in `stmts`, and whether
+/// there is inline assembly (which may use any register).
+fn scan_body(stmts: &[Stmt], taken: &mut HashSet<String>, asm: &mut bool) {
+    fn ex(e: &Expr, taken: &mut HashSet<String>) {
+        match &e.kind {
+            ExprKind::Unary(UnOp::Addr, inner) => {
+                if let ExprKind::Name(n) = &inner.kind {
+                    taken.insert(n.clone());
+                }
+                ex(inner, taken);
+            }
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => ex(a, taken),
+            ExprKind::Binary(_, a, b) | ExprKind::Assign(_, a, b) | ExprKind::Index(a, b) => {
+                ex(a, taken);
+                ex(b, taken);
+            }
+            ExprKind::Call(f, args) => {
+                ex(f, taken);
+                args.iter().for_each(|a| ex(a, taken));
+            }
+            ExprKind::Cond(a, b, c) => {
+                ex(a, taken);
+                ex(b, taken);
+                ex(c, taken);
+            }
+            ExprKind::List(xs) => xs.iter().for_each(|a| ex(a, taken)),
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Var(d) => {
+                if let Some(i) = &d.init {
+                    ex(i, taken);
+                }
+            }
+            StmtKind::Expr(e) => ex(e, taken),
+            StmtKind::Block(b) => scan_body(b, taken, asm),
+            StmtKind::If(c, t, e) => {
+                ex(c, taken);
+                scan_body(std::slice::from_ref(t), taken, asm);
+                if let Some(e) = e {
+                    scan_body(std::slice::from_ref(e), taken, asm);
+                }
+            }
+            StmtKind::While(c, b) => {
+                ex(c, taken);
+                scan_body(std::slice::from_ref(b), taken, asm);
+            }
+            StmtKind::Loop(b) => scan_body(std::slice::from_ref(b), taken, asm),
+            StmtKind::For(i, c, st, b) => {
+                if let Some(i) = i {
+                    scan_body(std::slice::from_ref(i), taken, asm);
+                }
+                if let Some(c) = c {
+                    ex(c, taken);
+                }
+                if let Some(st) = st {
+                    ex(st, taken);
+                }
+                scan_body(std::slice::from_ref(b), taken, asm);
+            }
+            StmtKind::Sign { e, neg, zero, pos } => {
+                ex(e, taken);
+                for b in [neg, zero, pos] {
+                    scan_body(b, taken, asm);
+                }
+            }
+            StmtKind::Switch { e, cases, default } => {
+                ex(e, taken);
+                for (ks, b) in cases {
+                    ks.iter().for_each(|k| ex(k, taken));
+                    scan_body(b, taken, asm);
+                }
+                if let Some(d) = default {
+                    scan_body(d, taken, asm);
+                }
+            }
+            StmtKind::Return(Some(e)) => ex(e, taken),
+            StmtKind::Asm(_) => *asm = true,
+            StmtKind::Break | StmtKind::Continue | StmtKind::Return(None) => {}
+        }
+    }
 }
 
 /// Where an object lives, for initialisers.
@@ -193,6 +283,14 @@ pub struct Compiler {
     loops: Vec<(Option<String>, String)>, // (continue, break)
     ret_ty: Ty,
     ret_label: String,
+    /// Register allocation for locals: names that must stay in memory,
+    /// registers free now, and every register the function uses.
+    addr_taken: HashSet<String>,
+    no_regs: bool,
+    free_regs: Vec<&'static str>,
+    used_regs: Vec<&'static str>,
+    /// Optimize the generated code.
+    pub optimize: bool,
     // output
     code: Vec<String>,
     strings: Vec<(String, String)>,
@@ -222,6 +320,11 @@ impl Compiler {
             loops: Vec::new(),
             ret_ty: Ty::Void,
             ret_label: String::new(),
+            addr_taken: HashSet::new(),
+            no_regs: true,
+            free_regs: Vec::new(),
+            used_regs: Vec::new(),
+            optimize: true,
             code: Vec::new(),
             strings: Vec::new(),
             reals: Vec::new(),
@@ -556,8 +659,27 @@ impl Compiler {
         let off = first_centre - (!self.word_addressed(&ty)) as i64;
         self.next_slot = first_centre - 3;
         self.lowest_slot = self.lowest_slot.min(first_centre);
-        self.locals.push(Local { name: name.into(), ty, off });
+        self.locals.push(Local { name: name.into(), ty, off, reg: None });
         Ok(off)
+    }
+
+    /// Can `name` of type `ty` live in a register?
+    fn reg_eligible(&self, name: &str, ty: &Ty) -> bool {
+        !self.no_regs && matches!(ty, Ty::Int | Ty::Ptr(_)) && !self.addr_taken.contains(name) && !self.free_regs.is_empty()
+    }
+
+    /// Declare a register local (the caller checked `reg_eligible`).
+    fn alloc_local_reg(&mut self, name: &str, ty: Ty, pos: Pos) -> R<&'static str> {
+        let start = *self.scopes.last().unwrap();
+        if self.locals[start..].iter().any(|l| l.name == name) {
+            return err(pos, format!("`{name}` is already declared in this block"));
+        }
+        let r = self.free_regs.pop().expect("a free register");
+        if !self.used_regs.contains(&r) {
+            self.used_regs.push(r);
+        }
+        self.locals.push(Local { name: name.into(), ty, off: 0, reg: Some(r) });
+        Ok(r)
     }
 
     fn alloc_global(&mut self, ty: &Ty, align: Option<i64>, pos: Pos) -> R<i64> {
@@ -753,6 +875,8 @@ impl Compiler {
     }
 
     fn begin_fn(&mut self, ret: Ty) {
+        self.free_regs = LOCAL_REGS.iter().rev().copied().collect();
+        self.used_regs.clear();
         self.locals.clear();
         self.scopes = vec![0];
         self.next_slot = -3;
@@ -765,6 +889,10 @@ impl Compiler {
     fn function(&mut self, f: &FnDecl) -> R<()> {
         let Some(Global::Func { ty: Ty::Fn(ps, ret), .. }) = self.globals.get(&f.name).cloned() else { unreachable!() };
         self.begin_fn((*ret).clone());
+        self.addr_taken.clear();
+        let mut has_asm = false;
+        scan_body(f.body.as_ref().unwrap(), &mut self.addr_taken, &mut has_asm);
+        self.no_regs = !self.optimize || has_asm;
         self.label(&f.name);
         const SAVED: &[&str] = &["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r-10", "r-11", "r-12", "r-13"];
         if f.interrupt {
@@ -786,6 +914,18 @@ impl Compiler {
                 self.emit(format!("fstd f{j}, {}", mem("fp", off)));
                 continue;
             }
+            if self.reg_eligible(&p.name, t) {
+                // the slot from alloc_local above goes unused
+                self.locals.pop();
+                let r = self.alloc_local_reg(&p.name, t.clone(), f.pos)?;
+                if i < 6 {
+                    self.emit(format!("mov {r}, r{}", i + 1));
+                } else {
+                    self.emit(format!("ldw {r}, {}", mem("fp", 6 + 3 * (i - 6))));
+                }
+                i += 1;
+                continue;
+            }
             let st = if t.is_tryte_sized() { "stt" } else { "stw" };
             if i < 6 {
                 self.emit(format!("{st} r{}, {}", i + 1, mem("fp", off)));
@@ -798,12 +938,26 @@ impl Compiler {
         for s in f.body.as_ref().unwrap() {
             self.stmt(s)?;
         }
+        // the frame, and below it the callee-saved registers this uses
         let frame = -self.lowest_slot;
-        if frame > 0 {
-            self.code.insert(frame_at, format!("        sub sp, sp, {frame}"));
+        let saves: Vec<(&str, i64)> =
+            self.used_regs.iter().enumerate().map(|(k, r)| (*r, -frame - 3 * (k as i64 + 1))).collect();
+        let total = frame + 3 * saves.len() as i64;
+        let mut prologue = Vec::new();
+        if total > 0 {
+            prologue.push(format!("        sub sp, sp, {total}"));
+        }
+        for (r, off) in &saves {
+            prologue.push(format!("        stw {r}, {}", mem("fp", *off)));
+        }
+        for (k, line) in prologue.into_iter().enumerate() {
+            self.code.insert(frame_at + k, line);
         }
         let rl = self.ret_label.clone();
         self.label(&rl);
+        for (r, off) in &saves {
+            self.emit(format!("ldw {r}, {}", mem("fp", *off)));
+        }
         self.emit("mov sp, fp");
         self.emit("pop fp");
         self.emit("pop lr");
@@ -827,6 +981,11 @@ impl Compiler {
             self.stmt(s)?;
         }
         let start = self.scopes.pop().unwrap();
+        for l in &self.locals[start..] {
+            if let Some(r) = l.reg {
+                self.free_regs.push(r);
+            }
+        }
         self.locals.truncate(start);
         self.next_slot = saved;
         Ok(())
@@ -838,6 +997,18 @@ impl Compiler {
                 let ty = self.resolve(&d.ty, d.pos)?;
                 if ty == Ty::Void {
                     return err(d.pos, "a variable cannot be void");
+                }
+                // A word scalar whose address is never taken: a register.
+                if self.reg_eligible(&d.name, &ty) {
+                    if let Some(init) = &d.init {
+                        let got = self.expr(init)?;
+                        self.check_assign(&ty, &got, init)?;
+                    }
+                    let r = self.alloc_local_reg(&d.name, ty, d.pos)?;
+                    if d.init.is_some() {
+                        self.emit(format!("mov {r}, r1"));
+                    }
+                    return Ok(());
                 }
                 // The initialiser cannot see the variable it initialises.
                 if let Some(init) = &d.init {
@@ -1057,12 +1228,26 @@ impl Compiler {
             self.emit("fcmp f1, f2");
             return Ok(true);
         }
-        let ta = self.expr(a)?.decay();
-        if let Some(v) = self.const_eval(b) {
+        let b_const = self.const_eval(b);
+        let simple = b_const.is_some() || self.is_simple_operand(b);
+        let (left, ta) = if simple { self.left_operand(a)? } else { ("r1", self.expr(a)?.decay()) };
+        if let Some(v) = b_const {
             if !(ta.is_integer() || ta.is_pointer() && v == 0) {
                 return err(b.pos, format!("cannot compare {} with a number", self.tyname(&ta)));
             }
-            self.emit(format!("cmp r1, {v}"));
+            self.emit(format!("cmp {left}, {v}"));
+            return Ok(false);
+        }
+        if simple {
+            let (rreg, tb) = self.simple_operand(b).expect("checked simple");
+            let tb = tb.decay();
+            let ok = (ta.is_integer() && tb.is_integer())
+                || (ta.is_pointer() && tb.is_pointer())
+                || (matches!(ta, Ty::Fn(..) | Ty::Null) && matches!(tb, Ty::Fn(..) | Ty::Null));
+            if !ok {
+                return err(b.pos, format!("cannot compare {} with {}", self.tyname(&ta), self.tyname(&tb)));
+            }
+            self.emit(format!("cmp {left}, {rreg}"));
             return Ok(false);
         }
         self.emit("push r1");
@@ -1269,6 +1454,10 @@ impl Compiler {
             ExprKind::Name(n) => {
                 if let Some(l) = self.lookup_local(n) {
                     let (ty, off) = (l.ty.clone(), l.off);
+                    if let Some(r) = l.reg {
+                        self.emit(format!("mov r1, {r}"));
+                        return Ok(ty);
+                    }
                     if ty.is_real() {
                         self.emit(format!("fldd f1, {}", mem("fp", off)));
                     } else if ty.is_scalar() {
@@ -1443,6 +1632,7 @@ impl Compiler {
             ExprKind::Name(n) => {
                 if let Some(l) = self.lookup_local(n) {
                     let (ty, off) = (l.ty.clone(), l.off);
+                    assert!(l.reg.is_none(), "the address of register local `{n}`");
                     self.emit(format!("add r1, fp, {off}"));
                     return Ok(ty);
                 }
@@ -1511,8 +1701,15 @@ impl Compiler {
     }
 
     /// Apply `r1 := r1 op r2` (or `r1 op imm`). `lt`/`rt` are operand types.
+    /// r1 := left op right, where `left` is a register and the right side
+    /// a constant (`imm`) or the register `rreg`.
     fn arith(&mut self, op: BinOp, lt: &Ty, rt: &Ty, imm: Option<i64>, pos: Pos) -> R<Ty> {
-        let operand = |imm: Option<i64>| imm.map_or("r2".to_string(), |v| v.to_string());
+        self.arith_regs(op, lt, rt, "r1", imm, "r2", pos)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arith_regs(&mut self, op: BinOp, lt: &Ty, rt: &Ty, left: &str, imm: Option<i64>, rreg: &str, pos: Pos) -> R<Ty> {
+        let operand = |imm: Option<i64>| imm.map_or(rreg.to_string(), |v| v.to_string());
         let ptr_elem = |t: &Ty| match t {
             Ty::Ptr(e) => Some((**e).clone()),
             _ => None,
@@ -1525,28 +1722,32 @@ impl Compiler {
                         Some(v) => (v * size).to_string(),
                         None => {
                             if size != 1 {
-                                self.emit(format!("mul r2, r2, {size}"));
+                                self.emit(format!("mul r2, {rreg}, {size}"));
+                                "r2".into()
+                            } else {
+                                rreg.to_string()
                             }
-                            "r2".into()
                         }
                     };
                     let m = if op == BinOp::Add { "add" } else { "sub" };
-                    self.emit(format!("{m} r1, r1, {n}"));
+                    self.emit(format!("{m} r1, {left}, {n}"));
                     return Ok(lt.clone());
                 }
                 if let (true, Some(e), BinOp::Add) = (lt.is_integer(), ptr_elem(rt), op) {
                     let size = self.size(&e).max(1);
                     if size != 1 {
-                        self.emit(format!("mul r1, r1, {size}"));
+                        self.emit(format!("mul r1, {left}, {size}"));
+                        self.emit(format!("add r1, r1, {}", operand(imm)));
+                    } else {
+                        self.emit(format!("add r1, {left}, {}", operand(imm)));
                     }
-                    self.emit(format!("add r1, r1, {}", operand(imm)));
                     return Ok(rt.clone());
                 }
                 if let (Some(a), Some(b), BinOp::Sub) = (ptr_elem(lt), ptr_elem(rt), op) {
                     if a != b {
                         return err(pos, format!("cannot subtract {} from {}", self.tyname(rt), self.tyname(lt)));
                     }
-                    self.emit(format!("sub r1, r1, {}", operand(imm)));
+                    self.emit(format!("sub r1, {left}, {}", operand(imm)));
                     let size = self.size(&a).max(1);
                     if size != 1 {
                         self.emit(format!("div r1, r1, {size}"));
@@ -1570,10 +1771,10 @@ impl Compiler {
             BinOp::Shl => "sh",
             BinOp::Shr => {
                 match imm {
-                    Some(v) => self.emit(format!("sh r1, r1, {}", -v)),
+                    Some(v) => self.emit(format!("sh r1, {left}, {}", -v)),
                     None => {
-                        self.emit("neg r2, r2");
-                        self.emit("sh r1, r1, r2");
+                        self.emit(format!("neg r2, {rreg}"));
+                        self.emit(format!("sh r1, {left}, r2"));
                     }
                 }
                 return Ok(Ty::Int);
@@ -1583,8 +1784,69 @@ impl Compiler {
         if matches!(op, BinOp::Div | BinOp::Mod) && imm == Some(0) {
             return err(pos, "division by zero");
         }
-        self.emit(format!("{m} r1, r1, {}", operand(imm)));
+        self.emit(format!("{m} r1, {left}, {}", operand(imm)));
         Ok(Ty::Int)
+    }
+
+    /// The register holding local `e`, if it is a register local.
+    fn reg_local(&self, e: &Expr) -> Option<(&'static str, Ty)> {
+        match self.lookup_local_name(e) {
+            Some(Local { reg: Some(r), ty, .. }) => Some((r, ty.clone())),
+            _ => None,
+        }
+    }
+
+    /// A right operand that needs no evaluation in r1: a register local,
+    /// or a scalar variable in memory (loaded into r2). None otherwise.
+    fn simple_operand(&mut self, e: &Expr) -> Option<(&'static str, Ty)> {
+        if !self.optimize {
+            return None;
+        }
+        if let Some(rt) = self.reg_local(e) {
+            return Some(rt);
+        }
+        let ExprKind::Name(n) = &e.kind else { return None };
+        let (ty, operand) = match self.lookup_local(n) {
+            Some(l) => (l.ty.clone(), mem("fp", l.off)),
+            None => match self.globals.get(n) {
+                Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) => (ty.clone(), format!("[{label}]")),
+                _ => return None,
+            },
+        };
+        if !ty.is_scalar() || ty.is_real() {
+            return None;
+        }
+        let op = if ty.is_tryte_sized() { "ldt" } else { "ldw" };
+        self.emit(format!("{op} r2, {operand}"));
+        Some(("r2", ty))
+    }
+
+    /// Could `simple_operand` take `e`? (No code emitted.)
+    fn is_simple_operand(&self, e: &Expr) -> bool {
+        if !self.optimize || self.reg_local(e).is_some() {
+            return self.optimize;
+        }
+        let ExprKind::Name(n) = &e.kind else { return false };
+        let ty = match self.lookup_local(n) {
+            Some(l) => l.ty.clone(),
+            None => match self.globals.get(n) {
+                Some(Global::Var { ty, .. }) | Some(Global::Extern { ty, .. }) => ty.clone(),
+                _ => return false,
+            },
+        };
+        ty.is_scalar() && !ty.is_real()
+    }
+
+    /// Evaluate `a` for use as a left operand: a register local stays where
+    /// it is; anything else goes into r1. Returns the register and type.
+    fn left_operand(&mut self, a: &Expr) -> R<(&'static str, Ty)> {
+        if self.optimize {
+            if let Some((r, t)) = self.reg_local(a) {
+                return Ok((r, t.decay()));
+            }
+        }
+        let t = self.expr(a)?.decay();
+        Ok(("r1", t))
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr, pos: Pos) -> R<Ty> {
@@ -1649,10 +1911,16 @@ impl Compiler {
                     self.real_op(op);
                     return Ok(Ty::Real);
                 }
-                let lt = self.expr(a)?.decay();
-                if let Some(v) = self.const_eval(b) {
-                    return self.arith(op, &lt, &Ty::Int, Some(v), pos);
+                let b_const = self.const_eval(b);
+                if b_const.is_some() || self.is_simple_operand(b) {
+                    let (left, lt) = self.left_operand(a)?;
+                    if let Some(v) = b_const {
+                        return self.arith_regs(op, &lt, &Ty::Int, left, Some(v), "r2", pos);
+                    }
+                    let (rreg, rt) = self.simple_operand(b).expect("checked simple");
+                    return self.arith_regs(op, &lt, &rt.decay(), left, None, rreg, pos);
                 }
+                let lt = self.expr(a)?.decay();
                 self.emit("push r1");
                 let rt = self.expr(b)?.decay();
                 self.emit("mov r2, r1");
@@ -1711,6 +1979,13 @@ impl Compiler {
             None => {
                 // Fast path: a named scalar variable.
                 if let ExprKind::Name(n) = &lhs.kind {
+                    if let Some(Local { ty, reg: Some(r), .. }) = self.lookup_local(n) {
+                        let (ty, r) = (ty.clone(), *r);
+                        let rt = self.expr(rhs)?;
+                        self.check_assign(&ty, &rt, rhs)?;
+                        self.emit(format!("mov {r}, r1"));
+                        return Ok(ty);
+                    }
                     let target = match self.lookup_local(n) {
                         Some(l) => Some((l.ty.clone(), mem("fp", l.off))),
                         None => match self.globals.get(n) {
@@ -1743,6 +2018,25 @@ impl Compiler {
                 Ok(lt)
             }
             Some(op) => {
+                // a register local: in place
+                if let ExprKind::Name(n) = &lhs.kind {
+                    if let Some(Local { ty, reg: Some(r), .. }) = self.lookup_local(n) {
+                        let (lt, r) = (ty.clone(), *r);
+                        let (rt, imm) = match self.const_eval(rhs) {
+                            Some(v) => (Ty::Int, Some(v)),
+                            None => {
+                                let rt = self.expr(rhs)?.decay();
+                                self.emit("mov r2, r1");
+                                (rt, None)
+                            }
+                        };
+                        self.emit(format!("mov r1, {r}"));
+                        let res = self.arith(op, &lt, &rt, imm, rhs.pos)?;
+                        self.check_assign(&lt, &res, rhs)?;
+                        self.emit(format!("mov {r}, r1"));
+                        return Ok(lt);
+                    }
+                }
                 let lt = self.addr(lhs)?;
                 if !lt.is_scalar() {
                     return err(lhs.pos, format!("cannot apply an operator to a whole {}", self.tyname(&lt)));

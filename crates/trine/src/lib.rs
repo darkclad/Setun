@@ -61,6 +61,8 @@ pub struct Options {
     /// Initial stack pointer (the stack grows down).
     pub stack: i64,
     pub kind: Kind,
+    /// Optimize the generated code (on by default; off for comparisons).
+    pub optimize: bool,
 }
 
 /// Boot protocol (docs/BOOT.md): sector 0 of disk 0 is loaded into frame 1.
@@ -76,25 +78,25 @@ impl Options {
     /// A ROM program: code at the reset vector −3^10, globals from the start
     /// of RAM frame 1 upward, stack below them in frame 0.
     pub fn rom() -> Self {
-        Options { org: -59_049, data: 9_843, stack: 9_840, kind: Kind::Rom }
+        Options { org: -59_049, data: 9_843, stack: 9_840, kind: Kind::Rom, optimize: true }
     }
 
     /// The BIOS: like `rom()`, but frame 1 stays free for the boot sector;
     /// the stack is in frame 2 and globals start in frame 3.
     pub fn bios() -> Self {
-        Options { org: -59_049, data: 49_209, stack: 49_206, kind: Kind::Rom }
+        Options { org: -59_049, data: 49_209, stack: 49_206, kind: Kind::Rom, optimize: true }
     }
 
     /// A boot sector program: code from the centre of frame 1, stack in
     /// frame 2, globals from frame 3.
     pub fn boot() -> Self {
-        Options { org: BOOT_ENTRY, data: 49_209, stack: 49_206, kind: Kind::Boot }
+        Options { org: BOOT_ENTRY, data: 49_209, stack: 49_206, kind: Kind::Boot, optimize: true }
     }
 
     /// A Trinux user program: code at `USER_BASE`, globals 27 pages higher,
     /// stack just below −3^18.
     pub fn user() -> Self {
-        Options { org: USER_BASE, data: USER_DATA, stack: USER_STACK, kind: Kind::User }
+        Options { org: USER_BASE, data: USER_DATA, stack: USER_STACK, kind: Kind::User, optimize: true }
     }
 }
 
@@ -251,6 +253,7 @@ _trine_vectors:
 
 fn finish(loader: Loader, opts: &Options) -> Result<Build, String> {
     let mut c = compile::Compiler::new();
+    c.optimize = opts.optimize;
     let out = c
         .compile(&loader.items, &compile::Layout { data_org: opts.data })
         .map_err(|e| if e.pos == lexer::Pos::default() { e.msg.clone() } else { loader.fmt(&e) })?;
