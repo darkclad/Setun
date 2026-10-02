@@ -1,0 +1,376 @@
+// calc [expression ...]: a calculator on the Setun-387 FPU.
+//
+//   calc '2^0.5'          evaluate the arguments and print the result
+//   calc                  read expressions line by line (a prompt on a tty)
+//
+// Expressions: + - * / % ^ (right-associative), unary minus, parentheses,
+// decimal numbers (1.5e-3), ternary integers (0t1T0, 0zD9), variables
+// (`x = 2*pi`, and `ans` = the last result), the constants pi and e, and
+//   sin cos tan asin acos atan atan2 sinh cosh tanh exp ln log log3 sqrt
+//   abs pow hypot floor ceil round trunc
+// Commands: `:t` shows each result in balanced ternary as well, `:d N`
+// sets the decimal digits (1..12), `:q` quits.
+
+import "../lib/tlibc.tri";
+import "../lib/ctype.tri";
+import "../lib/stdio.tri";
+import "math.tri";
+
+var src: *char;
+var at: int;
+var err: *char;                      // the first error in this line, or null
+var err_at: int;
+
+const NVARS: int = 27;
+var var_names: [27][16]char;
+var var_vals: [27]real;
+var nvars: int;
+var ans: real;
+var show_tern: int;
+var digits: int = 12;
+
+fn fail(msg: *char) {
+    if (err == null) { err = msg; err_at = at; }
+}
+
+fn skip() { while (src[at] == ' ' || src[at] == '\t') { at += 1; } }
+
+fn nan() -> real { var z: real = 0.0; return z / z; }
+
+// ---- numbers ---------------------------------------------------------------
+
+fn tern_digit(c: char) -> int {
+    if (c == '1') { return 1; }
+    if (c == '0') { return 0; }
+    if (c == 'T' || c == 't') { return -1; }
+    return 2;
+}
+
+fn b27_value(c: char) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    var u: char = toupper(c) as char;
+    if (u >= 'A' && u <= 'D') { return u - 'A' + 10; }
+    return 99;
+}
+
+fn number() -> real {
+    if (src[at] == '0' && (src[at + 1] == 't' || src[at + 1] == 'z')) {
+        var base: int = src[at + 1] == 't' ? 3 : 27;
+        at += 2;
+        var v: real = 0.0;
+        var n: int = 0;
+        loop {
+            var d: int = base == 3 ? tern_digit(src[at]) : b27_value(src[at]);
+            if ((base == 3 && d == 2) || (base == 27 && d == 99)) { break; }
+            v = v * base + d;
+            at += 1;
+            n += 1;
+        }
+        if (n == 0 || isalnum(src[at])) { fail(base == 3 ? "bad 0t number (digits 1 0 T)" : "bad 0z number (digits 0-9 A-D)"); }
+        return v;
+    }
+    var end: *char = null;
+    var v: real = strtor(&src[at], &end);
+    at = (end as int) - (&src[0] as int);
+    if (isalpha(src[at])) { fail("bad number"); }
+    return v;
+}
+
+// ---- names -------------------------------------------------------------------
+
+fn name_at(buf: *char) {
+    var n: int = 0;
+    while (isalnum(src[at]) || src[at] == '_') {
+        if (n < 15) { buf[n] = src[at]; n += 1; }
+        at += 1;
+    }
+    buf[n] = 0;
+}
+
+fn find_var(name: *char) -> int {
+    var i: int = 0;
+    while (i < nvars) {
+        if (strcmp(&var_names[i][0], name) == 0) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+fn unknown_function(name_at: int) {
+    var here: int = at;
+    at = name_at;
+    fail("unknown function");
+    at = here;
+}
+
+fn call1(f: *char, start: int, x: real) -> real {
+    if (strcmp(f, "sin") == 0) { return sin(x); }
+    if (strcmp(f, "cos") == 0) { return cos(x); }
+    if (strcmp(f, "tan") == 0) { return tan(x); }
+    if (strcmp(f, "asin") == 0) { return asin(x); }
+    if (strcmp(f, "acos") == 0) { return acos(x); }
+    if (strcmp(f, "atan") == 0) { return atan(x); }
+    if (strcmp(f, "sinh") == 0) { return sinh(x); }
+    if (strcmp(f, "cosh") == 0) { return cosh(x); }
+    if (strcmp(f, "tanh") == 0) { return tanh(x); }
+    if (strcmp(f, "exp") == 0) { return exp(x); }
+    if (strcmp(f, "ln") == 0) { return ln(x); }
+    if (strcmp(f, "log") == 0) { return log10(x); }
+    if (strcmp(f, "log3") == 0) { return log3(x); }
+    if (strcmp(f, "sqrt") == 0) { return sqrt(x); }
+    if (strcmp(f, "abs") == 0) { return x < 0 ? -x : x; }
+    if (strcmp(f, "floor") == 0) { return floor(x); }
+    if (strcmp(f, "ceil") == 0) { return ceil(x); }
+    if (strcmp(f, "round") == 0) { return round(x); }
+    if (strcmp(f, "trunc") == 0) { return trunc(x); }
+    unknown_function(start);
+    return nan();
+}
+
+fn call2(f: *char, start: int, x: real, y: real) -> real {
+    if (strcmp(f, "atan2") == 0) { return atan2(x, y); }
+    if (strcmp(f, "pow") == 0) { return pow(x, y); }
+    if (strcmp(f, "hypot") == 0) { return hypot(x, y); }
+    unknown_function(start);
+    return nan();
+}
+
+// ---- the grammar ---------------------------------------------------------------
+
+fn primary() -> real {
+    skip();
+    var c: char = src[at];
+    if (c == '(') {
+        at += 1;
+        var v: real = expr();
+        skip();
+        if (src[at] != ')') { fail("expected )"); return v; }
+        at += 1;
+        return v;
+    }
+    if (isdigit(c) || (c == '.' && isdigit(src[at + 1]))) { return number(); }
+    if (isalpha(c)) {
+        var name: [16]char;
+        var start: int = at;
+        name_at(&name[0]);
+        skip();
+        if (src[at] == '(') {
+            at += 1;
+            var a: real = expr();
+            skip();
+            var r: real = 0.0;
+            if (src[at] == ',') {
+                at += 1;
+                var b: real = expr();
+                skip();
+                r = call2(&name[0], start, a, b);
+            } else {
+                r = call1(&name[0], start, a);
+            }
+            if (src[at] != ')') { fail("expected )"); return r; }
+            at += 1;
+            return r;
+        }
+        if (strcmp(&name[0], "pi") == 0) { return pi(); }
+        if (strcmp(&name[0], "e") == 0) { return e(); }
+        if (strcmp(&name[0], "ans") == 0) { return ans; }
+        var i: int = find_var(&name[0]);
+        if (i < 0) { at = start; fail("unknown variable"); return nan(); }
+        return var_vals[i];
+    }
+    if (c == 0) { fail("unexpected end"); } else { fail("syntax error"); }
+    return nan();
+}
+
+fn unary() -> real {
+    skip();
+    if (src[at] == '-') { at += 1; return -unary(); }
+    if (src[at] == '+') { at += 1; return unary(); }
+    return power();
+}
+
+fn power() -> real {
+    var b: real = primary();
+    skip();
+    if (src[at] == '^') {
+        at += 1;
+        var x: real = unary();                           // 2^-1, 2^3^2 = 2^9
+        return pow(b, x);
+    }
+    return b;
+}
+
+fn term() -> real {
+    var v: real = unary();
+    loop {
+        skip();
+        var c: char = src[at];
+        if (c != '*' && c != '/' && c != '%') { return v; }
+        at += 1;
+        var r: real = unary();
+        if (c == '*') { v = v * r; }
+        if (c == '/') { v = v / r; }
+        if (c == '%') { v = v % r; }
+    }
+    return v;
+}
+
+fn expr() -> real {
+    var v: real = term();
+    loop {
+        skip();
+        var c: char = src[at];
+        if (c != '+' && c != '-') { return v; }
+        at += 1;
+        var r: real = term();
+        v = c == '+' ? v + r : v - r;
+    }
+    return v;
+}
+
+// ---- output ---------------------------------------------------------------------
+
+// x in balanced ternary: 0t1T0.1T…  (1 0 T, at most 27 digits after the point)
+fn put_tern(x: real) {
+    var c: int = fclass(x);
+    if (c == 3 || c == -3 || c == 4) { return; }
+    var n: real = round(x);
+    var f: real = x - n;
+    var d: [64]char;
+    var nd: int = 0;
+    if (n == 0.0) { d[0] = '0'; nd = 1; }
+    while (n != 0.0 && nd < 60) {
+        var r: real = rem(n, 3);                         // the nearest remainder: -1, 0 or 1
+        d[nd] = r > 0 ? '1' : r < 0 ? 'T' : '0';
+        nd += 1;
+        n = (n - r) / 3;
+    }
+    puts("0t");
+    if (n != 0.0) { puts("..."); }
+    while (nd > 0) { nd -= 1; putc(d[nd]); }
+    if (f != 0.0) {
+        putc('.');
+        var k: int = 0;
+        while (f != 0.0 && k < 27) {
+            f = f * 3;
+            var t: real = round(f);
+            if (t > 1) { t = 1.0; }
+            if (t < -1) { t = -1.0; }
+            putc(t > 0 ? '1' : t < 0 ? 'T' : '0');
+            f = f - t;
+            k += 1;
+        }
+        if (f != 0.0) { puts("..."); }
+    }
+}
+
+fn putc(c: char) {
+    var b: [2]char;
+    b[0] = c;
+    b[1] = 0;
+    puts(&b[0]);
+}
+
+fn show(x: real) {
+    var buf: [24]char;
+    puts(rtoa(x, digits, &buf[0]));
+    if (show_tern && fclass(x) != 4 && fclass(x) != 3 && fclass(x) != -3) {
+        puts("   ");
+        put_tern(x);
+    }
+    puts("\n");
+}
+
+// ---- lines ----------------------------------------------------------------------
+
+// Evaluate one line; returns 0, 1 for an error, or 2 to quit.
+fn line(s: *char) -> int {
+    src = s;
+    at = 0;
+    err = null;
+    skip();
+    if (src[at] == 0) { return 0; }
+    if (src[at] == ':') {
+        var cmd: char = src[at + 1];
+        if (cmd == 'q') { return 2; }
+        if (cmd == 't') { show_tern = !show_tern; puts(show_tern ? "ternary on\n" : "ternary off\n"); return 0; }
+        if (cmd == 'd') {
+            var n: int = atoi(&src[at + 2]);
+            if (n < 1 || n > 12) { puts("calc: digits are 1..12\n"); return 1; }
+            digits = n;
+            return 0;
+        }
+        puts("calc: commands are :t :d N :q\n");
+        return 1;
+    }
+    // `name = expr`
+    var assign: int = 0;
+    var name: [16]char;
+    var save: int = at;
+    if (isalpha(src[at])) {
+        name_at(&name[0]);
+        skip();
+        if (src[at] == '=') {
+            at += 1;
+            assign = 1;
+            if (strcmp(&name[0], "pi") == 0 || strcmp(&name[0], "e") == 0 || strcmp(&name[0], "ans") == 0) {
+                at = save;
+                fail("cannot assign to a constant");
+            } else if (find_var(&name[0]) < 0 && nvars == NVARS) {
+                at = save;
+                fail("too many variables");
+            }
+        } else {
+            at = save;
+        }
+    }
+    var v: real = expr();
+    skip();
+    if (src[at] != 0 && src[at] != '\n') { fail("syntax error"); }
+    if (err != null) {
+        puts("calc: ");
+        puts(err);
+        puts(" at column ");
+        put_int(err_at + 1);
+        puts("\n");
+        return 1;
+    }
+    if (assign) {
+        var i: int = find_var(&name[0]);
+        if (i < 0) { i = nvars; strcpy(&var_names[i][0], &name[0]); nvars += 1; }
+        var_vals[i] = v;
+    }
+    ans = v;
+    show(v);
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 1) {
+        // the arguments, joined with spaces, are one expression
+        var buf: [512]char;
+        var n: int = 0;
+        var i: int = 1;
+        while (i < argc) {
+            var k: int = 0;
+            while (argv[i][k] != 0 && n < 510) { buf[n] = argv[i][k]; n += 1; k += 1; }
+            if (i + 1 < argc && n < 510) { buf[n] = ' '; n += 1; }
+            i += 1;
+        }
+        buf[n] = 0;
+        return line(&buf[0]) == 1;
+    }
+    var tty: int = isatty(0);
+    var bad: int = 0;
+    var text: [512]char;
+    loop {
+        if (tty) { puts("calc> "); }
+        if (fgets(&text[0], 512, stdin()) == null) { break; }
+        var len: int = strlen(&text[0]);
+        if (len > 0 && text[len - 1] == '\n') { text[len - 1] = 0; }
+        var r: int = line(&text[0]);
+        if (r == 2) { break; }
+        if (r == 1) { bad = 1; }
+    }
+    return bad && !tty;
+}

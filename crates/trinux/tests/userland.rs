@@ -827,3 +827,70 @@ fn k7_clear_uses_the_vt100_subset() {
     assert!(row(1).starts_with("$ true"), "row 1: {:?}", row(1));
     assert!(!(0..30).any(|r| row(r).contains("Trinux version")), "the screen was not cleared");
 }
+
+#[test]
+fn calc_on_the_fpu() {
+    let out = session(
+        &[
+            "calc '1/3'",
+            "calc 2^0.5",
+            "calc 'sin(pi/6)'",
+            "calc '0t1T0 + 0zD'",
+            "calc 'atan2(1, -1) * 4 / pi'",
+            "calc '2^3^2'; calc '-2^2'; calc '7 % 3'",
+            "calc 1/0; calc 'ln(-1)'; calc 'log(1000) + log3(1/27)'",
+            "calc <<EOF\nx = 2*pi\nx / 4\n:t\n1/3\n0.5\nans*2\n-8\n:t\n:d 5\ne\n:q\n1\nEOF",
+            "echo st=$?",
+        ],
+        600_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "$ calc '1/3'\n0.333333333333\n",
+            "$ calc 2^0.5\n1.41421356237\n",
+            "$ calc 'sin(pi/6)'\n0.5\n",
+            "$ calc '0t1T0 + 0zD'\n19\n",
+            "$ calc 'atan2(1, -1) * 4 / pi'\n3\n",
+            "512\n-4\n1\n",
+            "inf\nnan\n0\n",
+            "6.28318530718\n1.57079632679\nternary on\n0.333333333333   0t0.1\n0.5   0t0.111111111111111111111111111...\n1   0t1\n-8   0tT01\nternary off\n2.7183\n$ echo st=$?\nst=0\n",
+        ],
+    );
+}
+
+#[test]
+fn calc_errors() {
+    let out = session(
+        &[
+            "calc '2 +'; echo st=$?",
+            "calc 'foo(1)'; echo st=$?",
+            "calc 'y + 1'; echo st=$?",
+            "calc '0t12'; echo st=$?",
+            "calc '0zE'; echo st=$?",
+            "calc '(1+2'; echo st=$?",
+            "calc 'pi = 3'; echo st=$?",
+            "calc '1.5q'; echo st=$?",
+            "calc '1 2'; echo st=$?",
+            "calc <<EOF\n:x\n:d 0\nz = 1 +\nz\n2\nEOF",
+            "echo st=$?",
+        ],
+        600_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "calc: unexpected end at column 4\nst=1\n",
+            "calc: unknown function at column 1\nst=1\n",
+            "calc: unknown variable at column 1\nst=1\n",
+            "calc: bad 0t number (digits 1 0 T) at column 4\nst=1\n",
+            "calc: bad 0z number (digits 0-9 A-D) at column 3\nst=1\n",
+            "calc: expected ) at column 5\nst=1\n",
+            "calc: cannot assign to a constant at column 1\nst=1\n",
+            "calc: bad number at column 4\nst=1\n",
+            "calc: syntax error at column 3\nst=1\n",
+            // a failed assignment makes no variable; later lines still run
+            "calc: commands are :t :d N :q\ncalc: digits are 1..12\ncalc: unexpected end at column 8\ncalc: unknown variable at column 1\n2\n$ echo st=$?\nst=1\n",
+        ],
+    );
+}

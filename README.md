@@ -13,6 +13,7 @@ tritwise multiply and threshold-add operations, and the 3-way branch.
 - 3^27-tryte address space (3^3^3), paged 9|9|9 with 3^9-tryte pages
 - default RAM 3^18 = 9^9 trytes (≈ 691 MB equivalent)
 - 27 general registers, a load/store 3-operand ISA, a sign trit and a carry trit
+- the Setun-387 FPU: 27 real registers, real27 (9-trit exponent, 18-trit mantissa) and real81 (72-trit mantissa), where 1/3 is exact and 1/10 is not
 - 3 privilege rings on one trit, 243 interrupt vectors, 3^9 I/O ports (a port number is one tryte)
 - 640×480 framebuffer, one tryte per pixel = 3^9 colours (27 levels per channel)
 - a tryte holds a Unicode code point directly

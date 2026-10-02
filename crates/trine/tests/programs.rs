@@ -416,3 +416,78 @@ fn compile_errors_are_reported_with_positions() {
     assert!(compile_err("import \"nowhere.tri\"; fn main() -> int { return 0; }").contains("cannot find"));
     assert!(compile_err("fn main() -> int { return 'ab'; }").contains("exactly one character"));
 }
+
+#[test]
+fn math_library() {
+    let src = r#"
+        import "console.tri";
+        import "math.tri";
+        var fails: int;
+        fn check(name: *char, cond: int) {
+            if (!cond) { print("FAIL "); print(name); print("\n"); fails += 1; }
+        }
+        fn near(a: real, b: real) -> int { return abs(a - b) <= 1e-30 * (abs(b) > 1 ? abs(b) : 1.0); }
+        fn show(x: real) { var b: [24]char; print(rtoa(x, 12, &b[0])); print(" "); }
+        fn main() -> int {
+            var p: real = pi();
+            // identities to 30 digits
+            check("exp(1)", near(exp(1.0), e()));
+            check("exp(ln)", near(exp(ln(12345.678)), 12345.678));
+            check("ln(exp)", near(ln(exp(-3.75)), -3.75));
+            check("ln 10", near(ln(10.0), 2.302585092994045684017991454684364));
+            check("exp 10", near(exp(10.0), 22026.46579480671651695790064528424));
+            check("ln small", near(ln(1e-200), -460.5170185988091368035982909368728));
+            check("sin pi/6", near(sin(p / 6), 0.5));
+            check("cos pi/3", near(cos(p / 3), 0.5));
+            check("sin2+cos2", near(sin(2.5) * sin(2.5) + cos(2.5) * cos(2.5), 1.0));
+            check("sin big", near(sin(1000.0), 0.8268795405320025602558874291092192));
+            check("tan pi/4", near(tan(p / 4), 1.0));
+            check("atan 1", near(4 * atan(1.0), p));
+            check("atan big", near(atan(1e10), p / 2 - 1e-10));
+            check("asin", near(asin(0.5), p / 6));
+            check("acos", near(acos(-1.0), p));
+            check("pow half", near(pow(2.0, 0.5), sqrt(2.0)));
+            check("pow frac", near(pow(10.0, 0.25) * pow(10.0, 0.75), 10.0));
+            check("sinh", near(sinh(1.0), 1.175201193643801456882381850595601));
+            check("sinh small", near(sinh(1e-5), 0.0000100000000001666666666675));
+            check("tanh", near(tanh(0.5), 0.4621171572600097585023184836436725));
+            check("hypot", hypot(3.0, 4.0) == 5.0);
+            // exact by construction
+            check("log3 81", log3(81.0) == 4.0);
+            check("log3 1/27", log3(1.0 / 27) == -3.0);
+            check("log10 1000", log10(1000.0) == 3.0);
+            check("log10 0.001", log10(0.001) == -3.0);
+            check("pow int", pow(-2.0, 3.0) == -8.0 && pow(3.0, -2.0) == 1.0 / 9);
+            check("pow 0", pow(0.0, 0.0) == 1.0);
+            // atan2 quadrants
+            check("atan2 q2", near(atan2(1.0, -1.0), 3 * p / 4));
+            check("atan2 q3", near(atan2(-1.0, -1.0), -3 * p / 4));
+            check("atan2 axes", atan2(1.0, 0.0) == p / 2 && atan2(0.0, -1.0) == p && atan2(0.0, 0.0) == 0.0);
+            // special values, with their flags
+            set_fsr(19683 * 121);
+            var n: real = ln(-1.0);
+            check("ln(-1) is NaN", n != n && fsr() % 243 == 81);
+            set_fsr(19683 * 121);
+            check("ln(0) is -inf", fclass(ln(0.0)) == -3 && fsr() % 243 == 27);
+            set_fsr(19683 * 121);
+            check("exp overflows", fclass(exp(20000.0)) == 3 && fsr() % 27 == 10);
+            check("exp underflows", exp(-20000.0) == 0.0);
+            check("exp(-inf)", exp(-1.0 / 0.0) == 0.0);
+            n = sin(1.0 / 0.0);
+            check("sin(inf) is NaN", n != n);
+            n = asin(2.0);
+            check("asin(2) is NaN", n != n);
+            n = pow(-8.0, 1.0 / 3);
+            check("pow(-8, 1/3) is NaN", n != n);
+            n = 0.0 / 0.0;
+            check("NaN goes through", exp(n) != exp(n) && cos(n) != cos(n) && atan2(n, 1.0) != atan2(n, 1.0));
+            check("hypot(inf, NaN)", fclass(hypot(-1.0 / 0.0, n)) == 3);
+            check("atan2 infinities", near(atan2(1.0 / 0.0, -1.0 / 0.0), 3 * p / 4));
+            show(exp(1.0)); show(ln(2.0)); show(sin(1.0)); show(atan2(-2.0, 3.0)); show(pow(2.0, 100.0)); show(cosh(-2.0));
+            return fails;
+        }
+    "#;
+    let (o, serial) = run_with(src, "");
+    assert_eq!(o, Outcome::Exit(0), "{serial}");
+    assert_eq!(serial, "2.71828182846 0.69314718056 0.841470984808 -0.588002603548 1.26765060023e+30 3.76219569108 ");
+}

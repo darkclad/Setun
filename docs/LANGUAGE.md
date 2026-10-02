@@ -258,6 +258,7 @@ Structs and arrays are passed as pointers. This is the same convention as the IS
 | `rt.tri` | `memset`, `memcpy`, `strlen`, `strcmp`, `itoa` (decimal), `itoa27` (a word as 9 base-27 digits, negative ones overlined), `itoa3` (base 3), `b27_digit` |
 | `console.tri` | serial `putc`/`puts`/`getc`; a text-mode screen writer with cursor, colours and scrolling |
 | `real.tri` | `rtoa(x, digits, buf)` (decimal text, like `%g`), `strtor`, `atof`, `pow10`, `floor`, `ceil` |
+| `math.tri` | `exp ln log3 log10 pow sin cos tan asin acos atan atan2 sinh cosh tanh hypot pi e`, from the FPU's `+ − × ÷ √` to about 30 digits; ternary range reduction (`exponent3`/`scale3`), so `log3` of a power of 3 is exact; C's special values and flags |
 | `ports.tri` | named constants for every device register in ISA §8 |
 | (generated) | startup code, see §9 |
 

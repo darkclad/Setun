@@ -235,6 +235,7 @@ fmt_nl(f);
   - `if`/`while`/`for`;
   - builtins: `cd`, `exit`, `export`, `jobs`, `fg`/`bg`.
 - **Core utilities:** `ls cat echo pwd mkdir rmdir rm cp mv ln touch chmod ps kill sleep date uname true false head tail wc grep sort env clear`.
+- **`/bin/calc`:** a calculator on the Setun-387 (`math.tri`): `+ − * / % ^`, functions, variables, `0t`/`0z` integers, and `:t` to show results in balanced ternary as well (`1/3` → `0t0.1`).
 
 ## 12. Known departures from POSIX
 

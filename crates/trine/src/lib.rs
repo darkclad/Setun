@@ -28,6 +28,7 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("console.tri", include_str!("../lib/console.tri")),
     ("keymap.tri", include_str!("../lib/keymap.tri")),
     ("real.tri", include_str!("../lib/real.tri")),
+    ("math.tri", include_str!("../lib/math.tri")),
 ];
 
 /// What the build produces.
