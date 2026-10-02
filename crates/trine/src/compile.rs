@@ -209,6 +209,153 @@ fn scan_body(stmts: &[Stmt], taken: &mut HashSet<String>, asm: &mut bool) {
     }
 }
 
+/// Statements and expressions in `stmts` (a size measure for inlining).
+fn body_size(stmts: &[Stmt]) -> usize {
+    fn ex(e: &Expr) -> usize {
+        1 + match &e.kind {
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => ex(a),
+            ExprKind::Binary(_, a, b) | ExprKind::Assign(_, a, b) | ExprKind::Index(a, b) => ex(a) + ex(b),
+            ExprKind::Call(f, args) => ex(f) + args.iter().map(ex).sum::<usize>(),
+            ExprKind::Cond(a, b, c) => ex(a) + ex(b) + ex(c),
+            ExprKind::List(xs) => xs.iter().map(ex).sum(),
+            _ => 0,
+        }
+    }
+    let one = |s: &Stmt| body_size(std::slice::from_ref(s));
+    stmts
+        .iter()
+        .map(|s| {
+            1 + match &s.kind {
+                StmtKind::Var(d) => d.init.as_ref().map_or(0, ex),
+                StmtKind::Expr(e) | StmtKind::Return(Some(e)) => ex(e),
+                StmtKind::Block(b) => body_size(b),
+                StmtKind::If(c, t, e) => ex(c) + one(t) + e.as_ref().map_or(0, |e| one(e)),
+                StmtKind::While(c, b) => ex(c) + one(b),
+                StmtKind::Loop(b) => one(b),
+                StmtKind::For(i, c, st, b) => {
+                    i.as_ref().map_or(0, |i| one(i)) + c.as_ref().map_or(0, ex) + st.as_ref().map_or(0, ex) + one(b)
+                }
+                StmtKind::Sign { e, neg, zero, pos } => ex(e) + body_size(neg) + body_size(zero) + body_size(pos),
+                StmtKind::Switch { e, cases, default } => {
+                    ex(e) + cases.iter().map(|(k, b)| k.iter().map(ex).sum::<usize>() + body_size(b)).sum::<usize>()
+                        + default.as_ref().map_or(0, |d| body_size(d))
+                }
+                // never inlined: counts as huge
+                StmtKind::Asm(_) => 1000,
+                StmtKind::Break | StmtKind::Continue | StmtKind::Return(None) => 0,
+            }
+        })
+        .sum()
+}
+
+/// A function is inlined when its cost (its size plus the cost of what it
+/// would inline in turn) is at most this, and it makes no real call; each
+/// function may grow by at most `INLINE_BUDGET` this way.
+const INLINE_MAX: usize = 60;
+const INLINE_BUDGET: usize = 200;
+
+/// Variables declared in `stmts` (a register-need estimate).
+fn var_count(stmts: &[Stmt]) -> usize {
+    let one = |s: &Stmt| var_count(std::slice::from_ref(s));
+    stmts
+        .iter()
+        .map(|s| match &s.kind {
+            StmtKind::Var(_) => 1,
+            StmtKind::Block(b) => var_count(b),
+            StmtKind::If(_, t, e) => one(t) + e.as_ref().map_or(0, |e| one(e)),
+            StmtKind::While(_, b) | StmtKind::Loop(b) => one(b),
+            StmtKind::For(i, _, _, b) => i.as_ref().map_or(0, |i| one(i)) + one(b),
+            StmtKind::Sign { neg, zero, pos, .. } => var_count(neg) + var_count(zero) + var_count(pos),
+            StmtKind::Switch { cases, default, .. } => {
+                cases.iter().map(|(_, b)| var_count(b)).sum::<usize>() + default.as_ref().map_or(0, |d| var_count(d))
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Direct calls in `stmts`: the callee names.
+fn calls_in(stmts: &[Stmt], out: &mut Vec<String>) {
+    fn ex(e: &Expr, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Call(f, args) => {
+                if let ExprKind::Name(n) = &f.kind {
+                    out.push(n.clone());
+                } else {
+                    out.push(String::new()); // through a pointer: a real call
+                }
+                ex(f, out);
+                args.iter().for_each(|a| ex(a, out));
+            }
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => ex(a, out),
+            ExprKind::Binary(_, a, b) | ExprKind::Assign(_, a, b) | ExprKind::Index(a, b) => {
+                ex(a, out);
+                ex(b, out);
+            }
+            ExprKind::Cond(a, b, c) => {
+                ex(a, out);
+                ex(b, out);
+                ex(c, out);
+            }
+            ExprKind::List(xs) => xs.iter().for_each(|a| ex(a, out)),
+            _ => {}
+        }
+    }
+    let one = |s: &Stmt, out: &mut Vec<String>| calls_in(std::slice::from_ref(s), out);
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Var(d) => {
+                if let Some(i) = &d.init {
+                    ex(i, out);
+                }
+            }
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => ex(e, out),
+            StmtKind::Block(b) => calls_in(b, out),
+            StmtKind::If(c, t, e) => {
+                ex(c, out);
+                one(t, out);
+                if let Some(e) = e {
+                    one(e, out);
+                }
+            }
+            StmtKind::While(c, b) => {
+                ex(c, out);
+                one(b, out);
+            }
+            StmtKind::Loop(b) => one(b, out),
+            StmtKind::For(i, c, st, b) => {
+                if let Some(i) = i {
+                    one(i, out);
+                }
+                if let Some(c) = c {
+                    ex(c, out);
+                }
+                if let Some(st) = st {
+                    ex(st, out);
+                }
+                one(b, out);
+            }
+            StmtKind::Sign { e, neg, zero, pos } => {
+                ex(e, out);
+                for b in [neg, zero, pos] {
+                    calls_in(b, out);
+                }
+            }
+            StmtKind::Switch { e, cases, default } => {
+                ex(e, out);
+                for (ks, b) in cases {
+                    ks.iter().for_each(|k| ex(k, out));
+                    calls_in(b, out);
+                }
+                if let Some(d) = default {
+                    calls_in(d, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Where an object lives, for initialisers.
 #[derive(Clone, Copy)]
 enum Place {
@@ -291,6 +438,15 @@ pub struct Compiler {
     used_regs: Vec<&'static str>,
     /// Optimize the generated code.
     pub optimize: bool,
+    /// Function bodies, for inlining; the ones being inlined now; and the
+    /// first local an inlined body may see (the caller's are hidden).
+    fns: HashMap<String, FnDecl>,
+    /// Inlining cost of each function (None: never inlined).
+    inline_cost: HashMap<String, Option<usize>>,
+    inlining: Vec<String>,
+    local_floor: usize,
+    /// What this function has grown by through inlining.
+    inlined: usize,
     // output
     code: Vec<String>,
     strings: Vec<(String, String)>,
@@ -325,6 +481,11 @@ impl Compiler {
             free_regs: Vec::new(),
             used_regs: Vec::new(),
             optimize: true,
+            fns: HashMap::new(),
+            inline_cost: HashMap::new(),
+            inlining: Vec::new(),
+            local_floor: 0,
+            inlined: 0,
             code: Vec::new(),
             strings: Vec::new(),
             reals: Vec::new(),
@@ -646,7 +807,7 @@ impl Compiler {
     // ---- names -------------------------------------------------------------------
 
     fn lookup_local(&self, n: &str) -> Option<&Local> {
-        self.locals.iter().rev().find(|l| l.name == n)
+        self.locals[self.local_floor..].iter().rev().find(|l| l.name == n)
     }
 
     fn alloc_local(&mut self, name: &str, ty: Ty, pos: Pos) -> R<i64> {
@@ -789,7 +950,18 @@ impl Compiler {
                 Item::Struct { .. } | Item::Import(..) => {}
             }
         }
-        // Pass 3: function bodies.
+        // Pass 3: function bodies (the small ones are also inlined at calls).
+        for it in items {
+            if let Item::Fn(f) = it {
+                if f.body.is_some() {
+                    self.fns.insert(f.name.clone(), f.clone());
+                }
+            }
+        }
+        let names: Vec<String> = self.fns.keys().cloned().collect();
+        for n in names {
+            self.cost_of(&n, &mut Vec::new());
+        }
         for it in items {
             if let Item::Fn(f) = it {
                 if f.body.is_some() {
@@ -797,12 +969,14 @@ impl Compiler {
                 }
             }
         }
-        // Global initialisers.
+        // Global initialisers (no register locals or inlining: crt0 keeps
+        // values in callee-saved registers across this, unsaved).
         self.label("_trine_init");
         self.emit("push lr");
         self.emit("push fp");
         self.emit("mov fp, sp");
         self.begin_fn(Ty::Void);
+        self.no_regs = true;
         let body_start = self.code.len();
         for (place, ty, init) in &inits {
             self.init_object(*place, ty, init)?;
@@ -877,6 +1051,8 @@ impl Compiler {
     fn begin_fn(&mut self, ret: Ty) {
         self.free_regs = LOCAL_REGS.iter().rev().copied().collect();
         self.used_regs.clear();
+        self.local_floor = 0;
+        self.inlined = 0;
         self.locals.clear();
         self.scopes = vec![0];
         self.next_slot = -3;
@@ -2299,6 +2475,11 @@ impl Compiler {
         if params.len() != args.len() {
             return err(pos, format!("expected {} argument(s), found {}", params.len(), args.len()));
         }
+        if let Some((name, _)) = &direct {
+            if let Some(f) = self.inline_candidate(name, &params, &ret) {
+                return self.inline_call(&f, &params, &ret, args);
+            }
+        }
         let nreal = params.iter().filter(|p| p.is_real()).count();
         if nreal > 0 {
             // each argument pushed in turn (a real takes three words), then
@@ -2371,6 +2552,122 @@ impl Compiler {
             self.emit(format!("add sp, sp, {}", 3 * cleanup));
         }
         Ok(*ret)
+    }
+
+    /// The inlining cost of `name`: its size plus what it would inline,
+    /// or None if it is too big, calls something it cannot inline, or is
+    /// recursive (`path`: the functions being costed).
+    fn cost_of(&mut self, name: &str, path: &mut Vec<String>) -> Option<usize> {
+        if let Some(c) = self.inline_cost.get(name) {
+            return *c;
+        }
+        if path.iter().any(|n| n == name) {
+            return None;
+        }
+        let f = self.fns.get(name)?.clone();
+        let body = f.body.as_ref()?;
+        let mut cost = Some(body_size(body)).filter(|&c| c <= INLINE_MAX && !f.interrupt);
+        let mut callees = Vec::new();
+        calls_in(body, &mut callees);
+        path.push(name.to_string());
+        for c in callees {
+            if cost.is_none() {
+                break;
+            }
+            if BUILTINS.contains(&c.as_str()) && !self.fns.contains_key(&c) {
+                continue;
+            }
+            cost = match (cost, self.cost_of(&c, path)) {
+                (Some(a), Some(b)) if a + b <= INLINE_MAX => Some(a + b),
+                _ => None,
+            };
+        }
+        path.pop();
+        self.inline_cost.insert(name.to_string(), cost);
+        cost
+    }
+
+    /// The body of `name` if a call to it may be inlined here.
+    fn inline_candidate(&self, name: &str, params: &[Ty], ret: &Ty) -> Option<FnDecl> {
+        if !self.optimize || self.no_regs || self.inlining.iter().any(|n| n == name) {
+            return None;
+        }
+        let cost = (*self.inline_cost.get(name)?)?;
+        // the outermost inlining pays for the whole tree
+        if self.inlining.is_empty() && self.inlined + cost > INLINE_BUDGET {
+            return None;
+        }
+        let plain = params.len() <= 6 && !params.iter().any(|p| p.is_real()) && !ret.is_real();
+        // a called function has nine registers of its own; inlined, it
+        // shares the caller's, and spilling would cost more than the call
+        let f = &self.fns[name];
+        let locals = var_count(f.body.as_ref()?);
+        let need = f.params.len() + locals;
+        // outside a loop the call may be cold, while the registers the body
+        // takes would be saved and restored on every call of this function:
+        // only tiny bodies with no locals of their own are worth it there
+        let worth = !self.loops.is_empty() || !self.inlining.is_empty() || (locals == 0 && cost <= 15);
+        (plain && worth && need <= self.free_regs.len()).then(|| f.clone())
+    }
+
+    /// Compile a call to `f` as its body in place: the arguments are
+    /// evaluated left to right and pushed, as for a call, then bound to the
+    /// parameters in a scope that cannot see the caller's locals; `return`
+    /// leaves the value in r1 and jumps to the end.
+    fn inline_call(&mut self, f: &FnDecl, params: &[Ty], ret: &Ty, args: &[Expr]) -> R<Ty> {
+        if self.inlining.is_empty() {
+            self.inlined += self.inline_cost[&f.name].unwrap_or(0);
+        }
+        self.inlining.push(f.name.clone());
+        self.scopes.push(self.locals.len());
+        let saved_slot = self.next_slot;
+        // the callee's own address-taken names keep its locals in memory,
+        // for the inlined body only
+        let saved_taken = self.addr_taken.clone();
+        let mut asm = false;
+        scan_body(f.body.as_ref().unwrap(), &mut self.addr_taken, &mut asm);
+        // each argument straight into its parameter, which stays nameless
+        // until all are evaluated (later arguments see the caller's names)
+        let first = self.locals.len();
+        for (k, ((a, p), t)) in args.iter().zip(&f.params).zip(params).enumerate() {
+            let at = self.expr(a)?;
+            self.check_assign(t, &at, a)?;
+            let hidden = format!("#arg{k}");
+            if self.reg_eligible(&p.name, t) {
+                let r = self.alloc_local_reg(&hidden, t.clone(), f.pos)?;
+                self.emit(format!("mov {r}, r1"));
+            } else {
+                let off = self.alloc_local(&hidden, t.clone(), f.pos)?;
+                self.store(t, "r1", &mem("fp", off));
+            }
+        }
+        for (l, p) in self.locals[first..].iter_mut().zip(&f.params) {
+            l.name = p.name.clone();
+        }
+        let saved_floor = std::mem::replace(&mut self.local_floor, first);
+        let saved_ret = (std::mem::replace(&mut self.ret_ty, ret.clone()), std::mem::take(&mut self.ret_label));
+        self.ret_label = self.new_label();
+        let saved_loops = std::mem::take(&mut self.loops);
+        for s in f.body.as_ref().unwrap() {
+            self.stmt(s)?;
+        }
+        let end = std::mem::take(&mut self.ret_label);
+        self.label(&end);
+        // close the scope
+        self.loops = saved_loops;
+        (self.ret_ty, self.ret_label) = saved_ret;
+        self.local_floor = saved_floor;
+        let start = self.scopes.pop().unwrap();
+        for l in &self.locals[start..] {
+            if let Some(r) = l.reg {
+                self.free_regs.push(r);
+            }
+        }
+        self.locals.truncate(start);
+        self.next_slot = saved_slot;
+        self.addr_taken = saved_taken;
+        self.inlining.pop();
+        Ok(ret.clone())
     }
 
     /// Evaluate two operands into r1 (first) and r2 (second).

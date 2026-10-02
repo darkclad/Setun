@@ -204,3 +204,48 @@ fn arrays_and_fields_the_same_way() {
     "#;
     same_both_ways_src("arrays.tri", src, 50_000_000);
 }
+
+#[test]
+fn inlining_keeps_meaning() {
+    let src = r#"
+        import "console.tri";
+        var g: int = 1000;
+        var order: int;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn uses_g(x: int) -> int { return x + g; }               // sees the global g
+        fn first_odd(a: int, b: int) -> int {                    // early returns, loops
+            var i: int = a;
+            while (i < b) {
+                if (i % 2 == 0) { i += 1; continue; }
+                if (i > 50) { break; }
+                return i;
+            }
+            return -1;
+        }
+        fn via_ptr(x: int) -> int { var t: int = x; var p: *int = &t; *p = *p * 3; return t; }
+        fn sq(x: int) -> int { return x * x; }
+        fn sum_sq(a: int, b: int) -> int { return sq(a) + sq(b); }      // nested
+        fn fact(n: int) -> int { if (n <= 1) { return 1; } return n * fact(n - 1); }
+        fn tick(v: int) -> int { order = order * 10 + v; return v; }
+        fn three(a: int, b: int, c: int) -> int { return a * 100 + b * 10 + c; }
+        fn main() -> int {
+            var total: int = 0;
+            var k: int = 0;
+            while (k < 6) {
+                var g: int = 5;                                  // shadows the global
+                total = total + uses_g(k) + g;
+                total = total + first_odd(k * 9, 60) + via_ptr(k) + sum_sq(k, k + 1);
+                k += 1;
+            }
+            put(total);
+            put(fact(7));
+            var r: int = 0;
+            var j: int = 0;
+            while (j < 2) { r = r + three(tick(1), tick(2), tick(3)); j += 1; }
+            put(r);
+            put(order);
+            return total % 1000;
+        }
+    "#;
+    same_both_ways_src("inline.tri", src, 50_000_000);
+}
