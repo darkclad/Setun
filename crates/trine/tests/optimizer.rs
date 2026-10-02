@@ -157,3 +157,50 @@ fn conditions_short_circuit_the_same_way() {
     "#;
     same_both_ways_src("conditions.tri", src, 50_000_000);
 }
+
+#[test]
+fn arrays_and_fields_the_same_way() {
+    let src = r#"
+        import "console.tri";
+        struct P { tag: tryte; x: int; name: [5]char; y: int; r: real; }
+        var garr: [20]int;
+        var gch: [12]char;
+        var gp: P;
+        var greal: [4]real;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn fill(p: *P, v: int) { p.x = v; p.y = v * 2; p.tag = (v % 9) as tryte; p.name[1] = 'q'; }
+        fn main() -> int {
+            var larr: [15]int;
+            var lch: [9]char;
+            var lp: P;
+            var i: int = 0;
+            while (i < 15) { larr[i] = i * 7 - 20; garr[i] = larr[i] + larr[14 - i]; i += 1; }
+            var sum: int = 0;
+            var j: int = 0;
+            while (j < 15) { sum = sum + garr[j] * 3 - larr[j]; j += 1; }
+            put(sum);
+            // tryte arrays, constant and computed indexes
+            var k: int = 0;
+            while (k < 9) { lch[k] = ('a' + k) as char; gch[k + 2] = lch[k]; k += 1; }
+            gch[0] = 'X';
+            put(gch[0] + gch[5] + lch[8]);
+            // a pointer in a register: indexing, negative offsets, deref
+            var pt: *int = &garr[10];
+            put(pt[-3] + pt[2] + *pt);
+            *pt = 999;
+            pt[1] = pt[-1] + 1;
+            put(garr[10] + garr[11]);
+            // struct fields: global, local, through a pointer
+            fill(&gp, 7);
+            fill(&lp, 11);
+            var q: *P = &lp;
+            q.x = q.x + gp.y;
+            put(lp.x + lp.y + gp.tag + q.tag + gp.name[1]);
+            gp.r = 2.5;
+            greal[2] = gp.r * 2.0;
+            put((greal[2] + gp.r) as int);
+            return sum % 9841;
+        }
+    "#;
+    same_both_ways_src("arrays.tri", src, 50_000_000);
+}

@@ -1469,6 +1469,123 @@ impl Compiler {
 
     // ---- expressions -----------------------------------------------------------------
 
+    /// The memory operand of a scalar or real lvalue whose address needs no
+    /// evaluation in r1: an element of a global or local array or of a
+    /// register pointer, `*p` or `p.f` for a register pointer, or a field
+    /// of a global or local struct, with a constant or simple index. Only
+    /// `tmp` is written. None otherwise (and nothing is emitted).
+    fn simple_addr(&mut self, e: &Expr, tmp: &str) -> R<Option<(String, Ty)>> {
+        if !self.optimize {
+            return Ok(None);
+        }
+        // where the object starts: a register (+ offset), or an absolute address
+        enum Base {
+            Reg(&'static str, i64),
+            Abs(i64),
+        }
+        let base_of = |c: &Compiler, a: &Expr| -> Option<(Base, Ty)> {
+            let ExprKind::Name(n) = &a.kind else { return None };
+            if let Some(l) = c.lookup_local(n) {
+                return Some(match l.reg {
+                    Some(r) => (Base::Reg(r, 0), l.ty.clone()),
+                    None => (Base::Reg("fp", l.off), l.ty.clone()),
+                });
+            }
+            match c.globals.get(n) {
+                Some(Global::Var { ty, label }) => Some((Base::Abs(label.parse().ok()?), ty.clone())),
+                _ => None,
+            }
+        };
+        let fits = |t: &Ty| t.is_scalar() || t.is_real();
+        let operand = |base: &Base, extra: i64| match base {
+            Base::Reg(r, off) => mem(r, off + extra),
+            Base::Abs(a) => format!("[{}]", a + extra),
+        };
+        match &e.kind {
+            ExprKind::Index(a, i) => {
+                let Some((base, bt)) = base_of(self, a) else { return Ok(None) };
+                // an array in place, or a pointer held in a register
+                let elem = match (&base, bt) {
+                    (Base::Reg(r, _), Ty::Ptr(t)) if *r != "fp" => *t,
+                    (Base::Reg("fp", _) | Base::Abs(_), Ty::Array(_, t)) => *t,
+                    _ => return Ok(None),
+                };
+                if !fits(&elem) || elem == Ty::Void {
+                    return Ok(None);
+                }
+                let size = self.size(&elem);
+                if let Some(k) = self.const_eval(i) {
+                    return Ok(Some((operand(&base, k * size), elem)));
+                }
+                if !self.is_simple_operand(i) {
+                    return Ok(None);
+                }
+                let (ir, ti) = self.simple_operand_into(i, tmp).expect("checked simple");
+                if !ti.is_integer() {
+                    return Ok(None);
+                }
+                if size != 1 {
+                    self.emit(format!("mul {tmp}, {ir}, {size}"));
+                } else if ir != tmp {
+                    self.emit(format!("mov {tmp}, {ir}"));
+                }
+                Ok(Some(match base {
+                    Base::Reg(r, off) => {
+                        self.emit(format!("add {tmp}, {tmp}, {r}"));
+                        (mem(tmp, off), elem)
+                    }
+                    Base::Abs(addr) => (mem(tmp, addr), elem),
+                }))
+            }
+            ExprKind::Unary(UnOp::Deref, p) => match base_of(self, p) {
+                Some((Base::Reg(r, 0), Ty::Ptr(t))) if r != "fp" && fits(&t) && *t != Ty::Void => Ok(Some((format!("[{r}]"), *t))),
+                _ => Ok(None),
+            },
+            ExprKind::Field(sx, f) => {
+                let Some((base, bt)) = base_of(self, sx) else { return Ok(None) };
+                let id = match (&base, bt) {
+                    (Base::Reg(r, _), Ty::Ptr(t)) if *r != "fp" => match *t {
+                        Ty::Struct(id) => id,
+                        _ => return Ok(None),
+                    },
+                    (Base::Reg("fp", _) | Base::Abs(_), Ty::Struct(id)) => id,
+                    _ => return Ok(None),
+                };
+                let Some((_, ft, off)) = self.structs[id].fields.iter().find(|(n, _, _)| n == f).cloned() else {
+                    return Ok(None); // the slow path reports it
+                };
+                if !fits(&ft) {
+                    return Ok(None);
+                }
+                Ok(Some((operand(&base, off), ft)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Like `simple_operand`, but a variable in memory is loaded into `tmp`.
+    fn simple_operand_into(&mut self, e: &Expr, tmp: &str) -> Option<(&'static str, Ty)> {
+        if let Some(rt) = self.reg_local(e) {
+            return Some(rt);
+        }
+        let (r, t) = self.simple_operand(e)?;
+        debug_assert_eq!(r, "r2");
+        if tmp != "r2" {
+            self.emit(format!("mov {tmp}, r2"));
+        }
+        Some((if tmp == "r1" { "r1" } else { "r2" }, t))
+    }
+
+    /// Load a scalar into r1 (a real into f1) from a memory operand.
+    fn load_operand(&mut self, t: &Ty, op: &str) {
+        if t.is_real() {
+            self.emit(format!("fldd f1, {op}"));
+        } else {
+            let m = if t.is_tryte_sized() { "ldt" } else { "ldw" };
+            self.emit(format!("{m} r1, {op}"));
+        }
+    }
+
     fn load(&mut self, t: &Ty) {
         if t.is_real() {
             self.emit("fldd f1, [r1]");
@@ -1590,6 +1707,10 @@ impl Compiler {
                     Ok(Ty::Int)
                 }
                 UnOp::Deref => {
+                    if let Some((op, t)) = self.simple_addr(e, "r1")? {
+                        self.load_operand(&t, &op);
+                        return Ok(t);
+                    }
                     let t = self.addr(e)?;
                     self.load(&t);
                     Ok(t)
@@ -1611,6 +1732,10 @@ impl Compiler {
             ExprKind::Assign(op, lhs, rhs) => self.assign(*op, lhs, rhs),
             ExprKind::Call(f, args) => self.call(f, args, e.pos),
             ExprKind::Index(..) | ExprKind::Field(..) => {
+                if let Some((op, t)) = self.simple_addr(e, "r1")? {
+                    self.load_operand(&t, &op);
+                    return Ok(t);
+                }
                 let t = self.addr(e)?;
                 self.load(&t);
                 Ok(t)
@@ -2077,6 +2202,14 @@ impl Compiler {
                     }
                 }
                 let rt = self.expr(rhs)?;
+                if let Some((op, lt)) = self.simple_addr(lhs, "r2")? {
+                    if !lt.is_scalar() {
+                        return err(lhs.pos, format!("cannot assign a whole {}; copy it field by field", self.tyname(&lt)));
+                    }
+                    self.check_assign(&lt, &rt, rhs)?;
+                    self.store(&lt, "r1", &op);
+                    return Ok(lt);
+                }
                 self.emit("push r1");
                 let lt = self.addr(lhs)?;
                 if !lt.is_scalar() {
