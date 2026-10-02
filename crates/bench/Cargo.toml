@@ -12,9 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 setun-core = { path = "../core" }
+setun-asm = { path = "../asm" }
 trine = { path = "../trine" }
 trinux = { path = "../trinux" }
 ternary = { path = "../ternary" }
+backtrace = "0.3"
 
 [features]
 opstats = ["setun-core/opstats"]

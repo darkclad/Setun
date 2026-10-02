@@ -9,6 +9,8 @@
 //! optimisation that does not change behaviour must reproduce every hash
 //! and step count exactly.
 
+mod micro;
+
 use setun_core::Machine;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -164,8 +166,38 @@ fn trinux() -> Vec<Outcome> {
     results
 }
 
+/// Print the source location (with inlined frames) of each RVA in this
+/// executable, for reading profiles.
+fn resolve(rvas: &[String]) {
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> usize;
+    }
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) };
+    for r in rvas {
+        let rva = usize::from_str_radix(r.trim_start_matches("0x"), 16).expect("hex RVA");
+        let mut frames = Vec::new();
+        backtrace::resolve((base + rva) as *mut std::ffi::c_void, |s| {
+            let name = s.name().map(|n| format!("{n:#}")).unwrap_or_default();
+            let at = match (s.filename(), s.lineno()) {
+                (Some(f), Some(l)) => format!("{}:{l}", f.file_name().unwrap().to_string_lossy()),
+                _ => String::new(),
+            };
+            frames.push(format!("{name} @ {at}"));
+        });
+        println!("{r}: {}", frames.join("  <=  "));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--resolve") {
+        resolve(&args[1..]);
+        return;
+    }
+    if args.iter().any(|a| a == "--micro") {
+        micro::run();
+        return;
+    }
     let record = args.iter().any(|a| a == "--record");
     let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let want = |n: &str| only.is_empty() || only.iter().any(|o| *o == n);
