@@ -205,6 +205,8 @@ All of these fit `SYS`'s ±9841 range.
 
 `trine build --user` produces TEF binaries linked at `USER_BASE`. `execve` maps their segments (demand-loaded through the page cache), builds the stack with `argc`, `argv`, `envp` and an auxiliary vector, and jumps to the entry point in ring −1. Shell scripts start with `#!`.
 
+**The text cache (as built):** text pages are read-only, so `execve` shares them. Each page it reads stays in a 243-entry cache after the program exits, keyed by the file's inode slot, the inode's generation and the page. The generation is new whenever the slot is filled or the file is written or truncated, so a changed or replaced file never matches. The next exec of the same file maps the cached frames instead of reading the file again, and code the emulator's JIT compiled for those frames stays valid. When memory runs short, `alloc_pages` empties the cache before it fails. Frames still mapped by a process stay with it.
+
 ## 10. The C library, in Trine (`tlibc`)
 
 **POSIX functions with POSIX names and semantics**, in Trine syntax:

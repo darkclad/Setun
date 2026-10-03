@@ -55,9 +55,15 @@ fn is_free_block(c: int, k: int) -> int {
 }
 
 // Allocate 3^k contiguous frames; returns the centre frame, or -1.
+// Short of memory, the text cache gives its frames back first.
 fn alloc_pages(k: int) -> int {
     var j: int = k;
     while (j <= MAX_ORDER && free_head[j] == NONE) { j += 1; }
+    if (j > MAX_ORDER && text_cache_count > 0) {
+        text_cache_drop();
+        j = k;
+        while (j <= MAX_ORDER && free_head[j] == NONE) { j += 1; }
+    }
     if (j > MAX_ORDER) { return -1; }
     var c: int = free_head[j];
     list_remove(c, j);
@@ -214,6 +220,73 @@ fn put_page(f: int) {
         frame_ref[f] = 0;
         free_pages(f, 0);
     }
+}
+
+// ---- the text cache -----------------------------------------------------------
+//
+// Frames of executable text stay after the last process using them exits,
+// so the next exec of the same file maps them instead of reading it again
+// (and code the emulator has compiled for them stays valid). An entry is
+// keyed by the file's inode slot, the inode's generation (new whenever the
+// slot is filled or the file is written) and the page; a stale entry is
+// never matched, and goes when its slot is reused or memory runs short.
+
+const TEXT_CACHE: int = 243;
+
+struct TextPage {
+    used: int;
+    ino: int;
+    gen: int;
+    page: int;
+    frame: int;
+}
+
+var text_cache: [243]TextPage;
+var text_cache_count: int;
+var text_cache_next: int;             // the slot to reuse next when all are taken
+
+// The cached frame for (ino, gen, page), or -1.
+fn text_cache_find(ino: int, gen: int, page: int) -> int {
+    var k: int = 0;
+    while (k < TEXT_CACHE) {
+        var e: *TextPage = &text_cache[k];
+        if (e.used && e.page == page && e.ino == ino && e.gen == gen) { return e.frame; }
+        k += 1;
+    }
+    return -1;
+}
+
+// Keep `frame` (holding that page) in the cache, with a reference of its own.
+fn text_cache_add(ino: int, gen: int, page: int, frame: int) {
+    var k: int = 0;
+    while (k < TEXT_CACHE && text_cache[k].used) { k += 1; }
+    if (k == TEXT_CACHE) {
+        k = text_cache_next;
+        text_cache_next = (text_cache_next + 1) % TEXT_CACHE;
+        put_page(text_cache[k].frame);
+        text_cache_count -= 1;
+    }
+    var e: *TextPage = &text_cache[k];
+    e.used = 1;
+    e.ino = ino;
+    e.gen = gen;
+    e.page = page;
+    e.frame = frame;
+    get_page(frame);
+    text_cache_count += 1;
+}
+
+// Give every cached frame back (those still mapped stay with their users).
+fn text_cache_drop() {
+    var k: int = 0;
+    while (k < TEXT_CACHE) {
+        if (text_cache[k].used) {
+            text_cache[k].used = 0;
+            put_page(text_cache[k].frame);
+        }
+        k += 1;
+    }
+    text_cache_count = 0;
 }
 
 // Copy a whole frame (6561 words).

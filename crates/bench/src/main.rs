@@ -176,6 +176,9 @@ fn trinux() -> Vec<Outcome> {
         Some(&format!("{SHELL_SCRIPT}\n")),
         3_000_000_000,
     ));
+    // the same again: programs exec'd before (their text cached, their
+    // code compiled)
+    results.push(phase(&mut m, &mut serial, "again", Some(&format!("{SHELL_SCRIPT}\n")), 3_000_000_000));
     // idle at the prompt: mostly HLT, woken by the timer
     let t = Instant::now();
     let i0 = instructions(&m);
@@ -252,7 +255,7 @@ fn main() {
     if want("mandel") {
         all.push(rom("mandel", &r.join("examples/mandel.tri"), 2_000_000_000));
     }
-    if want("boot") || want("shell") || want("idle") {
+    if want("boot") || want("shell") || want("again") || want("idle") {
         all.extend(trinux());
     }
 

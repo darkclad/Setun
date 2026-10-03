@@ -894,3 +894,42 @@ fn calc_errors() {
         ],
     );
 }
+
+#[test]
+fn exec_sees_a_rewritten_program_not_its_cached_text() {
+    // exec keeps text frames after a program exits; overwriting, truncating
+    // or replacing the file must not run the old code
+    let out = session(
+        &[
+            "cp /bin/echo /tmp/p; /tmp/p one; /tmp/p two",
+            "cp /bin/true /tmp/p; /tmp/p three; echo st=$?",
+            "cat /bin/echo > /tmp/p; /tmp/p four",
+            "rm /tmp/p; cp /bin/false /tmp/p; /tmp/p five; echo st=$?",
+            "/bin/echo six",
+            "exit",
+        ],
+        400_000_000,
+    );
+    assert_has(&out, &["one\n", "two\n", "st=0\n", "four\n", "st=1\n", "six\n"]);
+    assert_lacks(&out, &["three\n", "five\n"]); // (the echoed command lines have "three;")
+}
+
+
+#[test]
+fn memory_runs_short_and_the_text_cache_gives_its_frames_back() {
+    // ten programs run and exit (their text stays cached), then children
+    // that need nearly all memory at once: free + (-22) pages of heap, plus
+    // their own tables and stacks. Measured here: up to about free - 30
+    // fits without the cache's frames, up to about free - 15 with them.
+    let out = session(
+        &[
+            "ls /etc > /dev/null; wc /etc/motd > /dev/null; sort /etc/motd > /dev/null; head /etc/motd > /dev/null",
+            "tail /etc/motd > /dev/null; uniq /etc/motd > /dev/null; grep a /etc/motd > /dev/null; df > /dev/null",
+            "md5sum /etc/motd > /dev/null; ps > /dev/null",
+            "k3test hog -22",
+            "exit",
+        ],
+        1_500_000_000,
+    );
+    assert_has(&out, &["k3test: hog touched every page\n"]);
+}

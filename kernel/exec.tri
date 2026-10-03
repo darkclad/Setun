@@ -74,7 +74,9 @@ fn exec_load() -> int {
     var l1: int = new_address_space();
     if (l1 < 0) { return -ENOMEM; }
 
-    // Text: map each page read-only + execute and read the file into it.
+    // Text: map each page read-only + execute: the text cache's frame for
+    // it, or a new one with the file read into it (and then cached).
+    var gen: int = inodes[file].gen;
     var i: int = 0;
     while (i < text_size) {
         var va: int = text + i;
@@ -82,11 +84,18 @@ fn exec_load() -> int {
         var page_end: int = p * 19683 + 9842;          // first tryte of the next page
         var chunk: int = page_end - va;
         if (chunk > text_size - i) { chunk = text_size - i; }
-        var f: int = alloc_user_frame();
-        if (f < 0 || !map_page(l1, va, f, 0, 1)) { free_address_space(l1); return -ENOMEM; }
-        var phys: int = f * 19683 - p * 19683 + va;     // the frame's copy of va
-        r = vfs_read(file, 18 + i, phys as *tryte, chunk);
-        if (r != chunk) { free_address_space(l1); return r < 0 ? r : -ENOEXEC; }
+        var f: int = text_cache_find(file, gen, p);
+        if (f >= 0) {
+            get_page(f);
+            if (!map_page(l1, va, f, 0, 1)) { put_page(f); free_address_space(l1); return -ENOMEM; }
+        } else {
+            f = alloc_user_frame();
+            if (f < 0 || !map_page(l1, va, f, 0, 1)) { free_address_space(l1); return -ENOMEM; }
+            var phys: int = f * 19683 - p * 19683 + va;     // the frame's copy of va
+            r = vfs_read(file, 18 + i, phys as *tryte, chunk);
+            if (r != chunk) { free_address_space(l1); return r < 0 ? r : -ENOEXEC; }
+            text_cache_add(file, gen, p, f);
+        }
         i += chunk;
     }
 

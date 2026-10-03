@@ -82,11 +82,13 @@ struct Inode {
     uid: int;                         // owner and group (cred.tri)
     gid: int;
     name: [27]char;                   // ramfs only
+    gen: int;                         // new when the slot is filled or the data changes (exec's text cache)
 }
 
 var inodes: [243]Inode;
 var root_ino: int;
 var vfs_stamp: int;                   // bumped once per system call
+var inode_gen: int;                   // the last generation handed out
 
 struct File {
     refs: int;                        // descriptors (in any process) sharing it
@@ -201,6 +203,10 @@ fn inode_init(i: int, type: int, mode: int, fs: int, mnt: int) {
     n.uid = current_task().euid;                      // a new file belongs to its creator
     n.gid = current_task().egid;
     n.name[0] = 0;
+    // a slot evicted and refilled with another file must not match the
+    // old file's cached text, even though nothing is written
+    inode_gen += 1;
+    n.gen = inode_gen;
 }
 
 // A ramfs (or anonymous) inode.
@@ -617,12 +623,16 @@ fn vfs_read(i: int, pos: int, buf: *tryte, n: int) -> int {
 
 fn vfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
     var fs: int = inodes[i].fs;
+    inode_gen += 1;
+    inodes[i].gen = inode_gen;
     if (fs == FS_TFS) { return tfs_write(i, pos, buf, n); }
     if (fs == FS_PROC) { return -EACCES_; }
     return ram_write(i, pos, buf, n);
 }
 
 fn vfs_truncate(i: int) -> int {
+    inode_gen += 1;
+    inodes[i].gen = inode_gen;
     if (inodes[i].fs == FS_TFS) { return tfs_truncate(i); }
     inodes[i].size = 0;
     return 0;
