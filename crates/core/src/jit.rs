@@ -1,8 +1,10 @@
 //! The JIT: hot regions of decoded instructions compiled to native code
 //! with Cranelift (not in the WebAssembly build).
 //!
-//! A region is a set of basic blocks in one page, entered at its first
-//! block. Guest registers and the flags are Cranelift variables, so they
+//! A region is a set of basic blocks in one page, entered at any of them
+//! (a batch can end anywhere in a loop): the run loop passes the entry
+//! block's offset from the region's root, and every block of the region
+//! points at its code. Guest registers and the flags are Cranelift variables, so they
 //! live in host registers inside the region; they are loaded at entry,
 //! and every register write is also stored to the CPU, so exits only
 //! store the flags and the PC. ADD/SUB/CMP, LI, LEA, branches, BR3 and JAL
@@ -31,12 +33,14 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I64, I8};
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, UserFuncName, Value};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use std::collections::HashMap;
 
-pub(super) type NativeFn = unsafe extern "C" fn(*mut Cpu, *mut Memory, i64, i64) -> i64;
+/// (cpu, memory, the region root's address, budget, the entry block's
+/// offset from the root) -> steps run.
+pub(super) type NativeFn = unsafe extern "C" fn(*mut Cpu, *mut Memory, i64, i64, i64) -> i64;
 
 /// One basic block of a region: its offset in trytes from the region's
 /// start, and its instructions.
@@ -460,7 +464,7 @@ impl Jit {
         let tcfg = self.module.target_config();
         let ptr = tcfg.pointer_type();
         self.module.clear_context(&mut self.ctx);
-        for t in [ptr, ptr, I64, I64] {
+        for t in [ptr, ptr, I64, I64, I64] {
             self.ctx.func.signature.params.push(AbiParam::new(t));
         }
         self.ctx.func.signature.returns.push(AbiParam::new(I64));
@@ -483,7 +487,7 @@ impl Jit {
         b.switch_to_block(entry);
         b.seal_block(entry);
         let p = b.block_params(entry).to_vec();
-        let (cpu, mem, va_base, budget) = (p[0], p[1], p[2], p[3]);
+        let (cpu, mem, va_base, budget, entry_off) = (p[0], p[1], p[2], p[3], p[4]);
         let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
 
         // which registers the region uses
@@ -522,8 +526,23 @@ impl Jit {
         for rb in region {
             blocks.insert(rb.off, g.b.create_block());
         }
-        let first = blocks[&region[0].off];
-        g.b.ins().jump(first, &[]);
+        // enter at any of its blocks (a batch may end anywhere in a loop);
+        // an offset that is not one of them runs nothing
+        if region.len() == 1 {
+            let first = blocks[&region[0].off];
+            g.b.ins().jump(first, &[]);
+        } else {
+            let none = g.b.create_block();
+            let mut sw = Switch::new();
+            for rb in region {
+                sw.set_entry((rb.off + 3 * PAGE) as u128, blocks[&rb.off]);
+            }
+            let key = g.b.ins().iadd_imm_s(entry_off, 3 * PAGE);
+            sw.emit(&mut g.b, key, none);
+            g.enter(none);
+            let pc = g.b.ins().iadd(va_base, entry_off);
+            g.leave(pc, 0);
+        }
 
         for rb in region {
             g.b.switch_to_block(blocks[&rb.off]);

@@ -614,3 +614,51 @@ fn a_tryte_load_one_past_its_page_misses_the_window() {
     let (st, _) = both_ways_jit(1, setup, &prog, 40);
     assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (111, 555));
 }
+
+#[test]
+fn compiled_regions_entered_at_any_block_agree() {
+    // a loop of several blocks (a branch inside), run in odd-sized slices
+    // so batches end, and compiled code is re-entered, at every block
+    let mut prog = Vec::new();
+    prog.push(isa::s6(op::LIQ, 0, 9, 200)); // 0
+    let top = prog.len() as i64; // 3
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 1, 1, 3)); // 3
+    prog.push(isa::rrr(op::ALUQ, alu::MOD, 2, 1, 7)); // 6
+    prog.push(isa::rrr(op::ALUQ, alu::CMP, 0, 2, 3)); // 9
+    prog.push(isa::s6(op::BRQ, 0, cond::GE, 3)); // 12: to 21
+    prog.push(isa::rrr(op::ALU, alu::ADD, 3, 3, 2)); // 15
+    prog.push(isa::s6(op::BRQ, 0, cond::ALWAYS, 2)); // 18: to 24
+    prog.push(isa::rrr(op::ALU, alu::SUB, 4, 4, 2)); // 21
+    prog.push(isa::rrr(op::ALUQ, alu::MUL, 5, 3, 2)); // 24
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 4)); // 27
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1)); // 30
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here)); // 33
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    // (and the least that must run compiled: entering only at a region's
+    // root gives about 1100, 1280, 1400 and 1850)
+    for (slice, least) in [(7u64, 1300), (11, 1450), (13, 1500), (1000, 1800)] {
+        let mut fast = Machine::new(FRAMES, 0);
+        let mut slow = Machine::new(FRAMES, 0);
+        for m in [&mut fast, &mut slow] {
+            m.mem.load_words(0, &prog);
+            m.cpu.pc = Word::ZERO;
+        }
+        // not eager (threshold 1 makes every block a region of its own):
+        // one region covers the loop
+        fast.cpu.set_jit_threshold(3);
+        fast.cpu.set_jit_wait(true);
+        let steps = 3000;
+        let mut done = 0;
+        while done < steps {
+            fast.run(slice.min(steps - done));
+            done += slice.min(steps - done);
+        }
+        for _ in 0..steps {
+            slow.step();
+        }
+        assert_eq!(digest(&mut fast), digest(&mut slow), "slices of {slice}");
+        let st = fast.cpu.jit_stats();
+        assert!(st[2] > least, "compiled code entered mid-loop (slices of {slice}): {st:?}");
+    }
+}

@@ -133,10 +133,14 @@ pub struct Cpu {
     #[cfg(not(target_arch = "wasm32"))]
     jit: Option<jit::JitThread>,
     jit_off: bool,
+    /// Wait for each region to compile (tests: deterministic timing).
+    jit_wait: bool,
     jit_threshold: u32,
     /// Regions being compiled: request id → (root block, slot, word, arena
     /// generation), to check the block is still current when code arrives.
-    jit_pending: Vec<(u64, u32, usize, usize, u64)>,
+    /// Regions being compiled: (request, its blocks and their offsets
+    /// from the root, code slot, root's word index, arena generation).
+    jit_pending: Vec<(u64, Vec<(u32, i64)>, usize, usize, u64)>,
     jit_next: u64,
     /// A fault raised inside compiled code, for the block engine to deliver.
     jit_fault: Option<Fault>,
@@ -220,6 +224,8 @@ struct Block {
     /// Times run by the interpreter; compiled code (a `NativeFn`), or 0.
     heat: u32,
     native: usize,
+    /// This block's offset from the root of the region `native` belongs to.
+    entry: i64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -355,6 +361,7 @@ impl Cpu {
             #[cfg(not(target_arch = "wasm32"))]
             jit: None,
             jit_off: cfg!(target_arch = "wasm32"),
+            jit_wait: false,
             jit_threshold: 1000,
             jit_pending: Vec::new(),
             jit_next: 0,
@@ -814,12 +821,12 @@ impl Cpu {
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let native = self.blocks[id as usize - 1].native;
+                let (native, entry) = (self.blocks[id as usize - 1].native, self.blocks[id as usize - 1].entry);
                 if native != 0 {
                     // SAFETY: compiled for this block, which is still current;
                     // the code only touches the CPU and memory it is given
                     let f: jit::NativeFn = unsafe { std::mem::transmute::<usize, jit::NativeFn>(native) };
-                    let ran = unsafe { f(self as *mut Cpu, m as *mut Memory, pc, (budget - n) as i64) } as u64;
+                    let ran = unsafe { f(self as *mut Cpu, m as *mut Memory, pc - entry, (budget - n) as i64, entry) } as u64;
                     self.jit_stats[1] += 1;
                     self.jit_stats[2] += ran;
                     if let Some(f) = self.jit_fault.take() {
@@ -1006,6 +1013,8 @@ impl Cpu {
         if inline(&region[0]) == 0 || !(eager || has_loop || inline(&region[0]) >= 16) {
             return; // heat stays past the threshold: not tried again
         }
+        let offs_in_order: Vec<i64> = region.iter().map(|rb| rb.off).collect();
+        debug_assert_eq!(ids[0], root, "the region starts at its root");
         let id = self.jit_next;
         self.jit_next += 1;
         if !self.jit.as_ref().expect("created above").send(jit::Request { id, region }) {
@@ -1020,8 +1029,9 @@ impl Cpu {
                 *h = (*h).max(self.jit_threshold + 1);
             }
         }
-        self.jit_pending.push((id, root, slot, i, gen));
-        if eager {
+        let members: Vec<(u32, i64)> = ids.iter().zip(&offs_in_order).map(|(&b, &o)| (b, o)).collect();
+        self.jit_pending.push((id, members, slot, i, gen));
+        if eager || self.jit_wait {
             self.jit_install(true); // tests: run the code from the next entry
         }
     }
@@ -1034,14 +1044,24 @@ impl Cpu {
         while !self.jit_pending.is_empty() {
             let Some(done) = (if wait { j.recv() } else { j.try_recv() }) else { break };
             let Some(k) = self.jit_pending.iter().position(|p| p.0 == done.id) else { continue };
-            let (_, root, slot, i, gen) = self.jit_pending.swap_remove(k);
+            let (_, members, slot, i, gen) = self.jit_pending.swap_remove(k);
             self.jit_stats[3] += done.micros;
-            let current = gen == self.arena_gen
-                && self.block_at.get(slot).and_then(|t| t.as_ref()).is_some_and(|t| t[i] == root);
-            if done.code != 0 && current {
-                self.blocks[root as usize - 1].native = done.code;
-                self.jit_stats[0] += 1;
+            if done.code == 0 || gen != self.arena_gen {
+                continue;
             }
+            let Some(t) = self.block_at.get(slot).and_then(|t| t.as_ref()) else { continue };
+            if t[i] != members[0].0 {
+                continue; // the root is gone
+            }
+            // every block of the region that is still current enters it
+            for &(b, off) in &members {
+                let k = i as i64 + off / 3;
+                if (0..WORDS_PER_FRAME as i64).contains(&k) && t[k as usize] == b {
+                    let blk = &mut self.blocks[b as usize - 1];
+                    (blk.native, blk.entry) = (done.code, off);
+                }
+            }
+            self.jit_stats[0] += 1;
         }
     }
 
@@ -1055,6 +1075,12 @@ impl Cpu {
     /// its first run, whether or not it looks worth it (for tests).
     pub fn set_jit_threshold(&mut self, runs: u32) {
         self.jit_threshold = runs.max(1);
+    }
+
+    /// Wait for each region to compile instead of carrying on meanwhile
+    /// (for tests: compiled code then appears at the same step every run).
+    pub fn set_jit_wait(&mut self, wait: bool) {
+        self.jit_wait = wait;
     }
 
     /// One step on the reference path (no interrupt check): returns whether
@@ -1127,7 +1153,7 @@ impl Cpu {
         if count == 0 {
             return 0;
         }
-        self.blocks.push(Block { first: first as u32, count: count as u32, links: [Link::default(); 2], next_link: 0, heat: 0, native: 0 });
+        self.blocks.push(Block { first: first as u32, count: count as u32, links: [Link::default(); 2], next_link: 0, heat: 0, native: 0, entry: 0 });
         let id = self.blocks.len() as u32;
         self.block_at[slot].get_or_insert_with(|| vec![0; WORDS_PER_FRAME].into_boxed_slice())[i] = id;
         if m.watch_code(slot) {
