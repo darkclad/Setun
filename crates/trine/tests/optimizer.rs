@@ -249,3 +249,18 @@ fn inlining_keeps_meaning() {
     "#;
     same_both_ways_src("inline.tri", src, 50_000_000);
 }
+
+#[test]
+fn builds_are_reproducible() {
+    // inlining compiles the callee's body at every call; nothing it caches
+    // may depend on hash order or on where a copy happens to live
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for f in ["user/bin/cat.tri", "user/bin/sort.tri", "user/bin/login.tri"] {
+        let p = root.join(f);
+        let first = build_file(&p, &Options::user()).unwrap_or_else(|e| panic!("{e}")).asm;
+        for _ in 0..4 {
+            let again = build_file(&p, &Options::user()).unwrap_or_else(|e| panic!("{e}")).asm;
+            assert!(again == first, "{f}: two builds differ");
+        }
+    }
+}

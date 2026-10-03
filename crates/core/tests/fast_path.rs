@@ -380,3 +380,65 @@ fn multiply_and_divide_in_a_compiled_loop() {
     assert_ne!(reg_in(&st, 12), 77, "the division by zero faulted");
     assert_ne!(reg_in(&st, 8), 0, "products carried");
 }
+
+#[test]
+fn a_load_one_page_up_misses_the_open_window() {
+    // a compiled loop loads from page 1 (opening the read window there),
+    // then from the same offset in page 2, which is mapped to frame 5, not
+    // to the frame after page 1's
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
+    prog.extend(isa::wide(op::LI, 0, 3, 0, 2 * PAGE + 300));
+    prog.push(isa::s6(op::LIQ, 0, 9, 5));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDW, 5, 2, 0));
+    prog.push(isa::rrr(op::MEM, mem::LDW, 6, 3, 0));
+    prog.extend(isa::wide(op::MEMD, mem::LDW, 7, 2, PAGE)); // page 2 again, by offset
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(5, 1, 1, -1))).unwrap(); // page 2 -> frame 5
+        m.mem.write_word(PAGE + 300, w(111)).unwrap();
+        m.mem.write_word(2 * PAGE + 300, w(222)).unwrap(); // frame 2: not mapped
+        m.mem.write_word(5 * PAGE + 300, w(555)).unwrap();
+    };
+    let st = both_ways(setup, &prog, 60);
+    assert_eq!((reg_in(&st, 5), reg_in(&st, 6), reg_in(&st, 7)), (111, 555, 555));
+}
+
+#[test]
+fn an_address_that_wraps_round_is_wrapped_in_a_compiled_loop() {
+    // base ≈ W_MAX + offset wraps to page −1 (mapped to frame 2); each
+    // round loads, adds 1 and stores there, and steps 1500 words down,
+    // so the fourth round's load reaches page −2, unmapped, and faults:
+    // the fault address is the wrapped one
+    let w_max = 3_812_798_742_493;
+    let target = -PAGE + 300;
+    let imm = target + 2 * w_max + 1 - w_max; // W_MAX + imm = target + 3^27
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, w_max));
+    prog.push(isa::s6(op::LIQ, 0, 9, 10));
+    let top = prog.len() as i64;
+    prog.extend(isa::wide(op::MEMD, mem::LDW, 5, 2, imm));
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 5, 1));
+    prog.extend(isa::wide(op::MEMD, mem::STW, 5, 2, imm));
+    prog.extend(isa::wide(op::ALUI, alu::SUB, 2, 2, 4500));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE - 3, w(pte(2, 1, 1, -1))).unwrap(); // page −1 -> frame 2
+        for k in 0..3 {
+            m.mem.write_word(2 * PAGE + 300 - 4500 * k, w(40 + k)).unwrap();
+        }
+    };
+    let st = both_ways(setup, &prog, 60);
+    assert_eq!(reg_in(&st, 9), 7, "three rounds ran");
+    assert_eq!(reg_in(&st, 5), 43, "the third round's value, plus one");
+    assert_eq!(st[5 * (cr::FADDR + 13) as usize + 1], target - 3 * 4500, "the fault address, wrapped");
+}

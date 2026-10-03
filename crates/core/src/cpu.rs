@@ -142,7 +142,6 @@ const OFF_RW_LO: usize = std::mem::offset_of!(Cpu, rw_lo);
 const OFF_RW_PTR: usize = std::mem::offset_of!(Cpu, rw_ptr);
 const OFF_WW_LO: usize = std::mem::offset_of!(Cpu, ww_lo);
 const OFF_WW_PTR: usize = std::mem::offset_of!(Cpu, ww_ptr);
-const OFF_PT_DIRTY: usize = std::mem::offset_of!(Memory, pt_dirty);
 const _: () = assert!(std::mem::size_of::<Word>() == 8);
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
@@ -924,9 +923,11 @@ impl Cpu {
                 continue;
             }
             let k = k as usize;
+            // only code that has run: never-taken paths stay exits
             let id = match self.block_at.get(slot).and_then(|t| t.as_ref()).map(|t| t[k]) {
                 Some(id) if id != 0 => id,
-                _ => self.build_block(m, pa + off, slot, k),
+                _ if off == 0 => self.build_block(m, pa + off, slot, k),
+                _ => continue,
             };
             if self.arena_gen != gen {
                 return; // the arena was cleared under us

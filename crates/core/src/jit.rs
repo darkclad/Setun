@@ -3,8 +3,9 @@
 //!
 //! A region is a set of basic blocks in one page, entered at its first
 //! block. Guest registers and the flags are Cranelift variables, so they
-//! live in host registers inside the region; they are loaded at entry and
-//! written back at every exit. ADD/SUB/CMP, LI, LEA, branches, BR3 and JAL
+//! live in host registers inside the region; they are loaded at entry,
+//! and every register write is also stored to the CPU, so exits only
+//! store the flags and the PC. ADD/SUB/CMP, LI, LEA, branches, BR3 and JAL
 //! are compiled inline (jumps within the region are native jumps), and so
 //! are word loads and stores through the CPU's read and write windows,
 //! with a helper call when the window misses. Any other non-control
@@ -16,7 +17,8 @@
 //!
 //! The S flag is kept lazily: a variable holds a value whose sign is S (the
 //! last result, or the difference of a comparison), and the sign is only
-//! taken where S is read. C is kept as the trit itself.
+//! taken where S is read. C likewise: a raw (unwrapped) sum whose carry is
+//! C.
 //!
 //! A compiled region is `fn(cpu, mem, va_base, budget) -> steps`:
 //! `va_base` is the virtual address of the region's first instruction (the
@@ -62,6 +64,9 @@ const FAULT: i64 = 2;
 
 unsafe extern "C" fn jit_load_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, out: *mut i64) -> i64 {
     let (cpu, m) = (&mut *cpu, &mut *mem);
+    // compiled code passes base + offset unwrapped (the page walk would
+    // not mind, but the windows must stay in range)
+    let va = wrap_carry(va).0;
     match cpu.load_word_fast(m, va) {
         Ok(v) => {
             *out = v.value();
@@ -76,6 +81,7 @@ unsafe extern "C" fn jit_load_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, out
 
 unsafe extern "C" fn jit_store_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, v: i64) -> i64 {
     let (cpu, m) = (&mut *cpu, &mut *mem);
+    let va = wrap_carry(va).0;
     match cpu.store_word_fast(m, va, Word::new(v).expect("a word")) {
         Ok(()) if !m.code_dirty.is_empty() || m.pt_dirty => OK_EXIT,
         Ok(()) => OK,
@@ -108,7 +114,6 @@ type IrBlock = cranelift_codegen::ir::Block;
 struct Gen<'a> {
     b: FunctionBuilder<'a>,
     cpu: Value,
-    mem: Value,
     va_base: Value,
     reg: [Option<Variable>; 27],
     s_var: Variable,
@@ -131,9 +136,39 @@ impl Gen<'_> {
         }
     }
 
+    /// Write a guest register: into its variable for later reads, and
+    /// through to the CPU at once, so exits need not carry it.
     fn set(&mut self, r: i64, v: Value) {
         if r != 0 {
             self.b.def_var(self.reg[idx(r)].expect("used register"), v);
+            self.b.ins().store(FL, v, self.cpu, (OFF_REGS + 8 * idx(r)) as i32);
+        }
+    }
+
+    /// C, kept lazily like S: `raw` is an unwrapped sum whose carry is C
+    /// (C = +1 above W_MAX, −1 below −W_MAX, else 0).
+    fn set_c(&mut self, raw: Value) {
+        self.b.def_var(self.c_var, raw);
+    }
+
+    /// The carry trit of the lazily kept C.
+    fn carry(&mut self) -> Value {
+        let raw = self.b.use_var(self.c_var);
+        let over = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, raw, W_MAX);
+        let under = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, raw, -W_MAX);
+        let o = self.b.ins().uextend(I64, over);
+        let u = self.b.ins().uextend(I64, under);
+        self.b.ins().isub(o, u)
+    }
+
+    /// S and C into the CPU.
+    fn s_to_cpu(&mut self) {
+        if self.flags_live {
+            let sv = self.b.use_var(self.s_var);
+            let s = self.sign(sv);
+            self.b.ins().istore8(FL, s, self.cpu, (OFF_MODE + mode::S) as i32);
+            let c = self.carry();
+            self.b.ins().istore8(FL, c, self.cpu, (OFF_MODE + mode::C) as i32);
         }
     }
 
@@ -146,18 +181,15 @@ impl Gen<'_> {
         self.b.ins().isub(p, n)
     }
 
-    /// Wrap a sum of a few words: (word, carry trit). The word comes from
-    /// two selects, so dependent adds wait only on compares and moves.
+    /// Wrap a sum of a few words into a word. Returns (word, raw) — the
+    /// raw sum keeps the carry for `set_c`.
     fn wrap(&mut self, v: Value) -> (Value, Value) {
         let over = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, v, W_MAX);
         let under = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, v, -W_MAX);
         let down = self.b.ins().iadd_imm_s(v, -W_MOD);
         let up = self.b.ins().iadd_imm_s(v, W_MOD);
         let v1 = self.b.ins().select(over, down, v);
-        let w = self.b.ins().select(under, up, v1);
-        let o = self.b.ins().uextend(I64, over);
-        let u = self.b.ins().uextend(I64, under);
-        (w, self.b.ins().isub(o, u))
+        (self.b.ins().select(under, up, v1), v)
     }
 
     /// A word product split in two: (high word, low word), as the
@@ -199,6 +231,13 @@ impl Gen<'_> {
         self.wrap(v).0
     }
 
+    /// Switch to a block whose predecessors are all emitted, and seal it
+    /// (cheaper SSA construction than sealing everything at the end).
+    fn enter(&mut self, block: IrBlock) {
+        self.b.switch_to_block(block);
+        self.b.seal_block(block);
+    }
+
     fn leave(&mut self, pc: Value, unrun: i64) {
         let u = self.b.ins().iconst(I64, unrun);
         self.b.def_var(self.exit_pc, pc);
@@ -219,44 +258,36 @@ impl Gen<'_> {
         }
     }
 
-    fn flags_to_cpu(&mut self) {
-        if self.flags_live {
-            let sv = self.b.use_var(self.s_var);
-            let s = self.sign(sv);
-            let c = self.b.use_var(self.c_var);
-            self.b.ins().istore8(FL, s, self.cpu, (OFF_MODE + mode::S) as i32);
-            self.b.ins().istore8(FL, c, self.cpu, (OFF_MODE + mode::C) as i32);
-        }
-    }
-
     fn flags_from_cpu(&mut self) {
         if self.flags_live {
             let s = self.b.ins().sload8(I64, FL, self.cpu, (OFF_MODE + mode::S) as i32);
             let c = self.b.ins().sload8(I64, FL, self.cpu, (OFF_MODE + mode::C) as i32);
+            let raw = self.b.ins().imul_imm_s(c, W_MAX + 1); // a raw sum with that carry
             self.b.def_var(self.s_var, s);
-            self.b.def_var(self.c_var, c);
+            self.b.def_var(self.c_var, raw);
         }
     }
 
     /// The window test for a word access at `va` through the window at
     /// `lo_off`/`ptr_off`: (covered?, the word's host address).
+    ///
+    /// The word index is (va − first centre) / 3: multiplying by 3's
+    /// inverse modulo 2^64 gives it exactly for a word centre, and a huge
+    /// number for anything misaligned or below the window, so one unsigned
+    /// compare checks range and alignment. (A pending page-table write
+    /// needs no test: compiled code is only entered without one and leaves
+    /// as soon as a store makes one; an address that would need wrapping
+    /// is outside every window.)
     fn window(&mut self, va: Value, lo_off: usize, ptr_off: usize) -> (Value, Value) {
+        const INV3: i64 = 0xAAAA_AAAA_AAAA_AAABu64 as i64;
         let lo = self.b.ins().load(I64, FL, self.cpu, lo_off as i32);
         let ptr = self.b.ins().load(I64, FL, self.cpu, ptr_off as i32);
         let off = self.b.ins().isub(va, lo);
-        // q = off / 3 for 0 ≤ off < 2^16, r = off − 3q (a word centre: 1)
-        let q = self.b.ins().imul_imm_s(off, 43_691);
-        let q = self.b.ins().ushr_imm_s(q, 17);
-        let q3 = self.b.ins().imul_imm_s(q, 3);
-        let r = self.b.ins().isub(off, q3);
-        let in_page = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, off, PAGE);
-        let centre = self.b.ins().icmp_imm_s(IntCC::Equal, r, 1);
+        let off = self.b.ins().iadd_imm_s(off, -1); // from the first word's centre
+        let q = self.b.ins().imul_imm_s(off, INV3);
+        let in_window = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, q, PAGE / 3);
         let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, ptr, 0);
-        let dirty = self.b.ins().load(I8, FL, self.mem, OFF_PT_DIRTY as i32);
-        let clean = self.b.ins().icmp_imm_s(IntCC::Equal, dirty, 0);
-        let a = self.b.ins().band(in_page, centre);
-        let c = self.b.ins().band(has, clean);
-        let ok = self.b.ins().band(a, c);
+        let ok = self.b.ins().band(in_window, has);
         let byte = self.b.ins().ishl_imm_s(q, 3);
         let addr = self.b.ins().iadd(ptr, byte);
         (ok, addr)
@@ -266,8 +297,9 @@ impl Gen<'_> {
 impl Jit {
     pub(super) fn new() -> Option<Jit> {
         let mut flags = settings::builder();
-        flags.set("opt_level", "speed").ok()?;
+        flags.set("opt_level", "none").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
+        flags.set("enable_verifier", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
         let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
@@ -324,27 +356,23 @@ impl Jit {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
+        b.seal_block(entry);
         let p = b.block_params(entry).to_vec();
         let (cpu, mem, va_base, budget) = (p[0], p[1], p[2], p[3]);
         let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
 
-        // which registers the region uses and writes
+        // which registers the region uses
         let mut used = [false; 27];
-        let mut written = [false; 27];
         let mut flags_live = false;
         for rb in region {
             for d in &rb.ops {
                 for r in [d.x, d.y, d.z] {
                     used[idx(r as i64)] = true;
                 }
-                if !matches!(d.op, Op::Stt | Op::Stw | Op::Br | Op::Br3 | Op::CmpR | Op::CmpK | Op::Generic) {
-                    written[idx(d.x as i64)] = true;
-                }
                 flags_live |= !matches!(d.op, Op::Li | Op::Lea | Op::Jal | Op::Jalr | Op::Ldw | Op::Stw | Op::Generic);
             }
         }
         used[idx(0)] = false;
-        written[idx(0)] = false;
 
         let mut reg = [None::<Variable>; 27];
         for r in 0..27 {
@@ -362,7 +390,7 @@ impl Jit {
         let exit = b.create_block();
         let exit_pc = b.declare_var(I64);
         let exit_unrun = b.declare_var(I64);
-        let mut g = Gen { b, cpu, mem, va_base, reg, s_var, c_var, left, exit, exit_pc, exit_unrun, flags_live };
+        let mut g = Gen { b, cpu, va_base, reg, s_var, c_var, left, exit, exit_pc, exit_unrun, flags_live };
         g.flags_from_cpu();
 
         let mut blocks = HashMap::new();
@@ -383,10 +411,10 @@ impl Jit {
             let stop = g.b.create_block();
             g.b.set_cold_block(stop);
             g.b.ins().brif(short, stop, &[], go, &[]);
-            g.b.switch_to_block(stop);
+            g.enter(stop);
             let pc = g.pc_in_page(rb.off);
             g.leave(pc, 0);
-            g.b.switch_to_block(go);
+            g.enter(go);
             let l2 = g.b.ins().iadd_imm_s(l, -count);
             g.b.def_var(g.left, l2);
 
@@ -405,7 +433,7 @@ impl Jit {
                         };
                         let raw = if matches!(d.op, Op::AddR | Op::AddK) { g.b.ins().iadd(a, c) } else { g.b.ins().isub(a, c) };
                         let (v, carry) = g.wrap(raw);
-                        g.b.def_var(g.c_var, carry);
+                        g.set_c(carry);
                         g.b.def_var(g.s_var, v);
                         g.set(x, v);
                     }
@@ -421,7 +449,8 @@ impl Jit {
                         let (hi, lo) = g.mul_split(a, c);
                         if d.f as i64 == alu::MUL {
                             let carry = g.sign(hi);
-                            g.b.def_var(g.c_var, carry);
+                            let raw = g.b.ins().imul_imm_s(carry, W_MAX + 1);
+                            g.set_c(raw);
                             g.b.def_var(g.s_var, lo);
                             g.set(x, lo);
                         } else {
@@ -438,14 +467,15 @@ impl Jit {
                         let fault = g.b.create_block();
                         g.b.set_cold_block(fault);
                         g.b.ins().brif(zero, fault, &[], divide, &[]);
-                        g.b.switch_to_block(fault);
+                        g.enter(fault);
                         let pc = g.pc_in_page(off);
                         let keep = Box::new(*d);
                         let dp = g.b.ins().iconst(ptr, &*keep as *const Dec as i64);
                         ops_keep.push(keep);
+                        g.s_to_cpu();
                         g.b.ins().call(ex, &[cpu, mem, dp, pc]);
                         g.leave(pc, unrun);
-                        g.b.switch_to_block(divide);
+                        g.enter(divide);
                         let r = if d.f as i64 == alu::DIV { g.b.ins().sdiv(a, c) } else { g.b.ins().srem(a, c) };
                         g.b.def_var(g.s_var, r);
                         g.set(x, r);
@@ -460,8 +490,9 @@ impl Jit {
                     }
                     Op::Ldw | Op::Stw => {
                         let base = g.get(y);
-                        let raw = g.b.ins().iadd_imm_s(base, d.imm);
-                        let va = g.wrap(raw).0;
+                        // unwrapped: a miss if it would need wrapping, and
+                        // the helper wraps it
+                        let va = g.b.ins().iadd_imm_s(base, d.imm);
                         let fast = g.b.create_block();
                         let slow = g.b.create_block();
                         let done = g.b.create_block();
@@ -470,7 +501,7 @@ impl Jit {
                         g.b.set_cold_block(slow);
                         g.b.ins().brif(ok, fast, &[], slow, &[]);
                         // through the window
-                        g.b.switch_to_block(fast);
+                        g.enter(fast);
                         if d.op == Op::Ldw {
                             let v = g.b.ins().load(I64, FL, addr, 0);
                             g.set(x, v);
@@ -480,7 +511,7 @@ impl Jit {
                         }
                         g.b.ins().jump(done, &[]);
                         // the helper: TLB, a new window, or a fault
-                        g.b.switch_to_block(slow);
+                        g.enter(slow);
                         let status = if d.op == Op::Ldw {
                             let out = g.b.ins().stack_addr(ptr, slot, 0);
                             let call = g.b.ins().call(lw, &[cpu, mem, va, out]);
@@ -495,10 +526,10 @@ impl Jit {
                         g.b.set_cold_block(fault);
                         let bad = g.b.ins().icmp_imm_s(IntCC::Equal, status, FAULT);
                         g.b.ins().brif(bad, fault, &[], ok, &[]);
-                        g.b.switch_to_block(fault);
+                        g.enter(fault);
                         let pc = g.pc_in_page(off);
                         g.leave(pc, unrun);
-                        g.b.switch_to_block(ok);
+                        g.enter(ok);
                         if d.op == Op::Ldw {
                             let v = g.b.ins().stack_load(ptr, I64, slot, 0);
                             g.set(x, v);
@@ -508,11 +539,11 @@ impl Jit {
                             let out = g.b.create_block();
                             let dirty = g.b.ins().icmp_imm_s(IntCC::Equal, status, OK_EXIT);
                             g.b.ins().brif(dirty, out, &[], done, &[]);
-                            g.b.switch_to_block(out);
+                            g.enter(out);
                             let pc = g.pc_in_page(next_off);
                             g.leave(pc, unrun - 1);
                         }
-                        g.b.switch_to_block(done);
+                        g.enter(done);
                     }
                     Op::Jal => {
                         let link = g.pc_any(next_off);
@@ -531,7 +562,7 @@ impl Jit {
                                         let cc = [IntCC::SignedLessThan, IntCC::Equal, IntCC::SignedGreaterThan][k as usize];
                                         g.b.ins().icmp_imm_s(cc, v, 0)
                                     } else {
-                                        let c = g.b.use_var(g.c_var);
+                                        let c = g.carry();
                                         g.b.ins().icmp_imm_s(IntCC::Equal, c, k - 1)
                                     };
                                     hits.push(hit);
@@ -551,9 +582,9 @@ impl Jit {
                             let yes = g.b.create_block();
                             let no = g.b.create_block();
                             g.b.ins().brif(cond, yes, &[], no, &[]);
-                            g.b.switch_to_block(yes);
+                            g.enter(yes);
                             g.goto(&blocks, t);
-                            g.b.switch_to_block(no);
+                            g.enter(no);
                         }
                         g.goto(&blocks, next_off);
                         ended = true;
@@ -574,13 +605,8 @@ impl Jit {
                     }
                     _ => {
                         // the interpreter's code for this one instruction
-                        for r in [x, y, z] {
-                            if r != 0 {
-                                let v = g.get(r);
-                                g.b.ins().store(FL, v, cpu, (OFF_REGS + 8 * idx(r)) as i32);
-                            }
-                        }
-                        g.flags_to_cpu();
+                        // (registers and C are already in the CPU)
+                        g.s_to_cpu();
                         let keep = Box::new(*d);
                         let dp = g.b.ins().iconst(ptr, &*keep as *const Dec as i64);
                         ops_keep.push(keep);
@@ -592,22 +618,22 @@ impl Jit {
                         g.b.set_cold_block(fault);
                         let bad = g.b.ins().icmp_imm_s(IntCC::Equal, status, FAULT);
                         g.b.ins().brif(bad, fault, &[], ok, &[]);
-                        g.b.switch_to_block(fault);
+                        g.enter(fault);
                         g.leave(pc, unrun);
-                        g.b.switch_to_block(ok);
+                        g.enter(ok);
                         if x != 0 {
                             let v = g.b.ins().load(I64, FL, cpu, (OFF_REGS + 8 * idx(x)) as i32);
-                            g.set(x, v);
+                            g.b.def_var(g.reg[idx(x)].expect("used register"), v);
                         }
                         g.flags_from_cpu();
                         let out = g.b.create_block();
                         let on = g.b.create_block();
                         let dirty = g.b.ins().icmp_imm_s(IntCC::Equal, status, OK_EXIT);
                         g.b.ins().brif(dirty, out, &[], on, &[]);
-                        g.b.switch_to_block(out);
+                        g.enter(out);
                         let pc = g.pc_in_page(next_off);
                         g.leave(pc, unrun - 1);
-                        g.b.switch_to_block(on);
+                        g.enter(on);
                     }
                 }
                 if ended {
@@ -622,13 +648,8 @@ impl Jit {
 
         // exit: registers, flags, PC; steps = budget − left − unrun
         g.b.switch_to_block(exit);
-        for (r, &w) in written.iter().enumerate() {
-            if w {
-                let v = g.b.use_var(g.reg[r].expect("used register"));
-                g.b.ins().store(FL, v, cpu, (OFF_REGS + 8 * r) as i32);
-            }
-        }
-        g.flags_to_cpu();
+        // registers are written through; S and C are kept lazily
+        g.s_to_cpu();
         let pc = g.b.use_var(g.exit_pc);
         g.b.ins().store(FL, pc, cpu, OFF_PC as i32);
         let l = g.b.use_var(g.left);

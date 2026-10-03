@@ -11,6 +11,7 @@ use crate::ast::*;
 use crate::lexer::Pos;
 use crate::Error;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::fmt;
 
 // ---- types --------------------------------------------------------------------
@@ -446,7 +447,7 @@ pub struct Compiler {
     pub optimize: bool,
     /// Function bodies, for inlining; the ones being inlined now; and the
     /// first local an inlined body may see (the caller's are hidden).
-    fns: HashMap<String, FnDecl>,
+    fns: HashMap<String, Rc<FnDecl>>,
     /// Inlining cost of each function (None: never inlined).
     inline_cost: HashMap<String, Option<usize>>,
     inlining: Vec<String>,
@@ -963,13 +964,18 @@ impl Compiler {
         for it in items {
             if let Item::Fn(f) = it {
                 if f.body.is_some() {
-                    self.fns.insert(f.name.clone(), f.clone());
+                    self.fns.insert(f.name.clone(), Rc::new(f.clone()));
                 }
             }
         }
-        let names: Vec<String> = self.fns.keys().cloned().collect();
-        for n in names {
-            self.cost_of(&n, &mut Vec::new());
+        // in source order: with recursion, what is cached depends on where
+        // the walk starts, and the output must not depend on hash order
+        for it in items {
+            if let Item::Fn(f) = it {
+                if f.body.is_some() {
+                    self.cost_of(&f.name, &mut Vec::new());
+                }
+            }
         }
         for it in items {
             if let Item::Fn(f) = it {
@@ -2633,7 +2639,7 @@ impl Compiler {
     }
 
     /// The body of `name` if a call to it may be inlined here.
-    fn inline_candidate(&self, name: &str, params: &[Ty], ret: &Ty) -> Option<FnDecl> {
+    fn inline_candidate(&self, name: &str, params: &[Ty], ret: &Ty) -> Option<Rc<FnDecl>> {
         if !self.optimize || self.no_regs || self.inlining.iter().any(|n| n == name) {
             return None;
         }
