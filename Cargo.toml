@@ -12,3 +12,12 @@ authors = ["dvladi"]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# For tests and benchmarks while developing: release speed without the
+# full-LTO link (each test binary rebuilds in seconds, not minutes).
+# `cargo test --profile fast`, `cargo build --profile fast -p setun-bench`
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
