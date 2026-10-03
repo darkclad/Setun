@@ -523,3 +523,94 @@ fn a_set_but_unmasked_fpu_flag_traps_every_time() {
     }
 }
 
+
+#[test]
+fn tryte_loads_and_stores_through_the_windows_in_a_compiled_loop() {
+    // nine consecutive trytes (every place in three words, extremes
+    // included), each loaded, folded into an order-sensitive sum, and
+    // stored plus one ten words further on; in frame 1, away from the
+    // code (a store into the code's frame drops its compiled blocks)
+    let trytes = [-9841i64, 0, 9841, 1, -1, 4321, -9000, 13, 9840];
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 599)); // the first tryte of a word
+    prog.push(isa::s6(op::LIQ, 0, 9, 9));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDT, 5, 2, 0));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 5));
+    prog.push(isa::rrr(op::ALUQ, alu::MUL, 11, 11, 3));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 11, 11, 5));
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 6, 5, 1));
+    prog.extend(isa::wide(op::MEMD, mem::STT, 6, 2, 30));
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 2, 2, 1));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        for (k, &t) in trytes.iter().enumerate() {
+            m.mem.write_tryte(PAGE + 599 + k as i64, ternary::Tryte::new(t).unwrap()).unwrap();
+            // the store targets hold something to overwrite
+            m.mem.write_tryte(PAGE + 629 + k as i64, ternary::Tryte::new(7 - k as i64 * 1000).unwrap()).unwrap();
+        }
+    };
+    let (st, fast) = both_ways_jit(1, setup, &prog, 200);
+    assert!(fast.cpu.jit_stats()[2] > 50, "the loop ran compiled: {:?}", fast.cpu.jit_stats());
+    assert_eq!(reg_in(&st, 10), trytes.iter().sum::<i64>());
+    for (k, &t) in trytes.iter().enumerate() {
+        let want = if t == 9841 { -9841 } else { t + 1 }; // the low tryte of t + 1
+        assert_eq!(fast.mem.read_tryte(PAGE + 629 + k as i64).unwrap().value(), want, "tryte {k}");
+    }
+}
+
+#[test]
+fn a_tryte_store_into_code_ahead_runs_the_new_code() {
+    // three rounds; the STT goes to 31 + (r9 - 1) * PAGE: data in frames 2
+    // and 1 (the loop's block is built and compiled meanwhile), then the
+    // operand tryte of the LIQ r5, 0 further on, which must then give 7
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 1, 0, 5 * 729 + 7)); // 0, 3: LIQ r5, 7's operand tryte
+    prog.push(isa::s6(op::LIQ, 0, 9, 3)); // 6
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 2, 9, 1)); // 9
+    prog.extend(isa::wide(op::ALUI, alu::MUL, 2, 2, PAGE)); // 12, 15
+    prog.extend(isa::wide(op::ALUI, alu::ADD, 2, 2, 31)); // 18, 21
+    prog.push(isa::rrr(op::MEM, mem::STT, 1, 2, 0)); // 24
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1)); // 27
+    prog.push(isa::s6(op::LIQ, 0, 5, 0)); // 30: its low tryte is at 31
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, -8)); // 33: to 9
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0)); // 36
+    for setup in [(|_: &mut Machine| {}) as fn(&mut Machine), paged] {
+        for threshold in [u32::MAX, 1] {
+            let (st, fast) = both_ways_jit(threshold, setup, &prog, 40);
+            assert_eq!(reg_in(&st, 5), 7, "the rewritten instruction ran (threshold {threshold})");
+            if threshold == 1 {
+                assert!(fast.cpu.jit_stats()[2] > 0, "the last round ran compiled");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_tryte_load_one_past_its_page_misses_the_window() {
+    // the last tryte of page 1, then the first of page 2, which is mapped
+    // to frame 5 (frame 2, next in host memory, is not mapped)
+    let last = PAGE + 9841;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, last));
+    prog.push(isa::s6(op::LIQ, 0, 9, 4));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDT, 5, 2, 0));
+    prog.push(isa::rrr(op::MEM, mem::LDT, 6, 2, 1));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(5, 1, 1, -1))).unwrap(); // page 2 -> frame 5
+        m.mem.write_tryte(last, ternary::Tryte::new(111).unwrap()).unwrap();
+        m.mem.write_tryte(2 * PAGE - 9841, ternary::Tryte::new(222).unwrap()).unwrap();
+        m.mem.write_tryte(5 * PAGE - 9841, ternary::Tryte::new(555).unwrap()).unwrap();
+    };
+    let (st, _) = both_ways_jit(1, setup, &prog, 40);
+    assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (111, 555));
+}

@@ -51,6 +51,8 @@ pub(super) struct Jit {
     fctx: FunctionBuilderContext,
     load_word: FuncId,
     store_word: FuncId,
+    load_tryte: FuncId,
+    store_tryte: FuncId,
     exec_one: FuncId,
     next_id: usize,
 }
@@ -86,6 +88,49 @@ unsafe extern "C" fn jit_store_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, v:
     let raw = va;
     let va = wrap_carry(va).0;
     match cpu.store_word_fast(m, va, Word::new(v).expect("a word")) {
+        Ok(()) if !m.code_dirty.is_empty() || m.pt_dirty => OK_EXIT,
+        Ok(()) => {
+            cpu.jw_fill(raw, true);
+            OK
+        }
+        Err(f) => {
+            cpu.jit_fault = Some(f);
+            FAULT
+        }
+    }
+}
+
+/// A tryte load, likewise (LDT: the tryte, sign-extended).
+unsafe extern "C" fn jit_load_tryte(cpu: *mut Cpu, mem: *mut Memory, va: i64, out: *mut i64) -> i64 {
+    let (cpu, m) = (&mut *cpu, &mut *mem);
+    let raw = va;
+    let va = wrap_carry(va).0;
+    let r = cpu
+        .data_pa(m, va, Access::Read, false)
+        .and_then(|pa| m.read_tryte(pa).map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Read)));
+    match r {
+        Ok(t) => {
+            *out = t.value();
+            cpu.jw_fill(raw, false);
+            OK
+        }
+        Err(f) => {
+            cpu.jit_fault = Some(f);
+            FAULT
+        }
+    }
+}
+
+/// A tryte store (STT: the low tryte of `v`).
+unsafe extern "C" fn jit_store_tryte(cpu: *mut Cpu, mem: *mut Memory, va: i64, v: i64) -> i64 {
+    let (cpu, m) = (&mut *cpu, &mut *mem);
+    let raw = va;
+    let va = wrap_carry(va).0;
+    let r = cpu.data_pa(m, va, Access::Write, false).and_then(|pa| {
+        m.write_tryte(pa, Word::new(v).expect("a word").resize())
+            .map_err(|_| Fault::mem(vector::BUS_ERROR, va, Access::Write))
+    });
+    match r {
         Ok(()) if !m.code_dirty.is_empty() || m.pt_dirty => OK_EXIT,
         Ok(()) => {
             cpu.jw_fill(raw, true);
@@ -306,6 +351,65 @@ impl Gen<'_> {
     }
 }
 
+/// 3^9, and its inverse modulo 2^64 (exact division by multiplying).
+const T9: i64 = 19_683;
+const T9_INV: i64 = {
+    let mut x: u64 = 1;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub((T9 as u64).wrapping_mul(x)));
+        i += 1;
+    }
+    x as i64
+};
+const _: () = assert!(T9.wrapping_mul(T9_INV) == 1);
+
+impl Gen<'_> {
+    /// The window test for a tryte access at `va`: (covered?, the host
+    /// address of its word, its place in the word: 0 high, 1, 2 low).
+    fn tryte_window(&mut self, va: Value, write: bool) -> (Value, Value, Value) {
+        let k = self.b.ins().sshr_imm_s(va, JW_SHIFT);
+        let k = self.b.ins().band_imm_s(k, (JW - 1) as i64);
+        let k = self.b.ins().ishl_imm_s(k, 4);
+        let entry = self.b.ins().iadd(self.cpu, k);
+        let base = (OFF_JWIN + if write { 16 * JW } else { 0 }) as i32;
+        let lo = self.b.ins().load(I64, FL, entry, base);
+        let ptr = self.b.ins().load(I64, FL, entry, base + 8);
+        let off = self.b.ins().isub(va, lo);
+        let in_page = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, off, PAGE);
+        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, ptr, 0);
+        let ok = self.b.ins().band(in_page, has);
+        // (only used when off < PAGE) q = off / 3, r = off - 3q
+        let q = self.b.ins().udiv_imm_u(off, 3);
+        let q3 = self.b.ins().imul_imm_s(q, 3);
+        let r = self.b.ins().isub(off, q3);
+        let byte = self.b.ins().ishl_imm_s(q, 3);
+        (ok, self.b.ins().iadd(ptr, byte), r)
+    }
+
+    /// The low tryte of a word, balanced: v mod 3^9 in -9841..9841.
+    fn low_tryte(&mut self, v: Value) -> Value {
+        // into the positive range first (|v| < 3^27 / 2 < 3^9 * 2^31)
+        let c = self.b.ins().iadd_imm_s(v, 9841 + T9 * (1 << 31));
+        let u = self.b.ins().urem_imm_u(c, T9);
+        self.b.ins().iadd_imm_s(u, -9841)
+    }
+
+    /// The tryte at place `r` (0 high .. 2 low) of word `w`.
+    fn tryte_of(&mut self, w: Value, r: Value) -> Value {
+        let t2 = self.low_tryte(w);
+        let rest = self.b.ins().isub(w, t2);
+        let rest = self.b.ins().imul_imm_s(rest, T9_INV); // exact: (w - t2) / 3^9
+        let t1 = self.low_tryte(rest);
+        let top = self.b.ins().isub(rest, t1);
+        let t0 = self.b.ins().imul_imm_s(top, T9_INV);
+        let is0 = self.b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+        let is1 = self.b.ins().icmp_imm_s(IntCC::Equal, r, 1);
+        let t12 = self.b.ins().select(is1, t1, t2);
+        self.b.ins().select(is0, t0, t12)
+    }
+}
+
 impl Jit {
     pub(super) fn new() -> Option<Jit> {
         let mut flags = settings::builder();
@@ -317,6 +421,8 @@ impl Jit {
         let mut jb = JITBuilder::with_isa(isa, default_libcall_names());
         jb.symbol("jit_load_word", jit_load_word as *const u8);
         jb.symbol("jit_store_word", jit_store_word as *const u8);
+        jb.symbol("jit_load_tryte", jit_load_tryte as *const u8);
+        jb.symbol("jit_store_tryte", jit_store_tryte as *const u8);
         jb.symbol("jit_exec_one", jit_exec_one as *const u8);
         let mut module = JITModule::new(jb);
         let ptr = module.target_config().pointer_type();
@@ -330,6 +436,8 @@ impl Jit {
         };
         let load_word = decl("jit_load_word", [ptr, ptr, I64, ptr])?;
         let store_word = decl("jit_store_word", [ptr, ptr, I64, I64])?;
+        let load_tryte = decl("jit_load_tryte", [ptr, ptr, I64, ptr])?;
+        let store_tryte = decl("jit_store_tryte", [ptr, ptr, I64, I64])?;
         let exec_one = decl("jit_exec_one", [ptr, ptr, ptr, I64])?;
         Some(Jit {
             ctx: module.make_context(),
@@ -337,6 +445,8 @@ impl Jit {
             fctx: FunctionBuilderContext::new(),
             load_word,
             store_word,
+            load_tryte,
+            store_tryte,
             exec_one,
             next_id: 0,
         })
@@ -360,9 +470,12 @@ impl Jit {
         self.ctx.func.name = UserFuncName::user(0, fid.as_u32());
 
         let (load_word, store_word, exec_one) = (self.load_word, self.store_word, self.exec_one);
+        let (load_tryte, store_tryte) = (self.load_tryte, self.store_tryte);
         let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
         let lw = self.module.declare_func_in_func(load_word, b.func);
         let sw = self.module.declare_func_in_func(store_word, b.func);
+        let lt = self.module.declare_func_in_func(load_tryte, b.func);
+        let st = self.module.declare_func_in_func(store_tryte, b.func);
         let ex = self.module.declare_func_in_func(exec_one, b.func);
 
         let entry = b.create_block();
@@ -547,6 +660,72 @@ impl Jit {
                             g.b.ins().jump(done, &[]);
                         } else {
                             // it wrote code or a page table: leave after it
+                            let out = g.b.create_block();
+                            let dirty = g.b.ins().icmp_imm_s(IntCC::Equal, status, OK_EXIT);
+                            g.b.ins().brif(dirty, out, &[], done, &[]);
+                            g.enter(out);
+                            let pc = g.pc_in_page(next_off);
+                            g.leave(pc, unrun - 1);
+                        }
+                        g.enter(done);
+                    }
+                    Op::Ldt | Op::Stt => {
+                        let base = g.get(y);
+                        let va = g.b.ins().iadd_imm_s(base, d.imm);
+                        let fast = g.b.create_block();
+                        let slow = g.b.create_block();
+                        let done = g.b.create_block();
+                        let (ok, addr, r) = g.tryte_window(va, d.op == Op::Stt);
+                        g.b.set_cold_block(slow);
+                        g.b.ins().brif(ok, fast, &[], slow, &[]);
+                        // through the window: the word, and its tryte r
+                        g.enter(fast);
+                        let w = g.b.ins().load(I64, FL, addr, 0);
+                        let old = g.tryte_of(w, r);
+                        if d.op == Op::Ldt {
+                            g.set(x, old);
+                        } else {
+                            // w + (new - old) * 3^(9 * (2 - r))
+                            let v = g.get(x);
+                            let new = g.low_tryte(v);
+                            let is0 = g.b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                            let is1 = g.b.ins().icmp_imm_s(IntCC::Equal, r, 1);
+                            let w0 = g.b.ins().iconst(I64, T9 * T9);
+                            let w1 = g.b.ins().iconst(I64, T9);
+                            let w2 = g.b.ins().iconst(I64, 1);
+                            let w12 = g.b.ins().select(is1, w1, w2);
+                            let weight = g.b.ins().select(is0, w0, w12);
+                            let diff = g.b.ins().isub(new, old);
+                            let delta = g.b.ins().imul(diff, weight);
+                            let nw = g.b.ins().iadd(w, delta);
+                            g.b.ins().store(FL, nw, addr, 0);
+                        }
+                        g.b.ins().jump(done, &[]);
+                        // the helper: TLB, a new window, or a fault
+                        g.enter(slow);
+                        let status = if d.op == Op::Ldt {
+                            let out = g.b.ins().stack_addr(ptr, slot, 0);
+                            let call = g.b.ins().call(lt, &[cpu, mem, va, out]);
+                            g.b.inst_results(call)[0]
+                        } else {
+                            let v = g.get(x);
+                            let call = g.b.ins().call(st, &[cpu, mem, va, v]);
+                            g.b.inst_results(call)[0]
+                        };
+                        let fault = g.b.create_block();
+                        let ok = g.b.create_block();
+                        g.b.set_cold_block(fault);
+                        let bad = g.b.ins().icmp_imm_s(IntCC::Equal, status, FAULT);
+                        g.b.ins().brif(bad, fault, &[], ok, &[]);
+                        g.enter(fault);
+                        let pc = g.pc_in_page(off);
+                        g.leave(pc, unrun);
+                        g.enter(ok);
+                        if d.op == Op::Ldt {
+                            let v = g.b.ins().stack_load(ptr, I64, slot, 0);
+                            g.set(x, v);
+                            g.b.ins().jump(done, &[]);
+                        } else {
                             let out = g.b.create_block();
                             let dirty = g.b.ins().icmp_imm_s(IntCC::Equal, status, OK_EXIT);
                             g.b.ins().brif(dirty, out, &[], done, &[]);
