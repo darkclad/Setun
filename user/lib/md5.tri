@@ -1,10 +1,11 @@
 // md5: the MD5 message digest (RFC 1321).
 //
-// The machine has no binary AND/OR/XOR (Trine's & and | are tritwise min
-// and max), so 32-bit words are plain integers 0..2^32-1 and the boolean
-// functions run a bit at a time. Text is hashed as UTF-8, so a file's digest
-// matches md5sum elsewhere; a negative tryte v (not text) is hashed as the
-// code point v + 3^9, which no positive tryte can be.
+// The machine has no binary AND/OR/XOR, so 32-bit words are plain
+// integers 0..2^32-1 for the additions, and for the boolean functions
+// each half is spread to one bit per trit (see spread16). Text is hashed
+// as UTF-8, so a file's digest matches md5sum elsewhere; a negative tryte
+// v (not text) is hashed as the code point v + 3^9, which no positive
+// tryte can be.
 //
 //   md5_init(); md5_put_char(c) ...; md5_final(&digest[0]);   16 bytes
 //   md5_hex(s, n, &hex[0]);                                    32 hex digits
@@ -29,6 +30,7 @@ var md5_fill: int;
 var md5_bytes: int;                   // message length so far
 
 fn md5_init() {
+    if (md5_tables == 0) { md5_make_tables(); }
     md5_state[0] = 1732584193;
     md5_state[1] = 4023233417;
     md5_state[2] = 2562383102;
@@ -37,40 +39,49 @@ fn md5_init() {
     md5_bytes = 0;
 }
 
-fn pow2(n: int) -> int {
-    var v: int = 1;
-    while (n > 0) { v *= 2; n -= 1; }
-    return v;
-}
+// Bits as trits: a 16-bit half held as the trits (each 0 or 1) of an
+// integer. Then AND and OR are tritwise minimum and maximum (& and |),
+// XOR is (a | b) - (a & b) and NOT is ONES16 - a, with no carries or
+// borrows. Bytes are spread to trits and gathered back by table.
+const T8: int = 6561;                 // 3^8: one byte's worth of trits
+const ONES16: int = 21523360;         // sixteen 1 trits: (3^16 - 1) / 2
+var md5_spread: [256]int;             // a byte -> its bits as trits
+var md5_gather: [3281]int;            // eight 0/1 trits -> the byte
+var md5_pow2: [33]int;                // 2^0 .. 2^32
+var md5_g: [64]int;                   // step i's message word
+var md5_s: [64]int;                   // and its rotation
+var md5_tables: int;
 
-// Round r's boolean function of x, y, z (0 F, 1 G, 2 H, 3 I), bit by bit.
-fn md5_fun(r: int, x: int, y: int, z: int) -> int {
-    var out: int = 0;
-    var bit: int = 1;
-    var k: int = 0;
-    while (k < 32) {
-        var a: int = x % 2;
-        var b: int = y % 2;
-        var c: int = z % 2;
-        x = x / 2;
-        y = y / 2;
-        z = z / 2;
-        var v: int;
-        if (r == 0) { v = a != 0 ? b : c; }                 // (x and y) or (not x and z)
-        else if (r == 1) { v = c != 0 ? a : b; }            // (x and z) or (y and not z)
-        else if (r == 2) { v = (a + b + c) % 2; }           // x xor y xor z
-        else { v = (b + (a != 0 || c == 0 ? 1 : 0)) % 2; }  // y xor (x or not z)
-        out += v * bit;
-        bit *= 2;
-        k += 1;
+fn md5_make_tables() {
+    var b: int = 0;
+    while (b < 256) {
+        var v: int = 0;
+        var t: int = 1;
+        var k: int = b;
+        while (k > 0) { v += k % 2 * t; t *= 3; k = k / 2; }
+        md5_spread[b] = v;
+        md5_gather[v] = b;
+        b += 1;
     }
-    return out;
+    md5_pow2[0] = 1;
+    var i: int = 1;
+    while (i <= 32) { md5_pow2[i] = 2 * md5_pow2[i - 1]; i += 1; }
+    i = 0;
+    while (i < 64) {
+        var r: int = i / 16;
+        if (r == 0) { md5_g[i] = i; }
+        else if (r == 1) { md5_g[i] = (5 * i + 1) % 16; }
+        else if (r == 2) { md5_g[i] = (3 * i + 5) % 16; }
+        else { md5_g[i] = 7 * i % 16; }
+        md5_s[i] = md5_shift[4 * r + i % 4];
+        i += 1;
+    }
+    md5_tables = 1;
 }
 
-fn rotl32(x: int, s: int) -> int {
-    var m: int = pow2(32 - s);
-    return x % m * pow2(s) + x / m;
-}
+// A 16-bit value <-> its bits as trits.
+fn spread16(v: int) -> int { return md5_spread[v % 256] + T8 * md5_spread[v / 256]; }
+fn gather16(t: int) -> int { return md5_gather[t % T8] + 256 * md5_gather[t / T8]; }
 
 fn md5_transform() {
     var w: [16]int;
@@ -83,19 +94,48 @@ fn md5_transform() {
     var b: int = md5_state[1];
     var c: int = md5_state[2];
     var d: int = md5_state[3];
+    // b, c and d as trits too, low and high halves (c and d were b before)
+    var bl: int = spread16(b % 65536);
+    var bh: int = spread16(b / 65536);
+    var cl: int = spread16(c % 65536);
+    var ch: int = spread16(c / 65536);
+    var dl: int = spread16(d % 65536);
+    var dh: int = spread16(d / 65536);
     i = 0;
     while (i < 64) {
-        var r: int = i / 16;
-        var g: int;
-        if (r == 0) { g = i; }
-        else if (r == 1) { g = (5 * i + 1) % 16; }
-        else if (r == 2) { g = (3 * i + 5) % 16; }
-        else { g = 7 * i % 16; }
-        var f: int = (md5_fun(r, b, c, d) + a + md5_k[i] + w[g]) % TWO32;
+        // the round's boolean function, on both halves
+        var fl: int;
+        var fh: int;
+        if (i < 16) {                                       // (b and c) or (not b and d)
+            fl = (bl & cl) | ((ONES16 - bl) & dl);
+            fh = (bh & ch) | ((ONES16 - bh) & dh);
+        } else if (i < 32) {                                // (b and d) or (c and not d)
+            fl = (bl & dl) | (cl & (ONES16 - dl));
+            fh = (bh & dh) | (ch & (ONES16 - dh));
+        } else if (i < 48) {                                // b xor c xor d
+            var xl: int = (bl | cl) - (bl & cl);
+            var xh: int = (bh | ch) - (bh & ch);
+            fl = (xl | dl) - (xl & dl);
+            fh = (xh | dh) - (xh & dh);
+        } else {                                            // c xor (b or not d)
+            var tl: int = bl | (ONES16 - dl);
+            var th: int = bh | (ONES16 - dh);
+            fl = (cl | tl) - (cl & tl);
+            fh = (ch | th) - (ch & th);
+        }
+        var fun: int = gather16(fl) + 65536 * gather16(fh);
+        var f: int = (fun + a + md5_k[i] + w[md5_g[i]]) % TWO32;
+        var m: int = md5_pow2[32 - md5_s[i]];
         a = d;
         d = c;
+        dl = cl;
+        dh = ch;
         c = b;
-        b = (b + rotl32(f, md5_shift[4 * r + i % 4])) % TWO32;
+        cl = bl;
+        ch = bh;
+        b = (b + f % m * md5_pow2[md5_s[i]] + f / m) % TWO32;
+        bl = spread16(b % 65536);
+        bh = spread16(b / 65536);
         i += 1;
     }
     md5_state[0] = (md5_state[0] + a) % TWO32;

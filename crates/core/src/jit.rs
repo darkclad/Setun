@@ -66,10 +66,12 @@ unsafe extern "C" fn jit_load_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, out
     let (cpu, m) = (&mut *cpu, &mut *mem);
     // compiled code passes base + offset unwrapped (the page walk would
     // not mind, but the windows must stay in range)
+    let raw = va;
     let va = wrap_carry(va).0;
     match cpu.load_word_fast(m, va) {
         Ok(v) => {
             *out = v.value();
+            cpu.jw_fill(raw, false);
             OK
         }
         Err(f) => {
@@ -81,10 +83,14 @@ unsafe extern "C" fn jit_load_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, out
 
 unsafe extern "C" fn jit_store_word(cpu: *mut Cpu, mem: *mut Memory, va: i64, v: i64) -> i64 {
     let (cpu, m) = (&mut *cpu, &mut *mem);
+    let raw = va;
     let va = wrap_carry(va).0;
     match cpu.store_word_fast(m, va, Word::new(v).expect("a word")) {
         Ok(()) if !m.code_dirty.is_empty() || m.pt_dirty => OK_EXIT,
-        Ok(()) => OK,
+        Ok(()) => {
+            cpu.jw_fill(raw, true);
+            OK
+        }
         Err(f) => {
             cpu.jit_fault = Some(f);
             FAULT
@@ -268,8 +274,9 @@ impl Gen<'_> {
         }
     }
 
-    /// The window test for a word access at `va` through the window at
-    /// `lo_off`/`ptr_off`: (covered?, the word's host address).
+    /// The window test for a word access at `va` through its entry in
+    /// the window table (`write`: the write half): (covered?, the word's
+    /// host address).
     ///
     /// The word index is (va − first centre) / 3: multiplying by 3's
     /// inverse modulo 2^64 gives it exactly for a word centre, and a huge
@@ -278,10 +285,15 @@ impl Gen<'_> {
     /// needs no test: compiled code is only entered without one and leaves
     /// as soon as a store makes one; an address that would need wrapping
     /// is outside every window.)
-    fn window(&mut self, va: Value, lo_off: usize, ptr_off: usize) -> (Value, Value) {
+    fn window(&mut self, va: Value, write: bool) -> (Value, Value) {
         const INV3: i64 = 0xAAAA_AAAA_AAAA_AAABu64 as i64;
-        let lo = self.b.ins().load(I64, FL, self.cpu, lo_off as i32);
-        let ptr = self.b.ins().load(I64, FL, self.cpu, ptr_off as i32);
+        let k = self.b.ins().sshr_imm_s(va, JW_SHIFT);
+        let k = self.b.ins().band_imm_s(k, (JW - 1) as i64);
+        let k = self.b.ins().ishl_imm_s(k, 4); // 16 bytes an entry
+        let entry = self.b.ins().iadd(self.cpu, k);
+        let base = (OFF_JWIN + if write { 16 * JW } else { 0 }) as i32;
+        let lo = self.b.ins().load(I64, FL, entry, base);
+        let ptr = self.b.ins().load(I64, FL, entry, base + 8);
         let off = self.b.ins().isub(va, lo);
         let off = self.b.ins().iadd_imm_s(off, -1); // from the first word's centre
         let q = self.b.ins().imul_imm_s(off, INV3);
@@ -496,8 +508,7 @@ impl Jit {
                         let fast = g.b.create_block();
                         let slow = g.b.create_block();
                         let done = g.b.create_block();
-                        let (lo, pt) = if d.op == Op::Ldw { (OFF_RW_LO, OFF_RW_PTR) } else { (OFF_WW_LO, OFF_WW_PTR) };
-                        let (ok, addr) = g.window(va, lo, pt);
+                        let (ok, addr) = g.window(va, d.op == Op::Stw);
                         g.b.set_cold_block(slow);
                         g.b.ins().brif(ok, fast, &[], slow, &[]);
                         // through the window

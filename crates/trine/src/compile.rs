@@ -2663,7 +2663,10 @@ impl Compiler {
         // takes would be saved and restored on every call of this function:
         // only tiny bodies with no locals of their own are worth it there
         let worth = !self.loops.is_empty() || !self.inlining.is_empty() || (locals == 0 && cost <= 15);
-        (plain && worth && need <= self.free_regs.len()).then(|| f.clone())
+        // (a tiny body is worth it even with its parameters in memory: the
+        // call, return, frame and argument pushes cost more)
+        let fits = need <= self.free_regs.len() || (locals == 0 && cost <= 15);
+        (plain && worth && fits).then(|| f.clone())
     }
 
     /// Compile a call to `f` as its body in place: the arguments are

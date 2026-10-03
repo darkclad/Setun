@@ -22,6 +22,9 @@ use std::time::Instant;
 
 const CHUNK: u64 = 1_000_000;
 
+/// The shell workload's script.
+const SHELL_SCRIPT: &str = "md5sum /bin/calc; sort /etc/pangrams | wc; calc 'atan(1)*4'; ls -l /bin | wc -l";
+
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -170,7 +173,7 @@ fn trinux() -> Vec<Outcome> {
         &mut m,
         &mut serial,
         "shell",
-        Some("md5sum /bin/calc; sort /etc/pangrams | wc; calc 'atan(1)*4'; ls -l /bin | wc -l\n"),
+        Some(&format!("{SHELL_SCRIPT}\n")),
         3_000_000_000,
     ));
     // idle at the prompt: mostly HLT, woken by the timer
@@ -219,6 +222,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--resolve") {
         resolve(&args[1..]);
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--profile-trinux") {
+        let script = args.get(1).map_or(SHELL_SCRIPT, String::as_str);
+        profile::trinux(&format!("{}\n", script.trim_end()));
         return;
     }
     if args.first().map(String::as_str) == Some("--profile") {

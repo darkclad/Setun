@@ -134,6 +134,50 @@ pub fn wrap_trits(v: i128, n: u32) -> i128 {
     (v + h).rem_euclid(m) - h
 }
 
+/// 3^9: a group of nine trits.
+const T9: i64 = 19_683;
+
+/// For each nine-digit unbalanced value (trit + 1 per digit): its +1
+/// trits in bits 0..9 and its −1 trits in bits 9..18.
+static MASKS9: [u32; T9 as usize] = {
+    let mut t = [0u32; T9 as usize];
+    let mut c = 0;
+    while c < T9 as usize {
+        let (mut v, mut i, mut e) = (c, 0, 0u32);
+        while i < 9 {
+            match v % 3 {
+                2 => e |= 1 << i,
+                0 => e |= 1 << (i + 9),
+                _ => {}
+            }
+            v /= 3;
+            i += 1;
+        }
+        t[c] = e;
+        c += 1;
+    }
+    t
+};
+
+/// For each nine-bit mask: the sum of 3^i over its bits.
+static POW9: [i64; 512] = {
+    let mut t = [0i64; 512];
+    let mut m = 0;
+    while m < 512 {
+        let (mut i, mut p, mut v) = (0, 1i64, 0i64);
+        while i < 9 {
+            if m & (1 << i) != 0 {
+                v += p;
+            }
+            p *= 3;
+            i += 1;
+        }
+        t[m] = v;
+        m += 1;
+    }
+    t
+};
+
 /// An `N`-trit balanced-ternary integer (`N` ≤ 39 so it fits in an `i64`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(transparent)]
@@ -277,30 +321,67 @@ impl<const N: usize> Tern<N> {
 
     /// Trit-by-trit product (`TMUL`, the Setun-70 `SMT`).
     pub fn tritwise_mul(self, rhs: Self) -> Self {
-        self.tritwise(rhs, |a, b| a * b)
+        let ((pa, na), (pb, nb)) = (self.masks(), rhs.masks());
+        Self::from_masks((pa & pb) | (na & nb), (pa & nb) | (na & pb))
     }
 
     /// Trit-by-trit "threshold addition" (`TSAT`, the Setun-70 `SAT`): each
     /// result trit is the sign of the sum of the two input trits.
     pub fn tritwise_sat(self, rhs: Self) -> Self {
-        self.tritwise(rhs, |a, b| Trit::from_i64(a as i64 + b as i64))
+        let ((pa, na), (pb, nb)) = (self.masks(), rhs.masks());
+        let (p, n) = (pa | pb, na | nb);
+        Self::from_masks(p & !n, n & !p)
     }
 
     /// Trit-by-trit minimum (ternary "AND").
     pub fn tritwise_min(self, rhs: Self) -> Self {
-        self.tritwise(rhs, |a, b| a.min(b))
+        let ((pa, na), (pb, nb)) = (self.masks(), rhs.masks());
+        Self::from_masks(pa & pb, na | nb)
     }
 
     /// Trit-by-trit maximum (ternary "OR").
     pub fn tritwise_max(self, rhs: Self) -> Self {
-        self.tritwise(rhs, |a, b| a.max(b))
+        let ((pa, na), (pb, nb)) = (self.masks(), rhs.masks());
+        Self::from_masks(pa | pb, na & nb)
     }
 
     /// Trit-by-trit consensus: the common trit where both agree, else 0.
     pub fn tritwise_cons(self, rhs: Self) -> Self {
-        self.tritwise(rhs, |a, b| if a == b { a } else { Trit::Z })
+        let ((pa, na), (pb, nb)) = (self.masks(), rhs.masks());
+        Self::from_masks(pa & pb, na & nb)
     }
 
+    /// The trits as two bit masks, least significant trit in bit 0: which
+    /// are +1, and which are −1. Nine trits at a time by table, from the
+    /// digits of value + MAX (each trit + 1: 0, 1 or 2).
+    fn masks(self) -> (u64, u64) {
+        let mut u = self.0 + Self::MAX.0;
+        let (mut p, mut n) = (0u64, 0u64);
+        let mut shift = 0;
+        while shift < N {
+            let e = MASKS9[(u % T9) as usize] as u64;
+            u /= T9;
+            p |= (e & 0x1ff) << shift;
+            n |= (e >> 9) << shift;
+            shift += 9;
+        }
+        let all = (1u64 << N) - 1; // a top group's missing trits read as −1
+        (p & all, n & all)
+    }
+
+    /// The value with the +1 trits `p` and −1 trits `n` (disjoint).
+    fn from_masks(p: u64, n: u64) -> Self {
+        let (mut v, mut scale, mut shift) = (0i64, 1i64, 0);
+        while shift < N {
+            let (pg, ng) = ((p >> shift) & 0x1ff, (n >> shift) & 0x1ff);
+            v += (POW9[pg as usize] - POW9[ng as usize]) * scale;
+            scale = scale.wrapping_mul(T9);
+            shift += 9;
+        }
+        Tern(v)
+    }
+
+    #[cfg(test)]
     fn tritwise(self, rhs: Self, f: impl Fn(Trit, Trit) -> Trit) -> Self {
         let (a, b) = (self.trits(), rhs.trits());
         let mut out = [Trit::Z; N];
@@ -681,6 +762,41 @@ mod tests {
         assert_eq!(a.tritwise_cons(b).to_ascii(), "10T000");
         assert_eq!(t::<9>("0001T0000").leading_zero_trits(), 3);
         assert_eq!(Tryte::ZERO.leading_zero_trits(), 9);
+    }
+
+    /// The table-driven tritwise operations against trit by trit, at
+    /// widths that do and do not fill their last group of nine.
+    fn tritwise_fast_is_exact<const N: usize>() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ N as u64;
+        let mut vals = vec![Tern::<N>::MIN, Tern::<N>::MAX, Tern::<N>::ZERO, Tern::<N>(1), Tern::<N>(-1)];
+        for _ in 0..400 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            vals.push(Tern::<N>::wrap((x >> 1) as i128 - (1i128 << 62)));
+        }
+        for &a in &vals {
+            for &b in vals.iter().take(60) {
+                assert_eq!(a.tritwise_min(b), a.tritwise(b, |p, q| p.min(q)), "min {a} {b}");
+                assert_eq!(a.tritwise_max(b), a.tritwise(b, |p, q| p.max(q)), "max {a} {b}");
+                assert_eq!(a.tritwise_mul(b), a.tritwise(b, |p, q| p * q), "mul {a} {b}");
+                assert_eq!(a.tritwise_sat(b), a.tritwise(b, |p, q| Trit::from_i64(p as i64 + q as i64)), "sat {a} {b}");
+                assert_eq!(a.tritwise_cons(b), a.tritwise(b, |p, q| if p == q { p } else { Trit::Z }), "cons {a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn tritwise_fast_paths() {
+        tritwise_fast_is_exact::<1>();
+        tritwise_fast_is_exact::<3>();
+        tritwise_fast_is_exact::<8>();
+        tritwise_fast_is_exact::<9>();
+        tritwise_fast_is_exact::<10>();
+        tritwise_fast_is_exact::<18>();
+        tritwise_fast_is_exact::<26>();
+        tritwise_fast_is_exact::<27>();
+        tritwise_fast_is_exact::<39>();
     }
 
     #[test]

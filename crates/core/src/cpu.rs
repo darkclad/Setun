@@ -116,6 +116,13 @@ pub struct Cpu {
     ww_frame: usize,
     rw_ptr: usize,
     ww_ptr: usize,
+    /// Compiled code's data windows: copies of the read windows (first
+    /// `JW`) and write windows (last `JW`) of the pages it used lately, as
+    /// (lo, ptr), so it can work on several pages without helper calls.
+    /// Direct-mapped by address bits; every entry is checked in full, and
+    /// all are dropped with the windows (`jw_live`: any is set).
+    jwin: [[i64; 2]; 2 * JW],
+    jw_live: bool,
     /// Bumped when the block arena is cleared.
     arena_gen: u64,
     /// The JIT (native builds): created on first use; `jit_off` once it
@@ -138,10 +145,13 @@ pub struct Cpu {
 const OFF_REGS: usize = std::mem::offset_of!(Cpu, regs);
 const OFF_MODE: usize = std::mem::offset_of!(Cpu, mode_trits);
 const OFF_PC: usize = std::mem::offset_of!(Cpu, pc);
-const OFF_RW_LO: usize = std::mem::offset_of!(Cpu, rw_lo);
-const OFF_RW_PTR: usize = std::mem::offset_of!(Cpu, rw_ptr);
-const OFF_WW_LO: usize = std::mem::offset_of!(Cpu, ww_lo);
-const OFF_WW_PTR: usize = std::mem::offset_of!(Cpu, ww_ptr);
+const OFF_JWIN: usize = std::mem::offset_of!(Cpu, jwin);
+
+/// Compiled code's data windows of each kind (a power of 2), and the
+/// address bits that pick one: 2^15 > PAGE, so a page has at most two.
+const JW: usize = 16;
+const JW_SHIFT: i64 = 15;
+const JW_EMPTY: [[i64; 2]; 2 * JW] = [[i64::MIN, 0]; 2 * JW];
 const _: () = assert!(std::mem::size_of::<Word>() == 8);
 
 /// A decoded instruction. `Generic` ones go through [`Cpu::execute`].
@@ -333,6 +343,8 @@ impl Cpu {
             ww_frame: usize::MAX,
             rw_ptr: 0,
             ww_ptr: 0,
+            jwin: JW_EMPTY,
+            jw_live: false,
             arena_gen: 0,
             #[cfg(not(target_arch = "wasm32"))]
             jit: None,
@@ -377,6 +389,21 @@ impl Cpu {
         self.ww_lo = i64::MIN;
         self.rw_ptr = 0;
         self.ww_ptr = 0;
+        if self.jw_live {
+            self.jwin = JW_EMPTY;
+            self.jw_live = false;
+        }
+    }
+
+    /// Compiled code's window entry for `va` (raw, as it computed it),
+    /// from the read or write window if that covers `va` now.
+    fn jw_fill(&mut self, va: i64, write: bool) {
+        let (lo, ptr) = if write { (self.ww_lo, self.ww_ptr) } else { (self.rw_lo, self.rw_ptr) };
+        if ptr != 0 && (0..PAGE).contains(&va.wrapping_sub(lo)) {
+            let k = ((va >> JW_SHIFT) as usize & (JW - 1)) + if write { JW } else { 0 };
+            self.jwin[k] = [lo, ptr as i64];
+            self.jw_live = true;
+        }
     }
 
     /// Physical address of `va` for `acc` through a window, or the full
@@ -912,6 +939,7 @@ impl Cpu {
         }
         let gen = self.arena_gen;
         let mut region = Vec::new();
+        let mut ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut todo = vec![0i64];
         while let Some(off) = todo.pop() {
@@ -948,6 +976,7 @@ impl Cpu {
                 _ => todo.push(end),
             }
             region.push(jit::RegionBlock { off, ops });
+            ids.push(id);
         }
         // only worth it with a loop inside, or a long run of inline work:
         // entering and leaving compiled code costs a load and a store per
@@ -975,6 +1004,14 @@ impl Cpu {
         if !self.jit.as_ref().expect("created above").send(jit::Request { id, region }) {
             self.jit_off = true;
             return;
+        }
+        // its other blocks will run inside it: they need no regions of
+        // their own (which would be the same code again, queued behind it)
+        if !eager {
+            for &b in &ids[1..] {
+                let h = &mut self.blocks[b as usize - 1].heat;
+                *h = (*h).max(self.jit_threshold + 1);
+            }
         }
         self.jit_pending.push((id, root, slot, i, gen));
         if eager {
