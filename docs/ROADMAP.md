@@ -46,8 +46,9 @@ In rough order of payoff for effort (estimates from the benchmarks):
 | P5 | ~~Staying native across calls and returns~~ | JIT | dropped: at most about 5% measured (the calls that matter are inlined now) |
 | P6 | Inline tryte loads and stores, and FPU instructions, in compiled code | JIT | strings and floating point |
 | P7 | Branch inversion, constants on the left of `*`/`+` (inlining ✅ done, with a cost model) | Trine | 5–10% |
-| P8 | Lower compile latency: IR per instruction cut by a fifth ✅; still open: small first-tier regions, hot ones recompiled bigger | JIT | short workloads (boot, one-shot commands) |
+| P8 | ~~Two-tier compilation~~: IR per instruction cut by a fifth ✅; tiers dropped: region size (4–32 blocks) and acceptance thresholds made no measurable difference, compiles run in the background | JIT | — |
 | P9 | A WebAssembly JIT for the browser build, which only interprets | Web | several times in the artifact |
+| P10 | Fewer interpreted instructions: about a fifth of the shell workload still runs in the block interpreter (cold blocks, and short regions without loops); each new process's code starts cold | JIT, kernel | up to about 1.5× on the shell workload |
 
 ## Later
 
