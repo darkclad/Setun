@@ -76,6 +76,9 @@ pub struct Cpu {
     /// The FPU: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
     fregs: [Real; 27],
     fsr: Word,
+    /// Exception flags (`setun_real` bits) already set in FSR and masked,
+    /// so raising them again changes nothing (0 whenever FSR is written).
+    fsr_quiet: u8,
     /// Inside [`Cpu::run_batch`]: port I/O is deferred to a single step.
     batch: bool,
     /// End the batch after this instruction (it may have changed IE or TF).
@@ -194,6 +197,8 @@ enum Op {
     Jal,
     Br,
     Br3,
+    /// An FPU instruction: run by `exec_fpu` without ending the block.
+    Fpu,
     Generic,
 }
 
@@ -325,6 +330,7 @@ impl Cpu {
             inst_pc: Word::ZERO,
             fregs: [Real::ZERO; 27],
             fsr: Word::ZERO,
+            fsr_quiet: 0,
             batch: false,
             stop_batch: false,
             tlb: vec![TLB_EMPTY; 3 * TLB_SIZE].into_boxed_slice(),
@@ -370,6 +376,7 @@ impl Cpu {
         self.set_mode(mode::FE, 1);
         self.fregs = [Real::ZERO; 27];
         self.fsr = Word::new(fsr::RESET).unwrap();
+        self.fsr_quiet = 0;
         self.pc = Word::new(RESET_PC).unwrap();
         self.halted = false;
         self.tlb_flush();
@@ -856,7 +863,7 @@ impl Cpu {
                     Ok(Ctl::Next) => {
                         pc += d.len as i64;
                         k += 1;
-                        if matches!(d.op, Op::Stt | Op::Stw | Op::Swap) && (!m.code_dirty.is_empty() || m.pt_dirty) {
+                        if matches!(d.op, Op::Stt | Op::Stw | Op::Swap | Op::Fpu) && (!m.code_dirty.is_empty() || m.pt_dirty) {
                             break; // it wrote code or a page table: look again
                         }
                     }
@@ -873,7 +880,7 @@ impl Cpu {
                         let (a, b) = (d.a as i64, d.f as i64);
                         let (x, y, z) = (d.x as i64, d.y as i64, d.z as i64);
                         let r = if bal_split(a, 6561).0 == -1 {
-                            self.exec_fpu(m, a, b, x, y, z, pc)
+                            self.exec_fpu(m, a, b, x, y, z, pc, None)
                         } else {
                             self.exec_major(m, io, pc, a, b, x, y, z, d.imm, pc + d.len as i64)
                         };
@@ -1104,7 +1111,7 @@ impl Cpu {
         while k < WORDS_PER_FRAME && self.ops.len() - first < MAX_BLOCK {
             let at = pa + 3 * (k - i) as i64;
             let Ok(w1) = m.read_word(at).map(|w| w.value()) else { break };
-            let two = bal_split(bal_split(bal_split(w1, 19_683).0, 19_683).0, 6561).0 == 1;
+            let two = Self::two_words(bal_split(bal_split(w1, 19_683).0, 19_683).0);
             if two && k + 1 >= WORDS_PER_FRAME {
                 break; // the second word is in the next frame
             }
@@ -1131,6 +1138,16 @@ impl Cpu {
 
     /// Decode the instruction with words `w1`, `w2` (the second only matters
     /// for 2-word forms).
+    /// Whether the instruction with major opcode `a` has a second word: A's
+    /// leading trit is +1, or, for the FPU (−1), its second trit is.
+    fn two_words(a: i64) -> bool {
+        match bal_split(a, 6561).0 {
+            1 => true,
+            -1 => bal_split(a + 6561, 2187).0 == 1,
+            _ => false,
+        }
+    }
+
     fn decode(w1: i64, w2: i64) -> Dec {
         let (ab, opnd) = bal_split(w1, 19_683);
         let (a, b) = bal_split(ab, 19_683);
@@ -1138,12 +1155,14 @@ impl Cpu {
         let (x, y) = bal_split(xy, 27);
         let imm6 = y * 27 + z;
         let len_trit = bal_split(a, 6561).0;
-        let len = if len_trit == 1 { 6 } else { 3 };
-        let imm = if len_trit == 1 { w2 } else { 0 };
+        let two = Self::two_words(a);
+        let len = if two { 6 } else { 3 };
+        let imm = if two { w2 } else { 0 };
         // `imm` starts as the raw second word, as `exec_major` wants it
         let mut d = Dec { op: Op::Generic, a: a as i16, x: x as i8, y: y as i8, z: z as i8, len, f: b as i16, imm, imm2: 0 };
         if len_trit == -1 {
-            return d; // the FPU
+            d.op = Op::Fpu;
+            return d;
         }
         match a {
             op::ALU => {
@@ -1311,6 +1330,7 @@ impl Cpu {
                     _ => ww(next).value(),
                 }))
             }
+            Op::Fpu => self.exec_fpu(m, d.a as i64, d.f as i64, x, y, z, pc, Some(d.imm))?,
             Op::Generic => {
                 let _ = z;
                 return Ok(Ctl::Generic);
@@ -1336,7 +1356,7 @@ impl Cpu {
         let (imm, next) = match len_trit {
             0 => (0, pc + 3),
             1 => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
-            _ => return self.exec_fpu(m, a, b, x, y, z, pc),
+            _ => return self.exec_fpu(m, a, b, x, y, z, pc, None),
         };
         self.exec_major(m, io, pc, a, b, x, y, z, imm, next)
     }
@@ -1478,8 +1498,8 @@ impl Cpu {
     /// Record exception flags: set the sticky FSR flags, and trap (vector
     /// −11, before any result is written) on the first unmasked one.
     fn fpu_flags(&mut self, flags: u8) -> Result<(), Fault> {
-        if flags == 0 {
-            return Ok(());
+        if flags & !self.fsr_quiet == 0 {
+            return Ok(()); // (nearly every operation is inexact)
         }
         let bits = [setun_real::IV, setun_real::DZ, setun_real::OF, setun_real::UF, setun_real::IX];
         for (i, bit) in bits.iter().enumerate() {
@@ -1493,11 +1513,18 @@ impl Cpu {
                 return Err(Fault { info: i as i64 + 1, ..Fault::new(vector::FP_EXCEPTION) });
             }
         }
+        self.fsr_quiet = 0;
+        for (i, bit) in bits.iter().enumerate() {
+            if self.fsr.trit(fsr::FLAG_FIRST + i) as i64 == 1 && self.fsr.trit(fsr::MASK_FIRST + i) as i64 == 1 {
+                self.fsr_quiet |= bit;
+            }
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn exec_fpu(&mut self, m: &mut Memory, a: i64, b: i64, x: i64, y: i64, z: i64, pc: i64) -> Result<(), Fault> {
+    /// `imm2`: the second word when the caller already has it.
+    fn exec_fpu(&mut self, m: &mut Memory, a: i64, b: i64, x: i64, y: i64, z: i64, pc: i64, imm2: Option<i64>) -> Result<(), Fault> {
         let ill = || Fault::new(vector::ILLEGAL);
         // A[2] sets the length. Reserved majors are ILL whether or not the
         // unit is enabled; known ones trap as unavailable when it is off.
@@ -1512,8 +1539,11 @@ impl Cpu {
         if self.mode(mode::FE) != 1 {
             return Err(Fault::new(vector::FPU_UNAVAILABLE));
         }
-        let (imm, next) =
-            if two_words { (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6) } else { (0, pc + 3) };
+        let (imm, next) = match (two_words, imm2) {
+            (true, Some(v)) => (v, pc + 6),
+            (true, None) => (self.load_word_as(m, pc + 3, Access::Fetch)?.value(), pc + 6),
+            _ => (0, pc + 3),
+        };
         match a {
             op::FALU => {
                 let (fa, fb) = (self.freg(y), self.freg(z));
@@ -1541,7 +1571,7 @@ impl Cpu {
                                 self.set_c(1); // unordered
                             }
                         }
-                        self.pc = w(next as i128);
+                        self.pc = ww(next);
                         return Ok(());
                     }
                     _ => return Err(ill()),
@@ -1581,6 +1611,7 @@ impl Cpu {
                         f = f.with_field(k..=k, v.trit(k) as i64);
                     }
                     self.fsr = f;
+                    self.fsr_quiet = 0;
                 }
                 fcvt::FCLASS => self.set_reg(x, Word::new(self.freg(y).class()).unwrap()),
                 fcvt::FCONST => self.set_freg(x, Real::constant(y).ok_or_else(ill)?),
@@ -1594,12 +1625,12 @@ impl Cpu {
                 }
                 let size = if words == 1 { 3 } else { 9 };
                 let off = if a == op::FMEM { size * z as i128 } else { imm as i128 };
-                let va = w(self.reg(y).value() as i128 + off).value();
+                let va = ww(self.reg(y).value() + off as i64).value();
                 let n = if words == 1 { 1 } else { 3 };
                 if b > 0 {
                     let mut ws = [0i64; 3];
                     for (k, slot) in ws.iter_mut().enumerate().take(n) {
-                        *slot = self.load_word_as(m, va + 3 * k as i64, Access::Read)?.value();
+                        *slot = self.load_word_fast(m, ww(va + 3 * k as i64).value())?.value();
                     }
                     self.set_freg(x, Real::from_words(ws));
                 } else {
@@ -1610,8 +1641,11 @@ impl Cpu {
                     } else {
                         self.freg(x).to_words()
                     };
-                    // all or nothing: every word must be writable first
-                    for k in 0..n {
+                    // all or nothing: every word must be writable first (within
+                    // one page the first store would fault before any write)
+                    let page = |v: i64| (v + HALF_PAGE).div_euclid(PAGE);
+                    let one_page = page(va) == page(va + 3 * (n as i64 - 1));
+                    for k in 0..if one_page { 0 } else { n } {
                         let at = va + 3 * k as i64;
                         if at.rem_euclid(3) != 0 {
                             return Err(Fault::mem(vector::MISALIGNED, at, Access::Write));
@@ -1619,14 +1653,14 @@ impl Cpu {
                         self.xlate(m, at, Access::Write)?;
                     }
                     for (k, v) in ws.iter().enumerate().take(n) {
-                        self.store_word(m, va + 3 * k as i64, Word::new(*v).unwrap())?;
+                        self.store_word_fast(m, ww(va + 3 * k as i64).value(), Word::new(*v).unwrap())?;
                     }
                 }
             }
             op::FLI => self.set_freg(x, Real::from_word27(imm)),
             _ => return Err(ill()),
         }
-        self.pc = w(next as i128);
+        self.pc = ww(next);
         Ok(())
     }
 

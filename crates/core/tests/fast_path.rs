@@ -186,6 +186,12 @@ use setun_core::isa::{self, alu, cond, mem, sys};
 
 /// Load `prog` at 0 and run it both ways for `steps`; the states must match.
 fn both_ways(setup: impl Fn(&mut Machine), prog: &[Word], steps: u64) -> Vec<i64> {
+    both_ways_jit(1, setup, prog, steps).0
+}
+
+/// `both_ways` with this JIT threshold on the fast side (`u32::MAX`: the
+/// block interpreter only); also returns the fast machine.
+fn both_ways_jit(threshold: u32, setup: impl Fn(&mut Machine), prog: &[Word], steps: u64) -> (Vec<i64>, Machine) {
     let mut fast = Machine::new(FRAMES, 0);
     let mut slow = Machine::new(FRAMES, 0);
     for m in [&mut fast, &mut slow] {
@@ -197,14 +203,14 @@ fn both_ways(setup: impl Fn(&mut Machine), prog: &[Word], steps: u64) -> Vec<i64
         m.cpu.pc = Word::ZERO;
         setup(m);
     }
-    fast.cpu.set_jit_threshold(1);
+    fast.cpu.set_jit_threshold(threshold);
     fast.run(steps);
     for _ in 0..steps {
         slow.step();
     }
     let (a, b) = (digest(&mut fast), digest(&mut slow));
     assert_eq!(a, b, "fast and reference paths differ");
-    a
+    (a, fast)
 }
 
 /// Register `r` in a digest (five items per register: reg, cr, 3 FPU words).
@@ -442,3 +448,78 @@ fn an_address_that_wraps_round_is_wrapped_in_a_compiled_loop() {
     assert_eq!(reg_in(&st, 5), 43, "the third round's value, plus one");
     assert_eq!(st[5 * (cr::FADDR + 13) as usize + 1], target - 3 * 4500, "the fault address, wrapped");
 }
+
+#[test]
+fn an_fpu_store_over_the_rest_of_its_block_runs_the_new_code() {
+    // FLDD three instruction words, FSTD them over the next three: the
+    // block interpreter must run the new ones (and so must compiled code)
+    use setun_core::isa::fmem;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, 300)); // 0, 3
+    prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0)); // 6
+    prog.extend(isa::wide(op::FMEMD, fmem::FSTD, 1, 0, 15)); // 9, 12: over 15, 18, 21
+    prog.push(isa::s6(op::LIQ, 0, 5, 1)); // 15
+    prog.push(isa::s6(op::LIQ, 0, 6, 1)); // 18
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0)); // 21
+    let setup = |m: &mut Machine| {
+        m.mem.load_words(300, &[isa::s6(op::LIQ, 0, 5, 2), isa::s6(op::LIQ, 0, 6, 2), isa::rrr(op::SYS, sys::HLT, 0, 0, 0)]);
+    };
+    for threshold in [u32::MAX, 1] {
+        let (st, _) = both_ways_jit(threshold, setup, &prog, 10);
+        assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (2, 2), "the stored instructions ran (threshold {threshold})");
+    }
+}
+
+#[test]
+fn an_fpu_store_across_into_a_read_only_page_writes_nothing() {
+    // FSTD at the last two words of page 1 and the first of page 2, which
+    // is read-only: a protection fault, and page 1 keeps its words
+    use setun_core::isa::fmem;
+    let at = PAGE + 9837; // word centres 29520, 29523 | 29526
+    assert_eq!((at % 3, (at + 6 + 9841).div_euclid(PAGE), (at + 3 + 9841).div_euclid(PAGE)), (0, 2, 1));
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
+    prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0));
+    prog.extend(isa::wide(op::LI, 0, 3, 0, at));
+    prog.push(isa::rrr(op::FMEM, fmem::FSTD, 1, 3, 0));
+    prog.push(isa::s6(op::LIQ, 0, 5, 77)); // never reached
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(2, -1, 1, -1))).unwrap(); // page 2: read-only
+        m.mem.load_words(PAGE + 300, &[w(5), w(6), w(7)]);
+        m.mem.load_words(at, &[w(111), w(222)]);
+    };
+    for threshold in [u32::MAX, 1] {
+        let (st, fast) = both_ways_jit(threshold, setup, &prog, 12);
+        assert_ne!(reg_in(&st, 5), 77, "the store faulted");
+        assert_eq!((fast.mem.read_word(at).unwrap().value(), fast.mem.read_word(at + 3).unwrap().value()), (111, 222), "nothing written");
+    }
+}
+
+#[test]
+fn a_set_but_unmasked_fpu_flag_traps_every_time() {
+    // FSR: IX already flagged but unmasked, the rest masked. 1/0 raises
+    // only DZ (masked: no trap); then 1/2 is inexact (1/3 would be
+    // exact: 0.1 in ternary) and must trap
+    use setun_core::isa::{falu, fcvt};
+    let p3 = |k: u32| 3i64.pow(k);
+    let fsr = p3(13) + p3(12) + p3(11) + p3(10) + 1;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 1, 0, fsr)); // 0, 3
+    prog.push(isa::rrr(op::FCVT, fcvt::FMTS, 0, 1, 0)); // 6
+    prog.push(isa::s6(op::LIQ, 0, 3, 1)); // 9
+    prog.push(isa::rrr(op::FCVT, fcvt::FCVTIF, 1, 3, 0)); // 12
+    prog.push(isa::rrr(op::FALU, falu::FDIV, 3, 1, 0)); // 15: 1/0
+    prog.push(isa::s6(op::LIQ, 0, 3, 2)); // 18
+    prog.push(isa::rrr(op::FCVT, fcvt::FCVTIF, 2, 3, 0)); // 21
+    prog.push(isa::rrr(op::FALU, falu::FDIV, 4, 1, 2)); // 24: 1/2, traps
+    prog.push(isa::s6(op::LIQ, 0, 5, 77)); // 27: never reached
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    for threshold in [u32::MAX, 1] {
+        let (st, _) = both_ways_jit(threshold, |_| {}, &prog, 12);
+        assert_ne!(reg_in(&st, 5), 77, "the inexact division trapped");
+        assert_eq!(st[5 * (cr::EPC + 13) as usize + 1], 24, "at the second division, not the first");
+    }
+}
+

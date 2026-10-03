@@ -4,7 +4,7 @@
 //! the caller then takes the exact big-integer path. Where both apply they
 //! give identical results: each rounds the exact value once, correctly.
 
-use crate::{Real, E_MAX, E_MIN, IX, N81};
+use crate::{Real, E_MAX, E_MIN, IX, M_MAX, M_NORM, N81};
 use std::cmp::Ordering;
 use ethnum::{I256, U256};
 use std::sync::OnceLock;
@@ -146,8 +146,144 @@ fn scaled(m: i128, k: u32) -> Option<I256> {
     Some(if m < 0 { -v.as_i256() } else { v.as_i256() })
 }
 
+// ---- in i128 ----------------------------------------------------------------
+//
+// Rounding to nearest in balanced ternary is dropping trits (no ties for a
+// power of 3), and dropping k trits and then j more is dropping k + j: so
+// a sum or product can be rounded in steps, each in i128, and still be
+// rounded once, exactly. These return None where they would have to look
+// further (cancellation after an inexact step, subnormals, the exponent
+// ends); the 256-bit paths below then take over.
+
+/// (hi:lo) / d and the remainder, for hi < d: one hardware division.
+#[inline(always)]
+fn div_2by1(hi: u64, lo: u64, d: u64) -> (u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (q, r): (u64, u64);
+        // SAFETY: hi < d, so the quotient fits in 64 bits and DIV cannot fault
+        unsafe {
+            std::arch::asm!("div {d}", d = in(reg) d, inout("rax") lo => q, inout("rdx") hi => r, options(pure, nomem, nostack));
+        }
+        (q, r)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let n = (hi as u128) << 64 | lo as u128;
+        ((n / d as u128) as u64, (n % d as u128) as u64)
+    }
+}
+
+/// n / d and n % d for a 64-bit d: two hardware divisions at most, where
+/// i128 division is a library call.
+#[inline(always)]
+fn div_u64(n: u128, d: u64) -> (u128, u64) {
+    let (hi, lo) = ((n >> 64) as u64, n as u64);
+    if hi < d {
+        let (q, r) = div_2by1(hi, lo, d);
+        return (q as u128, r);
+    }
+    let (qh, rh) = (hi / d, hi % d);
+    let (ql, r) = div_2by1(rh, lo, d);
+    ((qh as u128) << 64 | ql as u128, r)
+}
+
+/// round(v / 3^k) for k ≤ 80, and whether that was inexact.
+#[inline(always)]
+fn drop_trits(v: i128, k: u32) -> (i128, bool) {
+    if k == 0 {
+        return (v, false);
+    }
+    let p = POW3_128[k as usize];
+    let (q, r) = if k <= 40 {
+        // 3^40 < 2^64
+        let (q, r) = div_u64(v.unsigned_abs(), p as u64);
+        if v < 0 { (-(q as i128), -(r as i128)) } else { (q as i128, r as i128) }
+    } else {
+        let q = v / p;
+        (q, v - q * p)
+    };
+    let half = p / 2; // (p − 1) / 2: p is odd
+    if r > half {
+        (q + 1, true)
+    } else if r < -half {
+        (q - 1, true)
+    } else {
+        (q, r != 0)
+    }
+}
+
+fn finish(m: i128, e: i64, inexact: bool) -> Option<(Real, u8)> {
+    if e <= E_MIN + 1 || e >= E_MAX - 1 {
+        return None;
+    }
+    Some((Real { e, m }, if inexact { IX } else { 0 }))
+}
+
+/// a + b: the smaller's trits below the larger's last one are dropped
+/// first, then the sum is renormalized.
+fn add_i128(a: Real, b: Real) -> Option<(Real, u8)> {
+    let (big, small) = if a.e >= b.e { (a, b) } else { (b, a) };
+    let d = (big.e - small.e) as u64;
+    if d > 80 {
+        return None;
+    }
+    let (s, mut inexact) = drop_trits(small.m, d as u32);
+    let (mut m, mut e) = (big.m + s, big.e);
+    if m.abs() > M_MAX {
+        let (q, ix) = drop_trits(m, 1);
+        (m, e) = (q, e + 1);
+        inexact |= ix;
+    } else if m.abs() <= M_NORM {
+        // leading trits cancelled: exact so far, shift up; else the trits
+        // dropped would be needed
+        if inexact || m == 0 {
+            return None;
+        }
+        while m.abs() <= M_NORM {
+            (m, e) = (m * 3, e - 1);
+        }
+    }
+    finish(m, e, inexact)
+}
+
+/// a · b: each significand as two balanced base-3^36 digits, the four
+/// partial products in i128, and the 143-odd-trit product dropped to 72
+/// trits in two steps of 36 (or 35, 34 when it is a trit or two shorter).
+fn mul_i128(a: Real, b: Real) -> Option<(Real, u8)> {
+    const B: i128 = POW3_128[36];
+    let split = |m: i128| {
+        let h = drop_trits(m, 36).0;
+        (h, m - h * B)
+    };
+    let ((ah, al), (bh, bl)) = (split(a.m), split(b.m));
+    let (p2, p1, p0) = (ah * bh, ah * bl + al * bh, al * bl);
+    let (q0, ix0) = drop_trits(p0, 36);
+    let p1 = p1 + q0;
+    // dropped 36 + k trits in all: e = a.e + b.e − 36 + k
+    let (q1, ix1) = drop_trits(p1, 36);
+    let m = p2 + q1;
+    if m.abs() > M_NORM {
+        return finish(m, a.e + b.e, ix0 || ix1);
+    }
+    let (q1, ix1) = drop_trits(p1, 35);
+    let m = p2 * 3 + q1;
+    if m.abs() > M_NORM {
+        return finish(m, a.e + b.e - 1, ix0 || ix1);
+    }
+    let (q1, ix1) = drop_trits(p1, 34);
+    let m = p2 * 9 + q1;
+    if m.abs() > M_NORM {
+        return finish(m, a.e + b.e - 2, ix0 || ix1);
+    }
+    None
+}
+
 /// Sum of two finite non-zero values whose exponents are not too far apart.
 pub(crate) fn add(a: Real, b: Real) -> Option<(Real, u8)> {
+    if let Some(r) = add_i128(a, b) {
+        return Some(r);
+    }
     let (pa, pb) = (a.e - N81 as i64, b.e - N81 as i64);
     if (pa - pb).abs() > 80 {
         return None;
@@ -159,6 +295,9 @@ pub(crate) fn add(a: Real, b: Real) -> Option<(Real, u8)> {
 
 /// Product of two finite non-zero values.
 pub(crate) fn mul(a: Real, b: Real) -> Option<(Real, u8)> {
+    if let Some(r) = mul_i128(a, b) {
+        return Some(r);
+    }
     let mag = mul128(a.m.unsigned_abs(), b.m.unsigned_abs()).as_i256();
     let num = if (a.m < 0) != (b.m < 0) { -mag } else { mag };
     round_int(num, a.e - N81 as i64 + b.e - N81 as i64, false, N81)
@@ -275,7 +414,13 @@ pub(crate) fn sqrt(a: Real) -> Option<(Real, u8)> {
 
 /// An integer as a real81 (always exact).
 pub(crate) fn from_i64(v: i64) -> Option<Real> {
-    round_int(I256::from(v as i128), 0, false, N81).map(|r| r.0)
+    if v == 0 {
+        return Some(Real::ZERO);
+    }
+    // t trits (|v| ≤ (3^t − 1)/2, t ≤ 40 < 72): exactly M = v · 3^(72 − t), E = t
+    let a = v.unsigned_abs() as i128;
+    let t = (1..=40).find(|&t| a <= (POW3_128[t] - 1) / 2)?;
+    Some(Real { e: t as i64, m: v as i128 * POW3_128[N81 as usize - t] })
 }
 
 /// v · 3^k for a finite non-zero value (also renormalizes, k = 0).
@@ -343,6 +488,13 @@ pub(crate) fn cmp(a: Real, b: Real) -> Option<Ordering> {
     let (sa, sb) = (a.m.signum(), b.m.signum());
     if sa != sb {
         return Some(sa.cmp(&sb));
+    }
+    // close exponents: scale the one with the larger up, in i128
+    // (|M| < 2^114, 3^8 < 2^13)
+    let d = a.e - b.e;
+    if d.abs() <= 8 {
+        let (x, y) = if d >= 0 { (a.m * POW3_128[d as usize], b.m) } else { (a.m, b.m * POW3_128[(-d) as usize]) };
+        return Some(x.cmp(&y));
     }
     let (pa, pb) = (a.e - N81 as i64, b.e - N81 as i64);
     if (pa - pb).abs() > 80 {
