@@ -8,6 +8,7 @@ fn main() {
         ("add", (|x: Real, y: Real| x.add(y)) as fn(Real, Real) -> (Real, u8)),
         ("mul", |x, y| x.mul(y)),
         ("div", |x, y| x.div(y)),
+        ("sqrt", |x, _| x.sqrt()),
     ] {
         let t = Instant::now();
         let mut acc = a;

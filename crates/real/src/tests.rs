@@ -432,3 +432,32 @@ fn fast_comparison_agrees_with_big_integers() {
         }
     }
 }
+
+#[test]
+fn division_and_roots_at_the_edges_agree_with_big_integers() {
+    // significands at the normalization bounds, around 3^72/4 (where the
+    // root's exponent changes) and divisions that land exactly halfway
+    // (y = 4 · 3^70: x · 3^K / y is often q + ½, which must go to even)
+    let p3 = |k: u32| (0..k).fold(1i128, |v, _| v * 3);
+    let quarter = p3(72) / 4;
+    let mut ms = Vec::new();
+    for k in 0..6 {
+        ms.extend([M_MAX - k, M_NORM + 1 + k, 2 * (M_NORM + 1 + k), quarter - k, quarter + 1 + k, 4 * p3(70) + k, 3 * p3(71) / 2 + k]);
+    }
+    let vals: Vec<Real> = ms
+        .iter()
+        .flat_map(|&m| [Real { e: 0, m }, Real { e: 1, m }, Real { e: -7, m: -m }])
+        .collect();
+    let mut ties = 0;
+    for &x in &vals {
+        assert_eq!(x.abs().sqrt_with(true), x.abs().sqrt_with(false), "sqrt {x:?}");
+        for &y in &vals {
+            let (r, f) = x.div_with(y, true);
+            assert_eq!((r, f), x.div_with(y, false), "div {x:?} {y:?}");
+            if y.m.abs() == 4 * p3(70) && f != 0 && r.m % 3 != 0 {
+                ties += 1;
+            }
+        }
+    }
+    assert!(ties > 0, "some divisions were inexact by the divisor 4 · 3^70");
+}

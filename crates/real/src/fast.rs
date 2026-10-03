@@ -279,6 +279,127 @@ fn mul_i128(a: Real, b: Real) -> Option<(Real, u8)> {
     None
 }
 
+/// (u2:u1:u0) / (d1:d0) for (u2:u1) < (d1:d0) and d1's top bit set: the
+/// 64-bit quotient digit (estimated from u2:u1 / d1, which is never too
+/// small and at most 2 too large) and the remainder.
+#[inline(always)]
+fn div_3by2(u2: u64, u1: u64, u0: u64, d1: u64, d0: u64) -> (u64, u128) {
+    let mut q = if u2 >= d1 { u64::MAX } else { div_2by1(u2, u1, d1).0 };
+    let d = (d1 as u128) << 64 | d0 as u128;
+    let n_lo = (u1 as u128) << 64 | u0 as u128;
+    // q · d as 192 bits (hi, lo)
+    let prod = |q: u64| {
+        let (lo, mid) = (q as u128 * d0 as u128, q as u128 * d1 as u128);
+        let (l, carry) = lo.overflowing_add(mid << 64);
+        ((mid >> 64) as u64 + carry as u64, l)
+    };
+    let (mut ph, mut pl) = prod(q);
+    while (ph, pl) > (u2, n_lo) {
+        q -= 1;
+        let (l, borrow) = pl.overflowing_sub(d);
+        (ph, pl) = (ph - borrow as u64, l);
+    }
+    (q, n_lo.wrapping_sub(pl))
+}
+
+/// (hi:lo) / d for hi < d and d ≥ 2^64: the 128-bit quotient and the
+/// remainder, by long division in 64-bit digits (Knuth's algorithm D).
+fn div_256_by_128(hi: u128, lo: u128, d: u128) -> (u128, u128) {
+    let s = d.leading_zeros(); // < 64
+    let d = d << s;
+    let (nh, nl) = if s == 0 { (hi, lo) } else { (hi << s | lo >> (128 - s), lo << s) };
+    let (d1, d0) = ((d >> 64) as u64, d as u64);
+    let (q1, r) = div_3by2((nh >> 64) as u64, nh as u64, (nl >> 64) as u64, d1, d0);
+    let (q0, r) = div_3by2((r >> 64) as u64, r as u64, nl as u64, d1, d0);
+    ((q1 as u128) << 64 | q0 as u128, r >> s)
+}
+
+/// a / b for normalized significands (|M| > M_NORM): M = round(x · 3^K / y),
+/// ties to even, with K = 72 + j for the j that puts x/y · 3^j in (1/6, 1/2]
+/// (the exponent rule of the 256-bit path below).
+fn div_i128(a: Real, b: Real) -> Option<(Real, u8)> {
+    let (x, y) = (a.m.unsigned_abs(), b.m.unsigned_abs());
+    if x <= M_NORM as u128 || y <= M_NORM as u128 {
+        return None;
+    }
+    // x/y is in (1/3, 3): j is 0, −1 or −2 (2x · 3^j ≤ y < 6x · 3^j)
+    let j: i64 = if 2 * x <= y {
+        0
+    } else if 2 * x <= 3 * y {
+        -1
+    } else {
+        -2
+    };
+    let k = (N81 as i64 + j) as usize;
+    let n = mul128(x, POW3_128[k] as u128);
+    let (nh, nl) = n.into_words();
+    let (q, r) = div_256_by_128(nh, nl, y);
+    let up = match (2 * r).cmp(&y) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => q & 1 == 1,
+    };
+    let m = (if up { q + 1 } else { q }).min(M_MAX as u128) as i128;
+    let neg = (a.m < 0) != (b.m < 0);
+    finish(if neg { -m } else { m }, a.e - b.e - j, r != 0)
+}
+
+/// floor(√x) for 2^128 ≤ x < 2^254: an f64 estimate, two Newton steps
+/// (the division in 128-bit digits), then exact correction.
+fn isqrt_256(x: U256) -> u128 {
+    let (h, l) = x.into_words();
+    let mut r = ((h as f64 * 2f64.powi(128) + l as f64).sqrt() as u128).max(1 << 64);
+    for _ in 0..2 {
+        // x / r < 2^128 while r is near the root (r ≥ 2^64)
+        if h >= r {
+            break;
+        }
+        r = (r + div_256_by_128(h, l, r).0) >> 1;
+    }
+    while mul128(r, r) > x {
+        r -= 1;
+    }
+    while mul128(r + 1, r + 1) <= x {
+        r += 1;
+    }
+    r
+}
+
+/// √a for a normalized positive value: M = round(√(m · 3^D)), D of the
+/// parity of the exponent, moved by 2 until M has 72 trits. (Rounding
+/// to nearest needs no tie rule: √X = r + ½ would make 4X odd.)
+fn sqrt_i128(a: Real) -> Option<(Real, u8)> {
+    let m = a.m as u128;
+    if a.m <= M_NORM {
+        return None;
+    }
+    let pe = a.e - N81 as i64;
+    // the D that gives 72 trits, from m in (3^71/2, 3^72/2): odd, √(m·3^73)
+    // ≥ 3^72/2 always rounds past M_MAX, so 71; even, 72 while
+    // √(m·3^72) < 3^72/2, i.e. 4m < 3^72, else 70
+    let mut d: i64 = if pe.rem_euclid(2) != 0 {
+        71
+    } else if 4 * m < POW3_128[72] as u128 {
+        72
+    } else {
+        70
+    };
+    for _ in 0..3 {
+        let x = mul128(m, POW3_128[d as usize] as u128);
+        let r = isqrt_256(x);
+        let rem = x - mul128(r, r); // < 2r + 1
+        let q = if rem > U256::from(r) { r + 1 } else { r };
+        if q > M_MAX as u128 {
+            d -= 2;
+        } else if q <= M_NORM as u128 {
+            d += 2;
+        } else {
+            return finish(q as i128, N81 as i64 + (pe - d) / 2, rem != U256::ZERO);
+        }
+    }
+    None
+}
+
 /// Sum of two finite non-zero values whose exponents are not too far apart.
 pub(crate) fn add(a: Real, b: Real) -> Option<(Real, u8)> {
     if let Some(r) = add_i128(a, b) {
@@ -305,6 +426,9 @@ pub(crate) fn mul(a: Real, b: Real) -> Option<(Real, u8)> {
 
 /// Quotient of two finite non-zero values.
 pub(crate) fn div(a: Real, b: Real) -> Option<(Real, u8)> {
+    if let Some(r) = div_i128(a, b) {
+        return Some(r);
+    }
     let (x, y) = (U256::from(a.m.unsigned_abs()), U256::from(b.m.unsigned_abs()));
     let p = (a.e - N81 as i64) - (b.e - N81 as i64);
     // the smallest e with 2x · 3^(p−e) ≤ y (no ties: x/y·3^k is never ½)
@@ -375,6 +499,9 @@ fn isqrt(x: U256) -> U256 {
 /// settles it. There are no ties: that would need 4x = ((2q ± 1)·3^s)², an
 /// odd number equal to a multiple of 4.
 pub(crate) fn sqrt(a: Real) -> Option<(Real, u8)> {
+    if let Some(r) = sqrt_i128(a) {
+        return Some(r);
+    }
     let m = a.m.unsigned_abs();
     let p = a.e - N81 as i64;
     // X = M · 3^d with p − d even and the root at least N81 + 2 trits long
