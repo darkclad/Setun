@@ -1855,6 +1855,16 @@ impl Compiler {
     /// of a global or local struct, with a constant or simple index. Only
     /// `tmp` is written. None otherwise (and nothing is emitted).
     fn simple_addr(&mut self, e: &Expr, tmp: &str) -> R<Option<(String, Ty)>> {
+        self.simple_addr_ex(e, tmp, false)
+    }
+
+    /// `simple_addr` for a load into r1: the index may then be any integer
+    /// expression (evaluated into r1, which holds nothing yet).
+    fn load_addr(&mut self, e: &Expr) -> R<Option<(String, Ty)>> {
+        self.simple_addr_ex(e, "r2", true)
+    }
+
+    fn simple_addr_ex(&mut self, e: &Expr, tmp: &str, any_index: bool) -> R<Option<(String, Ty)>> {
         if !self.optimize {
             return Ok(None);
         }
@@ -1899,10 +1909,14 @@ impl Compiler {
                 }
                 // a[i ± k]: the constant goes into the displacement
                 let (i, k) = self.index_parts(i);
-                if !self.is_simple_operand(i) {
+                let (ir, ti) = if self.is_simple_operand(i) {
+                    self.simple_operand_into(i, tmp).expect("checked simple")
+                } else if any_index && self.peek_type(i)?.is_integer() {
+                    let t = self.expr(i)?;
+                    ("r1", t)
+                } else {
                     return Ok(None);
-                }
-                let (ir, ti) = self.simple_operand_into(i, tmp).expect("checked simple");
+                };
                 if !ti.is_integer() {
                     return Ok(None);
                 }
@@ -2117,7 +2131,7 @@ impl Compiler {
                     Ok(Ty::Int)
                 }
                 UnOp::Deref => {
-                    if let Some((op, t)) = self.simple_addr(e, "r2")? {
+                    if let Some((op, t)) = self.load_addr(e)? {
                         self.load_operand(&t, &op);
                         return Ok(t);
                     }
@@ -2142,7 +2156,7 @@ impl Compiler {
             ExprKind::Assign(op, lhs, rhs) => self.assign(*op, lhs, rhs),
             ExprKind::Call(f, args) => self.call(f, args, e.pos),
             ExprKind::Index(..) | ExprKind::Field(..) => {
-                if let Some((op, t)) = self.simple_addr(e, "r2")? {
+                if let Some((op, t)) = self.load_addr(e)? {
                     self.load_operand(&t, &op);
                     return Ok(t);
                 }

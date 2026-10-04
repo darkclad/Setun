@@ -489,3 +489,46 @@ fn temporaries_in_registers_the_same_way() {
     }
     same_both_ways_src("temps.tri", &src.replace("DEEP", &deep), 50_000_000);
 }
+
+#[test]
+fn loads_with_any_index_the_same_way() {
+    // a load's index may be any integer expression (evaluated into r1):
+    // products, nested indexing, calls that change the array or the
+    // index's variables, every element type and base, inside expressions
+    // whose temporaries sit in registers
+    let src = r#"
+        import "console.tri";
+        var ga: [60]int;
+        var gc: [60]char;
+        var gr: [20]real;
+        var gi: int = 2;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn bump(k: int) -> int { gi += 1; ga[k] = ga[k] * 3 + 1; return k + 1; }
+        fn main() -> int {
+            var la: [30]int;
+            var i: int = 0;
+            while (i < 60) { ga[i] = i * i - 17 * i; gc[i] = (i * 7 % 26 + 'a') as char; i += 1; }
+            i = 0;
+            while (i < 30) { la[i] = 1000 - i * 31; i += 1; }
+            i = 0;
+            while (i < 20) { gr[i] = i as real * 0.75 - 3.0; i += 1; }
+            var p: *int = &ga[10];
+            var s: int = 0;
+            var j: int = 1;
+            while (j < 6) {
+                s = s * 3 + ga[4 * j + 1] - ga[j * j] + la[2 * j - 1] + gc[j * 5 + 2] + p[j * 3 - 2];
+                s = s % 1000003 + ga[la[j] % 50 + 1] + ga[ga[j + 2] % 7 + 20];   // nested
+                s += ga[bump(j * 2) + gi];                                      // a call in the index
+                s = (s + (ga[j * 2] + la[j + 3]) * (gc[j * 3] - ga[j * 4 + 1])) % 999983;
+                j += 1;
+            }
+            put(s);
+            var r: real = 0.0;
+            j = 0;
+            while (j < 6) { r = r * 0.5 + gr[j * 3 + 1] * gr[(j * 2) % 7] - gr[j + 2 * 1]; j += 1; }
+            put((r * 1000.0) as int);
+            return s % 9841;
+        }
+    "#;
+    same_both_ways_src("anyindex.tri", src, 50_000_000);
+}
