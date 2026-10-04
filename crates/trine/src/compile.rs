@@ -1726,6 +1726,8 @@ impl Compiler {
                 if let Some(k) = self.const_eval(i) {
                     return Ok(Some((operand(&base, k * size), elem)));
                 }
+                // a[i ± k]: the constant goes into the displacement
+                let (i, k) = self.index_parts(i);
                 if !self.is_simple_operand(i) {
                     return Ok(None);
                 }
@@ -1741,9 +1743,9 @@ impl Compiler {
                 Ok(Some(match base {
                     Base::Reg(r, off) => {
                         self.emit(format!("add {tmp}, {tmp}, {r}"));
-                        (mem(tmp, off), elem)
+                        (mem(tmp, off + k * size), elem)
                     }
-                    Base::Abs(addr) => (mem(tmp, addr), elem),
+                    Base::Abs(addr) => (mem(tmp, addr + k * size), elem),
                 }))
             }
             ExprKind::Unary(UnOp::Deref, p) => match base_of(self, p) {
@@ -1769,6 +1771,34 @@ impl Compiler {
                 Ok(Some((operand(&base, off), ft)))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// An index as (the rest, the constant added to it): `i + 2`, `2 + i`
+    /// and `i - 2` give (i, ±2), nested ones add up; anything else (e, 0).
+    /// (Addresses wrap like the arithmetic, so a[i + k] may use the address
+    /// of a[i] plus k elements.)
+    fn index_parts<'e>(&self, e: &'e Expr) -> (&'e Expr, i64) {
+        match &e.kind {
+            ExprKind::Binary(BinOp::Add, a, b) => {
+                if let Some(k) = self.const_eval(b) {
+                    let (r, j) = self.index_parts(a);
+                    return (r, j + k);
+                }
+                if let Some(k) = self.const_eval(a) {
+                    let (r, j) = self.index_parts(b);
+                    return (r, j + k);
+                }
+                (e, 0)
+            }
+            ExprKind::Binary(BinOp::Sub, a, b) => match self.const_eval(b) {
+                Some(k) => {
+                    let (r, j) = self.index_parts(a);
+                    (r, j - k)
+                }
+                None => (e, 0),
+            },
+            _ => (e, 0),
         }
     }
 

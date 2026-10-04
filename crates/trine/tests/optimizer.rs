@@ -264,3 +264,55 @@ fn builds_are_reproducible() {
         }
     }
 }
+
+#[test]
+fn indexes_with_constant_offsets_the_same_way() {
+    // a[i + k], a[k + i], a[i - k] and nested ones fold k into the
+    // displacement: loads and stores, word, tryte and real elements,
+    // global, local and pointer bases; the values all differ, and the sums
+    // weigh by position, so any element off by one shows
+    let src = r#"
+        import "console.tri";
+        var gw: [40]int;
+        var gc: [40]char;
+        var gr: [12]real;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn main() -> int {
+            var lw: [40]int;
+            var lc: [40]char;
+            var i: int = 0;
+            while (i < 40) { gw[i] = i * i - 37 * i; lw[i] = 3 * i + 1000; gc[i] = (i * 7 % 26 + 'a') as char; lc[i] = (i % 5 + 'A') as char; i += 1; }
+            var s: int = 0;
+            i = 5;
+            while (i < 30) {
+                s = s * 3 + gw[i + 1] - gw[i - 1] + gw[2 + i] + gw[i + 1 + 2] - gw[i - 3 + 1];
+                s = s % 1000003 + lw[i + 4] - lw[i - 5] + gc[i + 3] - gc[i - 2] + lc[i + 1];
+                lw[i + 1] = gw[i - 1] + i;                  // stores with offsets
+                gw[i - 2] = lw[i + 1] * 2;
+                lc[i + 2] = gc[i - 1];
+                gc[i + 1] = (gc[i + 1] + 1) as char;
+                i += 1;
+            }
+            put(s);
+            // a pointer in a register, with offsets either way
+            var p: *int = &gw[20];
+            var j: int = 0;
+            var t: int = 0;
+            while (j < 8) { t = t * 3 + p[j + 1] - p[j - 4] + p[3 - j]; p[j - 2] = t % 977; j += 1; }
+            put(t % 1000003);
+            // reals
+            var k: int = 0;
+            while (k < 12) { gr[k] = k as real * 1.5; k += 1; }
+            k = 1;
+            var r: real = 0.0;
+            while (k < 10) { r = r * 2.0 + gr[k + 1] - gr[k - 1]; gr[k + 2] = r; k += 1; }
+            put(r as int);
+            var w: int = 0;
+            i = 0;
+            while (i < 40) { w = (w * 3 + gw[i] + lw[i] + gc[i] + lc[i]) % 1000003; i += 1; }
+            put(w);
+            return w % 9841;
+        }
+    "#;
+    same_both_ways_src("offsets.tri", src, 80_000_000);
+}

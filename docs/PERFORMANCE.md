@@ -126,13 +126,12 @@ checked equal; best of several runs, Ryzen 9 5950X):
 | Program | Native | Setun | Setun instructions | Overhead |
 |---|---:|---:|---:|---:|
 | mandel (fixed-point arithmetic, framebuffer) | 9.5 ms | 99 ms | 70.9M | 10× |
-| sieve + insertion sort (tryte array, word array) | 0.15–0.2 ms | 36 ms | 13.3M | 180–240× |
+| sieve + insertion sort (tryte array, word array) | 0.2 ms | 12.5 ms | 7.2M | 60× (180–240× before indexes like `j + 1` were folded) |
 
 Mandelbrot is arithmetic in registers, where compiled Setun code runs at
 about 700 MIPS. The sieve and sort are memory loops, where the host compiler
-does far better than Trine: the sort's inner loop is about 22 Setun
-instructions per element (an index like `j + 1` still goes through the
-stack) against a handful natively. Both run 95% compiled.
+still does better than Trine (it keeps `j * 3` from the loop test, for one).
+Both run 95% compiled.
 
 ## Next
 
