@@ -1,0 +1,130 @@
+// netstat [-t] [-u] [-a] [-l]: the sockets, from /proc/net/tcp and
+// /proc/net/udp. Without -a only connections are shown, with -l only
+// listening sockets; addresses are always numeric.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+var buf: [6561]char;
+var all: int;
+var listening: int;
+
+fn hexval(s: *char, n: int) -> int {
+    var v: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var c: int = s[k];
+        var d: int = c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 0;
+        v = v * 16 + d;
+        k += 1;
+    }
+    return v;
+}
+
+// "0F02000A:0017" (Linux's little-endian address) into "10.0.2.15:23", padded.
+fn put_addr(s: *char, width: int) {
+    var a: int = hexval(s + 6, 2) * 16777216 + hexval(s + 4, 2) * 65536 + hexval(s + 2, 2) * 256 + hexval(s, 2);
+    var port: int = hexval(s + 9, 4);
+    var out: [32]char;
+    var n: int = 0;
+    var t: *char = inet_ntoa(a);
+    while (t[n] != 0) { out[n] = t[n]; n += 1; }
+    out[n] = ':';
+    n += 1;
+    if (port == 0) { out[n] = '*'; n += 1; out[n] = 0; }
+    else { itoa(port, &out[n]); }
+    puts(&out[0]);
+    var len: int = strlen(&out[0]);
+    while (len < width) { puts(" "); len += 1; }
+}
+
+fn state_name(st: int) -> *char {
+    switch (st) {
+        case 1: return "ESTABLISHED";
+        case 2: return "SYN_SENT";
+        case 3: return "SYN_RECV";
+        case 4: return "FIN_WAIT1";
+        case 5: return "FIN_WAIT2";
+        case 6: return "TIME_WAIT";
+        case 7: return "CLOSE";
+        case 8: return "CLOSE_WAIT";
+        case 9: return "LAST_ACK";
+        case 10: return "LISTEN";
+        case 11: return "CLOSING";
+    }
+    return "UNKNOWN";
+}
+
+fn pad_int(v: int, width: int) {
+    var tmp: [15]char;
+    var s: *char = itoa(v, &tmp[0]);
+    var len: int = strlen(s);
+    while (len < width) { puts(" "); len += 1; }
+    puts(s);
+}
+
+fn show(path: *char, proto: *char, tcp: int) {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { perror2("netstat", path); return; }
+    var n: int = read(fd, &buf[0], 6560);
+    close(fd);
+    if (n < 0) { return; }
+    buf[n] = 0;
+    var i: int = 0;
+    while (i < n && buf[i] != '\n') { i += 1; }        // the header
+    i += 1;
+    while (i < n) {
+        var line: int = i;
+        while (i < n && buf[i] != '\n') { i += 1; }
+        // "   0: LLLLLLLL:PPPP RRRRRRRR:PPPP ST TTTTTTTT:RRRRRRRR uid"
+        var k: int = line;
+        while (buf[k] != ':') { k += 1; }
+        k += 2;
+        var local: *char = &buf[k];
+        var remote: *char = &buf[k + 14];
+        var st: int = hexval(&buf[k + 28], 2);
+        var txq: int = hexval(&buf[k + 31], 8);
+        var rxq: int = hexval(&buf[k + 40], 8);
+        var is_listen: int = tcp ? st == 10 : st == 7;
+        if (all || (listening && is_listen) || (!listening && !is_listen)) {
+            puts(proto);
+            pad_int(rxq, 9);
+            pad_int(txq, 7);
+            puts(" ");
+            put_addr(local, 24);
+            put_addr(remote, 24);
+            if (tcp) { puts(state_name(st)); }
+            puts("\n");
+        }
+        i += 1;
+    }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var t: int = 0;
+    var u: int = 0;
+    var c: int = getopt(argc, argv, "tualn");
+    while (c != -1) {
+        switch (c) {
+            case 't': t = 1;
+            case 'u': u = 1;
+            case 'a': all = 1;
+            case 'l': listening = 1;
+            case 'n': {}
+            default: {
+                fputs(STDERR_FILENO, "usage: netstat [-tualn]\n");
+                return 2;
+            }
+        }
+        c = getopt(argc, argv, "tualn");
+    }
+    if (!t && !u) { t = 1; u = 1; }
+    puts(all ? "Active Internet connections (servers and established)\n"
+             : listening ? "Active Internet connections (only servers)\n" : "Active Internet connections (w/o servers)\n");
+    puts("Proto Recv-Q Send-Q Local Address           Foreign Address         State\n");
+    if (t) { show("/proc/net/tcp", "tcp", 1); }
+    if (u) { show("/proc/net/udp", "udp", 0); }
+    return 0;
+}

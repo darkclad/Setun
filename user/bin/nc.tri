@@ -1,0 +1,218 @@
+// nc [-l] [-u] [-b] [-z] [-v] [-p PORT] [-w SECONDS] [HOST] PORT: netcat.
+//
+//   nc HOST PORT        connect, then copy stdin to the socket and the socket to stdout
+//   nc -l [-p] PORT     listen for one connection (or, with -u, one sender) and do the same
+//   -u                  UDP instead of TCP
+//   -b                  binary: octets as they are; without it, text is sent as UTF-8
+//                       and received UTF-8 is decoded
+//   -z                  only see whether HOST PORT accepts a connection
+//   -v                  say what happens on stderr
+//   -w SECONDS          give up connecting after this long
+//
+// When stdin ends, a TCP connection is half-closed (shutdown SHUT_WR) and
+// nc keeps printing until the other side closes too.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+var udp: int;
+var binary: int;
+var verbose: int;
+var inbuf: [729]char;
+var wire: [5832]tryte;                        // 729 characters as UTF-8, 8 octets each at most
+var text: [2187]char;
+var dec: utf8_state;
+
+fn say(a: *char, b: *char, c: *char) {
+    if (!verbose) { return; }
+    fputs(STDERR_FILENO, a);
+    fputs(STDERR_FILENO, b);
+    fputs(STDERR_FILENO, c);
+}
+
+fn fail(what: *char) -> int {
+    perror2("nc", what);
+    return 1;
+}
+
+fn write_all(fd: int, p: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        var w: int = write(fd, (p + k) as *char, n - k);
+        if (w < 0) { return -1; }
+        k += w;
+    }
+    return 0;
+}
+
+// Copy between stdin/stdout and the socket until the socket closes.
+fn pump(s: int) -> int {
+    var stdin_open: int = 1;
+    loop {
+        var p: [2]pollfd;
+        p[0].fd = s;
+        p[0].events = POLLIN;
+        p[1].fd = stdin_open ? STDIN_FILENO : -1;
+        p[1].events = POLLIN;
+        // a UDP peer may never answer: once stdin is done, wait a second for replies
+        var r: int = poll(&p[0], 2, udp && !stdin_open ? 1000 : -1);
+        if (r < 0) {
+            if (errno == EINTR) { continue; }
+            return fail("poll");
+        }
+        if (r == 0) { return 0; }
+        if (p[0].revents != 0) {
+            var n: int = read(s, &wire[0] as *char, 2187);
+            if (n < 0) {
+                if (errno == EAGAIN) { continue; }
+                return fail("read");
+            }
+            if (n == 0) { return 0; }
+            if (binary) {
+                write_all(STDOUT_FILENO, &wire[0], n);
+            } else {
+                var m: int = utf8_to_text(&dec, &wire[0], n, &text[0]);
+                write_all(STDOUT_FILENO, &text[0] as *tryte, m);
+            }
+        }
+        if (stdin_open && p[1].revents != 0) {
+            var n: int = read(STDIN_FILENO, &inbuf[0], 729);
+            if (n <= 0) {
+                stdin_open = 0;
+                if (!udp) { shutdown(s, SHUT_WR); }
+                continue;
+            }
+            var m: int = n;
+            var out: *tryte = &inbuf[0] as *tryte;
+            if (!binary) {
+                m = text_to_utf8(&inbuf[0], n, &wire[0]);
+                out = &wire[0];
+            } else {
+                var k: int = 0;
+                while (k < n) {
+                    if (inbuf[k] < 0 || inbuf[k] > 255) {
+                        fputs(STDERR_FILENO, "nc: -b: input is not octets\n");
+                        return 1;
+                    }
+                    k += 1;
+                }
+            }
+            var k: int = 0;
+            while (k < m) {
+                var w: int = write(s, (out + k) as *char, m - k);
+                if (w < 0) { return fail("write"); }
+                k += w;
+            }
+        }
+    }
+}
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: nc [-lubzv] [-p port] [-w secs] [host] port\n");
+    return 2;
+}
+
+fn parse_port(s: *char) -> int {
+    var end: *char;
+    var p: int = strtol(s, &end, 10);
+    if (end == s || end[0] != 0 || p < 0 || p > 65535) { return -1; }
+    return p;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var listen_mode: int = 0;
+    var scan: int = 0;
+    var port: int = -1;
+    var wait_s: int = 0;
+    var c: int = getopt(argc, argv, "lubzvp:w:");
+    while (c != -1) {
+        switch (c) {
+            case 'l': listen_mode = 1;
+            case 'u': udp = 1;
+            case 'b': binary = 1;
+            case 'z': scan = 1;
+            case 'v': verbose = 1;
+            case 'p': { port = parse_port(optarg); if (port < 0) { return usage(); } }
+            case 'w': { wait_s = atoi(optarg); if (wait_s <= 0) { return usage(); } }
+            default: return usage();
+        }
+        c = getopt(argc, argv, "lubzvp:w:");
+    }
+    var rest: int = argc - optind;
+    var s: int = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (s < 0) { return fail("socket"); }
+    var a: sockaddr_in;
+    if (listen_mode) {
+        if (rest == 1 && port < 0) { port = parse_port(argv[optind]); }
+        else if (rest != 0) { return usage(); }
+        if (port < 0) { return usage(); }
+        var one: int = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+        sockaddr_set(&a, INADDR_ANY, port);
+        if (bind(s, &a, sizeof(sockaddr_in)) < 0) { return fail("bind"); }
+        if (udp) {
+            // the first datagram's sender becomes the peer
+            var n: int = 0;
+            var from: sockaddr_in;
+            var flen: int = sizeof(sockaddr_in);
+            n = recvfrom(s, &wire[0], 2187, MSG_PEEK, &from, &flen);
+            if (n < 0) { return fail("recvfrom"); }
+            if (connect(s, &from, sizeof(sockaddr_in)) < 0) { return fail("connect"); }
+            say("nc: datagram from ", inet_ntoa(from.sin_addr), "\n");
+            return pump(s);
+        }
+        if (listen(s, 1) < 0) { return fail("listen"); }
+        say("nc: listening on port ", argv[argc - 1], "\n");
+        var from: sockaddr_in;
+        var flen: int = sizeof(sockaddr_in);
+        var conn: int = accept(s, &from, &flen);
+        if (conn < 0) { return fail("accept"); }
+        close(s);
+        say("nc: connection from ", inet_ntoa(from.sin_addr), "\n");
+        return pump(conn);
+    }
+    if (rest != 2) { return usage(); }
+    var dst: int = 0;
+    if (!resolve_host(argv[optind], &dst)) {
+        fputs(STDERR_FILENO, "nc: ");
+        fputs(STDERR_FILENO, argv[optind]);
+        fputs(STDERR_FILENO, ": Name or service not known\n");
+        return 1;
+    }
+    var dport: int = parse_port(argv[optind + 1]);
+    if (dport < 0) { return usage(); }
+    if (port >= 0) {
+        sockaddr_set(&a, INADDR_ANY, port);
+        if (bind(s, &a, sizeof(sockaddr_in)) < 0) { return fail("bind"); }
+    }
+    sockaddr_set(&a, dst, dport);
+    if (wait_s > 0 && !udp) {
+        fcntl(s, 4, O_NONBLOCK);                         // F_SETFL
+        if (connect(s, &a, sizeof(sockaddr_in)) < 0 && errno != EINPROGRESS) { return fail("connect"); }
+        var p: pollfd;
+        p.fd = s;
+        p.events = POLLOUT;
+        if (poll(&p, 1, wait_s * 1000) == 0) {
+            errno = ETIMEDOUT;
+            return fail("connect");
+        }
+        var err: int = 0;
+        var elen: int = 3;
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen);
+        if (err != 0) { errno = err; return fail("connect"); }
+        fcntl(s, 4, 0);
+    } else if (connect(s, &a, sizeof(sockaddr_in)) < 0) {
+        return fail("connect");
+    }
+    if (scan || verbose) {
+        fputs(STDERR_FILENO, "Connection to ");
+        fputs(STDERR_FILENO, argv[optind]);
+        fputs(STDERR_FILENO, " port ");
+        fputs(STDERR_FILENO, argv[optind + 1]);
+        fputs(STDERR_FILENO, udp ? " [udp] succeeded!\n" : " [tcp] succeeded!\n");
+    }
+    if (scan) { return 0; }
+    return pump(s);
+}

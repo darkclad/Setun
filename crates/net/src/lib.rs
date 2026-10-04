@@ -288,11 +288,13 @@ impl Network {
         &self.conns[c.0].received
     }
 
-    /// True once the guest has closed its side and every byte has been read.
+    /// True once the guest has closed its side (or the connection is gone)
+    /// and every byte has been read.
     pub fn guest_closed(&mut self, c: ConnId) -> bool {
         self.drain(c);
         let s = self.tcp(c);
-        !s.may_recv() && s.recv_queue() == 0
+        let after_fin = matches!(s.state(), State::CloseWait | State::LastAck | State::Closing | State::TimeWait | State::Closed);
+        after_fin && s.recv_queue() == 0
     }
 
     /// Bytes queued for the guest that it has not acknowledged yet.
@@ -339,9 +341,14 @@ impl Network {
         self.sockets.add(s)
     }
 
-    /// The next connection the guest made to this listener, if any.
+    /// The next connection the guest made to this listener that has finished
+    /// its handshake, if any.
     pub fn accept(&mut self, l: ListenerId) -> Option<ConnId> {
-        self.listeners[l.0].accepted.pop_front()
+        let ready = self.listeners[l.0].accepted.iter().position(|&c| {
+            let h = self.conns[c.0].handle;
+            !matches!(self.sockets.get::<tcp::Socket>(h).state(), State::SynReceived)
+        })?;
+        self.listeners[l.0].accepted.remove(ready)
     }
 
     // ---- UDP ---------------------------------------------------------------------
@@ -491,7 +498,8 @@ impl Network {
                     }
                 }
             }
-            let guest_done = !s.may_recv() && s.recv_queue() == 0 && conn.to_host.is_empty();
+            let after_fin = matches!(s.state(), State::CloseWait | State::LastAck | State::Closing | State::TimeWait | State::Closed);
+            let guest_done = after_fin && s.recv_queue() == 0 && conn.to_host.is_empty();
             if guest_done || s.state() == State::Closed {
                 let _ = host.shutdown(std::net::Shutdown::Both);
                 if s.state() != State::Closed && s.state() != State::TimeWait {

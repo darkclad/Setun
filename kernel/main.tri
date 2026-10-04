@@ -12,6 +12,7 @@ import "fs/bcache.tri";
 import "fs/tfs.tri";
 import "fs/procfs.tri";
 import "drivers/tty.tri";
+import "drivers/tnic.tri";
 
 var boot_disk: int;
 
@@ -105,6 +106,7 @@ fn start_kernel(disk: int, frames: int) {
     else { inodes[mounts[tm].root].mode = 1023; }    // 01777: all may write; the sticky bit protects
     tty_init();
     input_init();
+    net_init();
     printk("VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty\n");
     {
         var pid: int = spawn_init("/sbin/init");

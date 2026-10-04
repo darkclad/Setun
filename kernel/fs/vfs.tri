@@ -28,6 +28,7 @@ const I_REG: int = 1;
 const I_DIR: int = 2;
 const I_CHR: int = 3;
 const I_FIFO: int = 4;
+const I_SOCK: int = 5;                // a socket (anonymous, kernel/net/socket.tri)
 
 const FS_RAM: int = 0;
 const FS_TFS: int = 1;
@@ -38,6 +39,7 @@ const S_IFIFO: int = 4096;
 const S_IFCHR: int = 8192;
 const S_IFDIR: int = 16384;
 const S_IFREG: int = 32768;
+const S_IFSOCK: int = 49152;
 
 // errno (Linux)
 const EPERM: int = 1;
@@ -606,6 +608,7 @@ fn st_mode(i: int) -> int {
     if (t == I_DIR) { return S_IFDIR + m; }
     if (t == I_CHR) { return S_IFCHR + m; }
     if (t == I_FIFO) { return S_IFIFO + m; }
+    if (t == I_SOCK) { return S_IFSOCK + m; }
     return S_IFREG + m;
 }
 

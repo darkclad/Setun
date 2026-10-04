@@ -3,6 +3,7 @@
 // to a root shell, so a broken disk can still be repaired.
 
 import "lib/tlibc.tri";
+import "lib/socket.tri";
 
 fn spawn(path: *char, name: *char) -> int {
     var pid: int = fork();
@@ -15,11 +16,26 @@ fn spawn(path: *char, name: *char) -> int {
     return pid;
 }
 
+// With a network attached, logins over telnet are served too.
+fn eth0_up() -> int {
+    var s: int = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { return 0; }
+    var r: ifreq;
+    r.ifr_name[0] = 'e'; r.ifr_name[1] = 't'; r.ifr_name[2] = 'h'; r.ifr_name[3] = '0'; r.ifr_name[4] = 0;
+    var up: int = ioctl(s, SIOCGIFFLAGS, &r as int) == 0 && r.ifr_value % 2 == 1;
+    close(s);
+    return up;
+}
+
 fn main(argc: int, argv: **char) -> int {
     puts("init: pid ");
     put_int(getpid());
     puts(", starting /bin/login\n");
     var pid: int = spawn("/bin/login", "login");
+    if (eth0_up()) {
+        puts("init: eth0 is up, starting /sbin/telnetd\n");
+        spawn("/sbin/telnetd", "telnetd");
+    }
     var quick_failures: int = 0;
     loop {
         var status: int = 0;

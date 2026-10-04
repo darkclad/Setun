@@ -1,0 +1,216 @@
+// /sbin/telnetd [-p PORT] [-1]: log in over the network (RFC 854).
+//
+// Each connection gets a pty with /bin/login on it and a relay process that
+// copies between the pty and the socket. Telnet's commands (IAC ...) are
+// read and dropped, except that the server offers to echo and to suppress
+// go-ahead, so a client goes character at a time. Text crosses the
+// network as UTF-8 (the console and the ptys carry code points).
+//
+//   -p PORT   listen on PORT (default 23)
+//   -1        serve one connection, then exit (for tests)
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+const IAC: int = 255;
+const DONT: int = 254;
+const DO: int = 253;
+const WONT: int = 252;
+const WILL: int = 251;
+const SB: int = 250;
+const SE: int = 240;
+const OPT_ECHO: int = 1;
+const OPT_SGA: int = 3;
+
+var net_in: [2187]tryte;
+var clean: [2187]tryte;
+var text: [2187]char;
+var pty_in: [729]char;
+var wire: [6561]tryte;
+var dec: utf8_state;
+var last_cr: int;                       // the last character sent was CR
+
+// Telnet input state: 0 data, 1 after IAC, 2 after IAC WILL/WONT/DO/DONT,
+// 3 inside a subnegotiation, 4 IAC inside a subnegotiation, 5 after CR.
+var tstate: int;
+
+// Remove Telnet commands from n octets; CR LF and CR NUL become CR.
+fn telnet_filter(p: *tryte, n: int, out: *tryte) -> int {
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var b: int = p[k];
+        k += 1;
+        switch (tstate) {
+            case 0: {
+                if (b == IAC) { tstate = 1; }
+                else {
+                    out[m] = b as tryte;
+                    m += 1;
+                    if (b == 13) { tstate = 5; }
+                }
+            }
+            case 1: {
+                if (b == IAC) { out[m] = 255; m += 1; tstate = 0; }
+                else if (b >= WILL && b <= DONT) { tstate = 2; }
+                else if (b == SB) { tstate = 3; }
+                else { tstate = 0; }                     // NOP, AYT, GA, ...: dropped
+            }
+            case 2: tstate = 0;                          // the option: we already said what we do
+            case 3: if (b == IAC) { tstate = 4; }
+            case 4: tstate = b == SE ? 0 : 3;
+            case 5: {
+                tstate = 0;
+                if (b == IAC) { tstate = 1; }
+                else if (b != 10 && b != 0) {
+                    out[m] = b as tryte;
+                    m += 1;
+                    if (b == 13) { tstate = 5; }
+                }
+            }
+        }
+    }
+    return m;
+}
+
+fn write_all(fd: int, p: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        var w: int = write(fd, (p + k) as *char, n - k);
+        if (w < 0) { return -1; }
+        k += w;
+    }
+    return 0;
+}
+
+// Copy between the connection and the pty until either side ends.
+fn relay(s: int, master: int) {
+    var offer: [9]tryte;
+    offer[0] = IAC as tryte; offer[1] = WILL as tryte; offer[2] = OPT_ECHO as tryte;
+    offer[3] = IAC as tryte; offer[4] = WILL as tryte; offer[5] = OPT_SGA as tryte;
+    offer[6] = IAC as tryte; offer[7] = DO as tryte; offer[8] = OPT_SGA as tryte;
+    write_all(s, &offer[0], 9);
+    loop {
+        var p: [2]pollfd;
+        p[0].fd = s;
+        p[0].events = POLLIN;
+        p[1].fd = master;
+        p[1].events = POLLIN;
+        if (poll(&p[0], 2, -1) < 0) {
+            if (errno == EINTR) { continue; }
+            return;
+        }
+        if (p[0].revents != 0) {
+            var n: int = read(s, &net_in[0] as *char, 2187);
+            if (n <= 0) { return; }
+            var m: int = telnet_filter(&net_in[0], n, &clean[0]);
+            var t: int = utf8_to_text(&dec, &clean[0], m, &text[0]);
+            if (write_all(master, &text[0] as *tryte, t) < 0) { return; }
+        }
+        if (p[1].revents != 0) {
+            var n: int = read(master, &pty_in[0], 729);
+            if (n <= 0) { return; }                      // the session is over
+            // to UTF-8, with the network's CR LF line ends (NVT)
+            var m: int = 0;
+            var k: int = 0;
+            while (k < n) {
+                if (pty_in[k] == '\n' && !last_cr) {
+                    wire[m] = 13;
+                    m += 1;
+                }
+                last_cr = pty_in[k] == '\r';
+                m += utf8_encode(pty_in[k], &wire[m]);
+                k += 1;
+            }
+            if (write_all(s, &wire[0], m) < 0) { return; }
+        }
+    }
+}
+
+fn serve(s: int) {
+    var master: int = posix_openpt(O_RDWR);
+    if (master < 0) { perror2("telnetd", "/dev/ptmx"); return; }
+    unlockpt(master);
+    var name: [27]char;
+    if (ptsname_r(master, &name[0], 27) < 0) { perror2("telnetd", "ptsname"); return; }
+    var ws: winsize;
+    ws.ws_row = 25;
+    ws.ws_col = 80;
+    ioctl(master, TIOCSWINSZ, &ws as int);
+    var pid: int = fork();
+    if (pid < 0) { perror2("telnetd", "fork"); return; }
+    if (pid == 0) {
+        setsid();
+        var slave: int = open(&name[0], O_RDWR, 0);
+        if (slave < 0) { perror2("telnetd", &name[0]); _exit(127); }
+        dup2(slave, 0);
+        dup2(slave, 1);
+        dup2(slave, 2);
+        var fd: int = 3;
+        while (fd < 27) { close(fd); fd += 1; }
+        setenv("TERM", "vt100", 1);
+        var argv: [2]*char = { "login", null };
+        execv("/bin/login", &argv[0]);
+        _exit(127);
+    }
+    relay(s, master);
+    shutdown(s, SHUT_RDWR);
+    close(s);
+    close(master);
+    kill(-pid, SIGHUP);                                  // the session, if it is still there
+    var status: int = 0;
+    waitpid(pid, &status, 0);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var port: int = 23;
+    var once: int = 0;
+    var c: int = getopt(argc, argv, "p:1");
+    while (c != -1) {
+        if (c == 'p') { port = atoi(optarg); }
+        else if (c == '1') { once = 1; }
+        else {
+            fputs(STDERR_FILENO, "usage: telnetd [-p port] [-1]\n");
+            return 2;
+        }
+        c = getopt(argc, argv, "p:1");
+    }
+    var l: int = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) { perror2("telnetd", "socket"); return 1; }
+    var one: int = 1;
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    var a: sockaddr_in;
+    sockaddr_set(&a, INADDR_ANY, port);
+    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("telnetd", "bind"); return 1; }
+    if (listen(l, 9) < 0) { perror2("telnetd", "listen"); return 1; }
+    loop {
+        var from: sockaddr_in;
+        var flen: int = sizeof(sockaddr_in);
+        var s: int = accept(l, &from, &flen);
+        if (s < 0) {
+            if (errno == EINTR) { continue; }
+            perror2("telnetd", "accept");
+            return 1;
+        }
+        // reap relays that have finished
+        var st: int = 0;
+        while (waitpid(-1, &st, WNOHANG) > 0) {}
+        fputs(STDERR_FILENO, "telnetd: connection from ");
+        fputs(STDERR_FILENO, inet_ntoa(from.sin_addr));
+        fputs(STDERR_FILENO, "\n");
+        if (once) {
+            close(l);
+            serve(s);
+            return 0;
+        }
+        var pid: int = fork();
+        if (pid == 0) {
+            close(l);
+            serve(s);
+            _exit(0);
+        }
+        close(s);
+    }
+}

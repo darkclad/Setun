@@ -1,0 +1,399 @@
+// /bin/nettest: the socket scenarios of docs/NETWORK.md N3/N4, one line
+// per check, on the loopback interface (it needs no network outside).
+
+import "../lib/tlibc.tri";
+import "../lib/socket.tri";
+
+var failures: int;
+var buf: [19683]tryte;
+var big: [19683]tryte;
+
+fn ok(what: *char, cond: int) {
+    puts("nettest: ");
+    puts(what);
+    if (cond) { puts(" ok\n"); } else { puts(" FAILED (errno "); put_int(errno); puts(")\n"); failures += 1; }
+}
+
+// The call failed with exactly this errno.
+fn fails(r: int, e: int) -> int { return r == -1 && errno == e; }
+
+fn tcp() -> int { return socket(AF_INET, SOCK_STREAM, 0); }
+fn udp() -> int { return socket(AF_INET, SOCK_DGRAM, 0); }
+
+fn bind_to(fd: int, addr: int, port: int) -> int {
+    var a: sockaddr_in;
+    sockaddr_set(&a, addr, port);
+    return bind(fd, &a, sizeof(sockaddr_in));
+}
+
+fn connect_to(fd: int, addr: int, port: int) -> int {
+    var a: sockaddr_in;
+    sockaddr_set(&a, addr, port);
+    return connect(fd, &a, sizeof(sockaddr_in));
+}
+
+fn local_port(fd: int) -> int {
+    var a: sockaddr_in;
+    var len: int = sizeof(sockaddr_in);
+    if (getsockname(fd, &a, &len) < 0) { return -1; }
+    return a.sin_port;
+}
+
+fn put_text(fd: int, s: *char) -> int { return write(fd, s, strlen(s)); }
+
+// Read exactly n octets (or to EOF); the count.
+fn read_n(fd: int, p: *tryte, n: int) -> int {
+    var got: int = 0;
+    while (got < n) {
+        var r: int = read(fd, (p + got) as *char, n - got);
+        if (r <= 0) { return got; }
+        got += r;
+    }
+    return got;
+}
+
+fn same(p: *tryte, s: *char) -> int {
+    var k: int = 0;
+    while (s[k] != 0) {
+        if (p[k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+fn readable_within(fd: int, ms: int) -> int {
+    var p: pollfd;
+    p.fd = fd;
+    p.events = POLLIN;
+    return poll(&p, 1, ms) == 1 && p.revents / POLLIN % 2 != 0;
+}
+
+fn writable_within(fd: int, ms: int) -> int {
+    var p: pollfd;
+    p.fd = fd;
+    p.events = POLLOUT;
+    return poll(&p, 1, ms) == 1 && p.revents / POLLOUT % 2 != 0;
+}
+
+// A listener on 127.0.0.1:port, a client connected to it and the accepted end.
+var srv: int;
+var cli: int;
+var acc: int;
+
+fn pair(port: int) -> int {
+    srv = tcp();
+    var one: int = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    if (bind_to(srv, INADDR_LOOPBACK, port) < 0 || listen(srv, 5) < 0) { return 0; }
+    cli = tcp();
+    if (connect_to(cli, INADDR_LOOPBACK, port) < 0) { return 0; }
+    acc = accept(srv, null, null);
+    return acc >= 0;
+}
+
+fn unpair() {
+    close(cli);
+    close(acc);
+    close(srv);
+}
+
+fn creation() {
+    ok("socket: unknown family is EAFNOSUPPORT", fails(socket(99, SOCK_STREAM, 0), EAFNOSUPPORT));
+    ok("socket: SOCK_SEQPACKET is ESOCKTNOSUPPORT", fails(socket(AF_INET, 5, 0), ESOCKTNOSUPPORT));
+    ok("socket: a nonsense type is EINVAL", fails(socket(AF_INET, 77, 0), EINVAL));
+    ok("socket: stream over UDP is EPROTONOSUPPORT", fails(socket(AF_INET, SOCK_STREAM, IPPROTO_UDP), EPROTONOSUPPORT));
+    ok("socket: raw TCP is EPROTONOSUPPORT", fails(socket(AF_INET, SOCK_RAW, IPPROTO_TCP), EPROTONOSUPPORT));
+    var s: int = tcp();
+    ok("socket: a stream socket", s >= 0);
+    var st: stat_t;
+    ok("fstat says S_IFSOCK", fstat(s, &st) == 0 && st.st_mode / 4096 % 16 * 4096 == S_IFSOCK);
+    ok("lseek is ESPIPE", fails(lseek(s, 0, SEEK_SET), ESPIPE));
+    var t: termios;
+    ok("a tty ioctl is ENOTTY", fails(tcgetattr(s, &t), ENOTTY));
+    var v: int = 0;
+    var len: int = 3;
+    ok("SO_TYPE is SOCK_STREAM", getsockopt(s, SOL_SOCKET, SO_TYPE, &v, &len) == 0 && v == SOCK_STREAM && len == 3);
+    ok("SO_ERROR starts at 0", getsockopt(s, SOL_SOCKET, SO_ERROR, &v, &len) == 0 && v == 0);
+    ok("getsockopt: unknown option is ENOPROTOOPT", fails(getsockopt(s, SOL_SOCKET, 999, &v, &len), ENOPROTOOPT));
+    len = 1;
+    ok("getsockopt: short optlen is EINVAL", fails(getsockopt(s, SOL_SOCKET, SO_TYPE, &v, &len), EINVAL));
+    ok("setsockopt: short optlen is EINVAL", fails(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &v, 1), EINVAL));
+    ok("setsockopt: unknown level is ENOPROTOOPT", fails(setsockopt(s, 77, 1, &v, 3), ENOPROTOOPT));
+    ok("TCP_NODELAY is accepted", setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &v, 3) == 0);
+    close(s);
+    var fd: int = open("/etc/hosts", O_RDONLY, 0);
+    ok("socket calls on a file are ENOTSOCK", fails(listen(fd, 1), ENOTSOCK) && fails(send(fd, &buf[0], 1, 0), ENOTSOCK));
+    close(fd);
+    ok("socket calls on a bad descriptor are EBADF", fails(listen(99, 1), EBADF));
+}
+
+fn binding() {
+    var s: int = tcp();
+    var a: sockaddr_in;
+    sockaddr_set(&a, INADDR_ANY, 4000);
+    ok("bind: addrlen 3 is EINVAL", fails(bind(s, &a, 3), EINVAL));
+    a.sin_family = 10;
+    ok("bind: AF_INET6 is EAFNOSUPPORT", fails(bind(s, &a, sizeof(sockaddr_in)), EAFNOSUPPORT));
+    ok("bind: an address not ours is EADDRNOTAVAIL", fails(bind_to(s, inet_addr("8.8.8.8"), 4000), EADDRNOTAVAIL));
+    ok("bind: port 70000 is EINVAL", fails(bind_to(s, INADDR_ANY, 70000), EINVAL));
+    ok("bind: a null address is EFAULT", fails(bind(s, null, sizeof(sockaddr_in)), EFAULT));
+    ok("bind: port 4000", bind_to(s, INADDR_ANY, 4000) == 0 && local_port(s) == 4000);
+    ok("bind: twice is EINVAL", fails(bind_to(s, INADDR_ANY, 4001), EINVAL));
+    var t: int = tcp();
+    ok("bind: the same port is EADDRINUSE", fails(bind_to(t, INADDR_LOOPBACK, 4000), EADDRINUSE));
+    var one: int = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    listen(s, 1);
+    ok("bind: SO_REUSEADDR does not share with a listener", fails(bind_to(t, INADDR_ANY, 4000), EADDRINUSE));
+    var u: int = udp();
+    ok("bind: UDP has its own ports", bind_to(u, INADDR_ANY, 4000) == 0);
+    close(s);
+    close(t);
+    close(u);
+    s = tcp();
+    ok("bind: port 0 picks an ephemeral port", bind_to(s, INADDR_ANY, 0) == 0 && local_port(s) >= 32768 && local_port(s) <= 60999);
+    close(s);
+    s = tcp();
+    ok("bind: the port is free again after close", bind_to(s, INADDR_ANY, 4000) == 0);
+    close(s);
+    var pid: int = fork();
+    if (pid == 0) {
+        setuid(1000);
+        var r: int = 0;
+        var x: int = tcp();
+        if (fails(bind_to(x, INADDR_ANY, 80), EACCES)) { r += 1; }
+        if (bind_to(x, INADDR_ANY, 8080) == 0) { r += 2; }
+        if (fails(socket(AF_INET, SOCK_RAW, IPPROTO_ICMP), EPERM)) { r += 4; }
+        _exit(r);
+    }
+    var status: int = 0;
+    waitpid(pid, &status, 0);
+    ok("bind: a user may not take port 80 (EACCES)", WEXITSTATUS(status) / 1 % 2 == 1);
+    ok("bind: a user may take port 8080", WEXITSTATUS(status) / 2 % 2 == 1);
+    ok("socket: raw sockets are root's (EPERM)", WEXITSTATUS(status) / 4 % 2 == 1);
+}
+
+fn streams() {
+    var s: int = tcp();
+    ok("listen on UDP is EOPNOTSUPP", fails(listen(udp(), 1), EOPNOTSUPP));
+    ok("accept on a socket not listening is EINVAL", fails(accept(s, null, null), EINVAL));
+    ok("send unconnected is ENOTCONN", fails(send(s, &buf[0], 1, 0), ENOTCONN));
+    ok("recv unconnected is ENOTCONN", fails(recv(s, &buf[0], 1, 0), ENOTCONN));
+    var a: sockaddr_in;
+    var len: int = sizeof(sockaddr_in);
+    ok("getpeername unconnected is ENOTCONN", fails(getpeername(s, &a, &len), ENOTCONN));
+    ok("shutdown unconnected is ENOTCONN", fails(shutdown(s, SHUT_WR), ENOTCONN));
+    ok("shutdown how=5 is EINVAL", fails(shutdown(s, 5), EINVAL));
+    ok("connect to a closed port is ECONNREFUSED", fails(connect_to(s, INADDR_LOOPBACK, 9), ECONNREFUSED));
+    close(s);
+    s = tcp();
+    ok("connect to port 0 is ECONNREFUSED", fails(connect_to(s, INADDR_LOOPBACK, 0), ECONNREFUSED));
+    close(s);
+
+    ok("connect and accept on loopback", pair(5001));
+    len = sizeof(sockaddr_in);
+    ok("getpeername: the server", getpeername(cli, &a, &len) == 0 && a.sin_addr == INADDR_LOOPBACK && a.sin_port == 5001);
+    var cport: int = local_port(cli);
+    len = sizeof(sockaddr_in);
+    ok("getpeername: the client", getpeername(acc, &a, &len) == 0 && a.sin_port == cport && cport >= 32768);
+    ok("connect again is EISCONN", fails(connect_to(cli, INADDR_LOOPBACK, 5001), EISCONN));
+    ok("write on the client", put_text(cli, "hello, server") == 13);
+    ok("read on the server", read(acc, &buf[0] as *char, 100) == 13 && same(&buf[0], "hello, server"));
+    ok("and back", put_text(acc, "hi") == 2 && read(cli, &buf[0] as *char, 100) == 2 && same(&buf[0], "hi"));
+    buf[0] = 300 as tryte;
+    ok("a tryte that is not an octet is EINVAL", fails(write(cli, &buf[0] as *char, 1), EINVAL));
+    buf[0] = -5 as tryte;
+    ok("a negative tryte is EINVAL too", fails(send(cli, &buf[0], 1, 0), EINVAL));
+    ok("nothing to read: non-blocking recv is EAGAIN", fails(recv(acc, &buf[0], 10, MSG_DONTWAIT), EAGAIN));
+    put_text(cli, "peekaboo");
+    ok("MSG_PEEK leaves the data", recv(acc, &buf[0], 4, MSG_PEEK) == 4 && recv(acc, &buf[0], 100, 0) == 8 && same(&buf[0], "peekaboo"));
+    ok("shutdown(SHUT_WR) sends EOF", shutdown(cli, SHUT_WR) == 0 && read(acc, &buf[0] as *char, 10) == 0);
+    ok("a half-closed client still reads", put_text(acc, "still here") == 10 && read(cli, &buf[0] as *char, 100) == 10);
+    ok("write after SHUT_WR is EPIPE", fails(send(cli, &buf[0], 1, MSG_NOSIGNAL), EPIPE));
+    close(acc);
+    ok("the server's close is EOF for the client", read(cli, &buf[0] as *char, 10) == 0);
+    unpair();
+
+    // flow control: more than both rings hold, through a child
+    ok("a second pair", pair(5002));
+    var pid: int = fork();
+    if (pid == 0) {
+        close(acc);
+        close(srv);
+        var k: int = 0;
+        while (k < 19683) { big[k] = (k * 7 % 256) as tryte; k += 1; }
+        var sent: int = 0;
+        while (sent < 100000) {
+            var n: int = 100000 - sent;
+            if (n > 19683) { n = 19683; }
+            var w: int = write(cli, &big[0] as *char, n);
+            if (w <= 0) { _exit(1); }
+            sent += w;
+        }
+        close(cli);
+        _exit(0);
+    }
+    close(cli);
+    var total: int = 0;
+    var good: int = 1;
+    loop {
+        var r: int = read(acc, &buf[0] as *char, 4000);
+        if (r <= 0) { break; }
+        var k: int = 0;
+        while (k < r) {
+            if (buf[k] != (total + k) % 19683 * 7 % 256) { good = 0; }
+            k += 1;
+        }
+        total += r;
+    }
+    var status: int = 0;
+    waitpid(pid, &status, 0);
+    ok("100000 octets through a 19683-octet window, in order", total == 100000 && good && WEXITSTATUS(status) == 0);
+    close(acc);
+    close(srv);
+
+    // unread data at close resets the connection
+    ok("a third pair", pair(5003));
+    put_text(cli, "you will never read this");
+    close(acc);
+    ok("close with unread data: the peer gets ECONNRESET", fails(read(cli, &buf[0] as *char, 10), ECONNRESET));
+    ok("after the error, reads see EOF", read(cli, &buf[0] as *char, 10) == 0);
+    close(cli);
+    close(srv);
+
+    // writing to a peer that is gone
+    ok("a fourth pair", pair(5004));
+    close(acc);
+    ok("the peer's FIN", read(cli, &buf[0] as *char, 10) == 0);
+    send(cli, &buf[0], 1, MSG_NOSIGNAL);           // reaches a closed socket, which resets
+    var r: int = send(cli, &buf[0], 1, MSG_NOSIGNAL);
+    ok("then writing fails (ECONNRESET or EPIPE)", fails(r, ECONNRESET) || fails(r, EPIPE));
+    close(cli);
+    close(srv);
+
+    // non-blocking connect; a full backlog
+    srv = tcp();
+    var one: int = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    bind_to(srv, INADDR_LOOPBACK, 5005);
+    listen(srv, 1);
+    ok("poll: a listener with nothing waiting is not readable", !readable_within(srv, 0));
+    var c1: int = socket(AF_INET, SOCK_STREAM + SOCK_NONBLOCK, 0);
+    ok("non-blocking connect is EINPROGRESS", fails(connect_to(c1, INADDR_LOOPBACK, 5005), EINPROGRESS));
+    ok("then it becomes writable", writable_within(c1, 1000));
+    var v: int = 7;
+    var len2: int = 3;
+    ok("with SO_ERROR 0", getsockopt(c1, SOL_SOCKET, SO_ERROR, &v, &len2) == 0 && v == 0);
+    ok("poll: the listener is readable", readable_within(srv, 0));
+    var c2: int = socket(AF_INET, SOCK_STREAM + SOCK_NONBLOCK, 0);
+    connect_to(c2, INADDR_LOOPBACK, 5005);
+    ok("a full backlog: the second connection waits", !writable_within(c2, 300));
+    var a1: int = accept(srv, null, null);
+    ok("accept makes room", a1 >= 0);
+    ok("and the second connection gets in on a retry", writable_within(c2, 3000));
+    var a2: int = accept4(srv, null, null, SOCK_NONBLOCK);
+    ok("accept4(SOCK_NONBLOCK)", a2 >= 0 && fails(read(a2, &buf[0] as *char, 1), EAGAIN));
+    ok("accept4 with a bad flag is EINVAL", fails(accept4(srv, null, null, 1), EINVAL));
+    fcntl(srv, 4, O_NONBLOCK);                   // F_SETFL
+    ok("nothing more: non-blocking accept is EAGAIN", fails(accept(srv, null, null), EAGAIN));
+    close(a1);
+    close(a2);
+    close(c1);
+    close(c2);
+
+    // TIME-WAIT holds the port of the side that closed first
+    ok("a fifth pair", pair(5006));
+    close(srv);
+    close(acc);                                  // the server closes first: TIME-WAIT on 5006
+    read(cli, &buf[0] as *char, 10);
+    close(cli);
+    s = tcp();
+    ok("TIME-WAIT keeps the port (EADDRINUSE)", fails(bind_to(s, INADDR_LOOPBACK, 5006), EADDRINUSE));
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    ok("SO_REUSEADDR takes it anyway", bind_to(s, INADDR_LOOPBACK, 5006) == 0);
+    close(s);
+}
+
+fn datagrams() {
+    var u: int = udp();
+    var a: sockaddr_in;
+    ok("UDP: send without an address is EDESTADDRREQ", fails(send(u, &buf[0], 1, 0), EDESTADDRREQ));
+    sockaddr_set(&a, INADDR_LOOPBACK, 0);
+    ok("UDP: port 0 is EINVAL", fails(sendto(u, &buf[0], 1, 0, &a, sizeof(sockaddr_in)), EINVAL));
+    sockaddr_set(&a, INADDR_LOOPBACK, 6001);
+    ok("UDP: 1473 octets is EMSGSIZE", fails(sendto(u, &buf[0], 1473, 0, &a, sizeof(sockaddr_in)), EMSGSIZE));
+    sockaddr_set(&a, INADDR_BROADCAST, 6001);
+    ok("UDP: broadcast without SO_BROADCAST is EACCES", fails(sendto(u, &buf[0], 1, 0, &a, sizeof(sockaddr_in)), EACCES));
+    ok("UDP: nothing queued: EAGAIN", fails(recv(u, &buf[0], 10, MSG_DONTWAIT), EAGAIN));
+    var r: int = udp();
+    bind_to(r, INADDR_LOOPBACK, 6001);
+    sockaddr_set(&a, INADDR_LOOPBACK, 6001);
+    sendto(u, "first" as *tryte, 5, 0, &a, sizeof(sockaddr_in));
+    sendto(u, "second datagram" as *tryte, 15, 0, &a, sizeof(sockaddr_in));
+    var from: sockaddr_in;
+    var flen: int = sizeof(sockaddr_in);
+    ok("UDP: datagrams keep their edges", recvfrom(r, &buf[0], 100, 0, &from, &flen) == 5 && same(&buf[0], "first"));
+    ok("UDP: with the sender's address", from.sin_addr == INADDR_LOOPBACK && from.sin_port == local_port(u) && flen == 9);
+    ok("UDP: MSG_TRUNC gives the whole length", recv(r, &buf[0], 6, MSG_PEEK + MSG_TRUNC) == 15);
+    ok("UDP: a short read drops the rest", recv(r, &buf[0], 6, 0) == 6 && same(&buf[0], "second") && fails(recv(r, &buf[0], 10, MSG_DONTWAIT), EAGAIN));
+    flen = 2;
+    sendto(u, "x" as *tryte, 1, 0, &a, sizeof(sockaddr_in));
+    ok("UDP: a short addrlen gets the length only", recvfrom(r, &buf[0], 10, 0, &from, &flen) == 1 && flen == 9);
+    // a connected socket hears only its peer
+    var other: int = udp();
+    bind_to(other, INADDR_LOOPBACK, 6002);
+    connect_to(r, INADDR_LOOPBACK, 6002);
+    sendto(u, "stranger" as *tryte, 8, 0, &a, sizeof(sockaddr_in));
+    sendto(other, "friend" as *tryte, 6, 0, &a, sizeof(sockaddr_in));
+    ok("UDP: connected, only the peer gets through", recv(r, &buf[0], 100, 0) == 6 && same(&buf[0], "friend"));
+    ok("UDP: and send needs no address", send(r, "back" as *tryte, 4, 0) == 4 && recv(other, &buf[0], 10, 0) == 4);
+    var none: sockaddr_in;
+    none.sin_family = AF_UNSPEC;
+    ok("UDP: AF_UNSPEC dissolves the association", connect(r, &none, sizeof(sockaddr_in)) == 0 && fails(send(r, &buf[0], 1, 0), EDESTADDRREQ));
+    close(u);
+    close(r);
+    close(other);
+}
+
+fn limits() {
+    var fds: [27]int;
+    var n: int = 0;
+    loop {
+        var s: int = udp();
+        if (s < 0) { break; }
+        fds[n] = s;
+        n += 1;
+        if (n == 27) { break; }
+    }
+    ok("sockets run out with EMFILE or ENFILE", n < 27 && (errno == EMFILE || errno == ENFILE));
+    var k: int = 0;
+    while (k < n) { close(fds[k]); k += 1; }
+    var s: int = udp();
+    ok("and come back when closed", s >= 0);
+    close(s);
+}
+
+fn interfaces() {
+    var s: int = udp();
+    var r: ifreq;
+    r.ifr_name[0] = 'l';
+    r.ifr_name[1] = 'o';
+    r.ifr_name[2] = 0;
+    ok("SIOCGIFADDR lo", ioctl(s, SIOCGIFADDR, &r as int) == 0 && r.ifr_value == INADDR_LOOPBACK);
+    r.ifr_name[0] = 'x';
+    ok("an unknown interface is ENODEV", fails(ioctl(s, SIOCGIFADDR, &r as int), ENODEV));
+    ok("an unknown ioctl is ENOTTY", fails(ioctl(s, 12345, &r as int), ENOTTY));
+    close(s);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    creation();
+    binding();
+    streams();
+    datagrams();
+    limits();
+    interfaces();
+    puts(failures == 0 ? "nettest: all passed\n" : "nettest: some checks FAILED\n");
+    return failures != 0;
+}

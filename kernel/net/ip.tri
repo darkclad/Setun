@@ -1,0 +1,122 @@
+// IPv4 (RFC 791) and ICMP (RFC 792).
+//
+// No fragmentation: received fragments are dropped and counted, and every
+// packet sent has Don't Fragment set. Routing is "on the loopback, on the
+// eth0 subnet, or through the default gateway". Trinux is a host, not a
+// router: packets for other addresses are dropped.
+
+import "net.tri";
+import "arp.tri";
+
+var ip_ident: int;
+
+// Send the transport payload at txbuf[L4_OFF] (`len` octets) from `src`
+// (0: the interface's address) to `dst`. 0 or -errno.
+fn ip_send(proto: int, src: int, dst: int, len: int) -> int {
+    if (len > NET_MTU - IP_HLEN) { return -EMSGSIZE; }
+    var lo: int = is_local_addr(dst);
+    var nh: int = dst;
+    if (!lo) {
+        var e: *Netif = &netifs[NETIF_ETH];
+        if (!e.up || e.addr == 0) { net_count(NS_IP_NO_ROUTE); return -ENETUNREACH; }
+        if (dst != INADDR_BROADCAST && !same_subnet(dst, e.addr, e.mask)) {
+            if (e.gw == 0) { net_count(NS_IP_NO_ROUTE); return -ENETUNREACH; }
+            nh = e.gw;
+        }
+        if (src == 0) { src = e.addr; }
+    } else if (src == 0) {
+        src = dst;                                // to ourselves: from the address used
+    }
+    var p: *tryte = &txbuf[ETH_HLEN];
+    p[0] = 69;                                // version 4, 5 words
+    p[1] = 0;
+    put16(p, 2, IP_HLEN + len);
+    ip_ident = (ip_ident + 1) % 65536;
+    put16(p, 4, ip_ident);
+    put16(p, 6, 16384);                       // Don't Fragment
+    p[8] = 64;                                // TTL
+    p[9] = proto as tryte;
+    put16(p, 10, 0);
+    put32(p, 12, src);
+    put32(p, 16, dst);
+    put16(p, 10, csum_fold(csum_add(0, p, 0, IP_HLEN)));
+    net_count(NS_IP_OUT);
+    if (lo) { return lo_xmit(p, IP_HLEN + len); }
+    return eth_send_ip(nh, IP_HLEN + len);
+}
+
+// The source address a packet to `dst` will carry.
+fn ip_source_for(dst: int) -> int {
+    if (is_local_addr(dst)) { return dst; }
+    return netifs[NETIF_ETH].addr;
+}
+
+// An IP packet of `len` octets at `p`, from interface `ifx`.
+fn ip_input(p: *tryte, len: int, ifx: int) {
+    net_count(NS_IP_IN);
+    if (len < IP_HLEN || p[0] / 16 != 4) { net_count(NS_IP_HDR_ERR); return; }
+    var hl: int = p[0] % 16 * 4;
+    var total: int = get16(p, 2);
+    if (hl < IP_HLEN || hl > len || total < hl || total > len) { net_count(NS_IP_HDR_ERR); return; }
+    if (csum_fold(csum_add(0, p, 0, hl)) != 0) { net_count(NS_IP_CSUM_ERR); return; }
+    var frag: int = get16(p, 6);
+    if (frag / 8192 % 2 != 0 || frag % 8192 != 0) { net_count(NS_IP_FRAG_DROP); return; }
+    var src: int = get32(p, 12);
+    var dst: int = get32(p, 16);
+    if (ifx == NETIF_ETH) {
+        var e: *Netif = &netifs[NETIF_ETH];
+        if (dst != e.addr && dst != INADDR_BROADCAST && dst != subnet_bcast(e.addr, e.mask)) {
+            net_count(NS_IP_NOT_OURS);
+            return;
+        }
+        if (src / 16777216 == 127) { net_count(NS_IP_NOT_OURS); return; }   // martian
+    }
+    var proto: int = p[9];
+    switch (proto) {
+        case IPPROTO_ICMP: icmp_input(p, hl, total, src, dst);
+        case IPPROTO_UDP: udp_input(p, hl, total, src, dst);
+        case IPPROTO_TCP: tcp_input(p, hl, total, src, dst);
+        default: {
+            net_count(NS_IP_NO_PROTO);
+            icmp_error(p, total, src, dst, 3, 2);       // protocol unreachable
+        }
+    }
+}
+
+// ---- ICMP -----------------------------------------------------------------------------------------
+
+fn icmp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
+    net_count(NS_ICMP_IN);
+    var n: int = total - hl;
+    if (n < 8 || csum_fold(csum_add(0, p, hl, n)) != 0) { net_count(NS_ICMP_ERR); return; }
+    raw_deliver(p, total, src);
+    var type: int = p[hl];
+    if (type == 8 && dst != INADDR_BROADCAST) {           // echo request: answer it
+        var q: *tryte = &txbuf[L4_OFF];
+        copy_trytes(q, p + hl, n);
+        q[0] = 0;                                         // echo reply
+        put16(q, 2, 0);
+        put16(q, 2, csum_fold(csum_add(0, q, 0, n)));
+        net_count(NS_ICMP_ECHO_REPLIES);
+        ip_send(IPPROTO_ICMP, dst, src, n);
+    }
+}
+
+// Report a problem with the received packet `p` to its sender: type 3
+// (destination unreachable) with `code`. Never about ICMP errors or
+// broadcasts.
+fn icmp_error(p: *tryte, total: int, src: int, dst: int, type: int, code: int) {
+    if (dst == INADDR_BROADCAST || src == 0) { return; }
+    if (p[9] == IPPROTO_ICMP && total > p[0] % 16 * 4 && p[p[0] % 16 * 4] != 8 && p[p[0] % 16 * 4] != 0) { return; }
+    var hl: int = p[0] % 16 * 4;
+    var keep: int = hl + 8;
+    if (keep > total) { keep = total; }
+    var q: *tryte = &txbuf[L4_OFF];
+    q[0] = type as tryte;
+    q[1] = code as tryte;
+    put16(q, 2, 0);
+    put32(q, 4, 0);
+    copy_trytes(q + 8, p, keep);
+    put16(q, 2, csum_fold(csum_add(0, q, 0, 8 + keep)));
+    ip_send(IPPROTO_ICMP, dst, src, 8 + keep);
+}

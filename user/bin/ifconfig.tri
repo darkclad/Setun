@@ -1,0 +1,179 @@
+// ifconfig [IFACE [ADDR] [netmask MASK] [gw GW] [up|down]]: show the
+// network interfaces, or set one up (root only). Settings go through
+// ioctls on a datagram socket, as on Linux; the counters come from
+// /proc/net/dev.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/socket.tri";
+
+var sock: int;
+var devbuf: [2187]char;
+var devlen: int;
+
+fn ifr_for(r: *ifreq, name: *char) {
+    var k: int = 0;
+    while (k < IFNAMSIZ - 1 && name[k] != 0) { r.ifr_name[k] = name[k]; k += 1; }
+    r.ifr_name[k] = 0;
+}
+
+fn get(name: *char, cmd: int, r: *ifreq) -> int {
+    ifr_for(r, name);
+    r.ifr_value = 0;
+    r.ifr_value2 = 0;
+    return ioctl(sock, cmd, r as int);
+}
+
+fn set(name: *char, cmd: int, v: int) -> int {
+    var r: ifreq;
+    ifr_for(&r, name);
+    r.ifr_value = v;
+    r.ifr_value2 = 0;
+    return ioctl(sock, cmd, &r as int);
+}
+
+fn hex2(v: int) {
+    var d: *char = "0123456789abcdef";
+    var s: [3]char;
+    s[0] = d[v / 16 % 16];
+    s[1] = d[v % 16];
+    s[2] = 0;
+    puts(&s[0]);
+}
+
+// The counters on the /proc/net/dev line of `name`: rx bytes, packets,
+// errors, dropped, then the same for tx (into c[0..7]).
+fn counters(name: *char, c: *int) {
+    var k: int = 0;
+    while (k < 8) { c[k] = 0; k += 1; }
+    var n: int = strlen(name);
+    var i: int = 0;
+    while (i < devlen) {
+        var line: int = i;
+        while (i < devlen && devbuf[i] != '\n') { i += 1; }
+        var j: int = line;
+        while (j < i && devbuf[j] == ' ') { j += 1; }
+        if (strncmp(&devbuf[j], name, n) == 0 && devbuf[j + n] == ':') {
+            j += n + 1;
+            var field: int = 0;
+            while (field < 16 && j < i) {
+                while (j < i && devbuf[j] == ' ') { j += 1; }
+                var v: int = 0;
+                while (j < i && devbuf[j] >= '0' && devbuf[j] <= '9') { v = v * 10 + devbuf[j] - '0'; j += 1; }
+                if (field < 4) { c[field] = v; }
+                if (field >= 8 && field < 12) { c[field - 4] = v; }
+                field += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn show(name: *char) -> int {
+    var r: ifreq;
+    if (get(name, SIOCGIFFLAGS, &r) < 0) {
+        perror2("ifconfig", name);
+        return 1;
+    }
+    var flags: int = r.ifr_value;
+    puts(name);
+    puts(": flags=");
+    put_int(flags);
+    puts("<");
+    var first: int = 1;
+    if (flags / IFF_UP % 2 != 0) { puts("UP"); first = 0; }
+    if (flags / IFF_BROADCAST % 2 != 0) { if (!first) { puts(","); } puts("BROADCAST"); first = 0; }
+    if (flags / IFF_LOOPBACK % 2 != 0) { if (!first) { puts(","); } puts("LOOPBACK"); first = 0; }
+    if (flags / IFF_RUNNING % 2 != 0) { if (!first) { puts(","); } puts("RUNNING"); first = 0; }
+    puts(">  mtu ");
+    get(name, SIOCGIFMTU, &r);
+    put_int(r.ifr_value);
+    puts("\n        inet ");
+    get(name, SIOCGIFADDR, &r);
+    puts(inet_ntoa(r.ifr_value));
+    puts("  netmask ");
+    get(name, SIOCGIFNETMASK, &r);
+    puts(inet_ntoa(r.ifr_value));
+    get(name, SIOCGIFGW, &r);
+    if (r.ifr_value != 0) {
+        puts("  gateway ");
+        puts(inet_ntoa(r.ifr_value));
+    }
+    puts("\n");
+    if (flags / IFF_LOOPBACK % 2 == 0) {
+        get(name, SIOCGIFHWADDR, &r);
+        puts("        ether ");
+        var k: int = 0;
+        while (k < 6) {
+            var w: int = k < 3 ? r.ifr_value : r.ifr_value2;
+            var j: int = k % 3;
+            hex2(j == 0 ? w / 65536 : j == 1 ? w / 256 % 256 : w % 256);
+            if (k < 5) { puts(":"); }
+            k += 1;
+        }
+        puts("\n");
+    }
+    var c: [8]int;
+    counters(name, &c[0]);
+    puts("        RX packets "); put_int(c[1]); puts("  bytes "); put_int(c[0]); puts("\n");
+    puts("        RX errors "); put_int(c[2]); puts("  dropped "); put_int(c[3]); puts("\n");
+    puts("        TX packets "); put_int(c[5]); puts("  bytes "); put_int(c[4]); puts("\n");
+    puts("        TX errors "); put_int(c[6]); puts("  dropped "); put_int(c[7]); puts("\n");
+    return 0;
+}
+
+fn bad(what: *char, arg: *char) -> int {
+    fputs(STDERR_FILENO, "ifconfig: ");
+    fputs(STDERR_FILENO, what);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, arg);
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) { perror2("ifconfig", "socket"); return 1; }
+    var fd: int = open("/proc/net/dev", O_RDONLY, 0);
+    if (fd >= 0) {
+        devlen = read(fd, &devbuf[0], 2186);
+        if (devlen < 0) { devlen = 0; }
+        close(fd);
+    }
+    if (argc == 1) {
+        var r: int = show("eth0");
+        puts("\n");
+        return show("lo") + r;
+    }
+    var name: *char = argv[1];
+    if (argc == 2) { return show(name); }
+    var k: int = 2;
+    while (k < argc) {
+        var a: *char = argv[k];
+        var v: int = 0;
+        var r: int = 0;
+        if (streq(a, "up") || streq(a, "down")) {
+            var q: ifreq;
+            if (get(name, SIOCGIFFLAGS, &q) < 0) { perror2("ifconfig", name); return 1; }
+            var flags: int = q.ifr_value;
+            var is_up: int = flags / IFF_UP % 2 != 0;
+            if (streq(a, "up") && !is_up) { flags += IFF_UP; }
+            if (streq(a, "down") && is_up) { flags -= IFF_UP; }
+            r = set(name, SIOCSIFFLAGS, flags);
+        } else if (streq(a, "netmask") || streq(a, "gw")) {
+            if (k + 1 >= argc) { return bad("missing value after", a); }
+            if (!inet_aton(argv[k + 1], &v)) { return bad("bad address", argv[k + 1]); }
+            r = set(name, streq(a, "gw") ? SIOCSIFGW : SIOCSIFNETMASK, v);
+            k += 1;
+        } else {
+            if (!inet_aton(a, &v)) { return bad("bad address", a); }
+            r = set(name, SIOCSIFADDR, v);
+        }
+        if (r < 0) {
+            perror2("ifconfig", a);
+            return 1;
+        }
+        k += 1;
+    }
+    return 0;
+}

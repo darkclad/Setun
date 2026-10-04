@@ -1,0 +1,724 @@
+// TCP (RFC 9293), with retransmission timing from RFC 6298.
+//
+// Kept simple where the virtual link allows it, and said so:
+//   - segments are accepted in order only; anything ahead of rcv_nxt is
+//     answered with a duplicate ACK and dropped, and the peer retransmits;
+//   - a timeout resends from snd_una (go-back-N); no SACK, no timestamps,
+//     no window scaling (the window is one page, 19 683 < 65 535);
+//   - no congestion control beyond the peer's window; Nagle and delayed
+//     ACKs are off;
+//   - TIME-WAIT lasts 2 s (2·MSL with MSL = 1 s), an orphaned FIN-WAIT-2 60 s.
+// States use Linux's numbers, as /proc/net/tcp shows them.
+
+import "net.tri";
+import "ip.tri";
+import "socket.tri";
+
+const TCP_ESTABLISHED: int = 1;
+const TCP_SYN_SENT: int = 2;
+const TCP_SYN_RECV: int = 3;
+const TCP_FIN_WAIT1: int = 4;
+const TCP_FIN_WAIT2: int = 5;
+const TCP_TIME_WAIT: int = 6;
+const TCP_CLOSE: int = 7;
+const TCP_CLOSE_WAIT: int = 8;
+const TCP_LAST_ACK: int = 9;
+const TCP_LISTEN: int = 10;
+const TCP_CLOSING: int = 11;
+
+const TH_FIN: int = 1;
+const TH_SYN: int = 2;
+const TH_RST: int = 4;
+const TH_PSH: int = 8;
+const TH_ACK: int = 16;
+
+const TCP_HLEN: int = 20;
+const TCP_MSS: int = 1460;
+const RTO_MIN: int = 20;                  // ticks: 200 ms
+const RTO_MAX: int = 6000;                // 60 s
+const SYN_RETRIES: int = 5;
+const DATA_RETRIES: int = 9;
+const TIME_WAIT_TICKS: int = 200;         // 2 s
+const FIN_WAIT2_TICKS: int = 6000;
+
+var tcp_iss_ctr: int;
+
+fn tcp_new_iss() -> int {
+    tcp_iss_ctr += 1;
+    return seq_add(jiffies * 250000, tcp_iss_ctr * 64019);
+}
+
+fn is_tcp_flag(flags: int, f: int) -> int { return flags / f % 2 != 0; }
+
+// The window we can offer: free room in the receive ring.
+fn tcp_rcv_wnd(s: int) -> int {
+    var w: int = rx_free(s);
+    return w > 65535 ? 65535 : w;
+}
+
+// ---- sending -----------------------------------------------------------------------------------------
+
+// Send one segment: `n` octets of the send ring from offset `off`, with
+// `flags` and sequence number `seq`; an MSS option on SYNs.
+fn tcp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
+    var k: *Socket = &socks[s];
+    var t: *tryte = &txbuf[L4_OFF];
+    var hl: int = is_tcp_flag(flags, TH_SYN) ? 24 : TCP_HLEN;
+    put16(t, 0, k.lport);
+    put16(t, 2, k.rport);
+    put32(t, 4, seq);
+    put32(t, 8, is_tcp_flag(flags, TH_ACK) ? k.rcv_nxt : 0);
+    t[12] = (hl / 4 * 16) as tryte;
+    t[13] = flags as tryte;
+    var wnd: int = tcp_rcv_wnd(s);
+    put16(t, 14, wnd);
+    put16(t, 16, 0);
+    put16(t, 18, 0);
+    if (hl == 24) {
+        t[20] = 2;                            // MSS
+        t[21] = 4;
+        put16(t, 22, TCP_MSS);
+    }
+    if (n > 0) { ring_read(k.txf, k.tx_head, off, t + hl, n); }
+    var src: int = k.laddr;
+    put16(t, 16, csum_fold(csum_add(csum_pseudo(src, k.raddr, IPPROTO_TCP, hl + n), t, 0, hl + n)));
+    if (is_tcp_flag(flags, TH_ACK)) { k.adv_edge = seq_add(k.rcv_nxt, wnd); }
+    ip_send(IPPROTO_TCP, src, k.raddr, hl + n);
+}
+
+fn tcp_send_ack(s: int) { tcp_send_seg(s, socks[s].snd_nxt, TH_ACK, 0, 0); }
+
+fn tcp_send_syn(s: int) {
+    var k: *Socket = &socks[s];
+    tcp_send_seg(s, k.iss, k.state == TCP_SYN_RECV ? TH_SYN + TH_ACK : TH_SYN, 0, 0);
+}
+
+fn tcp_arm_rtx(s: int) {
+    if (socks[s].rtx_at == 0) { socks[s].rtx_at = jiffies + socks[s].rto; }
+}
+
+// Has the FIN gone out (snd_nxt is past the data)?
+fn tcp_fin_sent(s: int) -> int {
+    var k: *Socket = &socks[s];
+    return k.fin_out && seq_diff(k.snd_nxt, k.snd_una) > k.tx_count;
+}
+
+// Send what the window allows, then the FIN if one is due.
+fn tcp_output(s: int) {
+    var k: *Socket = &socks[s];
+    if (k.state != TCP_ESTABLISHED && k.state != TCP_CLOSE_WAIT && k.state != TCP_FIN_WAIT1
+            && k.state != TCP_CLOSING && k.state != TCP_LAST_ACK) {
+        return;
+    }
+    loop {
+        var off: int = seq_diff(k.snd_nxt, k.snd_una);
+        if (off >= k.tx_count) { break; }
+        var room: int = k.snd_wnd - off;
+        if (room <= 0) { break; }
+        var n: int = k.tx_count - off;
+        if (n > room) { n = room; }
+        if (n > k.mss) { n = k.mss; }
+        var flags: int = TH_ACK + (off + n == k.tx_count ? TH_PSH : 0);
+        tcp_send_seg(s, k.snd_nxt, flags, off, n);
+        if (k.rtt_seq == 0) {
+            k.rtt_seq = seq_add(k.snd_nxt, n);
+            k.rtt_at = jiffies;
+        }
+        k.snd_nxt = seq_add(k.snd_nxt, n);
+        tcp_arm_rtx(s);
+    }
+    var sent: int = seq_diff(k.snd_nxt, k.snd_una);
+    if (k.fin_out && !k.fin_acked && sent == k.tx_count) {
+        tcp_send_seg(s, k.snd_nxt, TH_FIN + TH_ACK, 0, 0);
+        k.snd_nxt = seq_add(k.snd_nxt, 1);
+        tcp_arm_rtx(s);
+    }
+    // data waiting, a zero window and nothing in flight: probe it later
+    if (k.snd_wnd == 0 && k.tx_count > 0 && k.snd_nxt == k.snd_una && k.persist_at == 0) {
+        k.persist_at = jiffies + k.rto;
+    }
+}
+
+// A reset for a segment that has no connection (RFC 9293 §3.10.7.1).
+fn tcp_reset_reply(p: *tryte, hl: int, src: int, dst: int, seg_len: int) {
+    var th: *tryte = p + hl;
+    var flags: int = th[13];
+    if (is_tcp_flag(flags, TH_RST)) { return; }
+    var t: *tryte = &txbuf[L4_OFF];
+    var sport: int = get16(th, 0);
+    var dport: int = get16(th, 2);
+    put16(t, 0, dport);
+    put16(t, 2, sport);
+    if (is_tcp_flag(flags, TH_ACK)) {
+        put32(t, 4, get32(th, 8));
+        put32(t, 8, 0);
+        t[13] = TH_RST;
+    } else {
+        put32(t, 4, 0);
+        put32(t, 8, seq_add(get32(th, 4), seg_len));
+        t[13] = (TH_RST + TH_ACK) as tryte;
+    }
+    t[12] = 80;                                   // 5 words
+    put16(t, 14, 0);
+    put16(t, 16, 0);
+    put16(t, 18, 0);
+    put16(t, 16, csum_fold(csum_add(csum_pseudo(dst, src, IPPROTO_TCP, TCP_HLEN), t, 0, TCP_HLEN)));
+    net_count(NS_TCP_RST_OUT);
+    ip_send(IPPROTO_TCP, dst, src, TCP_HLEN);
+}
+
+fn tcp_send_rst(s: int) {
+    var k: *Socket = &socks[s];
+    tcp_send_seg(s, k.snd_nxt, TH_RST + TH_ACK, 0, 0);
+    net_count(NS_TCP_RST_OUT);
+}
+
+// ---- state changes ----------------------------------------------------------------------------------
+
+// The connection is over: error (positive errno) for the user, if any.
+fn tcp_done(s: int, err: int) {
+    var k: *Socket = &socks[s];
+    k.state = TCP_CLOSE;
+    k.rtx_at = 0;
+    k.persist_at = 0;
+    k.timer_at = 0;
+    if (err != 0) { k.error = err; }
+    sock_wake(s);
+    if (k.parent >= 0) { sock_wake(k.parent); }
+    if (k.files == 0) {
+        // nobody holds it: an orphan, or a child never accepted
+        sock_free(s);
+    }
+}
+
+// Reset and drop the connection.
+fn tcp_abort(s: int, err: int) {
+    var st: int = socks[s].state;
+    if (st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT || st == TCP_FIN_WAIT1 || st == TCP_FIN_WAIT2
+            || st == TCP_SYN_RECV || st == TCP_CLOSING || st == TCP_LAST_ACK) {
+        tcp_send_rst(s);
+    }
+    tcp_done(s, err);
+}
+
+fn tcp_time_wait(s: int) {
+    socks[s].state = TCP_TIME_WAIT;
+    socks[s].rtx_at = 0;
+    socks[s].timer_at = jiffies + TIME_WAIT_TICKS;
+    sock_wake(s);
+}
+
+// Active open.
+fn tcp_connect(s: int, dst: int, port: int) -> int {
+    var k: *Socket = &socks[s];
+    if (k.laddr == 0) {
+        if (!is_local_addr(dst)) {
+            if (!netifs[NETIF_ETH].up || netifs[NETIF_ETH].addr == 0) { return -ENETUNREACH; }
+            var e: *Netif = &netifs[NETIF_ETH];
+            if (!same_subnet(dst, e.addr, e.mask) && e.gw == 0) { return -ENETUNREACH; }
+        }
+        k.laddr = ip_source_for(dst);
+    }
+    k.raddr = dst;
+    k.rport = port;
+    if (k.lport == 0) {
+        var p: int = ephemeral_port(s, k.laddr);
+        if (p < 0) { return p; }
+        k.lport = p;
+    }
+    k.iss = tcp_new_iss();
+    k.snd_una = k.iss;
+    k.snd_nxt = seq_add(k.iss, 1);
+    k.snd_wnd = 0;
+    k.state = TCP_SYN_SENT;
+    k.was_connected = 1;
+    k.rto = HZ;
+    k.retries = 0;
+    k.error = 0;
+    net_count(NS_TCP_ACTIVE);
+    tcp_send_syn(s);
+    k.rtx_at = jiffies + k.rto;
+    return 0;
+}
+
+// The user is done sending (close or shutdown(SHUT_WR)).
+fn tcp_shutdown_send(s: int) {
+    var k: *Socket = &socks[s];
+    if (k.fin_out) { return; }
+    if (k.state == TCP_ESTABLISHED) { k.state = TCP_FIN_WAIT1; }
+    else if (k.state == TCP_CLOSE_WAIT) { k.state = TCP_LAST_ACK; }
+    else if (k.state == TCP_SYN_SENT) { tcp_done(s, 0); return; }
+    else { return; }
+    k.fin_out = 1;
+    tcp_output(s);
+}
+
+// The last descriptor closed.
+fn tcp_close(s: int) {
+    var k: *Socket = &socks[s];
+    if (k.state == TCP_LISTEN) {
+        // children not accepted yet are reset
+        var c: int = 0;
+        while (c < NSOCKS) {
+            if (socks[c].used && socks[c].parent == s) {
+                socks[c].parent = -1;
+                tcp_abort(c, 0);
+            }
+            c += 1;
+        }
+        k.state = TCP_CLOSE;
+        if (k.files == 0) { sock_free(s); }
+        return;
+    }
+    if (k.files > 0) { return; }
+    if (k.state == TCP_CLOSE || k.state == TCP_SYN_SENT) { tcp_done(s, 0); return; }
+    if (k.rx_count > 0 && (k.state == TCP_ESTABLISHED || k.state == TCP_CLOSE_WAIT)) {
+        tcp_abort(s, 0);                          // unread data: reset, as Linux does
+        return;
+    }
+    tcp_shutdown_send(s);
+    if (k.state == TCP_FIN_WAIT2) { k.timer_at = jiffies + FIN_WAIT2_TICKS; }
+}
+
+// A listener's child that has finished its handshake and waits for accept().
+fn tcp_ready_child(s: int) -> int {
+    var c: int = 0;
+    while (c < NSOCKS) {
+        var k: *Socket = &socks[c];
+        if (k.used && k.parent == s && k.state != TCP_SYN_RECV) { return c; }
+        c += 1;
+    }
+    return -1;
+}
+
+fn tcp_children(s: int) -> int {
+    var n: int = 0;
+    var c: int = 0;
+    while (c < NSOCKS) {
+        if (socks[c].used && socks[c].parent == s) { n += 1; }
+        c += 1;
+    }
+    return n;
+}
+
+// ---- receiving --------------------------------------------------------------------------------------
+
+// An RTT sample of `r` ticks (RFC 6298 §2, in ticks).
+fn tcp_rtt_sample(s: int, r: int) {
+    var k: *Socket = &socks[s];
+    if (k.srtt == 0) {
+        k.srtt = r + 1;
+        k.rttvar = (r + 1) / 2;
+    } else {
+        var d: int = k.srtt - r;
+        if (d < 0) { d = -d; }
+        k.rttvar = (3 * k.rttvar + d) / 4;
+        k.srtt = (7 * k.srtt + r) / 8;
+    }
+    var v: int = 4 * k.rttvar;
+    if (v < 1) { v = 1; }
+    k.rto = k.srtt + v;
+    if (k.rto < RTO_MIN) { k.rto = RTO_MIN; }
+    if (k.rto > RTO_MAX) { k.rto = RTO_MAX; }
+}
+
+// The MSS option of a SYN, or 536.
+fn tcp_parse_mss(th: *tryte, doff: int) -> int {
+    var i: int = TCP_HLEN;
+    while (i < doff) {
+        var kind: int = th[i];
+        if (kind == 0) { break; }
+        if (kind == 1) { i += 1; continue; }
+        if (i + 1 >= doff) { break; }
+        var len: int = th[i + 1];
+        if (len < 2 || i + len > doff) { break; }
+        if (kind == 2 && len == 4) {
+            var m: int = get16(th, i + 2);
+            if (m < 64) { m = 64; }
+            return m > TCP_MSS ? TCP_MSS : m;
+        }
+        i += len;
+    }
+    return 536;
+}
+
+// Find the socket for a segment: the connection, else a listener.
+fn tcp_lookup(src: int, sport: int, dst: int, dport: int) -> int {
+    var listener: int = -1;
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var k: *Socket = &socks[s];
+        if (k.used && k.type == SOCK_STREAM && k.lport == dport) {
+            if (k.state == TCP_LISTEN) {
+                if (k.laddr == 0 || k.laddr == dst) { listener = s; }
+            } else if (k.state != TCP_CLOSE && k.raddr == src && k.rport == sport && k.laddr == dst) {
+                return s;
+            }
+        }
+        s += 1;
+    }
+    return listener;
+}
+
+fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
+    net_count(NS_TCP_IN);
+    var th: *tryte = p + hl;
+    var n: int = total - hl;
+    if (n < TCP_HLEN) { net_count(NS_TCP_ERR); return; }
+    var doff: int = th[12] / 16 * 4;
+    if (doff < TCP_HLEN || doff > n) { net_count(NS_TCP_ERR); return; }
+    if (csum_fold(csum_add(csum_pseudo(src, dst, IPPROTO_TCP, n), th, 0, n)) != 0) { net_count(NS_TCP_ERR); return; }
+    if (dst == INADDR_BROADCAST || dst == subnet_bcast(netifs[NETIF_ETH].addr, netifs[NETIF_ETH].mask)) { return; }
+    var sport: int = get16(th, 0);
+    var dport: int = get16(th, 2);
+    var seq: int = get32(th, 4);
+    var ack: int = get32(th, 8);
+    var flags: int = th[13];
+    var wnd: int = get16(th, 14);
+    var dlen: int = n - doff;
+    var seg_len: int = dlen + (is_tcp_flag(flags, TH_SYN) ? 1 : 0) + (is_tcp_flag(flags, TH_FIN) ? 1 : 0);
+    var s: int = tcp_lookup(src, sport, dst, dport);
+    if (s < 0) {
+        net_count(NS_TCP_DROPPED);
+        tcp_reset_reply(p, hl, src, dst, seg_len);
+        return;
+    }
+    var k: *Socket = &socks[s];
+    var syn: int = is_tcp_flag(flags, TH_SYN);
+    var rst: int = is_tcp_flag(flags, TH_RST);
+    var has_ack: int = is_tcp_flag(flags, TH_ACK);
+    var fin: int = is_tcp_flag(flags, TH_FIN);
+
+    if (k.state == TCP_LISTEN) {
+        if (rst) { return; }
+        if (has_ack) { tcp_reset_reply(p, hl, src, dst, seg_len); return; }
+        if (!syn) { return; }
+        if (tcp_children(s) >= k.backlog) { net_count(NS_TCP_DROPPED); return; }
+        var c: int = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+        if (c < 0) { net_count(NS_TCP_DROPPED); return; }
+        var ck: *Socket = &socks[c];
+        ck.parent = s;
+        ck.reuse = k.reuse;
+        ck.uid = k.uid;
+        ck.laddr = dst;
+        ck.lport = dport;
+        ck.raddr = src;
+        ck.rport = sport;
+        ck.irs = seq;
+        ck.rcv_nxt = seq_add(seq, 1);
+        ck.iss = tcp_new_iss();
+        ck.snd_una = ck.iss;
+        ck.snd_nxt = seq_add(ck.iss, 1);
+        ck.snd_wnd = wnd;
+        ck.mss = tcp_parse_mss(th, doff);
+        ck.state = TCP_SYN_RECV;
+        ck.was_connected = 1;
+        net_count(NS_TCP_PASSIVE);
+        tcp_send_syn(c);
+        ck.rtx_at = jiffies + ck.rto;
+        return;
+    }
+
+    if (k.state == TCP_SYN_SENT) {
+        var ack_ok: int = has_ack && ack == k.snd_nxt;
+        if (has_ack && !ack_ok) {
+            if (!rst) { tcp_reset_reply(p, hl, src, dst, seg_len); }
+            return;
+        }
+        if (rst) {
+            if (ack_ok) { tcp_done(s, ECONNREFUSED); }
+            return;
+        }
+        if (!syn) { return; }
+        k.irs = seq;
+        k.rcv_nxt = seq_add(seq, 1);
+        k.mss = tcp_parse_mss(th, doff);
+        k.snd_wnd = wnd;
+        if (ack_ok) {
+            k.snd_una = ack;
+            k.state = TCP_ESTABLISHED;
+            k.rtx_at = 0;
+            k.retries = 0;
+            tcp_send_ack(s);
+            sock_wake(s);
+        } else {
+            k.state = TCP_SYN_RECV;                  // simultaneous open
+            tcp_send_syn(s);
+        }
+        return;
+    }
+
+    // ---- synchronized states: acceptability (RFC 9293 §3.10.7.4) ----
+    var rwnd: int = rx_free(s);
+    var dseq: int = seq_diff(seq, k.rcv_nxt);
+    var acceptable: int;
+    if (seg_len == 0) {
+        acceptable = rwnd == 0 ? dseq == 0 : dseq >= 0 && dseq < rwnd;
+    } else {
+        var last: int = dseq + seg_len - 1;
+        acceptable = rwnd > 0 && ((dseq >= 0 && dseq < rwnd) || (last >= 0 && last < rwnd));
+        if (rwnd == 0 && dseq == 0 && dlen == 0) { acceptable = 1; }
+    }
+    if (!acceptable) {
+        if (!rst) {
+            if (k.state == TCP_TIME_WAIT && fin) { k.timer_at = jiffies + TIME_WAIT_TICKS; }
+            tcp_send_ack(s);
+        }
+        return;
+    }
+    if (rst) {
+        if (dseq != 0) { tcp_send_ack(s); return; }   // RFC 5961: only an exact RST counts
+        if (k.state == TCP_SYN_RECV) { tcp_done(s, 0); return; }
+        var err: int = k.state == TCP_ESTABLISHED || k.state == TCP_FIN_WAIT1 || k.state == TCP_FIN_WAIT2
+            || k.state == TCP_CLOSE_WAIT ? ECONNRESET : 0;
+        if (err != 0 && k.peer_fin && k.state == TCP_CLOSE_WAIT) { err = ECONNRESET; }
+        tcp_done(s, err);
+        return;
+    }
+    if (syn) {
+        if (k.state == TCP_SYN_RECV && seq == k.irs) { tcp_send_syn(s); return; }   // our SYN-ACK was lost
+        tcp_send_ack(s);                              // challenge ACK (RFC 5961)
+        return;
+    }
+    if (!has_ack) { return; }
+
+    // ---- ACK ----
+    if (k.state == TCP_SYN_RECV) {
+        if (ack != k.snd_nxt) { tcp_reset_reply(p, hl, src, dst, seg_len); return; }
+        k.snd_una = ack;
+        k.snd_wnd = wnd;
+        k.state = TCP_ESTABLISHED;
+        k.rtx_at = 0;
+        k.retries = 0;
+        if (k.parent >= 0) { sock_wake(k.parent); }
+        sock_wake(s);
+    }
+    var acked: int = seq_diff(ack, k.snd_una);
+    var outstanding: int = seq_diff(k.snd_nxt, k.snd_una);
+    if (acked > outstanding) { tcp_send_ack(s); return; }       // acknowledges what we never sent
+    if (acked > 0) {
+        var data: int = acked > k.tx_count ? k.tx_count : acked;
+        k.tx_head = (k.tx_head + data) % SOCK_BUF;
+        k.tx_count -= data;
+        if (acked > data && k.fin_out) { k.fin_acked = 1; }
+        k.snd_una = ack;
+        if (k.rtt_seq != 0 && seq_diff(ack, k.rtt_seq) >= 0) {
+            tcp_rtt_sample(s, jiffies - k.rtt_at);
+            k.rtt_seq = 0;
+        }
+        k.retries = 0;
+        k.rtx_at = k.snd_una == k.snd_nxt ? 0 : jiffies + k.rto;
+        sock_wake(s);
+    }
+    if (acked >= 0) {
+        k.snd_wnd = wnd;
+        if (wnd > 0) { k.persist_at = 0; }
+    }
+    if (k.fin_acked) {
+        if (k.state == TCP_FIN_WAIT1) {
+            k.state = TCP_FIN_WAIT2;
+            if (k.files == 0) { k.timer_at = jiffies + FIN_WAIT2_TICKS; }
+        } else if (k.state == TCP_CLOSING) {
+            tcp_time_wait(s);
+        } else if (k.state == TCP_LAST_ACK) {
+            tcp_done(s, 0);
+            return;
+        }
+    }
+    if (k.state == TCP_TIME_WAIT) {
+        if (fin) {
+            tcp_send_ack(s);
+            k.timer_at = jiffies + TIME_WAIT_TICKS;
+        }
+        return;
+    }
+
+    // ---- data ----
+    var need_ack: int = 0;
+    if (dlen > 0 && k.files == 0 && k.parent < 0) {
+        tcp_abort(s, 0);                              // nobody will read it: reset, as Linux does
+        return;
+    }
+    if (dlen > 0 && (k.state == TCP_ESTABLISHED || k.state == TCP_FIN_WAIT1 || k.state == TCP_FIN_WAIT2)) {
+        if (dseq > 0) {
+            tcp_send_ack(s);                          // a gap: ask again for rcv_nxt
+            return;
+        }
+        var skip: int = -dseq;                        // already have these
+        var take: int = dlen - skip;
+        if (take > rwnd) { take = rwnd; }
+        if (take > 0) {
+            rx_put(s, th + doff + skip, take);
+            k.rcv_nxt = seq_add(k.rcv_nxt, take);
+            sock_wake(s);
+        }
+        need_ack = 1;
+        if (skip + take < dlen) { fin = 0; }          // the FIN comes after what we dropped
+    } else if (dlen > 0) {
+        need_ack = 1;                                 // data after their FIN: ignore it
+    }
+
+    // ---- FIN ----
+    if (fin && seq_diff(seq_add(seq, dlen), k.rcv_nxt) == 0 && !k.peer_fin) {
+        k.rcv_nxt = seq_add(k.rcv_nxt, 1);
+        k.peer_fin = 1;
+        need_ack = 1;
+        if (k.state == TCP_ESTABLISHED || k.state == TCP_SYN_RECV) { k.state = TCP_CLOSE_WAIT; }
+        else if (k.state == TCP_FIN_WAIT1) { if (k.fin_acked) { tcp_time_wait(s); } else { k.state = TCP_CLOSING; } }
+        else if (k.state == TCP_FIN_WAIT2) { tcp_time_wait(s); }
+        sock_wake(s);
+        if (k.parent >= 0) { sock_wake(k.parent); }
+    } else if (fin) {
+        need_ack = 1;
+    }
+    if (need_ack) { tcp_send_ack(s); }
+    tcp_output(s);
+}
+
+// ---- timers -------------------------------------------------------------------------------------------
+
+fn tcp_timeout(s: int) {
+    var k: *Socket = &socks[s];
+    k.rtx_at = 0;
+    k.retries += 1;
+    var limit: int = k.state == TCP_SYN_SENT || k.state == TCP_SYN_RECV ? SYN_RETRIES : DATA_RETRIES;
+    if (k.retries > limit) {
+        if (k.state == TCP_SYN_RECV) { tcp_done(s, 0); return; }
+        tcp_abort(s, ETIMEDOUT);
+        return;
+    }
+    k.rto *= 2;
+    if (k.rto > RTO_MAX) { k.rto = RTO_MAX; }
+    k.rtt_seq = 0;                                    // Karn: no samples from retransmissions
+    net_count(NS_TCP_RETRANS);
+    if (k.state == TCP_SYN_SENT || k.state == TCP_SYN_RECV) {
+        tcp_send_syn(s);
+        k.rtx_at = jiffies + k.rto;
+        return;
+    }
+    k.snd_nxt = k.snd_una;                            // go back and send it all again
+    tcp_output(s);
+    tcp_arm_rtx(s);
+}
+
+// A probe into a zero window: one octet beyond what was sent, not counted.
+fn tcp_persist(s: int) {
+    var k: *Socket = &socks[s];
+    k.persist_at = 0;
+    if (k.snd_wnd > 0 || k.tx_count == 0) { return; }
+    var off: int = seq_diff(k.snd_nxt, k.snd_una);
+    if (off < k.tx_count) { tcp_send_seg(s, k.snd_nxt, TH_ACK, off, 1); }
+    k.rto *= 2;
+    if (k.rto > RTO_MAX) { k.rto = RTO_MAX; }
+    k.persist_at = jiffies + k.rto;
+}
+
+fn tcp_tick() {
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var k: *Socket = &socks[s];
+        if (k.used && k.type == SOCK_STREAM) {
+            if (k.rtx_at != 0 && jiffies >= k.rtx_at) { tcp_timeout(s); }
+            if (k.used && k.persist_at != 0 && jiffies >= k.persist_at) { tcp_persist(s); }
+            if (k.used && k.timer_at != 0 && jiffies >= k.timer_at) {
+                k.timer_at = 0;
+                if (k.state == TCP_TIME_WAIT || k.state == TCP_FIN_WAIT2) { tcp_done(s, 0); }
+            }
+        }
+        s += 1;
+    }
+}
+
+// ---- the user's side ------------------------------------------------------------------------------------
+
+fn tcp_sendmsg(s: int, f: int, p: *tryte, n: int, flags: int) -> int {
+    var k: *Socket = &socks[s];
+    var sent: int = 0;
+    loop {
+        if (k.error) {
+            var e: int = k.error;
+            k.error = 0;
+            return sent > 0 ? sent : -e;
+        }
+        if (k.state == TCP_SYN_SENT) {
+            if (sock_nonblocking(f, flags)) { return -EAGAIN; }
+            if (net_sleep(sock_chan(s))) { return -ERESTARTSYS; }
+            continue;
+        }
+        if ((k.state != TCP_ESTABLISHED && k.state != TCP_CLOSE_WAIT) || k.shut_wr || k.fin_out) {
+            if (sent > 0) { return sent; }
+            if (!k.was_connected) { return -ENOTCONN; }
+            if (!has(flags, MSG_NOSIGNAL)) { send_signal(current, SIGPIPE); }
+            return -EPIPE;
+        }
+        if (sent == n) { return n; }
+        var room: int = SOCK_BUF - k.tx_count;
+        if (room > 0) {
+            var m: int = n - sent;
+            if (m > room) { m = room; }
+            ring_write(k.txf, k.tx_head, k.tx_count, p + sent, m);
+            k.tx_count += m;
+            sent += m;
+            tcp_output(s);
+            continue;
+        }
+        if (sock_nonblocking(f, flags)) { return sent > 0 ? sent : -EAGAIN; }
+        if (net_sleep(sock_chan(s))) { return sent > 0 ? sent : -ERESTARTSYS; }
+    }
+}
+
+fn tcp_recvmsg(s: int, f: int, p: *tryte, n: int, flags: int) -> int {
+    var k: *Socket = &socks[s];
+    if (k.state == TCP_LISTEN) { return -ENOTCONN; }
+    if (n == 0) { return 0; }
+    var got: int = 0;
+    loop {
+        if (k.rx_count > 0) {
+            var m: int = n - got;
+            if (m > k.rx_count) { m = k.rx_count; }
+            if (has(flags, MSG_PEEK)) {
+                ring_read(k.rxf, k.rx_head, 0, p + got, m);
+                return got + m;
+            }
+            rx_take(s, p + got, m);
+            got += m;
+            tcp_window_update(s);
+            if (got == n || !has(flags, MSG_WAITALL)) { return got; }
+            continue;
+        }
+        if (got > 0 && !has(flags, MSG_WAITALL)) { return got; }
+        if (k.error) {
+            var e: int = k.error;
+            k.error = 0;
+            return got > 0 ? got : -e;
+        }
+        if (k.peer_fin || k.shut_rd || k.state == TCP_CLOSE) {
+            if (k.state == TCP_CLOSE && !k.was_connected) { return -ENOTCONN; }
+            return got;
+        }
+        if (k.state == TCP_SYN_SENT && sock_nonblocking(f, flags)) { return -EAGAIN; }
+        if (sock_nonblocking(f, flags)) { return got > 0 ? got : -EAGAIN; }
+        if (net_sleep(sock_chan(s))) { return got > 0 ? got : -ERESTARTSYS; }
+    }
+}
+
+// After the user reads: tell the peer when the window has opened by a
+// segment or more since we last said.
+fn tcp_window_update(s: int) {
+    var k: *Socket = &socks[s];
+    if (k.state != TCP_ESTABLISHED && k.state != TCP_FIN_WAIT1 && k.state != TCP_FIN_WAIT2) { return; }
+    var edge: int = seq_add(k.rcv_nxt, tcp_rcv_wnd(s));
+    if (seq_diff(edge, k.adv_edge) >= k.mss || seq_diff(k.adv_edge, k.rcv_nxt) == 0) { tcp_send_ack(s); }
+}
+
+fn tcp_poll(s: int) -> int {
+    var k: *Socket = &socks[s];
+    var r: int = 0;
+    if (k.state == TCP_LISTEN) { return tcp_ready_child(s) >= 0 ? POLLIN_ : 0; }
+    if (k.rx_count > 0 || k.peer_fin || k.shut_rd) { r += POLLIN_; }
+    if ((k.state == TCP_ESTABLISHED || k.state == TCP_CLOSE_WAIT) && !k.shut_wr && k.tx_count < SOCK_BUF) { r += POLLOUT_; }
+    if (k.error) { r += POLLERR; }
+    if (k.state == TCP_CLOSE && k.was_connected) { r += POLLHUP_ + POLLIN_; }
+    else if (k.shut_rd && k.shut_wr) { r += POLLHUP_; }
+    return r;
+}

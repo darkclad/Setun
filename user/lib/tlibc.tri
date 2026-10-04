@@ -31,6 +31,7 @@ const EEXIST: int = 17;
 const ENOTDIR: int = 20;
 const EISDIR: int = 21;
 const EINVAL: int = 22;
+const ENFILE: int = 23;
 const EMFILE: int = 24;
 const ENOTTY: int = 25;
 const ENOSPC: int = 28;
@@ -46,6 +47,28 @@ const EDOM: int = 33;
 const EXDEV: int = 18;
 const ENODEV: int = 19;
 const EFBIG: int = 27;
+// the network's (Linux)
+const ENOTSOCK: int = 88;
+const EDESTADDRREQ: int = 89;
+const EMSGSIZE: int = 90;
+const ENOPROTOOPT: int = 92;
+const EPROTONOSUPPORT: int = 93;
+const ESOCKTNOSUPPORT: int = 94;
+const EOPNOTSUPP: int = 95;
+const EAFNOSUPPORT: int = 97;
+const EADDRINUSE: int = 98;
+const EADDRNOTAVAIL: int = 99;
+const ENETUNREACH: int = 101;
+const ECONNABORTED: int = 103;
+const ECONNRESET: int = 104;
+const ENOBUFS: int = 105;
+const EISCONN: int = 106;
+const ENOTCONN: int = 107;
+const ETIMEDOUT: int = 110;
+const ECONNREFUSED: int = 111;
+const EHOSTUNREACH: int = 113;
+const EALREADY: int = 114;
+const EINPROGRESS: int = 115;
 
 // signal.h (Linux numbers)
 const SIGHUP: int = 1;
@@ -694,6 +717,7 @@ fn strerror(e: int) -> *char {
         case EISDIR: return "Is a directory";
         case EINVAL: return "Invalid argument";
         case EMFILE: return "Too many open files";
+        case ENFILE: return "Too many open files in system";
         case ENOTTY: return "Not a tty";
         case ENOSPC: return "No space left on device";
         case ESPIPE: return "Illegal seek";
@@ -708,6 +732,28 @@ fn strerror(e: int) -> *char {
         case EDOM: return "Numerical argument out of domain";
         case ENODEV: return "No such device";
         case EFBIG: return "File too large";
+        case EAGAIN: return "Resource temporarily unavailable";
+        case ENOTSOCK: return "Socket operation on non-socket";
+        case EDESTADDRREQ: return "Destination address required";
+        case EMSGSIZE: return "Message too long";
+        case ENOPROTOOPT: return "Protocol not available";
+        case EPROTONOSUPPORT: return "Protocol not supported";
+        case ESOCKTNOSUPPORT: return "Socket type not supported";
+        case EOPNOTSUPP: return "Operation not supported";
+        case EAFNOSUPPORT: return "Address family not supported by protocol";
+        case EADDRINUSE: return "Address already in use";
+        case EADDRNOTAVAIL: return "Cannot assign requested address";
+        case ENETUNREACH: return "Network is unreachable";
+        case ECONNABORTED: return "Software caused connection abort";
+        case ECONNRESET: return "Connection reset by peer";
+        case ENOBUFS: return "No buffer space available";
+        case EISCONN: return "Transport endpoint is already connected";
+        case ENOTCONN: return "Transport endpoint is not connected";
+        case ETIMEDOUT: return "Connection timed out";
+        case ECONNREFUSED: return "Connection refused";
+        case EHOSTUNREACH: return "No route to host";
+        case EALREADY: return "Operation already in progress";
+        case EINPROGRESS: return "Operation now in progress";
     }
     return "Unknown error";
 }

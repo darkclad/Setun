@@ -1,0 +1,333 @@
+// net: what the whole network stack shares (docs/NETWORK.md §3).
+//
+// Octets live one per tryte (0..255). Packets are built in `txbuf` with the
+// Ethernet header at 0, the IP header at ETH_HLEN and the transport header
+// at ETH_HLEN + IP_HLEN; ip_send() fills in everything below the transport.
+//
+// The kernel runs with interrupts off and never preempts itself, so nothing
+// here locks. The one rule: never sleep while a packet is half built.
+// Packets to ourselves go through a loopback queue that net_bh() drains, so
+// a reply is never built while the packet it answers is still in txbuf.
+
+import "../params.tri";
+import "../printk.tri";
+import "../mm.tri";
+import "../sched.tri";
+
+const ETH_HLEN: int = 14;
+const IP_HLEN: int = 20;
+const L4_OFF: int = 34;                   // ETH_HLEN + IP_HLEN
+const NET_MTU: int = 1500;
+const FRAME_MAX: int = 1514;
+
+const ETH_P_IP: int = 2048;               // 0x0800
+const ETH_P_ARP: int = 2054;              // 0x0806
+
+const IPPROTO_ICMP: int = 1;
+const IPPROTO_TCP: int = 6;
+const IPPROTO_UDP: int = 17;
+
+const INADDR_ANY: int = 0;
+const INADDR_LOOPBACK: int = 2130706433;  // 127.0.0.1
+const INADDR_BROADCAST: int = 4294967295; // 255.255.255.255
+const TWO32: int = 4294967296;
+
+// errno values the network uses (Linux)
+const ENETUNREACH: int = 101;
+const EHOSTUNREACH: int = 113;
+const EMSGSIZE: int = 90;
+const ENOBUFS: int = 105;
+
+// ---- octets ----------------------------------------------------------------------------------
+
+fn get16(p: *tryte, k: int) -> int { return p[k] * 256 + p[k + 1]; }
+fn get32(p: *tryte, k: int) -> int { return get16(p, k) * 65536 + get16(p, k + 2); }
+
+fn put16(p: *tryte, k: int, v: int) {
+    p[k] = (v / 256 % 256) as tryte;
+    p[k + 1] = (v % 256) as tryte;
+}
+
+fn put32(p: *tryte, k: int, v: int) {
+    put16(p, k, v / 65536 % 65536);
+    put16(p, k + 2, v % 65536);
+}
+
+// The Internet checksum: the ones'-complement sum of 16-bit words. Adding
+// is all it takes, so ternary arithmetic does it directly.
+fn csum_add(sum: int, p: *tryte, k: int, n: int) -> int {
+    var i: int = 0;
+    while (i + 1 < n) {
+        sum += p[k + i] * 256 + p[k + i + 1];
+        i += 2;
+    }
+    if (i < n) { sum += p[k + i] * 256; }
+    return sum;
+}
+
+// Fold to 16 bits and complement: 0 when the data includes a right checksum.
+fn csum_fold(sum: int) -> int {
+    while (sum > 65535) { sum = sum % 65536 + sum / 65536; }
+    return 65535 - sum;
+}
+
+// The TCP/UDP pseudo-header.
+fn csum_pseudo(src: int, dst: int, proto: int, len: int) -> int {
+    return src / 65536 + src % 65536 + dst / 65536 + dst % 65536 + proto + len;
+}
+
+// a.b.c.d into `buf`; returns the length.
+fn ip_to_str(a: int, buf: *char) -> int {
+    var n: int = 0;
+    var k: int = 3;
+    while (k >= 0) {
+        var part: int = a / pow256(k) % 256;
+        var tmp: [5]char;
+        var s: *char = itoa(part, &tmp[0]);
+        var j: int = 0;
+        while (s[j] != 0) { buf[n] = s[j]; n += 1; j += 1; }
+        if (k > 0) { buf[n] = '.'; n += 1; }
+        k -= 1;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// 256^k
+fn pow256(k: int) -> int {
+    var r: int = 1;
+    while (k > 0) { r *= 256; k -= 1; }
+    return r;
+}
+
+fn pr_ip(a: int) {
+    var buf: [16]char;
+    ip_to_str(a, &buf[0]);
+    pr(&buf[0]);
+}
+
+// Network masks are contiguous, so the host part is a power of two in size
+// and plain division does what binary AND does elsewhere.
+fn subnet_of(a: int, mask: int) -> int { return a - a % (TWO32 - mask); }
+fn subnet_bcast(a: int, mask: int) -> int { return subnet_of(a, mask) + TWO32 - mask - 1; }
+fn same_subnet(a: int, b: int, mask: int) -> int { return subnet_of(a, mask) == subnet_of(b, mask); }
+
+// A mask with n leading one bits, and back.
+fn mask_of_len(n: int) -> int { return TWO32 - pow2(32 - n); }
+fn mask_len(mask: int) -> int {
+    var n: int = 0;
+    while (n <= 32 && mask_of_len(n) != mask) { n += 1; }
+    return n;                                   // 33: not a contiguous mask
+}
+
+fn pow2(k: int) -> int {
+    var r: int = 1;
+    while (k > 0) { r *= 2; k -= 1; }
+    return r;
+}
+
+fn ip_addr(a: int, b: int, c: int, d: int) -> int { return ((a * 256 + b) * 256 + c) * 256 + d; }
+
+// Sequence-number arithmetic modulo 2^32: a - b as -2^31 .. 2^31-1.
+fn seq_diff(a: int, b: int) -> int {
+    var d: int = (a - b) % TWO32;
+    if (d < 0) { d += TWO32; }
+    if (d >= TWO32 / 2) { d -= TWO32; }
+    return d;
+}
+
+fn seq_add(a: int, n: int) -> int {
+    var r: int = (a + n) % TWO32;
+    if (r < 0) { r += TWO32; }
+    return r;
+}
+
+// ---- interfaces --------------------------------------------------------------------------------
+
+const NETIF_LO: int = 0;
+const NETIF_ETH: int = 1;
+
+struct Netif {
+    up: int;
+    addr: int;
+    mask: int;
+    gw: int;                              // eth0: the default gateway, 0 = none
+    rx_packets: int;
+    rx_bytes: int;
+    rx_errors: int;
+    rx_dropped: int;
+    tx_packets: int;
+    tx_bytes: int;
+    tx_errors: int;
+    tx_dropped: int;
+}
+
+var netifs: [2]Netif;
+var eth_present: int;
+var eth_mac_hi: int;                      // octets 0..2 as o0*65536 + o1*256 + o2
+var eth_mac_lo: int;
+
+fn mac_octet(hi: int, lo: int, k: int) -> int {
+    var w: int = k < 3 ? hi : lo;
+    var j: int = k % 3;
+    if (j == 0) { return w / 65536 % 256; }
+    if (j == 1) { return w / 256 % 256; }
+    return w % 256;
+}
+
+fn netif_name(i: int) -> *char { return i == NETIF_LO ? "lo" : "eth0"; }
+
+// Is `a` one of our addresses?
+fn is_local_addr(a: int) -> int {
+    if (a / 16777216 == 127) { return 1; }
+    return netifs[NETIF_ETH].up && a == netifs[NETIF_ETH].addr && a != 0;
+}
+
+// ---- counters (/proc/net/stat) --------------------------------------------------------------------
+
+const NS_IP_IN: int = 0;
+const NS_IP_HDR_ERR: int = 1;
+const NS_IP_CSUM_ERR: int = 2;
+const NS_IP_FRAG_DROP: int = 3;
+const NS_IP_NOT_OURS: int = 4;
+const NS_IP_NO_PROTO: int = 5;
+const NS_IP_OUT: int = 6;
+const NS_IP_NO_ROUTE: int = 7;
+const NS_ARP_IN: int = 8;
+const NS_ARP_BAD: int = 9;
+const NS_ARP_FAILED: int = 10;
+const NS_ICMP_IN: int = 11;
+const NS_ICMP_ERR: int = 12;
+const NS_ICMP_ECHO_REPLIES: int = 13;
+const NS_UDP_IN: int = 14;
+const NS_UDP_ERR: int = 15;
+const NS_UDP_NO_PORT: int = 16;
+const NS_UDP_RCVBUF: int = 17;
+const NS_TCP_IN: int = 18;
+const NS_TCP_ERR: int = 19;
+const NS_TCP_RST_OUT: int = 20;
+const NS_TCP_RETRANS: int = 21;
+const NS_TCP_ACTIVE: int = 22;
+const NS_TCP_PASSIVE: int = 23;
+const NS_TCP_DROPPED: int = 24;
+const NS_ETH_BAD: int = 25;
+const NS_LO_DROP: int = 26;
+const NSTATS: int = 27;
+
+var net_stats: [27]int;
+
+fn net_count(k: int) { net_stats[k] += 1; }
+
+fn net_stat_name(k: int) -> *char {
+    switch (k) {
+        case NS_IP_IN: return "ip_in";
+        case NS_IP_HDR_ERR: return "ip_hdr_errors";
+        case NS_IP_CSUM_ERR: return "ip_csum_errors";
+        case NS_IP_FRAG_DROP: return "ip_frag_dropped";
+        case NS_IP_NOT_OURS: return "ip_not_ours";
+        case NS_IP_NO_PROTO: return "ip_unknown_proto";
+        case NS_IP_OUT: return "ip_out";
+        case NS_IP_NO_ROUTE: return "ip_no_route";
+        case NS_ARP_IN: return "arp_in";
+        case NS_ARP_BAD: return "arp_bad";
+        case NS_ARP_FAILED: return "arp_failed";
+        case NS_ICMP_IN: return "icmp_in";
+        case NS_ICMP_ERR: return "icmp_errors";
+        case NS_ICMP_ECHO_REPLIES: return "icmp_echo_replies_sent";
+        case NS_UDP_IN: return "udp_in";
+        case NS_UDP_ERR: return "udp_errors";
+        case NS_UDP_NO_PORT: return "udp_no_port";
+        case NS_UDP_RCVBUF: return "udp_rcvbuf_errors";
+        case NS_TCP_IN: return "tcp_in";
+        case NS_TCP_ERR: return "tcp_errors";
+        case NS_TCP_RST_OUT: return "tcp_rst_sent";
+        case NS_TCP_RETRANS: return "tcp_retransmits";
+        case NS_TCP_ACTIVE: return "tcp_active_opens";
+        case NS_TCP_PASSIVE: return "tcp_passive_opens";
+        case NS_TCP_DROPPED: return "tcp_dropped";
+        case NS_ETH_BAD: return "eth_bad_frames";
+        case NS_LO_DROP: return "lo_dropped";
+    }
+    return "?";
+}
+
+// ---- buffers ----------------------------------------------------------------------------------------
+
+var txbuf: [1514]tryte;                   // the packet being built
+var lo_buf: [1514]tryte;                  // the loopback packet being delivered
+
+// The loopback queue: one page of 9 slots of 3^7 trytes, each holding a
+// length and an IP packet.
+const LO_SLOTS: int = 9;
+const LO_SLOT: int = 2187;
+var lo_frame: int;
+var lo_head: int;
+var lo_count: int;
+
+fn lo_slot(k: int) -> *tryte { return (frame_start(lo_frame) + k * LO_SLOT) as *tryte; }
+
+// Queue an IP packet (starting at `p`) for local delivery.
+fn lo_xmit(p: *tryte, len: int) -> int {
+    netifs[NETIF_LO].tx_packets += 1;
+    netifs[NETIF_LO].tx_bytes += len;
+    if (lo_count == LO_SLOTS || lo_frame == 0) {
+        netifs[NETIF_LO].tx_dropped += 1;
+        net_count(NS_LO_DROP);
+        return -ENOBUFS;
+    }
+    var s: *tryte = lo_slot((lo_head + lo_count) % LO_SLOTS);
+    s[0] = len as tryte;
+    copy_trytes(s + 1, p, len);
+    lo_count += 1;
+    return 0;
+}
+
+var in_bh: int;
+
+// Deliver queued local packets (which may queue more). Called after every
+// entry into the stack: network system calls, the card's interrupt, the
+// tick. Returns how many packets it delivered.
+fn net_bh() -> int {
+    if (in_bh) { return 0; }
+    in_bh = 1;
+    var n: int = 0;
+    while (lo_count > 0) {
+        var s: *tryte = lo_slot(lo_head);
+        var len: int = s[0];
+        copy_trytes(&lo_buf[0], s + 1, len);
+        lo_head = (lo_head + 1) % LO_SLOTS;
+        lo_count -= 1;
+        netifs[NETIF_LO].rx_packets += 1;
+        netifs[NETIF_LO].rx_bytes += len;
+        ip_input(&lo_buf[0], len, NETIF_LO);
+        n += 1;
+    }
+    in_bh = 0;
+    return n;
+}
+
+// sleep_on for the network. Queued local packets go first; if there were
+// any, they may have done what the caller waits for (and woken it before
+// it slept), so the caller looks again instead of sleeping.
+fn net_sleep(chan: int) -> int {
+    if (net_bh() > 0) { return signal_pending(current_task()); }
+    return sleep_on(chan);
+}
+
+// Called on every timer tick.
+fn net_tick() {
+    arp_tick();
+    tcp_tick();
+    net_bh();
+}
+
+fn net_init() {
+    lo_frame = alloc_pages(0);
+    if (lo_frame < 0) { lo_frame = 0; }
+    netifs[NETIF_LO].up = 1;
+    netifs[NETIF_LO].addr = INADDR_LOOPBACK;
+    netifs[NETIF_LO].mask = ip_addr(255, 0, 0, 0);
+    arp_init();
+    tnic_init();
+    socket_init();
+}

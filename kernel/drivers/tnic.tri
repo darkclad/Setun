@@ -1,0 +1,88 @@
+// tnic: the driver for the TNIC network card (ISA §8.2, docs/NETWORK.md §1).
+//
+// The card copies a received frame to any physical address and sends one
+// from any physical address; each command completes before the next
+// instruction. The kernel is identity-mapped, so a global's address is its
+// physical address.
+
+import "../params.tri";
+import "../printk.tri";
+import "../net/net.tri";
+import "../net/tcp.tri";
+
+var tnic_rxbuf: [1514]tryte;
+
+fn tnic_init() {
+    eth_mac_hi = in(NIC_MAC_HI);
+    eth_mac_lo = in(NIC_MAC_LO);
+    eth_present = 1;
+    out(NIC_CTRL, 1);
+    out(TPIC_UNMASK, IRQ_NIC);
+    printk("eth0: TNIC at port 270, IRQ 8, MAC ");
+    var k: int = 0;
+    while (k < 6) {
+        var o: int = mac_octet(eth_mac_hi, eth_mac_lo, k);
+        pr_hex2(o);
+        if (k < 5) { pr(":"); }
+        k += 1;
+    }
+    if (in(NIC_LINK) == 1) {
+        // the user-mode network's defaults (QEMU's): 10.0.2.15/24 via 10.0.2.2
+        netifs[NETIF_ETH].addr = ip_addr(10, 0, 2, 15);
+        netifs[NETIF_ETH].mask = ip_addr(255, 255, 255, 0);
+        netifs[NETIF_ETH].gw = ip_addr(10, 0, 2, 2);
+        netifs[NETIF_ETH].up = 1;
+        pr(", link up, ");
+        pr_ip(netifs[NETIF_ETH].addr);
+        pr("/24 via ");
+        pr_ip(netifs[NETIF_ETH].gw);
+        pr_nl();
+    } else {
+        pr(", no link\n");
+    }
+}
+
+fn pr_hex2(v: int) {
+    var digits: *char = "0123456789abcdef";
+    var s: [3]char;
+    s[0] = digits[v / 16 % 16];
+    s[1] = digits[v % 16];
+    s[2] = 0;
+    pr(&s[0]);
+}
+
+// Send `len` octets from `p` (a whole Ethernet frame). 0 or -errno.
+fn tnic_xmit(p: *tryte, len: int) -> int {
+    out(NIC_TX_ADDR, p as int);
+    out(NIC_TX_LEN, len);
+    out(NIC_CMD, 1);
+    if (in(NIC_STATUS) != 0) {
+        netifs[NETIF_ETH].tx_dropped += 1;
+        return -ENOBUFS;
+    }
+    netifs[NETIF_ETH].tx_packets += 1;
+    netifs[NETIF_ETH].tx_bytes += len;
+    return 0;
+}
+
+// IRQ 8: take every queued frame up the stack.
+fn tnic_poll() {
+    while (in(NIC_RX_COUNT) > 0) {
+        var len: int = in(NIC_RX_LEN);
+        out(NIC_RX_ADDR, &tnic_rxbuf[0] as int);
+        out(NIC_CMD, -1);
+        if (in(NIC_STATUS) != 0) {
+            out(NIC_CMD, 0);                      // drop it rather than loop on it
+            netifs[NETIF_ETH].rx_errors += 1;
+            continue;
+        }
+        netifs[NETIF_ETH].rx_packets += 1;
+        netifs[NETIF_ETH].rx_bytes += len;
+        if (!netifs[NETIF_ETH].up) {
+            netifs[NETIF_ETH].rx_dropped += 1;
+            continue;
+        }
+        eth_input(&tnic_rxbuf[0], len);
+    }
+    net_bh();
+}

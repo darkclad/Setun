@@ -17,6 +17,7 @@ import "pipe.tri";
 import "devfs.tri";
 import "../drivers/tty.tri";
 import "../sched.tri";
+import "../net/tcp.tri";
 
 const NFDS: int = 27;
 const AT_FDCWD: int = -100;
@@ -78,6 +79,7 @@ fn file_close(f: int) {
     var i: int = files[f].ino;
     if (inodes[i].type == I_FIFO) { pipe_close(inodes[i].rdev, writable(f)); }
     if (inodes[i].type == I_CHR) { dev_close(inodes[i].rdev, f); }
+    if (inodes[i].type == I_SOCK) { sock_file_closed(inodes[i].rdev); }
     inodes[i].opens -= 1;
     inode_release(i);
 }
@@ -94,6 +96,7 @@ fn file_read(f: int, buf: *tryte, n: int) -> int {
         case I_DIR: return -EISDIR;
         case I_FIFO: return pipe_read(node.rdev, buf, n, nonblocking(f));
         case I_CHR: return dev_read(node.rdev, f, buf, n, nonblocking(f));
+        case I_SOCK: return sock_read(node.rdev, f, buf, n);
     }
     var r: int = vfs_read(i, files[f].pos, buf, n);
     if (r > 0) { files[f].pos += r; }
@@ -108,6 +111,7 @@ fn file_write(f: int, buf: *tryte, n: int) -> int {
         case I_DIR: return -EISDIR;
         case I_FIFO: return pipe_write(node.rdev, buf, n, nonblocking(f));
         case I_CHR: return dev_write(node.rdev, f, buf, n, nonblocking(f));
+        case I_SOCK: return sock_write(node.rdev, f, buf, n);
     }
     if (has(files[f].flags, O_APPEND)) { files[f].pos = node.size; }
     if (n == 0) { return 0; }
@@ -283,7 +287,7 @@ fn sys_lseek(fd: int, off: int, whence: int) -> int {
     if (f < 0) { return f; }
     var node: *Inode = &inodes[files[f].ino];
     var is_fb: int = node.type == I_CHR && node.rdev == DEV_FB0;    // fbdev seeks over its pixels
-    if (node.type == I_FIFO || (node.type == I_CHR && !is_fb)) { return -ESPIPE; }
+    if (node.type == I_FIFO || node.type == I_SOCK || (node.type == I_CHR && !is_fb)) { return -ESPIPE; }
     var pos: int;
     switch (whence) {
         case SEEK_SET: pos = off;
@@ -472,6 +476,7 @@ fn sys_ioctl(fd: int, cmd: int, arg: int) -> int {
     var f: int = fd_file(fd);
     if (f < 0) { return f; }
     var i: int = files[f].ino;
+    if (inodes[i].type == I_SOCK) { return sock_ioctl(cmd, arg); }
     if (inodes[i].type != I_CHR || !dev_ioctl_known(inodes[i].rdev, f, cmd)) { return -25; }   // ENOTTY
     if (!user_range_ok(arg - 1, sizeof(Termios))) { return -EFAULT; }
     return dev_ioctl(inodes[i].rdev, f, cmd, arg);
@@ -618,6 +623,7 @@ fn file_poll(f: int) -> int {
         return r;
     }
     if (node.type == I_CHR) { return dev_poll(node.rdev, f); }
+    if (node.type == I_SOCK) { return sock_poll(node.rdev); }
     return POLLIN_ + POLLOUT_;                       // files and directories never block
 }
 

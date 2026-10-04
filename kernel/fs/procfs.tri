@@ -4,6 +4,7 @@
 //   /proc/<pid>/stat     Linux's field order (the first 24 fields)
 //   /proc/<pid>/status   Name, State, Pid, PPid, PGid, Sid
 //   /proc/<pid>/cmdline  the arguments, NUL-separated
+//   /proc/net/{dev,arp,tcp,udp,stat}  the network (kernel/net/)
 //
 // An inode's ino_no says what it shows: kind + 16 * pid.
 
@@ -13,6 +14,7 @@ import "../mm.tri";
 import "vfs.tri";
 import "bcache.tri";
 import "../sched.tri";
+import "../net/tcp.tri";
 
 const PROC_ROOT: int = 1;
 const PROC_MEMINFO: int = 2;
@@ -22,6 +24,12 @@ const PROC_PID: int = 5;
 const PROC_STAT: int = 6;
 const PROC_STATUS: int = 7;
 const PROC_CMDLINE: int = 8;
+const PROC_NET: int = 9;
+const PROC_NET_DEV: int = 10;
+const PROC_NET_ARP: int = 11;
+const PROC_NET_TCP: int = 12;
+const PROC_NET_UDP: int = 13;
+const PROC_NET_STAT: int = 14;
 const ESRCH_: int = 3;
 
 var proc_mnt: int = -1;
@@ -42,7 +50,7 @@ fn live_task(pid: int) -> int {
 
 fn proc_iload(i: int) -> int {
     var k: int = proc_kind(i);
-    if (k == PROC_ROOT || k == PROC_PID) {
+    if (k == PROC_ROOT || k == PROC_PID || k == PROC_NET) {
         inodes[i].type = I_DIR;
         inodes[i].mode = 365;                     // 0555
         inodes[i].nlink = 2;
@@ -50,7 +58,7 @@ fn proc_iload(i: int) -> int {
         inodes[i].type = I_REG;
         inodes[i].mode = k == PROC_CMDLINE || k == PROC_STAT || k == PROC_STATUS ? 292 : 292;   // 0444
     }
-    if (k >= PROC_PID && live_task(proc_pid(i)) < 0) { return -ENOENT_; }
+    if (k >= PROC_PID && k <= PROC_CMDLINE && live_task(proc_pid(i)) < 0) { return -ENOENT_; }
     return 0;
 }
 
@@ -74,6 +82,16 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "cmdline")) { return iget(FS_PROC, m, base + PROC_CMDLINE); }
         return -ENOENT_;
     }
+    if (k == PROC_NET) {
+        if (len == 2 && s[0] == '.' && s[1] == '.') { return iget(FS_PROC, m, PROC_ROOT); }
+        if (proc_name_eq(s, len, "dev")) { return iget(FS_PROC, m, PROC_NET_DEV); }
+        if (proc_name_eq(s, len, "arp")) { return iget(FS_PROC, m, PROC_NET_ARP); }
+        if (proc_name_eq(s, len, "tcp")) { return iget(FS_PROC, m, PROC_NET_TCP); }
+        if (proc_name_eq(s, len, "udp")) { return iget(FS_PROC, m, PROC_NET_UDP); }
+        if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, PROC_NET_STAT); }
+        return -ENOENT_;
+    }
+    if (proc_name_eq(s, len, "net")) { return iget(FS_PROC, m, PROC_NET); }
     if (proc_name_eq(s, len, "meminfo")) { return iget(FS_PROC, m, PROC_MEMINFO); }
     if (proc_name_eq(s, len, "uptime")) { return iget(FS_PROC, m, PROC_UPTIME); }
     if (proc_name_eq(s, len, "mounts")) { return iget(FS_PROC, m, PROC_MOUNTS); }
@@ -96,6 +114,12 @@ fn proc_name_of(i: int, buf: *char) -> int {
         case PROC_STAT: copy_str(buf, "stat", 5);
         case PROC_STATUS: copy_str(buf, "status", 7);
         case PROC_CMDLINE: copy_str(buf, "cmdline", 8);
+        case PROC_NET: copy_str(buf, "net", 4);
+        case PROC_NET_DEV: copy_str(buf, "dev", 4);
+        case PROC_NET_ARP: copy_str(buf, "arp", 4);
+        case PROC_NET_TCP: copy_str(buf, "tcp", 4);
+        case PROC_NET_UDP: copy_str(buf, "udp", 4);
+        case PROC_NET_STAT: copy_str(buf, "stat", 5);
         case PROC_PID: itoa(proc_pid(i), buf);
         default: copy_str(buf, "proc", 5);
     }
@@ -108,6 +132,14 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
     info[1] = DT_REG;
     if (pos == 0) { copy_str(name, ".", 2); info[0] = inodes[dir].ino_no; info[1] = DT_DIR; return 1; }
     if (pos == 1) { copy_str(name, "..", 3); info[0] = PROC_ROOT; info[1] = DT_DIR; return 2; }
+    if (k == PROC_NET) {
+        if (pos == 2) { copy_str(name, "arp", 4); info[0] = PROC_NET_ARP; return 3; }
+        if (pos == 3) { copy_str(name, "dev", 4); info[0] = PROC_NET_DEV; return 4; }
+        if (pos == 4) { copy_str(name, "stat", 5); info[0] = PROC_NET_STAT; return 5; }
+        if (pos == 5) { copy_str(name, "tcp", 4); info[0] = PROC_NET_TCP; return 6; }
+        if (pos == 6) { copy_str(name, "udp", 4); info[0] = PROC_NET_UDP; return 7; }
+        return 0;
+    }
     if (k == PROC_PID) {
         var base: int = 16 * proc_pid(dir);
         if (pos == 2) { copy_str(name, "cmdline", 8); info[0] = base + PROC_CMDLINE; return 3; }
@@ -117,14 +149,15 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
     }
     if (pos == 2) { copy_str(name, "meminfo", 8); info[0] = PROC_MEMINFO; return 3; }
     if (pos == 3) { copy_str(name, "mounts", 7); info[0] = PROC_MOUNTS; return 4; }
-    if (pos == 4) { copy_str(name, "uptime", 7); info[0] = PROC_UPTIME; return 5; }
-    var t: int = pos - 4;                          // task slots 1..26
+    if (pos == 4) { copy_str(name, "net", 4); info[0] = PROC_NET; info[1] = DT_DIR; return 5; }
+    if (pos == 5) { copy_str(name, "uptime", 7); info[0] = PROC_UPTIME; return 6; }
+    var t: int = pos - 5;                          // task slots 1..26
     while (t < NTASKS) {
         if (tasks[t].state != TASK_UNUSED) {
             itoa(tasks[t].pid, name);
             info[0] = 16 * tasks[t].pid + PROC_PID;
             info[1] = DT_DIR;
-            return t + 5;
+            return t + 6;
         }
         t += 1;
     }
@@ -133,12 +166,13 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
 
 // ---- generated text ---------------------------------------------------------------------------
 
-var pbuf: [2187]char;
+const PBUF_MAX: int = 6560;
+var pbuf: [6561]char;
 var plen: int;
 
 fn ps(s: *char) {
     var k: int = 0;
-    while (s[k] != 0 && plen < 2186) { pbuf[plen] = s[k]; plen += 1; k += 1; }
+    while (s[k] != 0 && plen < PBUF_MAX) { pbuf[plen] = s[k]; plen += 1; k += 1; }
 }
 
 fn pi(v: int) {
@@ -146,7 +180,7 @@ fn pi(v: int) {
     ps(itoa(v, &b[0]));
 }
 
-fn pc(c: char) { if (plen < 2186) { pbuf[plen] = c; plen += 1; } }
+fn pc(c: char) { if (plen < PBUF_MAX) { pbuf[plen] = c; plen += 1; } }
 
 fn pfield(label: *char, v: int, unit: *char) {
     ps(label);
@@ -213,6 +247,7 @@ fn proc_generate(i: int) -> int {
         }
         return 0;
     }
+    if (k >= PROC_NET_DEV && k <= PROC_NET_STAT) { proc_net(k); return 0; }
     var ti: int = live_task(proc_pid(i));
     if (ti < 0) { return -ESRCH_; }
     var t: *Task = &tasks[ti];
@@ -238,8 +273,134 @@ fn proc_generate(i: int) -> int {
     }
     // cmdline
     var j: int = 0;
-    while (j < t.cmdline_len && plen < 2186) { pbuf[plen] = t.cmdline[j]; plen += 1; j += 1; }
+    while (j < t.cmdline_len && plen < PBUF_MAX) { pbuf[plen] = t.cmdline[j]; plen += 1; j += 1; }
     return 0;
+}
+
+// ---- /proc/net ------------------------------------------------------------------------------
+
+fn phex(v: int, digits: int) {
+    var d: *char = "0123456789ABCDEF";
+    var k: int = digits - 1;
+    while (k >= 0) {
+        var div: int = 1;
+        var j: int = 0;
+        while (j < k) { div *= 16; j += 1; }
+        pc(d[v / div % 16]);
+        k -= 1;
+    }
+}
+
+// Pad the line to column `col` (counted from the last newline).
+fn pcol(col: int) {
+    var start: int = plen;
+    while (start > 0 && pbuf[start - 1] != '\n') { start -= 1; }
+    while (plen - start < col) { pc(' '); }
+}
+
+// An address the way Linux prints it on a little-endian machine: 10.0.2.15 = 0F02000A.
+fn paddr_hex(a: int, port: int) {
+    phex(a % 256, 2);
+    phex(a / 256 % 256, 2);
+    phex(a / 65536 % 256, 2);
+    phex(a / 16777216 % 256, 2);
+    pc(':');
+    phex(port, 4);
+}
+
+fn pmac(hi: int, lo: int) {
+    var d: *char = "0123456789abcdef";
+    var o: int = 0;
+    while (o < 6) {
+        var v: int = mac_octet(hi, lo, o);
+        pc(d[v / 16]);
+        pc(d[v % 16]);
+        if (o < 5) { pc(':'); }
+        o += 1;
+    }
+}
+
+fn proc_net(k: int) {
+    if (k == PROC_NET_DEV) {
+        ps("Inter-|   Receive                                                |  Transmit\n");
+        ps(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+        var x: int = 0;
+        while (x < 2) {
+            if (x == NETIF_LO || eth_present) {
+                var e: *Netif = &netifs[x];
+                pcol(x == NETIF_LO ? 4 : 2);
+                ps(netif_name(x));
+                ps(": ");
+                pi(e.rx_bytes); pc(' '); pi(e.rx_packets); pc(' '); pi(e.rx_errors); pc(' '); pi(e.rx_dropped);
+                ps(" 0 0 0 0 ");
+                pi(e.tx_bytes); pc(' '); pi(e.tx_packets); pc(' '); pi(e.tx_errors); pc(' '); pi(e.tx_dropped);
+                ps(" 0 0 0 0\n");
+            }
+            x += 1;
+        }
+        return;
+    }
+    if (k == PROC_NET_ARP) {
+        ps("IP address       HW type     Flags       HW address            Mask     Device\n");
+        var a: int = 0;
+        while (a < NARP) {
+            var e: *ArpEntry = &arp_cache[a];
+            if (e.state != ARP_FREE) {
+                var buf: [16]char;
+                ip_to_str(e.ip, &buf[0]);
+                ps(&buf[0]);
+                pcol(17);
+                ps("0x1");
+                pcol(29);
+                ps(e.state == ARP_REACHABLE ? "0x2" : "0x0");
+                pcol(41);
+                if (e.state == ARP_REACHABLE) { pmac(e.mac_hi, e.mac_lo); } else { pmac(0, 0); }
+                pcol(63);
+                ps("*        eth0\n");
+            }
+            a += 1;
+        }
+        return;
+    }
+    if (k == PROC_NET_STAT) {
+        var n: int = 0;
+        while (n < NSTATS) {
+            ps(net_stat_name(n));
+            pc(' ');
+            pi(net_stats[n]);
+            pc('\n');
+            n += 1;
+        }
+        return;
+    }
+    // tcp, udp: Linux's first columns, then the owner's uid
+    ps("  sl  local_address rem_address   st tx_queue rx_queue uid\n");
+    var want: int = k == PROC_NET_TCP ? SOCK_STREAM : SOCK_DGRAM;
+    var sl: int = 0;
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var q: *Socket = &socks[s];
+        if (q.used && q.type == want) {
+            pcol(2);
+            if (sl < 10) { pc(' '); }
+            pi(sl);
+            ps(": ");
+            paddr_hex(q.laddr, q.lport);
+            pc(' ');
+            paddr_hex(q.raddr, q.rport);
+            pc(' ');
+            phex(k == PROC_NET_TCP ? q.state : (q.raddr != 0 ? TCP_ESTABLISHED : TCP_CLOSE), 2);
+            pc(' ');
+            phex(k == PROC_NET_TCP ? q.tx_count : 0, 8);
+            pc(':');
+            phex(q.rx_count, 8);
+            pc(' ');
+            pi(q.uid);
+            pc('\n');
+            sl += 1;
+        }
+        s += 1;
+    }
 }
 
 fn proc_read(i: int, pos: int, buf: *tryte, n: int) -> int {

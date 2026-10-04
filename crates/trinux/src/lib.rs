@@ -67,10 +67,11 @@ pub const ROOT_DIRS: [&str; 8] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/et
 /// Owners and modes that differ from the defaults (root:root, 0755 for
 /// programs and directories, 0644 for text): the password hashes are root's
 /// alone, su and passwd run set-user-ID root, and each user owns a home.
-pub const SPECIAL_MODES: [(&str, i64, i64, i64); 5] = [
+pub const SPECIAL_MODES: [(&str, i64, i64, i64); 6] = [
     ("/etc/shadow", 0o600, 0, 0),
     ("/bin/su", 0o4755, 0, 0),
     ("/bin/passwd", 0o4755, 0, 0),
+    ("/bin/ping", 0o4755, 0, 0),
     ("/root", 0o700, 0, 0),
     ("/home/user", 0o755, 1000, 1000),
 ];
@@ -135,6 +136,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
+        "nc", "ping", "netstat", "nettest",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -145,6 +147,8 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }
+    v.push(("/sbin/ifconfig".into(), u.join("bin/ifconfig.tri")));
+    v.push(("/sbin/telnetd".into(), u.join("bin/telnetd.tri")));
     for name in ["useradd", "userdel"] {
         v.push((format!("/sbin/{name}"), u.join("bin/useradm.tri")));
     }
@@ -163,7 +167,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
     v.push(("/etc/motd".into(), u.join("etc/motd")));
     v.push(("/etc/pangrams".into(), u.join("etc/pangrams")));
-    for db in ["passwd", "group", "shadow"] {
+    for db in ["passwd", "group", "shadow", "hosts"] {
         v.push((format!("/etc/{db}"), u.join(format!("etc/{db}"))));
     }
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));

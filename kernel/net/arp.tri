@@ -1,0 +1,217 @@
+// Ethernet II and ARP (RFC 826) for eth0.
+//
+// The ARP cache has 27 entries. A packet for a next hop that is not
+// resolved yet waits in one page of 9 slots of 3^7 trytes while ARP asks
+// (once a second, three times); then the waiting packets are dropped.
+
+import "net.tri";
+
+const ARP_FREE: int = 0;
+const ARP_INCOMPLETE: int = 1;
+const ARP_REACHABLE: int = 2;
+const NARP: int = 27;
+const ARP_TRIES: int = 3;
+const ARP_LIFETIME: int = 6000;           // ticks (60 s)
+
+struct ArpEntry {
+    state: int;
+    ip: int;
+    mac_hi: int;
+    mac_lo: int;
+    when: int;                            // jiffies: learned, or the last request
+    tries: int;
+}
+
+var arp_cache: [27]ArpEntry;
+
+// Waiting packets: arp_wait_ip[k] is slot k's next hop, 0 if the slot is free.
+const ARP_WAIT_SLOTS: int = 9;
+const ARP_WAIT_SLOT: int = 2187;
+var arp_wait_frame: int;
+var arp_wait_ip: [9]int;
+
+var arpbuf: [42]tryte;
+
+fn arp_init() {
+    arp_wait_frame = alloc_pages(0);
+    if (arp_wait_frame < 0) { arp_wait_frame = 0; }
+}
+
+fn arp_wait_slot(k: int) -> *tryte { return (frame_start(arp_wait_frame) + k * ARP_WAIT_SLOT) as *tryte; }
+
+fn arp_find(ip: int) -> int {
+    var k: int = 0;
+    while (k < NARP) {
+        if (arp_cache[k].state != ARP_FREE && arp_cache[k].ip == ip) { return k; }
+        k += 1;
+    }
+    return -1;
+}
+
+// A slot for `ip`: a free one, else the oldest.
+fn arp_slot(ip: int) -> int {
+    var k: int = arp_find(ip);
+    if (k >= 0) { return k; }
+    var best: int = 0;
+    k = 0;
+    while (k < NARP) {
+        if (arp_cache[k].state == ARP_FREE) { return k; }
+        if (arp_cache[k].when < arp_cache[best].when) { best = k; }
+        k += 1;
+    }
+    return best;
+}
+
+// Ethernet header at p[0..13].
+fn eth_header(p: *tryte, dst_hi: int, dst_lo: int, type: int) {
+    var k: int = 0;
+    while (k < 6) {
+        p[k] = mac_octet(dst_hi, dst_lo, k) as tryte;
+        p[6 + k] = mac_octet(eth_mac_hi, eth_mac_lo, k) as tryte;
+        k += 1;
+    }
+    put16(p, 12, type);
+}
+
+fn arp_send(op: int, target_ip: int, dst_hi: int, dst_lo: int) {
+    var p: *tryte = &arpbuf[0];
+    eth_header(p, dst_hi, dst_lo, ETH_P_ARP);
+    put16(p, 14, 1);                      // Ethernet
+    put16(p, 16, ETH_P_IP);
+    p[18] = 6;
+    p[19] = 4;
+    put16(p, 20, op);
+    var k: int = 0;
+    while (k < 6) {
+        p[22 + k] = mac_octet(eth_mac_hi, eth_mac_lo, k) as tryte;
+        p[32 + k] = (op == 1 ? 0 : mac_octet(dst_hi, dst_lo, k)) as tryte;
+        k += 1;
+    }
+    put32(p, 28, netifs[NETIF_ETH].addr);
+    put32(p, 38, target_ip);
+    tnic_xmit(p, 42);
+}
+
+fn arp_request(k: int) {
+    arp_cache[k].when = jiffies;
+    arp_cache[k].tries += 1;
+    arp_send(1, arp_cache[k].ip, 16777215, 16777215);   // broadcast
+}
+
+// Send the Ethernet frame in txbuf (IP packet of `len` octets at 14) to
+// next hop `nh`, resolving it first if needed.
+fn eth_send_ip(nh: int, len: int) -> int {
+    if (nh == INADDR_BROADCAST || nh == subnet_bcast(netifs[NETIF_ETH].addr, netifs[NETIF_ETH].mask)) {
+        eth_header(&txbuf[0], 16777215, 16777215, ETH_P_IP);
+        return tnic_xmit(&txbuf[0], ETH_HLEN + len);
+    }
+    var k: int = arp_find(nh);
+    if (k >= 0 && arp_cache[k].state == ARP_REACHABLE) {
+        eth_header(&txbuf[0], arp_cache[k].mac_hi, arp_cache[k].mac_lo, ETH_P_IP);
+        return tnic_xmit(&txbuf[0], ETH_HLEN + len);
+    }
+    // park the packet and ask
+    var w: int = 0;
+    while (w < ARP_WAIT_SLOTS && arp_wait_ip[w] != 0) { w += 1; }
+    if (w == ARP_WAIT_SLOTS || arp_wait_frame == 0) {
+        netifs[NETIF_ETH].tx_dropped += 1;
+        return -ENOBUFS;
+    }
+    var s: *tryte = arp_wait_slot(w);
+    s[0] = len as tryte;
+    copy_trytes(s + 1, &txbuf[ETH_HLEN], len);
+    arp_wait_ip[w] = nh;
+    if (k < 0) {
+        k = arp_slot(nh);
+        arp_cache[k].state = ARP_INCOMPLETE;
+        arp_cache[k].ip = nh;
+        arp_cache[k].tries = 0;
+        arp_request(k);
+    }
+    return 0;
+}
+
+// Send the packets waiting for `ip` (now resolved as entry k).
+fn arp_flush(k: int) {
+    var w: int = 0;
+    while (w < ARP_WAIT_SLOTS) {
+        if (arp_wait_ip[w] == arp_cache[k].ip) {
+            var s: *tryte = arp_wait_slot(w);
+            var len: int = s[0];
+            copy_trytes(&txbuf[ETH_HLEN], s + 1, len);
+            arp_wait_ip[w] = 0;
+            eth_header(&txbuf[0], arp_cache[k].mac_hi, arp_cache[k].mac_lo, ETH_P_IP);
+            tnic_xmit(&txbuf[0], ETH_HLEN + len);
+        }
+        w += 1;
+    }
+}
+
+fn arp_drop_waiting(ip: int) {
+    var w: int = 0;
+    while (w < ARP_WAIT_SLOTS) {
+        if (arp_wait_ip[w] == ip) {
+            arp_wait_ip[w] = 0;
+            netifs[NETIF_ETH].tx_dropped += 1;
+        }
+        w += 1;
+    }
+}
+
+fn arp_input(p: *tryte, len: int) {
+    net_count(NS_ARP_IN);
+    if (len < 28 || get16(p, 0) != 1 || get16(p, 2) != ETH_P_IP || p[4] != 6 || p[5] != 4) {
+        net_count(NS_ARP_BAD);
+        return;
+    }
+    var op: int = get16(p, 6);
+    var smac_hi: int = (p[8] * 256 + p[9]) * 256 + p[10];
+    var smac_lo: int = (p[11] * 256 + p[12]) * 256 + p[13];
+    var sip: int = get32(p, 14);
+    var tip: int = get32(p, 24);
+    if (op != 1 && op != 2) { net_count(NS_ARP_BAD); return; }
+    var me: int = netifs[NETIF_ETH].addr;
+    if (sip == 0 || sip == me) { return; }          // probes, or someone using our address
+    // learn the sender if it is in the cache or talking to us (RFC 826)
+    var k: int = arp_find(sip);
+    if (k >= 0 || tip == me) {
+        if (k < 0) { k = arp_slot(sip); }
+        arp_cache[k].state = ARP_REACHABLE;
+        arp_cache[k].ip = sip;
+        arp_cache[k].mac_hi = smac_hi;
+        arp_cache[k].mac_lo = smac_lo;
+        arp_cache[k].when = jiffies;
+        arp_cache[k].tries = 0;
+        arp_flush(k);
+    }
+    if (op == 1 && tip == me) { arp_send(2, sip, smac_hi, smac_lo); }
+}
+
+// Every tick: retry incomplete entries, give up after three tries, and
+// forget old ones.
+fn arp_tick() {
+    var k: int = 0;
+    while (k < NARP) {
+        var e: *ArpEntry = &arp_cache[k];
+        if (e.state == ARP_INCOMPLETE && jiffies - e.when >= HZ) {
+            if (e.tries >= ARP_TRIES) {
+                net_count(NS_ARP_FAILED);
+                arp_drop_waiting(e.ip);
+                e.state = ARP_FREE;
+            } else {
+                arp_request(k);
+            }
+        } else if (e.state == ARP_REACHABLE && jiffies - e.when >= ARP_LIFETIME) {
+            e.state = ARP_FREE;
+        }
+        k += 1;
+    }
+}
+
+fn eth_input(p: *tryte, len: int) {
+    if (len < ETH_HLEN) { net_count(NS_ETH_BAD); return; }
+    var type: int = get16(p, 12);
+    if (type == ETH_P_ARP) { arp_input(p + ETH_HLEN, len - ETH_HLEN); return; }
+    if (type == ETH_P_IP) { ip_input(p + ETH_HLEN, len - ETH_HLEN, NETIF_ETH); return; }
+    netifs[NETIF_ETH].rx_dropped += 1;           // not a protocol we speak
+}

@@ -8,6 +8,7 @@ import "vm.tri";
 import "fpu.tri";
 import "drivers/tty.tri";
 import "drivers/input.tri";
+import "drivers/tnic.tri";
 
 // ---- trap frame ---------------------------------------------------------------
 //
@@ -198,9 +199,11 @@ fn trap_handler(f: *int) {
             out(TPIC_EOI, irq);
             if (irq == IRQ_KEYBOARD || irq == IRQ_SERIAL) { tty_poll(); }
             if (irq == IRQ_MOUSE) { mouse_poll(); }
+            if (irq == IRQ_NIC) { tnic_poll(); }
             if (irq == IRQ_TIMER) {
                 jiffies += 1;
                 tty_poll();
+                net_tick();
                 scheduler_tick();
             }
         }

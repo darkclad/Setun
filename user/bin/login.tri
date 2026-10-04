@@ -4,8 +4,8 @@
 //   login -f user   no password (root only), e.g. for a scripted session
 //
 // The password is checked against /etc/shadow (crypt.tri) with the echo
-// off. Then the console devices (/dev/console, fb0, mouse, kbd) are handed
-// to the user, so they can run the window system; the supplementary groups,
+// off. Then, on the console, its devices (/dev/console, fb0, mouse, kbd)
+// are handed to the user, so they can run the window system; the supplementary groups,
 // group and user are set; and the shell starts in the home directory as a
 // login shell ("-sh") with HOME, USER, LOGNAME, SHELL, PATH and TERM.
 
@@ -14,6 +14,14 @@ import "../lib/string.tri";
 import "../lib/stdlib.tri";
 import "../lib/pwd.tri";
 import "../lib/crypt.tri";
+
+// Is this login on the console (and not, say, on a pty from telnetd)?
+fn on_console() -> int {
+    var a: stat_t;
+    var b: stat_t;
+    if (fstat(STDIN_FILENO, &a) < 0 || stat("/dev/console", &b) < 0) { return 0; }
+    return a.st_rdev == b.st_rdev;
+}
 
 // Read a line from the terminal after printing p; echo off for passwords.
 // Its length, or -1 at the end of the input.
@@ -75,9 +83,11 @@ fn start_session(pw: *passwd) {
     shell[242] = 0;
     var uid: int = pw.pw_uid;
     var gid: int = pw.pw_gid;
-    var devs: [4]*char = { "/dev/console", "/dev/fb0", "/dev/mouse", "/dev/kbd" };
-    var k: int = 0;
-    while (k < 4) { chown(devs[k], uid, gid); k += 1; }
+    if (on_console()) {
+        var devs: [4]*char = { "/dev/console", "/dev/fb0", "/dev/mouse", "/dev/kbd" };
+        var k: int = 0;
+        while (k < 4) { chown(devs[k], uid, gid); k += 1; }
+    }
     if (initgroups(&name[0], gid) < 0 || setgid(gid) < 0 || setuid(uid) < 0) {
         perror2("login", "cannot set the user and group");
         _exit(1);

@@ -111,6 +111,19 @@ const SYS_BRK: int = 214;
 const SYS_CLONE: int = 220;
 const SYS_EXECVE: int = 221;
 const SYS_WAIT4: int = 260;
+const SYS_SOCKET: int = 198;
+const SYS_BIND: int = 200;
+const SYS_LISTEN: int = 201;
+const SYS_ACCEPT: int = 202;
+const SYS_CONNECT: int = 203;
+const SYS_GETSOCKNAME: int = 204;
+const SYS_GETPEERNAME: int = 205;
+const SYS_SENDTO: int = 206;
+const SYS_RECVFROM: int = 207;
+const SYS_SETSOCKOPT: int = 208;
+const SYS_GETSOCKOPT: int = 209;
+const SYS_SHUTDOWN: int = 210;
+const SYS_ACCEPT4: int = 242;
 
 const WNOHANG: int = 1;
 const WUNTRACED: int = 2;
@@ -715,6 +728,19 @@ fn do_syscall(f: *int, n: int) {
         case SYS_GETPGID: f[F_R1] = sys_getpgid(f[0]);
         case SYS_GETSID: f[F_R1] = sys_getsid(f[0]);
         case SYS_SETSID: f[F_R1] = sys_setsid();
+        case SYS_SOCKET: f[F_R1] = sys_socket(f[0], f[1], f[2]);
+        case SYS_BIND: f[F_R1] = sys_bind(f[0], f[1], f[2]);
+        case SYS_LISTEN: f[F_R1] = sys_listen(f[0], f[1]);
+        case SYS_ACCEPT: f[F_R1] = sys_accept4(f[0], f[1], f[2], 0);
+        case SYS_ACCEPT4: f[F_R1] = sys_accept4(f[0], f[1], f[2], f[3]);
+        case SYS_CONNECT: f[F_R1] = sys_connect(f[0], f[1], f[2]);
+        case SYS_GETSOCKNAME: f[F_R1] = sys_getsockname(f[0], f[1], f[2]);
+        case SYS_GETPEERNAME: f[F_R1] = sys_getpeername(f[0], f[1], f[2]);
+        case SYS_SENDTO: f[F_R1] = sys_sendto(f[0], f[1], f[2], f[3], f[4], f[5]);
+        case SYS_RECVFROM: f[F_R1] = sys_recvfrom(f[0], f[1], f[2], f[3], f[4], f[5]);
+        case SYS_SETSOCKOPT: f[F_R1] = sys_setsockopt(f[0], f[1], f[2], f[3], f[4]);
+        case SYS_GETSOCKOPT: f[F_R1] = sys_getsockopt(f[0], f[1], f[2], f[3], f[4]);
+        case SYS_SHUTDOWN: f[F_R1] = sys_shutdown(f[0], f[1]);
         default: f[F_R1] = -ENOSYS;
     }
 }

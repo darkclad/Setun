@@ -1,0 +1,296 @@
+// socket.tri: sys/socket.h, netinet/in.h, arpa/inet.h, netdb.h and net/if.h
+// for Trinux (docs/NETWORK.md §4-5).
+//
+// struct sockaddr_in is one word per field. A word is not made of octets,
+// so "network byte order" means nothing inside one: htons and friends
+// return their argument, and the kernel writes octets in network order.
+// Socket data are octets (0..255 per tryte); text goes over the network as
+// UTF-8, converted with utf8_encode/utf8_decode.
+
+import "tlibc.tri";
+
+const AF_UNSPEC: int = 0;
+const AF_INET: int = 2;
+const PF_INET: int = 2;
+const SOCK_STREAM: int = 1;
+const SOCK_DGRAM: int = 2;
+const SOCK_RAW: int = 3;
+const SOCK_NONBLOCK: int = 2048;
+const SOCK_CLOEXEC: int = 524288;
+const IPPROTO_IP: int = 0;
+const IPPROTO_ICMP: int = 1;
+const IPPROTO_TCP: int = 6;
+const IPPROTO_UDP: int = 17;
+const INADDR_ANY: int = 0;
+const INADDR_LOOPBACK: int = 2130706433;
+const INADDR_BROADCAST: int = 4294967295;
+const INADDR_NONE: int = -1;
+const SOL_SOCKET: int = 1;
+const SO_REUSEADDR: int = 2;
+const SO_TYPE: int = 3;
+const SO_ERROR: int = 4;
+const SO_BROADCAST: int = 6;
+const SO_SNDBUF: int = 7;
+const SO_RCVBUF: int = 8;
+const SO_KEEPALIVE: int = 9;
+const SO_ACCEPTCONN: int = 30;
+const TCP_NODELAY: int = 1;
+const MSG_PEEK: int = 2;
+const MSG_TRUNC: int = 32;
+const MSG_DONTWAIT: int = 64;
+const MSG_WAITALL: int = 256;
+const MSG_NOSIGNAL: int = 16384;
+const SHUT_RD: int = 0;
+const SHUT_WR: int = 1;
+const SHUT_RDWR: int = 2;
+const SOMAXCONN: int = 27;
+const S_IFSOCK: int = 49152;
+
+struct sockaddr_in {
+    sin_family: int;
+    sin_port: int;
+    sin_addr: int;
+}
+
+fn socket(domain: int, type: int, proto: int) -> int { return _ret(syscall(198, domain, type, proto)); }
+fn bind(fd: int, a: *sockaddr_in, len: int) -> int { return _ret(syscall(200, fd, a, len)); }
+fn listen(fd: int, backlog: int) -> int { return _ret(syscall(201, fd, backlog)); }
+fn accept(fd: int, a: *sockaddr_in, len: *int) -> int { return _ret(syscall(202, fd, a, len)); }
+fn accept4(fd: int, a: *sockaddr_in, len: *int, flags: int) -> int { return _ret(syscall(242, fd, a, len, flags)); }
+fn connect(fd: int, a: *sockaddr_in, len: int) -> int { return _ret(syscall(203, fd, a, len)); }
+fn getsockname(fd: int, a: *sockaddr_in, len: *int) -> int { return _ret(syscall(204, fd, a, len)); }
+fn getpeername(fd: int, a: *sockaddr_in, len: *int) -> int { return _ret(syscall(205, fd, a, len)); }
+fn sendto(fd: int, buf: *tryte, n: int, flags: int, a: *sockaddr_in, len: int) -> int {
+    return _ret(syscall(206, fd, buf, n, flags, a, len));
+}
+fn recvfrom(fd: int, buf: *tryte, n: int, flags: int, a: *sockaddr_in, len: *int) -> int {
+    return _ret(syscall(207, fd, buf, n, flags, a, len));
+}
+fn send(fd: int, buf: *tryte, n: int, flags: int) -> int { return sendto(fd, buf, n, flags, null, 0); }
+fn recv(fd: int, buf: *tryte, n: int, flags: int) -> int { return recvfrom(fd, buf, n, flags, null, null); }
+fn setsockopt(fd: int, level: int, opt: int, val: *int, len: int) -> int { return _ret(syscall(208, fd, level, opt, val, len)); }
+fn getsockopt(fd: int, level: int, opt: int, val: *int, len: *int) -> int { return _ret(syscall(209, fd, level, opt, val, len)); }
+fn shutdown(fd: int, how: int) -> int { return _ret(syscall(210, fd, how)); }
+
+fn htons(v: int) -> int { return v; }
+fn ntohs(v: int) -> int { return v; }
+fn htonl(v: int) -> int { return v; }
+fn ntohl(v: int) -> int { return v; }
+
+fn sockaddr_set(a: *sockaddr_in, addr: int, port: int) {
+    a.sin_family = AF_INET;
+    a.sin_port = port;
+    a.sin_addr = addr;
+}
+
+// "a.b.c.d" (each 0..255) into *out; 1 if valid, as inet_aton.
+fn inet_aton(s: *char, out: *int) -> int {
+    var v: int = 0;
+    var parts: int = 0;
+    var k: int = 0;
+    while (parts < 4) {
+        if (s[k] < '0' || s[k] > '9') { return 0; }
+        var part: int = 0;
+        var digits: int = 0;
+        while (s[k] >= '0' && s[k] <= '9') {
+            part = part * 10 + s[k] - '0';
+            k += 1;
+            digits += 1;
+            if (digits > 3 || part > 255) { return 0; }
+        }
+        v = v * 256 + part;
+        parts += 1;
+        if (parts < 4) {
+            if (s[k] != '.') { return 0; }
+            k += 1;
+        }
+    }
+    if (s[k] != 0) { return 0; }
+    *out = v;
+    return 1;
+}
+
+fn inet_addr(s: *char) -> int {
+    var v: int = 0;
+    return inet_aton(s, &v) ? v : INADDR_NONE;
+}
+
+var _ntoa_buf: [16]char;
+
+// Dotted quad of `a` in a static buffer, as inet_ntoa.
+fn inet_ntoa(a: int) -> *char {
+    var n: int = 0;
+    var k: int = 3;
+    while (k >= 0) {
+        var div: int = 1;
+        var j: int = 0;
+        while (j < k) { div *= 256; j += 1; }
+        var tmp: [5]char;
+        var s: *char = itoa(a / div % 256, &tmp[0]);
+        j = 0;
+        while (s[j] != 0) { _ntoa_buf[n] = s[j]; n += 1; j += 1; }
+        if (k > 0) { _ntoa_buf[n] = '.'; n += 1; }
+        k -= 1;
+    }
+    _ntoa_buf[n] = 0;
+    return &_ntoa_buf[0];
+}
+
+// ---- names: /etc/hosts -------------------------------------------------------------------
+
+var _hosts_buf: [2187]char;
+
+// The address for `name`: a dotted quad, "localhost", or a line of
+// /etc/hosts. 1 if found.
+fn resolve_host(name: *char, out: *int) -> int {
+    if (inet_aton(name, out)) { return 1; }
+    var fd: int = open("/etc/hosts", O_RDONLY, 0);
+    if (fd >= 0) {
+        var n: int = read(fd, &_hosts_buf[0], 2186);
+        close(fd);
+        if (n < 0) { n = 0; }
+        _hosts_buf[n] = 0;
+        var k: int = 0;
+        while (k < n) {
+            // one line: address, then names
+            var line: int = k;
+            while (k < n && _hosts_buf[k] != '\n') { k += 1; }
+            var end: int = k;
+            k += 1;
+            if (_hosts_buf[line] == '#') { continue; }
+            var j: int = line;
+            while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
+            var saved: char = _hosts_buf[j];
+            _hosts_buf[j] = 0;
+            var addr: int = 0;
+            var ok: int = inet_aton(&_hosts_buf[line], &addr);
+            _hosts_buf[j] = saved;
+            if (!ok) { continue; }
+            while (j < end) {
+                while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
+                var w: int = j;
+                while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
+                if (j > w && _name_is(&_hosts_buf[w], j - w, name)) { *out = addr; return 1; }
+            }
+        }
+    }
+    if (_name_is("localhost", 9, name)) { *out = INADDR_LOOPBACK; return 1; }
+    return 0;
+}
+
+fn _name_is(s: *char, len: int, name: *char) -> int {
+    var k: int = 0;
+    while (k < len) {
+        if (name[k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return name[len] == 0;
+}
+
+// ---- interfaces (net/if.h) ---------------------------------------------------------------
+
+const IFNAMSIZ: int = 27;
+const IFF_UP: int = 1;
+const IFF_BROADCAST: int = 2;
+const IFF_LOOPBACK: int = 8;
+const IFF_RUNNING: int = 64;
+const SIOCGIFFLAGS: int = 35091;
+const SIOCSIFFLAGS: int = 35092;
+const SIOCGIFADDR: int = 35093;
+const SIOCSIFADDR: int = 35094;
+const SIOCGIFNETMASK: int = 35099;
+const SIOCSIFNETMASK: int = 35100;
+const SIOCGIFMTU: int = 35105;
+const SIOCGIFHWADDR: int = 35111;
+const SIOCGIFGW: int = 35312;          // Trinux: the default gateway
+const SIOCSIFGW: int = 35313;
+
+struct ifreq {
+    ifr_name: [27]char;
+    ifr_value: int;                    // address, mask, flags, MTU, or MAC octets 0..2
+    ifr_value2: int;                   // MAC octets 3..5
+}
+
+// ---- UTF-8 ---------------------------------------------------------------------------------
+
+// Encode the code point c as UTF-8 octets into out; returns how many (1..4).
+// A negative tryte (an overlined character) is sent as its digit followed
+// by U+0305, the way the serial console shows it.
+fn utf8_encode(c: int, out: *tryte) -> int {
+    if (c < 0) {
+        var n: int = utf8_encode(-c, out);
+        return n + utf8_encode(773, out + n);
+    }
+    if (c < 128) { out[0] = c as tryte; return 1; }
+    if (c < 2048) {
+        out[0] = (192 + c / 64) as tryte;
+        out[1] = (128 + c % 64) as tryte;
+        return 2;
+    }
+    if (c < 65536) {
+        out[0] = (224 + c / 4096) as tryte;
+        out[1] = (128 + c / 64 % 64) as tryte;
+        out[2] = (128 + c % 64) as tryte;
+        return 3;
+    }
+    out[0] = (240 + c / 262144) as tryte;
+    out[1] = (128 + c / 4096 % 64) as tryte;
+    out[2] = (128 + c / 64 % 64) as tryte;
+    out[3] = (128 + c % 64) as tryte;
+    return 4;
+}
+
+// An incremental UTF-8 decoder: feed octets one at a time. Returns the code
+// point when one is complete, -1 while more octets are needed, and '?' for
+// a malformed sequence or a code point a tryte cannot hold.
+struct utf8_state {
+    need: int;
+    cp: int;
+}
+
+fn utf8_decode(st: *utf8_state, b: int) -> int {
+    if (st.need > 0) {
+        if (b < 128 || b >= 192) { st.need = 0; return '?'; }
+        st.cp = st.cp * 64 + b % 64;
+        st.need -= 1;
+        if (st.need > 0) { return -1; }
+        return st.cp > 9841 ? '?' : st.cp;
+    }
+    if (b < 128) { return b; }
+    if (b >= 194 && b < 224) { st.need = 1; st.cp = b % 32; return -1; }
+    if (b >= 224 && b < 240) { st.need = 2; st.cp = b % 16; return -1; }
+    if (b >= 240 && b < 245) { st.need = 3; st.cp = b % 8; return -1; }
+    return '?';
+}
+
+// Decode n octets into characters; a character followed by U+0305
+// (combining overline) becomes the negative tryte, as on the serial
+// console. Returns how many characters were written to out (at most n).
+fn utf8_to_text(st: *utf8_state, in: *tryte, n: int, out: *char) -> int {
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var c: int = utf8_decode(st, in[k]);
+        k += 1;
+        if (c < 0) { continue; }
+        if (c == 773 && m > 0 && out[m - 1] > 32) {
+            out[m - 1] = (-out[m - 1]) as char;
+            continue;
+        }
+        out[m] = c as char;
+        m += 1;
+    }
+    return m;
+}
+
+// Encode n characters as UTF-8 into out (room for 8 octets per character);
+// returns the number of octets.
+fn text_to_utf8(in: *char, n: int, out: *tryte) -> int {
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        m += utf8_encode(in[k], out + m);
+        k += 1;
+    }
+    return m;
+}
