@@ -1946,7 +1946,7 @@ impl Compiler {
                     Ok(Ty::Int)
                 }
                 UnOp::Deref => {
-                    if let Some((op, t)) = self.simple_addr(e, "r1")? {
+                    if let Some((op, t)) = self.simple_addr(e, "r2")? {
                         self.load_operand(&t, &op);
                         return Ok(t);
                     }
@@ -1971,7 +1971,7 @@ impl Compiler {
             ExprKind::Assign(op, lhs, rhs) => self.assign(*op, lhs, rhs),
             ExprKind::Call(f, args) => self.call(f, args, e.pos),
             ExprKind::Index(..) | ExprKind::Field(..) => {
-                if let Some((op, t)) = self.simple_addr(e, "r1")? {
+                if let Some((op, t)) = self.simple_addr(e, "r2")? {
                     self.load_operand(&t, &op);
                     return Ok(t);
                 }

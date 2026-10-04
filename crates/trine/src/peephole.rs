@@ -271,6 +271,120 @@ fn substitute(i: &mut Ins, first_src: usize, from: &str, to: &str) {
     }
 }
 
+/// A memory operand as (base register, the rest): "[r-11+29847]" gives
+/// (Some(-11), "+29847"), "[29844]" gives (None, "29844").
+fn mem_parts(op: &str) -> Option<(Option<i64>, String)> {
+    let inner = op.strip_prefix('[')?.strip_suffix(']')?;
+    let base_bits = regs_of(op);
+    if base_bits == 0 {
+        return Some((None, inner.to_string()));
+    }
+    let r = (-13..=13).find(|&r| bit(r) == base_bits)?;
+    let name_len = match inner.strip_prefix("r-") {
+        Some(rest) => rest.find(['+', '-']).map_or(inner.len(), |k| k + 2),
+        None => inner.find(['+', '-']).unwrap_or(inner.len()),
+    };
+    Some((Some(r), inner[name_len..].to_string()))
+}
+
+/// Local value numbering: the first instruction that would put into its
+/// destination the value already there (and whose flags are not needed),
+/// which can go. Values are followed through straight-line code and on
+/// into the fall-through of a conditional branch; a label (another way
+/// in) forgets everything. A load's value is tied to the memory version,
+/// which any store, push, call or unknown instruction moves on.
+fn redundant(lines: &[String], live: &[u32]) -> Option<usize> {
+    let mut val: HashMap<i64, u32> = HashMap::new(); // register -> value number
+    let mut exprs: HashMap<String, u32> = HashMap::new();
+    let mut next = 1u32;
+    let mut epoch = 0u32;
+    let fresh = |next: &mut u32| {
+        *next += 1;
+        *next
+    };
+    for (k, l) in lines.iter().enumerate() {
+        let i = match classify(l) {
+            Line::Ins(i) => i,
+            _ => {
+                val.clear();
+                epoch += 1;
+                continue;
+            }
+        };
+        let a = &i.args;
+        let op = i.op.as_str();
+        // the value number of a source operand (registers and constants)
+        let operand = |s: &str, val: &mut HashMap<i64, u32>, next: &mut u32| -> String {
+            match reg_num(s) {
+                Some(0) => "#0".to_string(),
+                Some(r) => format!("v{}", *val.entry(r).or_insert_with(|| fresh(next))),
+                None => format!("#{s}"),
+            }
+        };
+        let flags_dead = live[k] & FLAGS == 0;
+        // (destination, its new value's key, whether the instruction sets flags)
+        let computed: Option<(i64, String, bool)> = match op {
+            _ if ALU3.contains(&op) && a.len() == 3 && !matches!(op, "adc" | "sbc") => {
+                let (x, y) = (operand(&a[1], &mut val, &mut next), operand(&a[2], &mut val, &mut next));
+                reg_num(&a[0]).map(|d| (d, format!("{op}({x},{y})"), true))
+            }
+            _ if ALU2.contains(&op) && a.len() == 2 => {
+                let x = operand(&a[1], &mut val, &mut next);
+                reg_num(&a[0]).map(|d| (d, format!("{op}({x})"), true))
+            }
+            "mov" if a.len() == 2 => {
+                let flags = reg_num(&a[1]).is_some();
+                let x = operand(&a[1], &mut val, &mut next);
+                reg_num(&a[0]).map(|d| (d, format!("={x}"), flags))
+            }
+            "li" | "la" | "lea" if a.len() == 2 => reg_num(&a[0]).map(|d| (d, format!("{op}#{}", a[1]), false)),
+            "ldw" | "ldt" if a.len() == 2 => match (reg_num(&a[0]), mem_parts(&a[1])) {
+                (Some(d), Some((base, rest))) => {
+                    let b = base.map_or("abs".to_string(), |r| operand(&format!("r{r}"), &mut val, &mut next));
+                    Some((d, format!("{op}[{b}{rest}]@{epoch}"), false))
+                }
+                _ => None,
+            },
+            "cmp" => {
+                continue; // flags only
+            }
+            _ => None,
+        };
+        match computed {
+            Some((d, key, sets_flags)) => {
+                // "=vN" (a copy) is the value N itself
+                let v = match key.strip_prefix("=v") {
+                    Some(n) => n.parse().ok(),
+                    None => None,
+                };
+                let v = v.unwrap_or_else(|| *exprs.entry(key).or_insert_with(|| fresh(&mut next)));
+                if d != 0 && val.get(&d) == Some(&v) && (flags_dead || !sets_flags) {
+                    return Some(k);
+                }
+                if d != 0 {
+                    val.insert(d, v);
+                }
+            }
+            None => {
+                match info(&i).map(|inf| inf.ctl) {
+                    // a conditional branch: its fall-through keeps the values
+                    Some(Ctl::Branch(_)) => continue,
+                    _ => {}
+                }
+                match op {
+                    // stores move memory on; registers stay
+                    "stw" | "stt" | "fstd" | "fsts" | "out" => epoch += 1,
+                    _ => {
+                        val.clear();
+                        epoch += 1;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Optimize one function's lines in place.
 pub fn run(lines: &mut Vec<String>) {
     // every change removes a line, so this ends
@@ -343,7 +457,84 @@ pub fn run(lines: &mut Vec<String>) {
             k += 1;
         }
         if !changed {
-            return;
+            // last, once the local rewrites are done (they turn li r1, X ;
+            // mov Y, r1 into li Y, X, which deleting the li would prevent)
+            match redundant(lines, &live) {
+                Some(k) => {
+                    lines.remove(k);
+                }
+                None => return,
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line value numbering would delete next, if any.
+    fn next_redundant(asm: &str) -> Option<String> {
+        let lines: Vec<String> = asm.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
+        let live = liveness(&lines).expect("analysable");
+        redundant(&lines, &live).map(|k| format!("{k}: {}", lines[k].trim()))
+    }
+
+    #[test]
+    fn a_reload_after_a_branch_goes() {
+        let asm = "        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        cmp r1, r-4
+        ble .L1
+        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        stw r1, [r2+29847]
+.L1:
+        ret";
+        assert_eq!(next_redundant(asm).as_deref(), Some("4: mul r2, r-5, 3"));
+        let without = asm.replacen("        mul r2, r-5, 3\n        ldw r1, [r2+29844]\n        stw", "        ldw r1, [r2+29844]\n        stw", 1);
+        assert_eq!(next_redundant(&without).as_deref(), Some("4: ldw r1, [r2+29844]"));
+    }
+
+    #[test]
+    fn what_may_have_changed_stays() {
+        // a store in between: the load must be done again
+        let store = "        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        stw r-6, [r-7]
+        ldw r1, [r2+29844]
+        ret";
+        assert_eq!(next_redundant(store), None);
+        // a label in between: another way in
+        let label = "        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+.L2:
+        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        stw r1, [r2+3]
+        b .L2";
+        assert_eq!(next_redundant(label), None);
+        // the index changed
+        let changed = "        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        add r-5, r-5, 1
+        mul r2, r-5, 3
+        ldw r1, [r2+29844]
+        ret";
+        assert_eq!(next_redundant(changed), None);
+        // the flags of the second multiply are read
+        let flags = "        mul r-2, r-5, 3
+        cmp r-5, 0
+        mul r-2, r-5, 3
+        bgt .L3
+.L3:
+        ret";
+        assert_eq!(next_redundant(flags), None);
+        // a call in between may change registers and memory
+        let call = "        mul r-2, r-5, 3
+        call f
+        mul r-2, r-5, 3
+        ret";
+        assert_eq!(next_redundant(call), None);
     }
 }
