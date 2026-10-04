@@ -1219,8 +1219,7 @@ fn md5_fd(fd: int, out: *char) -> int {
         if (r < 0 && errno == EINTR) { continue; }
         if (r < 0) { return -1; }
         if (r == 0) { break; }
-        var k: int = 0;
-        while (k < r) { md5_put_char(buf[k]); k += 1; }
+        md5_put_chars(&buf[0], r);
     }
     md5_digest_hex(out);
     return 0;

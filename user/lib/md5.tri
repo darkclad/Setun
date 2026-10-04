@@ -159,6 +159,30 @@ fn md5_put_char(c: int) {
     else { md5_put_byte(224 + c / 4096); md5_put_byte(128 + c / 64 % 64); md5_put_byte(128 + c % 64); }
 }
 
+// The n characters at s, as md5_put_char would put each (ASCII without
+// the calls, the fill count in a register meanwhile).
+fn md5_put_chars(s: *char, n: int) {
+    var f: int = md5_fill;
+    var ascii: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var c: int = s[k];
+        if (c >= 0 && c < 128) {
+            md5_block[f] = c;
+            f += 1;
+            ascii += 1;
+            if (f == 64) { md5_transform(); f = 0; }
+        } else {
+            md5_fill = f;
+            md5_put_char(c);
+            f = md5_fill;
+        }
+        k += 1;
+    }
+    md5_fill = f;
+    md5_bytes += ascii;
+}
+
 // Finish: the 16 digest bytes into out.
 fn md5_final(out: *int) {
     var bits: int = md5_bytes * 8;

@@ -588,6 +588,9 @@ fn text_tools() {
             "echo a b c | xargs echo x; echo 1 2 3 4 5 | xargs -n 2 echo; echo /etc/motd | xargs wc -l",
             "find /usr/lib -name 'c*' | xargs -I F echo [F]",
             "echo -n abc > /tmp/abc; md5sum /tmp/abc; echo Привет | md5sum",
+            // past one block, and a two-byte character across the block boundary
+            "echo Съешь же ещё этих мягких французских булок, да выпей чаю. The quick brown fox jumps over the lazy dog 0123456789 Ёё | md5sum",
+            "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaЖbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb | md5sum",
             "exit",
         ],
         900_000_000,
@@ -618,6 +621,8 @@ fn text_tools() {
             "x a b c\n1 2\n3 4\n5\n      2 /etc/motd\n",
             "[/usr/lib/trwtest/crash]\n",
             "900150983cd24fb0d6963f7d28e17f72  /tmp/abc\n5f0650b247a646355dfec2d2610a960c  -\n",
+            "10f151c678f0c290b6741be0f86798e2  -\n",
+            "007acfc60d776106ef64134342370347  -\n",
         ],
     );
 }
