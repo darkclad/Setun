@@ -33,6 +33,10 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - **Trine optimizer** ✅: register locals, direct operands, a liveness-driven peephole pass; optimized and plain builds must give the same results
     - Result so far: the Mandelbrot benchmark went from 312× slower than the same code compiled natively to about 19×; the Trinux shell workload from 77 s to 0.5 s
 
+11. **Networking** ([`NETWORK.md`](NETWORK.md)): the `TNIC` Ethernet card (one octet per tryte), `setun-net` (a user-mode gateway on smoltcp with port forwards, `setun --net`), and in Trinux: ARP, IPv4, ICMP, UDP, TCP (in order, go-back-N retransmission, RFC 6298 timers), BSD sockets with Linux's calls, `/proc/net`; `ifconfig`, `ping`, `nc`, `netstat`, `telnetd`
+    - N1–N5 ✅: tested against smoltcp both ways, over a lossy link, through a real host socket, and with hand-made broken packets; `nettest` checks the socket calls and their errors
+    - N6: outbound NAT and DNS; then SSH, which needs a decision about binary operations for SHA-2 and ChaCha20 (NETWORK.md §6)
+
 ## Next: performance
 
 In rough order of payoff for effort (estimates from the benchmarks):

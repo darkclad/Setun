@@ -86,6 +86,8 @@ The kernel runs with interrupts off and is never preempted, so the stack needs n
 - Timers (ARP retries, TCP retransmission, TIME-WAIT) run on the timer tick (HZ = 100).
 - Sends build the frame in a kernel buffer and DMA it out at once.
 
+The plan (as built, Ethernet shares `arp.tri`, ICMP is in `ip.tri`, and UDP and the interfaces' ioctls are in `socket.tri`; see §7):
+
 | File | Contents |
 |---|---|
 | `drivers/tnic.tri` | card driver: probe, MAC, receive loop, send, counters |
@@ -158,3 +160,77 @@ field arithmetic are plain modular arithmetic, which a ternary machine does well
 SHA-2 and ChaCha20 need binary XOR, AND and rotate. They can be done bit by bit
 (md5 does that) or with binary-integer instructions added to the ISA. That
 choice belongs with N6.
+
+## 7. As built (N1–N5)
+
+### Running it
+
+```
+cargo run --release -p setun-native -- --console --net 2323:23
+telnet localhost 2323          # from another terminal: Trinux's login prompt
+```
+
+- `--net` attaches the gateway. `HOSTPORT:GUESTPORT` adds a port forward, and `ADDR:HOSTPORT:GUESTPORT` listens on another host address. A bare `--net on` attaches the network without forwards.
+- Forwards listen on 127.0.0.1 unless an address is given, so the machine is not reachable from the LAN by accident. Trinux's accounts are `root`/`root` and `user`/`user`.
+- When `eth0` is up at boot (the card reports a link), init starts `/sbin/telnetd` next to the console login.
+
+### Kernel
+
+| File | Lines | What |
+|---|---|---|
+| `drivers/tnic.tri` | ~90 | probe, MAC, IRQ 8 receive loop, send |
+| `net/net.tri` | ~330 | octet helpers, checksums, `lo`/`eth0`, the 27 counters, the loopback queue, `net_bh`, `net_sleep` |
+| `net/arp.tri` | ~220 | Ethernet, the ARP cache, 9 waiting packets |
+| `net/ip.tri` | ~120 | IPv4 in and out, ICMP echo, destination unreachable |
+| `net/socket.tri` | ~820 | sockets, rings, the system calls, interface ioctls, UDP, raw ICMP |
+| `net/tcp.tri` | ~720 | TCP |
+
+- **Loopback** packets wait in a one-page queue (9 slots of 3^7) until `net_bh()` delivers them. It runs at the end of every network system call, the card's interrupt and the timer tick.
+  - A reply is therefore never built while the packet it answers is still in `txbuf`.
+  - `net_sleep()` delivers the queue before sleeping. If anything was delivered it returns at once, so a wake-up that came from that delivery is not lost and the caller checks its condition again.
+- **ARP**: a packet for a next hop that isn't resolved yet waits in one of 9 slots of 3^7 (one page). ARP asks once a second, three times, then drops the waiting packets and counts `arp_failed`.
+- **TCP** keeps things simple where a virtual link allows, and the tests check each choice:
+  - segments are accepted in order only; a gap gets a duplicate ACK;
+  - a timeout resends from `snd_una` (go-back-N);
+  - RTO follows RFC 6298 in 10 ms ticks, from 200 ms to 60 s, 5 SYN retries and 9 data retries;
+  - a zero-window probe goes out on the persist timer;
+  - RFC 5961's exact-RST and challenge-ACK rules apply;
+  - `TIME-WAIT` lasts 2 s; an orphaned `FIN-WAIT-2` lasts 60 s.
+- Closing a connection that still has unread data sends RST, and so does data arriving at an orphaned socket (both as Linux does).
+- `SO_REUSEADDR`, as on Linux: a stream socket may share a port with sockets that are not listening, such as connections still in `TIME-WAIT` or old ones a restarted server left behind.
+- A listener's backlog counts children still in the handshake and children waiting for `accept`. A SYN past the limit is dropped, and the client's retry gets in once there is room.
+- `/proc/net/stat` lists one counter per line (`ip_csum_errors`, `tcp_retransmits`, `udp_no_port`, …). The negative tests read it.
+- `/proc/net/tcp` and `/proc/net/udp` show Linux's first columns plus the owner's uid. `/proc/net/dev` and `/proc/net/arp` use Linux's layouts.
+- `struct ifreq` is `{ name: [27]char; value: int; value2: int; }`. `SIOCGIFHWADDR` returns octets 0..2 in `value` and 3..5 in `value2`, because 48 bits do not fit a 27-trit word.
+
+### User space
+
+- `user/lib/socket.tri`:
+  - the calls, `inet_aton`/`inet_ntoa`, and `resolve_host` (dotted quad, `/etc/hosts`, `localhost`);
+  - `struct ifreq`;
+  - UTF-8 helpers. A character followed by U+0305 decodes to the negative (overlined) tryte, and an overlined tryte encodes the same way, as on the serial console.
+- `nc [-lubzv] [-p port] [-w secs] [host] port`. When stdin ends, a TCP connection is half-closed and nc prints until the other side closes; a UDP client waits one more second for replies.
+- `ping [-c n] [-s size] [-W secs] host` is set-user-ID root and drops root once its raw socket is open.
+- `ifconfig [iface [addr] [netmask m] [gw g] [up|down]]`
+- `netstat [-tualn]`
+- `telnetd [-p port] [-1]`:
+  - each connection gets a pty with `/bin/login` and a relay process;
+  - the server offers `WILL ECHO` and `WILL SGA` and reads and drops every other command, including `NAWS`;
+  - CR LF and CR NUL become CR, and `\n` goes out as CR LF;
+  - when the client hangs up, the session gets `SIGHUP`.
+- `login` hands the console's devices to the user only when it runs on the console, not on a pty.
+
+### Tests
+
+- `crates/core/tests/nic.rs`: the card's registers, DMA, and every `ERROR` code.
+- `crates/net/tests/wire.rs`: the gateway answers hand-made frames.
+- `crates/trinux/tests/net.rs` boots Trinux with the gateway attached and covers:
+  - pings both ways; ARP failure; no route; no link;
+  - `ifconfig` settings and refusals, as root and as a user;
+  - 15 kinds of broken frame, each dropped and counted;
+  - UDP through the gateway and on loopback; ICMP port unreachable;
+  - `nettest`: 98 checks of the socket calls and their errors on loopback, including 100 000 octets through the 19 683-octet window, backlog retry, RST on close, `TIME-WAIT` and `SO_REUSEADDR`, and the socket limit;
+  - TCP against smoltcp in both directions; RST on a closed port; a reset in the middle of a connection;
+  - a link that drops every fourth frame each way;
+  - a forward from a real host socket;
+  - telnet: two sessions at once, a refused password, Ctrl-C, logout, and a client hang-up.

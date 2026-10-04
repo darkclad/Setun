@@ -949,3 +949,7 @@ The server keeps every window's pixels (server-side rendering), so clients never
 - **Exceptions:** an unmasked FPU exception (vector −11) is `SIGFPE`, like an integer divide by zero. Vector −12 in the kernel is a panic, since the kernel itself only touches the FPU in `fpu_save` and `fpu_load` (with its own `MODE.FE` turned on first).
 - **`/proc/<pid>/status`** has an `FPU:` line: `unused`, `live` (the owner) or `saved`.
 - **Tests:** `/bin/fputest` (`tests/boot.rs`) keeps values in `f12` and `f−12`, which compiled Trine code never uses, so only the kernel can preserve them. It checks two processes trading the FPU, fork, execve, a signal handler, and two refusals: unmasked divide by zero and an unmasked invalid `sqrt` kill only the offending child with `SIGFPE`. With switching turned off, five of its checks fail.
+
+## 24. Networking
+
+The TCP/IP stack, sockets and the network programs are described in [`NETWORK.md`](NETWORK.md). In short: `kernel/drivers/tnic.tri` and `kernel/net/` (Ethernet, ARP, IPv4, ICMP, UDP, TCP); sockets are anonymous `I_SOCK` inodes behind file descriptors, with Linux's system calls 198..210 and 242; `/proc/net/{dev,arp,tcp,udp,stat}`; init starts `/sbin/telnetd` when `eth0` is up.

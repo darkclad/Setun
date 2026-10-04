@@ -33,6 +33,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
 - [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K8 running: a POSIX-like system with a scripting shell, core utilities and a window system with a terminal)
+- [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet logins
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 
@@ -44,7 +45,8 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 | `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, memory map, devices (interrupt controller, timer, RTC, keyboard, mouse, serial, DMA disks, display renderer), `Machine` |
 | `crates/asm` | assembler, disassembler and the `setun-asm` tool ([`docs/ASSEMBLER.md`](docs/ASSEMBLER.md)) |
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
-| `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio |
+| `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio, `--net` |
+| `crates/net` | `setun-net`: the network behind the card, a user-mode gateway (10.0.2.2) on smoltcp with port forwards |
 | `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in) and the front-panel page |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
 | `examples/` | Trine programs, e.g. `mandel.tri` |
@@ -67,6 +69,7 @@ cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
 cargo run --release -p setun-native -- --console              # no window: this terminal is the console (ssh); Ctrl-] leaves
+cargo run --release -p setun-native -- --console --net 2323:23 # with a network; then `telnet localhost 2323` logs in
 sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
 python -m http.server 8026 --directory web     # then open http://localhost:8026
 ```
