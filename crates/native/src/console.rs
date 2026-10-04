@@ -67,13 +67,14 @@ pub fn crlf(s: &str) -> String {
 /// Run until the machine powers off or `input` says quit. `now_us` is the
 /// real clock (microseconds); `wait` is called when the guest is ahead of
 /// it (with the time to wait). The emulated clock never runs ahead of the
-/// real one by more than a slice.
+/// real one by more than a slice. `poll` runs after every turn (the network).
 pub fn run_loop(
     m: &mut Machine,
     mut input: impl FnMut() -> Vec<Input>,
     out: &mut impl Write,
     mut now_us: impl FnMut() -> i64,
     mut wait: impl FnMut(Duration),
+    mut poll: impl FnMut(&mut Machine),
 ) {
     let base = m.dev.now_us() - now_us();
     while !m.powered_off {
@@ -89,6 +90,7 @@ pub fn run_loop(
         } else {
             m.run(SLICE);
         }
+        poll(m);
         let s = m.dev.serial.take_output();
         if !s.is_empty() {
             let _ = out.write_all(crlf(&s).as_bytes());
@@ -106,7 +108,7 @@ impl Drop for Raw {
     }
 }
 
-pub fn run(mut m: Machine) {
+pub fn run(mut m: Machine, mut net: Option<setun_net::Network>) {
     // emulated speed far above what the host reaches: a busy guest is
     // limited by the host, an idle one by the clock
     m.ns_per_instruction = 1;
@@ -133,7 +135,15 @@ pub fn run(mut m: Machine) {
     let wait = |d: Duration| {
         let _ = event::poll(d);
     };
-    run_loop(&mut m, input, &mut stdout, || start.elapsed().as_micros() as i64, wait);
+    // with a network, a wait is at most a millisecond, so traffic flows
+    let networked = net.is_some();
+    let wait = |d: Duration| wait(if networked { d.min(Duration::from_millis(1)) } else { d });
+    let poll = |m: &mut Machine| {
+        if let Some(n) = net.as_mut() {
+            n.poll(m);
+        }
+    };
+    run_loop(&mut m, input, &mut stdout, || start.elapsed().as_micros() as i64, wait, poll);
     eprint!("\r\nsetun: left the console\r\n");
 }
 
@@ -213,6 +223,7 @@ mod tests {
             &mut out,
             || clock.get(),
             |d| clock.set(clock.get() + d.as_micros() as i64),
+            |_| {},
         );
         (String::from_utf8_lossy(&out).into_owned(), m.dev.now_us(), clock.get())
     }

@@ -16,5 +16,6 @@ minifb = "0.28.0"
 png = "0.18.1"
 setun-core = { path = "../core" }
 setun-demo = { path = "../demo" }
+setun-net = { path = "../net" }
 trine = { path = "../trine" }
 trinux = { path = "../trinux" }

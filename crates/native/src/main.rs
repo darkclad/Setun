@@ -34,6 +34,8 @@ struct Args {
     press: Vec<i64>,
     screenshot: Option<PathBuf>,
     console: bool,
+    /// `--net`: attach a network, with these port forwards (host, guest).
+    net: Option<Vec<(std::net::SocketAddr, u16)>>,
 }
 
 fn usage() -> ! {
@@ -67,6 +69,7 @@ fn parse_args() -> Args {
         press: Vec::new(),
         screenshot: None,
         console: false,
+        net: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -85,10 +88,41 @@ fn parse_args() -> Args {
             }
             "--screenshot" => a.screenshot = Some(val().into()),
             "--console" => a.console = true,
+            "--net" => {
+                let spec = val();
+                let fwds = a.net.get_or_insert_with(Vec::new);
+                if spec != "on" {
+                    fwds.push(parse_forward(&spec).unwrap_or_else(|| usage()));
+                }
+            }
             _ => usage(),
         }
     }
     a
+}
+
+/// `[ADDR:]HOSTPORT:GUESTPORT`.
+fn parse_forward(spec: &str) -> Option<(std::net::SocketAddr, u16)> {
+    let (host, guest) = spec.rsplit_once(':')?;
+    let guest: u16 = guest.parse().ok()?;
+    let host = if host.contains(':') { host.parse().ok()? } else { format!("127.0.0.1:{host}").parse().ok()? };
+    Some((host, guest))
+}
+
+/// Attach the network `--net` asked for, if any.
+fn attach_net(m: &mut Machine, args: &Args) -> Option<setun_net::Network> {
+    let fwds = args.net.as_ref()?;
+    let mut net = setun_net::Network::attach(m);
+    for &(host, guest) in fwds {
+        match net.forward(host, guest) {
+            Ok(a) => eprintln!("setun: {a} -> guest port {guest}"),
+            Err(e) => {
+                eprintln!("setun: cannot listen on {host}: {e}");
+                std::process::exit(1)
+            }
+        }
+    }
+    Some(net)
 }
 
 fn unix_now() -> i64 {
@@ -229,11 +263,13 @@ fn main() {
         });
         let mut m = build_machine(&args);
         m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
-        return console::run(m);
+        let net = attach_net(&mut m, &args);
+        return console::run(m, net);
     }
     let mut m = build_machine(&args);
+    let mut net = attach_net(&mut m, &args);
     if args.console {
-        return console::run(m);
+        return console::run(m, net);
     }
     if let Some(n) = args.headless {
         return headless(m, n, &args);
@@ -311,6 +347,9 @@ fn main() {
 
         // Emulate one video frame's worth of instructions.
         m.run(per_frame);
+        if let Some(n) = net.as_mut() {
+            n.poll(&mut m);
+        }
 
         let out = m.dev.serial.take_output();
         if !out.is_empty() {
