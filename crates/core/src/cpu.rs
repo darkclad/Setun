@@ -1865,6 +1865,7 @@ pub mod opstats {
     pub(super) fn count(d: &super::Dec) {
         let key = match d.op {
             super::Op::AluR | super::Op::AluK => format!("{:?} f{}", d.op, d.f),
+            super::Op::Fpu => format!("Fpu a{} f{}", d.a, d.f),
             o => format!("{o:?}"),
         };
         let mut c = COUNTS.lock().unwrap();

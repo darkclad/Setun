@@ -7,7 +7,7 @@
 //!
 //!   setun-bench --profile FILE.tri   where a ROM program spends its time
 //!
-//! SETUN_JIT_OFF=1 runs the Trinux workloads on the interpreter alone.
+//! SETUN_JIT_OFF=1 runs every workload on the interpreter alone.
 //!
 //! The emulator is deterministic (time is counted in instructions), so an
 //! optimisation that does not change behaviour must reproduce every hash
@@ -105,6 +105,9 @@ fn rom(name: &'static str, path: &Path, cap: u64) -> Outcome {
     let b = trine::build_file(path, &trine::Options::rom()).unwrap_or_else(|e| panic!("{name}: {e}"));
     let mut m = Machine::new(729, 1_790_000_000);
     m.load_rom(&b.image);
+    if std::env::var_os("SETUN_JIT_OFF").is_some() {
+        m.cpu.set_jit_threshold(u32::MAX);
+    }
     let t = Instant::now();
     let mut steps = 0;
     // until it powers off, or halts for good (mandel ends in HLT)

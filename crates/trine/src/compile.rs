@@ -282,6 +282,18 @@ fn var_count(stmts: &[Stmt]) -> usize {
 }
 
 /// Direct calls in `stmts`: the callee names.
+/// Is there a call in `e` (which may change any f register)?
+fn has_calls(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(..) => true,
+        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => has_calls(a),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(_, a, b) => has_calls(a) || has_calls(b),
+        ExprKind::Cond(a, b, c) => has_calls(a) || has_calls(b) || has_calls(c),
+        ExprKind::List(xs) => xs.iter().any(has_calls),
+        _ => false,
+    }
+}
+
 /// Could evaluating `e` change a variable (a call or an assignment in it)?
 fn has_effects(e: &Expr) -> bool {
     match &e.kind {
@@ -475,6 +487,10 @@ pub struct Compiler {
     reals: Vec<(String, [i64; 3])>,
     /// Types found by `peek_type`, by expression address.
     peeked: HashMap<usize, Ty>,
+    /// Real temporaries held in f3, f4, ... (instead of the stack).
+    fheld: usize,
+    /// Integer temporaries held in r4, r5, r6 (instead of the stack).
+    iheld: usize,
     labels: usize,
     data_cursor: i64,
     data_start: i64,
@@ -512,6 +528,8 @@ impl Compiler {
             strings: Vec::new(),
             reals: Vec::new(),
             peeked: HashMap::new(),
+            fheld: 0,
+            iheld: 0,
             labels: 0,
             data_cursor: 0,
             data_start: 0,
@@ -573,6 +591,56 @@ impl Compiler {
     fn pop_f1(&mut self) {
         self.emit("fldd f1, [sp]");
         self.emit("add sp, sp, 9");
+    }
+
+    /// Hold f1 in a free f register while `rest` is evaluated (optimizing,
+    /// when `rest` has no call, which could change f registers): the
+    /// register, or None (then use the stack). Release with `release_f`.
+    fn hold_f1(&mut self, rest: &[&Expr]) -> Option<String> {
+        if !self.optimize || self.fheld >= 11 || rest.iter().any(|e| has_calls(e)) {
+            return None;
+        }
+        let r = format!("f{}", 3 + self.fheld);
+        self.fheld += 1;
+        self.emit(format!("fmov {r}, f1"));
+        Some(r)
+    }
+
+    fn release_f(&mut self) {
+        self.fheld -= 1;
+    }
+
+    /// Hold r1 in r4..r6 while `rest` is evaluated, as `hold_f1` (those
+    /// carry arguments only for calls and system calls, which `rest`
+    /// then does not have).
+    fn hold_r1(&mut self, rest: &[&Expr]) -> Option<String> {
+        if !self.optimize || self.iheld >= 3 || rest.iter().any(|e| has_calls(e)) {
+            return None;
+        }
+        let r = format!("r{}", 4 + self.iheld);
+        self.iheld += 1;
+        self.emit(format!("mov {r}, r1"));
+        Some(r)
+    }
+
+    fn release_r(&mut self) {
+        self.iheld -= 1;
+    }
+
+    /// The memory operand of a named real variable (not in a register).
+    fn real_var_operand(&self, e: &Expr) -> Option<String> {
+        if !self.optimize {
+            return None;
+        }
+        let ExprKind::Name(n) = &e.kind else { return None };
+        match self.lookup_local(n) {
+            Some(l) if l.ty.is_real() && l.reg.is_none() => Some(mem("fp", l.off)),
+            Some(_) => None,
+            None => match self.globals.get(n) {
+                Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) if ty.is_real() => Some(format!("[{label}]")),
+                _ => None,
+            },
+        }
     }
 
     /// The type of `e`, found by compiling it and throwing the code away
@@ -1590,6 +1658,12 @@ impl Compiler {
     fn compare(&mut self, a: &Expr, b: &Expr) -> R<bool> {
         if self.peek_real(a)? || self.peek_real(b)? {
             self.expr_real(a)?;
+            if let Some(t) = self.hold_f1(&[b]) {
+                self.expr_real(b)?;
+                self.release_f();
+                self.emit(format!("fcmp {t}, f1"));
+                return Ok(true);
+            }
             self.push_f1();
             self.expr_real(b)?;
             self.emit("fmov f2, f1");
@@ -1619,13 +1693,21 @@ impl Compiler {
             self.emit(format!("cmp {left}, {rreg}"));
             return Ok(false);
         }
-        self.emit("push r1");
+        let held = self.hold_r1(&[b]);
+        if held.is_none() {
+            self.emit("push r1");
+        }
         let tb = self.expr(b)?.decay();
         let ok = (ta.is_integer() && tb.is_integer())
             || (ta.is_pointer() && tb.is_pointer())
             || (matches!(ta, Ty::Fn(..) | Ty::Null) && matches!(tb, Ty::Fn(..) | Ty::Null));
         if !ok {
             return err(b.pos, format!("cannot compare {} with {}", self.tyname(&ta), self.tyname(&tb)));
+        }
+        if let Some(t) = held {
+            self.release_r();
+            self.emit(format!("cmp {t}, r1"));
+            return Ok(false);
         }
         self.emit("mov r2, r1");
         self.emit("pop r1");
@@ -2428,6 +2510,17 @@ impl Compiler {
                     && (self.peek_real(a)? || self.peek_real(b)?)
                 {
                     self.expr_real(a)?;
+                    if let Some(operand) = self.real_var_operand(b) {
+                        self.emit(format!("fldd f2, {operand}"));
+                        self.real_op(op);
+                        return Ok(Ty::Real);
+                    }
+                    if let Some(t) = self.hold_f1(&[b]) {
+                        self.expr_real(b)?;
+                        self.release_f();
+                        self.emit(format!("{} f1, {t}, f1", self.real_mnemonic(op)));
+                        return Ok(Ty::Real);
+                    }
                     self.push_f1();
                     self.expr_real(b)?;
                     self.emit("fmov f2, f1");
@@ -2474,6 +2567,13 @@ impl Compiler {
                     return self.arith(op, &lt, &rt, None, pos);
                 }
                 let lt = self.expr(a)?.decay();
+                if let Some(t) = self.hold_r1(&[b]) {
+                    let rt = self.expr(b)?.decay();
+                    self.release_r();
+                    self.emit("mov r2, r1");
+                    self.emit(format!("mov r1, {t}"));
+                    return self.arith(op, &lt, &rt, None, pos);
+                }
                 self.emit("push r1");
                 let rt = self.expr(b)?.decay();
                 self.emit("mov r2, r1");
@@ -2485,7 +2585,12 @@ impl Compiler {
 
     /// f1 := f1 op f2 for a real arithmetic operator.
     fn real_op(&mut self, op: BinOp) {
-        let m = match op {
+        let m = self.real_mnemonic(op);
+        self.emit(format!("{m} f1, f1, f2"));
+    }
+
+    fn real_mnemonic(&self, op: BinOp) -> &'static str {
+        match op {
             BinOp::Add => "fadd",
             BinOp::Sub => "fsub",
             BinOp::Mul => "fmul",
@@ -2493,8 +2598,7 @@ impl Compiler {
             BinOp::Mod => "frem",
             BinOp::Min => "fmin",
             _ => "fmax",
-        };
-        self.emit(format!("{m} f1, f1, f2"));
+        }
     }
 
     /// Assignment to a real lvalue (plain or compound).
@@ -2502,6 +2606,17 @@ impl Compiler {
         match op {
             None => {
                 self.expr_real(rhs)?;
+                if let Some(operand) = self.real_var_operand(lhs) {
+                    self.emit(format!("fstd f1, {operand}"));
+                    return Ok(Ty::Real);
+                }
+                if let Some((operand, t)) = self.simple_addr(lhs, "r2")? {
+                    if t.is_real() {
+                        self.emit(format!("fstd f1, {operand}"));
+                        return Ok(Ty::Real);
+                    }
+                    return err(lhs.pos, "a real cannot be stored there".to_string());
+                }
                 self.push_f1();
                 self.addr(lhs)?;
                 self.pop_f1();

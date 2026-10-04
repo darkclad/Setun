@@ -434,3 +434,58 @@ fn calls_compound_assignments_and_operand_order_the_same_way() {
     "#;
     same_both_ways_src("calls.tri", src, 50_000_000);
 }
+
+#[test]
+fn temporaries_in_registers_the_same_way() {
+    // integer and real temporaries held in registers (r4-r6, f3-f13)
+    // instead of the stack: nested deeper than there are registers, with a
+    // call on the right (which must not find them changed), real stores to
+    // every kind of place, a simple real variable on the right, comparisons
+    let src = r#"
+        import "console.tri";
+        var gx: int = 7;
+        var gr: real = 1.5;
+        var ra: [5]real;
+        struct P { a: real; n: int; b: real; }
+        var gp: P;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        // f and g use r4..r6 and f3.. themselves (six arguments, temporaries)
+        fn six(a: int, b: int, c: int, d: int, e: int, h: int) -> int { return a + b * 2 + c * 3 + d * 4 + e * 5 + h * 6; }
+        fn f(v: int) -> int { gx += v; return six(v, v + 1, v * 2, v - 3, gx, 7) % 97 + v * 2 + 1; }
+        fn g(v: real) -> real { gr = gr + v * (v - (v * 2.0 - (v + 1.0))); return v * 0.5 + six(1, 2, 3, 4, 5, 6); }
+        fn main() -> int {
+            var a: int = 3;
+            var b: int = 5;
+            var m: int = 11;
+            var pm: *int = &m;
+            // deeper than r4..r6: the stack again from the fourth level
+            put((a + b) * ((b - a) * ((a * b + 1) * ((b + 2) * (a - 7) + (m - b)) - (a + m)) + (b * m - a)) - (m + a) * (b - m));
+            put((a + b) * f(a) + (b - a) * f(b) - gx);         // calls on the right
+            put((a * 2 + gx) - (f(m) + gx));                   // gx changed by f, read in order
+            if ((a + b) * 2 > (m - a) * (b - 1)) { put(1); } else { put(2); }
+            if ((a * b) == (b * a + m - m)) { put(3); }
+            var x: real = 2.0;
+            var y: real = 0.75;
+            var z: real = (x + y) * ((x - y) * ((x * y + 1.0) * ((y + 2.0) * (x - 7.0) + (x * y - y)) - (x + y)) + (y * x - x));
+            put((z * 1000.0) as int);
+            var w: real = 0.0;
+            w = (x * y + x / y) - (y * y - x * x) * DEEP;
+            put((w * 1000.0) as int);
+            var u: real = x * g(y) + (y - g(x)) * gr;          // calls on the right
+            put((u * 1000.0) as int);
+            ra[2] = x * y; gp.a = x - y; gp.b = gp.a * x + y; gr = gr * x;
+            ra[3] = ra[2] / y + gp.b;
+            put(((ra[2] + ra[3] + gp.a + gp.b + gr) * 100.0) as int);
+            if (x * y > y * y + x) { put(4); } else { put(5); }
+            if (x - y < gr) { put(6); }
+            put(((x * y + y * gr) * 1000.0) as int);
+            return (a + b + m) % 9841;
+        }
+    "#;
+    // right-nested 14 deep: more than the eleven f registers
+    let mut deep = String::from("(x - y)");
+    for k in 0..14 {
+        deep = format!("(x {} y * {deep})", if k % 2 == 0 { "+" } else { "-" });
+    }
+    same_both_ways_src("temps.tri", &src.replace("DEEP", &deep), 50_000_000);
+}
