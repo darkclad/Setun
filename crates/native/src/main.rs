@@ -3,10 +3,14 @@
 //! A window showing the display (text or graphics mode), keyboard and mouse
 //! input, and the serial console on stdin/stdout. Without `--rom` it boots
 //! the built-in BIOS (from bios/bios.tri); `--demo` boots the old demo ROM.
+//! `--console` runs without a window, the terminal as the serial console
+//! (for ssh); without `--disk` it boots a Trinux disk built from the source
+//! tree.
 //!
 //! ```text
 //! setun [--rom FILE.t1b2] [--disk FILE.t1b2] [--ram FRAMES] [--mips N]
 //!       [--scale N] [--headless INSTRUCTIONS] [--keys TEXT] [--screenshot FILE.png]
+//! setun --console [--disk FILE.t1b2] [--ram FRAMES]
 //! ```
 
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
@@ -15,6 +19,8 @@ use setun_core::machine::Machine;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
+
+mod console;
 
 struct Args {
     rom: Option<PathBuf>,
@@ -27,19 +33,23 @@ struct Args {
     keys: String,
     press: Vec<i64>,
     screenshot: Option<PathBuf>,
+    console: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale N]\n\
          \x20            [--headless INSTRUCTIONS] [--keys TEXT] [--screenshot FILE.png]\n\
+         \x20      setun --console [--disk FILE.t1b2] [--ram FRAMES]\n\
          \n\
          --ram FRAMES     RAM in 3^9-tryte pages (default 19683 = 3^18 trytes)\n\
          --mips N         emulated speed in millions of instructions per second (default 10)\n\
          --headless N     run N instructions without a window, print serial output and the text screen\n\
          --keys TEXT      (headless) feed TEXT to the serial console after booting\n\
          --press A,B,..   (headless) press these USB HID keys after booting\n\
-         --screenshot F   (headless) save the final screen as a PNG"
+         --screenshot F   (headless) save the final screen as a PNG\n\
+         --console        no window: this terminal is the serial console (Ctrl-] leaves);\n\
+         \x20                without --disk, a Trinux disk built from the source tree"
     );
     std::process::exit(2)
 }
@@ -56,6 +66,7 @@ fn parse_args() -> Args {
         keys: String::new(),
         press: Vec::new(),
         screenshot: None,
+        console: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -73,6 +84,7 @@ fn parse_args() -> Args {
                 a.press = val().split(',').map(|k| k.trim().parse().unwrap_or_else(|_| usage())).collect()
             }
             "--screenshot" => a.screenshot = Some(val().into()),
+            "--console" => a.console = true,
             _ => usage(),
         }
     }
@@ -210,7 +222,19 @@ fn hid(k: Key) -> Option<i64> {
 
 fn main() {
     let args = parse_args();
+    if args.console && args.disk.is_none() && args.rom.is_none() && !args.demo {
+        let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| {
+            eprintln!("setun: cannot build the Trinux disk (run from the source tree, or give --disk): {e}");
+            std::process::exit(1)
+        });
+        let mut m = build_machine(&args);
+        m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
+        return console::run(m);
+    }
     let mut m = build_machine(&args);
+    if args.console {
+        return console::run(m);
+    }
     if let Some(n) = args.headless {
         return headless(m, n, &args);
     }

@@ -66,6 +66,7 @@ cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
+cargo run --release -p setun-native -- --console              # no window: this terminal is the console (ssh); Ctrl-] leaves
 sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
 python -m http.server 8026 --directory web     # then open http://localhost:8026
 ```

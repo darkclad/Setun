@@ -11,8 +11,10 @@ name = "setun"
 path = "src/main.rs"
 
 [dependencies]
+crossterm = "0.29"
 minifb = "0.28.0"
 png = "0.18.1"
 setun-core = { path = "../core" }
 setun-demo = { path = "../demo" }
 trine = { path = "../trine" }
+trinux = { path = "../trinux" }
