@@ -382,3 +382,55 @@ fn loops_and_jumps_the_same_way() {
     "#;
     same_both_ways_src("loops.tri", src, 50_000_000);
 }
+
+#[test]
+fn calls_compound_assignments_and_operand_order_the_same_way() {
+    // arguments in registers (simple ones after the last call, which may
+    // change what earlier ones read), compound assignment in place, and a
+    // simple left operand read after the right side only when that cannot
+    // change it
+    let src = r#"
+        import "console.tri";
+        var x: int = 10;
+        var y: int = 20;
+        var gc: char = 'A';
+        var arr: [12]int;
+        var tr: [6]tryte;
+        struct S { a: int; t: tryte; b: int; }
+        var gs: S;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn bump() -> int { x = x * 2 + 1; y += 3; return 7; }
+        fn six(a: int, b: int, c: int, d: int, e: int, f: int) -> int { return ((((a * 3 + b) * 3 + c) * 3 + d) * 3 + e) * 3 + f; }
+        fn two(a: int, b: int) -> int { return a * 1000 + b; }
+        fn ch(c: char, n: int) -> int { return c * 10 + n; }
+        fn main() -> int {
+            var r: int = 4;
+            var mem: int = 9;
+            var pm: *int = &mem;                              // mem stays in memory
+            put(two(x, bump()));                              // x read before bump changes it
+            put(two(bump(), x));                              // x read after
+            put(six(x, y, bump(), x, y, r));                  // simple ones on both sides of a call
+            put(six(mem, x, y, mem, x, y));                   // several from memory in a row
+            put(six(1, two(x, y), 3, r, two(y, x), mem));      // calls inside, nested
+            put(ch(gc, x));                                   // a char from memory
+            // compound assignment in place
+            x += 5; y -= x; mem *= 3; *pm += 2; x /= 3; y %= 7;
+            var i: int = 0;
+            while (i < 12) { arr[i] = i * i; i += 1; }
+            i = 2;
+            arr[i] += 100; arr[i + 3] -= y; arr[7] *= r; arr[i * 2] %= 5;
+            gs.a += 9; gs.b -= gs.a; gs.t += 9000; gs.t += 9000; // tryte overflow wraps
+            tr[1] = 9800 as tryte; tr[1] += 100; tr[2] -= 9841;
+            var p: *int = &arr[0];
+            p += 3; p -= 1;                                    // pointer steps scale
+            put(x + y * 3 + mem + arr[2] + arr[5] + arr[7] + arr[4] + gs.a + gs.b + gs.t + tr[1] + tr[2] + *p);
+            // the left operand after the right side, only when safe
+            put(x + bump());                                  // bump changes x: x first
+            put(100 - bump());
+            put(r + (r = 5));                                 // the right side assigns r
+            put(mem + y * 2 + r);
+            return (x + y + r + mem) % 9841;
+        }
+    "#;
+    same_both_ways_src("calls.tri", src, 50_000_000);
+}

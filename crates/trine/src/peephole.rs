@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 
 const FLAGS: u32 = 1 << 27;
+/// sp and fp: writes to them always stay.
+const FRAME: u32 = (1 << (13 + 13)) | (1 << (11 + 13));
 
 fn reg_num(s: &str) -> Option<i64> {
     match s {
@@ -358,7 +360,7 @@ fn redundant(lines: &[String], live: &[u32]) -> Option<usize> {
                     None => None,
                 };
                 let v = v.unwrap_or_else(|| *exprs.entry(key).or_insert_with(|| fresh(&mut next)));
-                if d != 0 && val.get(&d) == Some(&v) && (flags_dead || !sets_flags) {
+                if d != 0 && bit(d) & FRAME == 0 && val.get(&d) == Some(&v) && (flags_dead || !sets_flags) {
                     return Some(k);
                 }
                 if d != 0 {
@@ -398,8 +400,9 @@ pub fn run(lines: &mut Vec<String>) {
                 continue;
             };
             let Some(ia) = info(&a) else { return };
-            // drop dead code
-            if ia.pure && ia.defs & live[k] == 0 {
+            // drop dead code (never a write to sp or fp: what lies below sp
+            // is not ours, an interrupt may push there at any moment)
+            if ia.pure && ia.defs & live[k] == 0 && ia.defs & FRAME == 0 {
                 lines.remove(k);
                 changed = true;
                 break; // liveness is stale now

@@ -282,6 +282,18 @@ fn var_count(stmts: &[Stmt]) -> usize {
 }
 
 /// Direct calls in `stmts`: the callee names.
+/// Could evaluating `e` change a variable (a call or an assignment in it)?
+fn has_effects(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(..) | ExprKind::Assign(..) => true,
+        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => has_effects(a),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => has_effects(a) || has_effects(b),
+        ExprKind::Cond(a, b, c) => has_effects(a) || has_effects(b) || has_effects(c),
+        ExprKind::List(xs) => xs.iter().any(has_effects),
+        _ => false,
+    }
+}
+
 fn calls_in(stmts: &[Stmt], out: &mut Vec<String>) {
     fn ex(e: &Expr, out: &mut Vec<String>) {
         match &e.kind {
@@ -1105,9 +1117,18 @@ impl Compiler {
                 self.emit(format!("push {r}"));
             }
         }
-        self.emit("push lr");
-        self.emit("push fp");
-        self.emit("mov fp, sp");
+        // the frame: lr and the caller's fp below sp, fp pointing at the
+        // saved fp (optimized: one sp adjustment instead of two pushes)
+        let fast_frame = self.optimize && !has_asm && !f.interrupt;
+        if fast_frame {
+            self.emit("stw lr, [sp-3]");
+            self.emit("stw fp, [sp-6]");
+            self.emit("sub fp, sp, 6");
+        } else {
+            self.emit("push lr");
+            self.emit("push fp");
+            self.emit("mov fp, sp");
+        }
         let frame_at = self.code.len();
         // Parameters: integers in r1..r6, then the stack (fp+6, fp+9, ...);
         // reals in f1..f9. Each is copied into its slot.
@@ -1154,7 +1175,9 @@ impl Compiler {
             .collect();
         let total = frame + 3 * saves.len() as i64;
         let mut prologue = Vec::new();
-        if total > 0 {
+        if fast_frame {
+            prologue.push(format!("        sub sp, sp, {}", total + 6));
+        } else if total > 0 {
             prologue.push(format!("        sub sp, sp, {total}"));
         }
         for (r, off) in &saves {
@@ -1168,9 +1191,15 @@ impl Compiler {
         for (r, off) in &saves {
             self.emit(format!("ldw {r}, {}", mem("fp", *off)));
         }
-        self.emit("mov sp, fp");
-        self.emit("pop fp");
-        self.emit("pop lr");
+        if fast_frame {
+            self.emit("ldw lr, [fp+3]");
+            self.emit("add sp, fp, 6");
+            self.emit("ldw fp, [fp]");
+        } else {
+            self.emit("mov sp, fp");
+            self.emit("pop fp");
+            self.emit("pop lr");
+        }
         if f.interrupt {
             for r in SAVED.iter().rev() {
                 self.emit(format!("pop {r}"));
@@ -2415,6 +2444,35 @@ impl Compiler {
                     let (rreg, rt) = self.simple_operand(b).expect("checked simple");
                     return self.arith_regs(op, &lt, &rt.decay(), left, None, rreg, pos);
                 }
+                // the right side first, then the left, without the stack: when
+                // the left is a constant, or a simple variable the right side
+                // cannot change (no calls, no assignments in it)
+                let left_after = self.const_eval(a).is_some() || (self.is_simple_operand(a) && !has_effects(b));
+                if self.optimize && left_after {
+                    let rt = self.expr(b)?.decay();
+                    self.emit("mov r2, r1");
+                    let lt = match self.const_eval(a) {
+                        Some(v) => {
+                            self.emit(format!("li r1, {v}"));
+                            self.peek_type(a)?.decay()
+                        }
+                        None => match self.reg_local(a) {
+                            Some((src, t)) => {
+                                self.emit(format!("mov r1, {src}"));
+                                t.decay()
+                            }
+                            None => {
+                                // simple_operand loads into r2: keep the right side
+                                self.emit("mov r3, r2");
+                                let (_, t) = self.simple_operand(a).expect("checked simple");
+                                self.emit("mov r1, r2");
+                                self.emit("mov r2, r3");
+                                t.decay()
+                            }
+                        },
+                    };
+                    return self.arith(op, &lt, &rt, None, pos);
+                }
                 let lt = self.expr(a)?.decay();
                 self.emit("push r1");
                 let rt = self.expr(b)?.decay();
@@ -2540,6 +2598,11 @@ impl Compiler {
                         return Ok(lt);
                     }
                 }
+                // a variable in memory, an array element or a field, with a
+                // constant or simple right side: load, operate, store
+                if let Some(r) = self.compound_in_place(op, lhs, rhs)? {
+                    return Ok(r);
+                }
                 let lt = self.addr(lhs)?;
                 if !lt.is_scalar() {
                     return err(lhs.pos, format!("cannot apply an operator to a whole {}", self.tyname(&lt)));
@@ -2644,6 +2707,9 @@ impl Compiler {
             self.emit(format!("add sp, sp, {cleanup}"));
             return Ok(*ret);
         }
+        if self.optimize && direct.is_some() && args.len() <= 6 {
+            return self.call_in_registers(&direct.as_ref().unwrap().0, args, &params, *ret);
+        }
         for (a, p) in args.iter().zip(&params) {
             let t = self.expr(a)?;
             self.check_assign(p, &t, a)?;
@@ -2675,6 +2741,107 @@ impl Compiler {
             self.emit(format!("add sp, sp, {}", 3 * cleanup));
         }
         Ok(*ret)
+    }
+
+    /// `lhs op= rhs` in place when lhs has a simple memory operand (a named
+    /// variable in memory, or what `simple_addr` takes) and rhs is a
+    /// constant or a simple operand: the address first (in r3), then rhs
+    /// (r2), as the general path orders them. None: not that case.
+    fn compound_in_place(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> R<Option<Ty>> {
+        if !self.optimize || !(self.const_eval(rhs).is_some() || self.is_simple_operand(rhs)) {
+            return Ok(None);
+        }
+        let named = match &lhs.kind {
+            ExprKind::Name(n) => match self.lookup_local(n) {
+                Some(l) if l.reg.is_none() => Some((mem("fp", l.off), l.ty.clone())),
+                Some(_) => None,
+                None => match self.globals.get(n) {
+                    Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) => Some((format!("[{label}]"), ty.clone())),
+                    _ => None,
+                },
+            },
+            _ => None,
+        };
+        let Some((operand, lt)) = (match named {
+            Some(x) => Some(x),
+            None => self.simple_addr(lhs, "r3")?,
+        }) else {
+            return Ok(None);
+        };
+        if !lt.is_scalar() || lt.is_real() {
+            return Err(Error { pos: lhs.pos, msg: format!("cannot apply an operator to a whole {}", self.tyname(&lt)) });
+        }
+        let (rt, imm) = match self.const_eval(rhs) {
+            Some(v) => (Ty::Int, Some(v)),
+            None => {
+                let (src, t) = self.simple_operand(rhs).expect("checked simple");
+                if src != "r2" {
+                    self.emit(format!("mov r2, {src}"));
+                }
+                (t.decay(), None)
+            }
+        };
+        self.load_operand(&lt, &operand);
+        let res = self.arith(op, &lt, &rt, imm, rhs.pos)?;
+        self.check_assign(&lt, &res, rhs)?;
+        self.store(&lt, "r1", &operand);
+        Ok(Some(lt))
+    }
+
+    /// A direct call with at most six integer arguments, optimized: the
+    /// arguments are evaluated left to right as always, but only those
+    /// before the last one that is not simple (a constant or a scalar
+    /// variable, which have no side effects) go through the stack; that one
+    /// goes straight to its register, and the simple ones after it are
+    /// loaded into theirs at the end.
+    fn call_in_registers(&mut self, name: &str, args: &[Expr], params: &[Ty], ret: Ty) -> R<Ty> {
+        let simple = |c: &Compiler, a: &Expr| c.const_eval(a).is_some() || c.is_simple_operand(a);
+        let last = args.iter().rposition(|a| !simple(self, a));
+        let pushed = last.unwrap_or(0);
+        for (a, p) in args.iter().zip(params).take(pushed) {
+            let t = self.expr(a)?;
+            self.check_assign(p, &t, a)?;
+            self.emit("push r1");
+        }
+        if let Some(m) = last {
+            let t = self.expr(&args[m])?;
+            self.check_assign(&params[m], &t, &args[m])?;
+            if m > 0 {
+                self.emit(format!("mov r{}, r1", m + 1));
+            }
+        }
+        for k in 0..pushed {
+            self.emit(format!("ldw r{}, {}", k + 1, mem("sp", 3 * (pushed - 1 - k) as i64)));
+        }
+        for k in last.map_or(0, |m| m + 1)..args.len() {
+            let a = &args[k];
+            let t = self.peek_type(a)?;
+            self.check_assign(&params[k], &t, a)?;
+            // straight into its register (by way of r2 would overwrite the
+            // argument already there)
+            let r = format!("r{}", k + 1);
+            if let Some(v) = self.const_eval(a) {
+                self.emit(format!("li {r}, {v}"));
+            } else if let Some((src, _)) = self.reg_local(a) {
+                self.emit(format!("mov {r}, {src}"));
+            } else {
+                let ExprKind::Name(n) = &a.kind else { unreachable!("a simple operand is a name") };
+                let operand = match self.lookup_local(n) {
+                    Some(l) => mem("fp", l.off),
+                    None => match self.globals.get(n) {
+                        Some(Global::Var { label, .. }) | Some(Global::Extern { label, .. }) => format!("[{label}]"),
+                        _ => unreachable!("a simple operand is a variable"),
+                    },
+                };
+                let op = if t.is_tryte_sized() { "ldt" } else { "ldw" };
+                self.emit(format!("{op} {r}, {operand}"));
+            }
+        }
+        self.emit(format!("call {name}"));
+        if pushed > 0 {
+            self.emit(format!("add sp, sp, {}", 3 * pushed));
+        }
+        Ok(ret)
     }
 
     /// The inlining cost of `name`: its size plus what it would inline,
