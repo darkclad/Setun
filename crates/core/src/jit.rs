@@ -520,7 +520,9 @@ impl Gen<'_> {
 impl Jit {
     pub(super) fn new() -> Option<Jit> {
         let mut flags = settings::builder();
-        flags.set("opt_level", "none").ok()?;
+        // compiles run in the background: the better code is worth it
+        // (mandel 9.9x -> 7.7x the native time; compiling about 30% slower)
+        flags.set("opt_level", "speed").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
