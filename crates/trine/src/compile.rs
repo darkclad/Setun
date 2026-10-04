@@ -130,10 +130,11 @@ const FREAL_REGS: [&str; 9] = ["f-1", "f-2", "f-3", "f-4", "f-5", "f-6", "f-7", 
 const LOCAL_REGS: [&str; 9] = ["r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8", "r-9"];
 
 /// More for a leaf function (one that makes no real call): caller-saved
-/// registers the code generator never uses itself (it uses r1-r3 for
-/// expressions, r1-r6 for system call arguments and r7, r8 for calls), so
-/// they need no saving at all.
-const LEAF_REGS: [&str; 6] = ["r9", "r10", "r-10", "r-11", "r-12", "r-13"];
+/// registers the code generator does not use there (it uses r1-r3 for
+/// expressions, r4-r6 for temporaries and system call arguments; r7, r8
+/// only for calls, and in the prologue for a seventh parameter, before
+/// these come to be used), so they need no saving at all.
+const LEAF_REGS: [&str; 8] = ["r9", "r10", "r-10", "r-11", "r-12", "r-13", "r7", "r8"];
 
 /// Names whose address is taken (`&x`) anywhere in `stmts`, and whether
 /// there is inline assembly (which may use any register).
@@ -604,7 +605,7 @@ impl Compiler {
     /// when `rest` has no call, which could change f registers): the
     /// register, or None (then use the stack). Release with `release_f`.
     fn hold_f1(&mut self, rest: &[&Expr]) -> Option<String> {
-        if !self.optimize || self.fheld >= 7 || rest.iter().any(|e| has_calls(e)) {
+        if !self.optimize || self.fheld >= 7 || rest.iter().any(|e| self.real_calls(e)) {
             return None;
         }
         let r = format!("f{}", 3 + self.fheld);
@@ -621,7 +622,7 @@ impl Compiler {
     /// carry arguments only for calls and system calls, which `rest`
     /// then does not have).
     fn hold_r1(&mut self, rest: &[&Expr]) -> Option<String> {
-        if !self.optimize || self.iheld >= 3 || rest.iter().any(|e| has_calls(e)) {
+        if !self.optimize || self.iheld >= 3 || rest.iter().any(|e| self.real_calls(e)) {
             return None;
         }
         let r = format!("r{}", 4 + self.iheld);
@@ -632,6 +633,40 @@ impl Compiler {
 
     fn release_r(&mut self) {
         self.iheld -= 1;
+    }
+
+    /// A call in `e` that may change r4..r6 and the f registers. In a leaf
+    /// function every call to a Trine function is inlined, so there only
+    /// the builtins count (`syscall` takes r1..r6), in `e` or in the
+    /// bodies inlined into it.
+    fn real_calls(&self, e: &Expr) -> bool {
+        if !self.leaf {
+            return has_calls(e);
+        }
+        match &e.kind {
+            ExprKind::Call(f, args) => {
+                let inlined = matches!(&f.kind, ExprKind::Name(n)
+                    if self.lookup_local(n).is_none() && self.only_inlined_calls(n));
+                !inlined || args.iter().any(|a| self.real_calls(a))
+            }
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => self.real_calls(a),
+            ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Assign(_, a, b) => self.real_calls(a) || self.real_calls(b),
+            ExprKind::Cond(a, b, c) => self.real_calls(a) || self.real_calls(b) || self.real_calls(c),
+            ExprKind::List(xs) => xs.iter().any(|x| self.real_calls(x)),
+            _ => false,
+        }
+    }
+
+    /// Is `name` a Trine function whose body calls nothing but Trine
+    /// functions like it (so inlined, it calls nothing at all)?
+    fn only_inlined_calls(&self, name: &str) -> bool {
+        let Some(f) = self.fns.get(name) else { return false };
+        if BUILTINS.contains(&name) || !self.inlinable(name) {
+            return false;
+        }
+        let mut callees = Vec::new();
+        calls_in(f.body.as_ref().unwrap(), &mut callees);
+        callees.iter().all(|c| self.only_inlined_calls(c))
     }
 
     /// The memory operand of a named real variable (not in a register).
@@ -1242,8 +1277,9 @@ impl Compiler {
             if i < 6 {
                 self.emit(format!("{st} r{}, {}", i + 1, mem("fp", off)));
             } else {
-                self.emit(format!("ldw r7, {}", mem("fp", 6 + 3 * (i - 6))));
-                self.emit(format!("{st} r7, {}", mem("fp", off)));
+                // r1 is free by now (r1..r6 are copied); r7 may hold a parameter
+                self.emit(format!("ldw r1, {}", mem("fp", 6 + 3 * (i - 6))));
+                self.emit(format!("{st} r1, {}", mem("fp", off)));
             }
             i += 1;
         }

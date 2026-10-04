@@ -412,6 +412,20 @@ pub fn run(lines: &mut Vec<String>) {
                 changed = true;
                 break;
             }
+            // a jump to a label right after it (the end of an inlined body)
+            if a.op == "b" && a.args.len() == 1 {
+                let mut j = k + 1;
+                let mut lands = false;
+                while let Some(Line::Label(l)) = lines.get(j).map(|l| classify(l)) {
+                    lands |= l == a.args[0];
+                    j += 1;
+                }
+                if lands {
+                    lines.remove(k);
+                    changed = true;
+                    break;
+                }
+            }
             let next = k + 1;
             if next < lines.len() {
                 if let Line::Ins(b) = classify(&lines[next]) {

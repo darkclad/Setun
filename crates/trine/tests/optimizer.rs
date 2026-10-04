@@ -589,3 +589,66 @@ fn real_locals_in_registers_the_same_way() {
     "#;
     same_both_ways_src("reals.tri", src, 80_000_000);
 }
+
+#[test]
+fn leaf_registers_and_inlined_calls_the_same_way() {
+    // a leaf function also keeps locals in r7 and r8 (a seventh parameter
+    // among them, with an eighth in memory loaded past it); temporaries held
+    // across calls a leaf inlines, plain ones and ones whose body uses a
+    // builtin; early returns out of inlined bodies (jumps to the next line)
+    let src = r#"
+        import "console.tri";
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn lo(x: int) -> int { if (x < 0) { return 0; } return x % 4096; }
+        fn hi(x: int) -> int { return lo(x / 4096) * 7 + 1; }
+        fn sg(x: int) -> int { return sgn(x) * 5 + abs(x) % 13; }
+        fn nine(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {
+            var p: *int = &h;                          // h in memory, after g in r7
+            *p = *p + 1;
+            var s: int = a + b * 2 + c * 3 + d * 5 + e * 7 + f * 11 + g * 13 + h * 17 + i * 19;
+            var t: int = s % 1000;
+            var u: int = t * 3 + g;
+            var v: int = u - a + i;
+            var w: int = v * 2 + e;
+            var k: int = 0;
+            while (k < 9) {
+                s = s * 3 + lo(s) + hi(t) * 1000 + lo(u) * hi(v) + sg(w - s);
+                t = (t + lo(s) * hi(u + k) - sg(s) * lo(w)) % 100003;
+                u = (u + hi(t) + g) % 99991;
+                v = (v * 3 + lo(t + u) + h) % 77777;
+                w = (w + sg(v - u) + i) % 88883;
+                s = s % 999983;
+                k += 1;
+            }
+            return s + t + u + v + w + g + h;
+        }
+        fn main() -> int {
+            var r: int = 0;
+            var q: int = 1;
+            while (q < 7) {
+                r = (r * 3 + nine(q, -q, q * 2, 5, -7, q + 3, 100 - q, q * q, -9)) % 1000003;
+                q += 1;
+            }
+            put(r);
+            return r % 9841;
+        }
+    "#;
+    same_both_ways_src("leafregs.tri", src, 80_000_000);
+}
+
+#[test]
+fn temporaries_not_held_across_an_inlined_syscall() {
+    // `syscall` takes r1..r6, so a temporary must not wait in r4..r6 across
+    // a call whose inlined body makes one (a ROM cannot run it: read the code)
+    let src = r#"
+        fn sc(x: int) -> int { return syscall(1, x, 2, 3, 4, 5); }
+        fn leafy(a: int, b: int) -> int { return a * 7 + sc(b) * 3; }
+        fn main() -> int { return leafy(1, 2); }
+    "#;
+    let b = build_source("sc.tri", src, None, &opts(true)).unwrap();
+    let body: Vec<&str> = b.asm.lines().skip_while(|l| !l.starts_with("leafy:")).take_while(|l| !l.starts_with("main:")).collect();
+    let sys = body.iter().position(|l| l.trim_start().starts_with("sys ")).expect("the syscall inlined");
+    for l in &body[sys + 1..] {
+        assert!(!["r4", "r5", "r6"].iter().any(|r| l.contains(r)), "r4..r6 read after the syscall: {l}\n{}", body.join("\n"));
+    }
+}
