@@ -42,6 +42,10 @@ fn auto_login(m: &mut setun_core::Machine, out: &str, logged_in: &mut bool) -> b
 }
 
 fn shell(lines: &[&str], max_steps: u64) -> String {
+    shell_machine(lines, max_steps).0
+}
+
+fn shell_machine(lines: &[&str], max_steps: u64) -> (String, setun_core::Machine) {
     let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
     let mut m = trinux::boot(&disk, 729, 0);
     let mut out = String::new();
@@ -78,7 +82,7 @@ fn shell(lines: &[&str], max_steps: u64) -> String {
             since_input = 0;
         }
     }
-    out
+    (out, m)
 }
 
 #[test]
@@ -371,4 +375,29 @@ fn fpu_lazy_switching() {
     assert!(out.contains("st=0\n"), "{out}");
     assert!(out.contains("FPU:\tunused\n"), "init never touched the FPU:\n{out}");
     assert!(!out.contains("FAILED") && !out.contains("Kernel panic"), "{out}");
+}
+
+#[test]
+fn page_tables_go_back_clean() {
+    // free_address_space clears each table it walks and keeps it for reuse
+    // unzeroed: after processes come and go (fork, exec, pipes, a longer
+    // stack), every table waiting there must be all zero, or a new address
+    // space would start with stale mappings
+    let (out, m) = shell_machine(
+        &["ls /bin | wc -l", "echo one two | wc -w", "cat /etc/passwd | head -n 2 | wc -c", "sh -c 'echo nested'", "md5sum /etc/passwd"],
+        400_000_000,
+    );
+    assert!(out.contains("nested"), "the commands did not run:\n{out}");
+    let kb = trine::build_file(&trinux::kernel_dir().join("main.tri"), &trinux::kernel_options()).unwrap();
+    let sym = |n: &str| *kb.program.symbols.get(n).unwrap_or_else(|| panic!("no symbol {n}"));
+    let word = |pa: i64| m.mem.read_word(pa).unwrap().value();
+    let count = word(sym("clean_count"));
+    assert!(count > 0, "no clean table cached: the check would prove nothing");
+    for k in 0..count {
+        let c = word(sym("clean_tables") + 3 * k);
+        let centre = c * 19683; // frame_centre
+        for i in -9841..=9841 {
+            assert_eq!(word(centre + 3 * i), 0, "clean table {k} (frame {c}) entry {i} is set");
+        }
+    }
 }

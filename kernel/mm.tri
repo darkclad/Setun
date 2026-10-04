@@ -55,12 +55,17 @@ fn is_free_block(c: int, k: int) -> int {
 }
 
 // Allocate 3^k contiguous frames; returns the centre frame, or -1.
-// Short of memory, the text cache gives its frames back first.
+// Short of memory, the text cache and the clean tables give their frames
+// back first.
 fn alloc_pages(k: int) -> int {
     var j: int = k;
     while (j <= MAX_ORDER && free_head[j] == NONE) { j += 1; }
-    if (j > MAX_ORDER && text_cache_count > 0) {
+    if (j > MAX_ORDER && (text_cache_count > 0 || clean_count > 0)) {
         text_cache_drop();
+        while (clean_count > 0) {
+            clean_count -= 1;
+            free_pages(clean_tables[clean_count], 1);
+        }
         j = k;
         while (j <= MAX_ORDER && free_head[j] == NONE) { j += 1; }
     }
@@ -275,8 +280,27 @@ fn alloc_frame_zeroed() -> int {
     return f;
 }
 
-// Allocate and zero 3 frames (a page table); returns the centre frame.
+// Page tables given back all zero (free_clean_table) wait here for reuse,
+// saving the zeroing of 19683 words for each new one.
+const CLEAN_TABLES: int = 27;
+var clean_tables: [27]int;
+var clean_count: int;
+
+fn free_clean_table(c: int) {
+    if (clean_count < CLEAN_TABLES) {
+        clean_tables[clean_count] = c;
+        clean_count += 1;
+    } else {
+        free_pages(c, 1);
+    }
+}
+
+// Allocate 3 zeroed frames (a page table); returns the centre frame.
 fn alloc_table() -> int {
+    if (clean_count > 0) {
+        clean_count -= 1;
+        return clean_tables[clean_count];
+    }
     var c: int = alloc_pages(1);
     if (c < 0) { return -1; }
     zero_words((frame_start(c - 1) + 1) as *int, 3 * 6561);

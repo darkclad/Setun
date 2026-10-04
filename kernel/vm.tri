@@ -105,24 +105,32 @@ fn uva_to_phys(l1: int, va: int) -> int {
     return pte_frame(*slot) * 19683 + (va - page * 19683);
 }
 
-// Release every user page and table, then the L1 table.
+// Release every user page and table, then the L1 table. Each table is
+// cleared as it is walked (the entries in use lie in tbl_lo..tbl_hi, and
+// an L1 table's kernel slots 0 and +1) and goes back clean.
 fn free_address_space(l1: int) {
     var i1: int = tbl_lo[l1];
-    while (i1 <= tbl_hi[l1] && i1 <= -1) {
-        var e1: int = *table_entry(l1, i1);
-        if (e1 != 0) {
+    while (i1 <= tbl_hi[l1]) {
+        var s1: *int = table_entry(l1, i1);
+        var e1: int = *s1;
+        if (e1 != 0 && i1 <= -1) {
             var l2: int = pte_frame(e1);
             var i2: int = tbl_lo[l2];
             while (i2 <= tbl_hi[l2]) {
-                var p: int = *table_entry(l2, i2);
+                var s2: *int = table_entry(l2, i2);
+                var p: int = *s2;
                 if (p != 0 && trit(p, 24) != -1) { put_page(pte_frame(p)); }   // device pages are not counted
+                *s2 = 0;
                 i2 += 1;
             }
-            free_pages(l2, 1);
+            free_clean_table(l2);
         }
+        *s1 = 0;
         i1 += 1;
     }
-    free_pages(l1, 1);
+    *table_entry(l1, 0) = 0;
+    *table_entry(l1, 1) = 0;
+    free_clean_table(l1);
 }
 
 // fork: a copy of `parent` sharing every page; writable pages become

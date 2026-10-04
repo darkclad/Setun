@@ -168,6 +168,7 @@ struct Task {
 }
 
 var tasks: [27]Task;
+var task_top: int = 1;                // above every slot alloc_task has handed out
 var current: int;                     // index into tasks; 0 is the idle task
 var next_pid: int;
 var user_tasks_alive: int;
@@ -185,7 +186,10 @@ fn sched_init() {
 fn alloc_task() -> int {
     var i: int = 1;
     while (i < NTASKS) {
-        if (tasks[i].state == TASK_UNUSED) { return i; }
+        if (tasks[i].state == TASK_UNUSED) {
+            if (i >= task_top) { task_top = i + 1; }
+            return i;
+        }
         i += 1;
     }
     return -1;
@@ -193,7 +197,7 @@ fn alloc_task() -> int {
 
 fn find_task(pid: int) -> int {
     var i: int = 1;
-    while (i < NTASKS) {
+    while (i < task_top) {
         if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) { return i; }
         i += 1;
     }
@@ -275,7 +279,7 @@ fn sleep_on(chan: int) -> int {
 // Every wake-up also wakes the tasks in poll(), which then look again.
 fn wake_up(chan: int) {
     var i: int = 1;
-    while (i < NTASKS) {
+    while (i < task_top) {                // the slots above were never used
         if (tasks[i].state == TASK_SLEEPING && (tasks[i].wchan == chan || tasks[i].wchan == POLL_CHAN)) {
             tasks[i].state = TASK_RUNNABLE;
             tasks[i].wchan = 0;

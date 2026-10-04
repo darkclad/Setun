@@ -207,6 +207,8 @@ All of these fit `SYS`'s ±9841 range.
 
 **The text cache (as built):** text pages are read-only, so `execve` shares them. Each page it reads stays in a 243-entry cache after the program exits, keyed by the file's inode slot, the inode's generation and the page. The generation is new whenever the slot is filled or the file is written or truncated, so a changed or replaced file never matches. The next exec of the same file maps the cached frames instead of reading the file again, and code the emulator's JIT compiled for those frames stays valid. When memory runs short, `alloc_pages` empties the cache before it fails. Frames still mapped by a process stay with it.
 
+**Clean page tables (as built):** a page table is 3 frames (19683 words), and zeroing one cost more than most of a fork. `free_address_space` now clears the entries it walks (those in `tbl_lo..tbl_hi`, plus an L1 table's kernel slots 0 and +1) and keeps up to 27 tables, all zero, for `alloc_table` to hand out without zeroing. `alloc_pages` gives them back when memory runs short, with the text cache. A test checks that every cached table is entirely zero after processes come and go.
+
 ## 10. The C library, in Trine (`tlibc`)
 
 **POSIX functions with POSIX names and semantics**, in Trine syntax:
