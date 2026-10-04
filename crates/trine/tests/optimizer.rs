@@ -532,3 +532,60 @@ fn loads_with_any_index_the_same_way() {
     "#;
     same_both_ways_src("anyindex.tri", src, 50_000_000);
 }
+
+#[test]
+fn real_locals_in_registers_the_same_way() {
+    // real locals of leaf functions live in f-1..f-9: more than nine (the
+    // rest in memory), scopes that end and free theirs, parameters,
+    // compound assignment, comparisons, an address taken; and a function
+    // that calls (not a leaf) keeping its reals across calls to leaves
+    // that use f-1..f-9 themselves
+    let src = r#"
+        import "console.tri";
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn leaf(x: real, y: real) -> real {
+            var a: real = x * 2.0;
+            var b: real = y - 1.0;
+            var c: real = a * b;
+            var d: real = c + x;
+            var e: real = d / 3.0;
+            var f: real = e - a;
+            var g: real = f * f;
+            var h: real = g + b;
+            var i: real = h - c;
+            var j: real = i + d;                   // the tenth and eleventh: memory
+            var k: real = j * e;
+            a += k; b -= j * 0.5; c *= 1.5; d /= 2.0;
+            if (a > b) { var t: real = a; a = b; b = t; }
+            { var u: real = c + d; c = u * 0.25; }
+            { var v: real = d - c; d = v + 1.0; }
+            var n: int = 0;
+            var s: real = 0.0;
+            while (s < a + 10.0 && n < 50) { s += b * 0.125 + 0.5; n += 1; }
+            return a + b + c + d + e + f + g + h + i + j + k + s + n;
+        }
+        fn addr_taken(x: real) -> real {
+            var r: real = x + 1.0;
+            var p: *real = &r;
+            *p = *p * 3.0;
+            return r;
+        }
+        fn caller(x: real) -> real {
+            var keep1: real = x * 7.0;              // not a leaf: in memory,
+            var keep2: real = x - 0.25;             // and must survive the calls
+            var r: real = leaf(x, keep1) + leaf(keep2, x);
+            return r + keep1 * keep2 + addr_taken(keep2);
+        }
+        fn main() -> int {
+            var t: int = 0;
+            var q: int = 1;
+            while (q < 6) {
+                t = (t * 3 + (caller(q as real * 0.7) * 100.0) as int) % 1000003;
+                q += 1;
+            }
+            put(t);
+            return t % 9841;
+        }
+    "#;
+    same_both_ways_src("reals.tri", src, 80_000_000);
+}

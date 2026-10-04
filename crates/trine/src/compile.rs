@@ -118,9 +118,13 @@ struct Local {
     ty: Ty,
     /// Object address relative to `fp` (unused for a register local).
     off: i64,
-    /// A word scalar kept in a callee-saved register.
+    /// A scalar kept in a register: a word one in a callee-saved r
+    /// register, a real one (leaf functions) in f-1..f-9.
     reg: Option<&'static str>,
 }
+
+/// f registers for real locals in leaf functions: f-1..f-9.
+const FREAL_REGS: [&str; 9] = ["f-1", "f-2", "f-3", "f-4", "f-5", "f-6", "f-7", "f-8", "f-9"];
 
 /// Registers for local variables: the callee-saved r-1..r-9 (ABI).
 const LOCAL_REGS: [&str; 9] = ["r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8", "r-9"];
@@ -489,6 +493,8 @@ pub struct Compiler {
     peeked: HashMap<usize, Ty>,
     /// Real temporaries held in f3, f4, ... (instead of the stack).
     fheld: usize,
+    /// f registers free for real locals (leaf functions: f-1..f-9).
+    free_fregs: Vec<&'static str>,
     /// Integer temporaries held in r4, r5, r6 (instead of the stack).
     iheld: usize,
     labels: usize,
@@ -529,6 +535,7 @@ impl Compiler {
             reals: Vec::new(),
             peeked: HashMap::new(),
             fheld: 0,
+            free_fregs: Vec::new(),
             iheld: 0,
             labels: 0,
             data_cursor: 0,
@@ -597,7 +604,7 @@ impl Compiler {
     /// when `rest` has no call, which could change f registers): the
     /// register, or None (then use the stack). Release with `release_f`.
     fn hold_f1(&mut self, rest: &[&Expr]) -> Option<String> {
-        if !self.optimize || self.fheld >= 11 || rest.iter().any(|e| has_calls(e)) {
+        if !self.optimize || self.fheld >= 7 || rest.iter().any(|e| has_calls(e)) {
             return None;
         }
         let r = format!("f{}", 3 + self.fheld);
@@ -1177,6 +1184,11 @@ impl Compiler {
                 self.free_regs.extend(LEAF_REGS.iter().rev().copied());
             }
         }
+        // real locals in f-1..f-9, in leaf functions only: they need no
+        // saving then (no caller keeps one in an f register across a call,
+        // for its callers are not leaves). f10..f13 and f-10..f-13 stay
+        // untouched: fputest keeps values in f12 and f-12 to watch the kernel.
+        self.free_fregs = if self.leaf && !self.no_regs { FREAL_REGS.iter().rev().copied().collect() } else { Vec::new() };
         let fn_start = self.code.len();
         self.label(&f.name);
         const SAVED: &[&str] = &["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r-10", "r-11", "r-12", "r-13"];
@@ -1205,6 +1217,12 @@ impl Compiler {
             let off = self.alloc_local(&p.name, t.clone(), f.pos)?;
             if t.is_real() {
                 j += 1;
+                if self.freg_eligible(&p.name, t) {
+                    self.locals.pop(); // the slot goes unused
+                    let r = self.alloc_local_freg(&p.name, t.clone(), f.pos)?;
+                    self.emit(format!("fmov {r}, f{j}"));
+                    continue;
+                }
                 self.emit(format!("fstd f{j}, {}", mem("fp", off)));
                 continue;
             }
@@ -1293,10 +1311,9 @@ impl Compiler {
             self.stmt(s)?;
         }
         let start = self.scopes.pop().unwrap();
-        for l in &self.locals[start..] {
-            if let Some(r) = l.reg {
-                self.free_regs.push(r);
-            }
+        let regs: Vec<&'static str> = self.locals[start..].iter().filter_map(|l| l.reg).collect();
+        for r in regs {
+            self.release_reg(r);
         }
         self.locals.truncate(start);
         self.next_slot = saved;
@@ -1309,6 +1326,17 @@ impl Compiler {
                 let ty = self.resolve(&d.ty, d.pos)?;
                 if ty == Ty::Void {
                     return err(d.pos, "a variable cannot be void");
+                }
+                // A real one in a leaf function: an f register.
+                if self.freg_eligible(&d.name, &ty) {
+                    if let Some(init) = &d.init {
+                        self.expr_real(init)?;
+                    }
+                    let r = self.alloc_local_freg(&d.name, ty, d.pos)?;
+                    if d.init.is_some() {
+                        self.emit(format!("fmov {r}, f1"));
+                    }
+                    return Ok(());
                 }
                 // A word scalar whose address is never taken: a register.
                 if self.reg_eligible(&d.name, &ty) {
@@ -1658,6 +1686,10 @@ impl Compiler {
     fn compare(&mut self, a: &Expr, b: &Expr) -> R<bool> {
         if self.peek_real(a)? || self.peek_real(b)? {
             self.expr_real(a)?;
+            if let Some(r) = self.freg_local(b) {
+                self.emit(format!("fcmp f1, {r}"));
+                return Ok(true);
+            }
             if let Some(t) = self.hold_f1(&[b]) {
                 self.expr_real(b)?;
                 self.release_f();
@@ -2067,7 +2099,11 @@ impl Compiler {
                 if let Some(l) = self.lookup_local(n) {
                     let (ty, off) = (l.ty.clone(), l.off);
                     if let Some(r) = l.reg {
-                        self.emit(format!("mov r1, {r}"));
+                        if ty.is_real() {
+                            self.emit(format!("fmov f1, {r}"));
+                        } else {
+                            self.emit(format!("mov r1, {r}"));
+                        }
                         return Ok(ty);
                     }
                     if ty.is_real() {
@@ -2411,8 +2447,41 @@ impl Compiler {
     /// The register holding local `e`, if it is a register local.
     fn reg_local(&self, e: &Expr) -> Option<(&'static str, Ty)> {
         match self.lookup_local_name(e) {
-            Some(Local { reg: Some(r), ty, .. }) => Some((r, ty.clone())),
+            Some(Local { reg: Some(r), ty, .. }) if !ty.is_real() => Some((r, ty.clone())),
             _ => None,
+        }
+    }
+
+    /// The f register of a real local held in one.
+    fn freg_local(&self, e: &Expr) -> Option<&'static str> {
+        match self.lookup_local_name(e) {
+            Some(Local { reg: Some(r), ty, .. }) if ty.is_real() => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Can real local `name` live in an f register (a leaf function, its
+    /// address never taken, one free)?
+    fn freg_eligible(&self, name: &str, ty: &Ty) -> bool {
+        ty.is_real() && !self.no_regs && self.leaf && !self.addr_taken.contains(name) && !self.free_fregs.is_empty()
+    }
+
+    fn alloc_local_freg(&mut self, name: &str, ty: Ty, pos: Pos) -> R<&'static str> {
+        let start = *self.scopes.last().unwrap();
+        if self.locals[start..].iter().any(|l| l.name == name) {
+            return err(pos, format!("`{name}` is already declared in this block"));
+        }
+        let r = self.free_fregs.pop().expect("a free f register");
+        self.locals.push(Local { name: name.into(), ty, off: 0, reg: Some(r) });
+        Ok(r)
+    }
+
+    /// A register back to its pool when its local's scope ends.
+    fn release_reg(&mut self, r: &'static str) {
+        if r.starts_with('f') {
+            self.free_fregs.push(r);
+        } else {
+            self.free_regs.push(r);
         }
     }
 
@@ -2524,6 +2593,10 @@ impl Compiler {
                     && (self.peek_real(a)? || self.peek_real(b)?)
                 {
                     self.expr_real(a)?;
+                    if let Some(r) = self.freg_local(b) {
+                        self.emit(format!("{} f1, f1, {r}", self.real_mnemonic(op)));
+                        return Ok(Ty::Real);
+                    }
                     if let Some(operand) = self.real_var_operand(b) {
                         self.emit(format!("fldd f2, {operand}"));
                         self.real_op(op);
@@ -2620,6 +2693,10 @@ impl Compiler {
         match op {
             None => {
                 self.expr_real(rhs)?;
+                if let Some(r) = self.freg_local(lhs) {
+                    self.emit(format!("fmov {r}, f1"));
+                    return Ok(Ty::Real);
+                }
                 if let Some(operand) = self.real_var_operand(lhs) {
                     self.emit(format!("fstd f1, {operand}"));
                     return Ok(Ty::Real);
@@ -2639,6 +2716,13 @@ impl Compiler {
             Some(op) => {
                 if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Min | BinOp::Max) {
                     return err(lhs.pos, format!("cannot apply {op:?} to a real"));
+                }
+                if let Some(r) = self.freg_local(lhs) {
+                    // the value also in f1, as after the store
+                    self.expr_real(rhs)?;
+                    self.emit(format!("{} f1, {r}, f1", self.real_mnemonic(op)));
+                    self.emit(format!("fmov {r}, f1"));
+                    return Ok(Ty::Real);
                 }
                 self.addr(lhs)?;
                 self.emit("push r1");
@@ -3103,10 +3187,9 @@ impl Compiler {
         (self.ret_ty, self.ret_label) = saved_ret;
         self.local_floor = saved_floor;
         let start = self.scopes.pop().unwrap();
-        for l in &self.locals[start..] {
-            if let Some(r) = l.reg {
-                self.free_regs.push(r);
-            }
+        let regs: Vec<&'static str> = self.locals[start..].iter().filter_map(|l| l.reg).collect();
+        for r in regs {
+            self.release_reg(r);
         }
         self.locals.truncate(start);
         self.next_slot = saved_slot;
