@@ -51,12 +51,20 @@ Native builds compile hot code with [Cranelift](https://cranelift.dev/)
 - **Registers in host registers.** Guest registers and the flags are
   Cranelift variables, loaded at entry and written back at every exit. S
   is kept lazily, as a value whose sign it is; C as the trit.
-- **Inline:** ADD/SUB/CMP, MUL/MULH/DIV/MOD, LI, LEA, branches, BR3, JAL, and
-  word loads and stores through the CPU's read and write windows (raw frame
-  pointers; a write pointer is only handed out for frames nothing watches,
-  and every window is dropped when a frame becomes watched, so a direct
-  store can never miss an invalidation). Everything else calls the
-  interpreter's own code for that one instruction.
+- **Inline:** ADD/SUB/CMP, MUL/MULH/DIV/MOD, NEG/SGN/ABS, LI, LEA, branches,
+  BR3, JAL, and word and tryte loads and stores through the CPU's read and
+  write windows (raw frame pointers; a write pointer is only handed out for
+  frames nothing watches, and every window is dropped when a frame becomes
+  watched, so a direct store can never miss an invalidation). FMOV, FLDD,
+  FLDS and FSTD (a real81) go through the windows too, after a check that
+  the FPU is on.
+- **Direct helpers.** The tritwise functions (MIN, MAX, TMUL, TSAT, CONS),
+  SH, TRIT and TLZ call a pure function of the two operands, and FCMP one
+  that compares two f registers; FSTD gets its three words from one. These
+  skip the generic path's flag and register round trip: MIN 12.8 to 9.0 ns,
+  FCMP 12.3 to 5.6 ns, FSTD 32 to 14 ns (`setun-bench --micro`).
+  Everything else calls the interpreter's own code for that one
+  instruction, about 13 ns.
 - **Exits.** JALR, generic instructions, faults, a store into code or a page
   table, and too little budget for the next block return to the block
   engine with the exact step count, PC and fault.

@@ -31,7 +31,7 @@
 use super::*;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I128, I64, I8};
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, UserFuncName, Value};
+use cranelift_codegen::ir::{AbiParam, FuncRef, InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, UserFuncName, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -58,6 +58,10 @@ pub(super) struct Jit {
     load_tryte: FuncId,
     store_tryte: FuncId,
     exec_one: FuncId,
+    alu: FuncId,
+    fcmp: FuncId,
+    real_words: FuncId,
+    fill_window: FuncId,
     next_id: usize,
 }
 
@@ -147,6 +151,52 @@ unsafe extern "C" fn jit_store_tryte(cpu: *mut Cpu, mem: *mut Memory, va: i64, v
     }
 }
 
+/// The ALU functions compiled code calls directly: pure, setting no flag
+/// but S (which is the result's sign), never faulting.
+fn alu_by_helper(f: i64) -> bool {
+    matches!(f, alu::MIN | alu::MAX | alu::TMUL | alu::TSAT | alu::CONS | alu::SH | alu::TRIT | alu::TLZ)
+}
+
+/// One of those (`x`, `y`: words).
+extern "C" fn jit_alu(f: i64, x: i64, y: i64) -> i64 {
+    let (a, b) = (Word::new(x).expect("a word"), Word::new(y).expect("a word"));
+    let r = match f {
+        alu::MIN => a.tritwise_min(b),
+        alu::MAX => a.tritwise_max(b),
+        alu::TMUL => a.tritwise_mul(b),
+        alu::TSAT => a.tritwise_sat(b),
+        alu::CONS => a.tritwise_cons(b),
+        alu::SH => a.shift(y.clamp(-40, 40) as i32),
+        alu::TRIT if (1..=27).contains(&y) => Word::new(a.trit(y as usize) as i64).expect("a trit"),
+        alu::TRIT => Word::ZERO,
+        _ => Word::new(a.leading_zero_trits() as i64).expect("a count"), // TLZ
+    };
+    r.value()
+}
+
+/// FCMP fy, fz: −1, 0 or +1, or 2 if unordered (a NaN).
+unsafe extern "C" fn jit_fcmp(cpu: *const Cpu, y: i64, z: i64, _: i64) -> i64 {
+    let cpu = &*cpu;
+    match cpu.freg(y).cmp(cpu.freg(z)) {
+        Some(o) => o as i64,
+        None => 2,
+    }
+}
+
+/// The three words of fx as a real81 (FSTD stores them).
+unsafe extern "C" fn jit_real_words(cpu: *const Cpu, x: i64, out: *mut i64, _: i64) -> i64 {
+    let ws = (*cpu).freg(x).to_words();
+    std::ptr::copy_nonoverlapping(ws.as_ptr(), out, 3);
+    OK
+}
+
+/// After the interpreter's access at `va` went through: its page into the
+/// window table (`write`: the write half).
+unsafe extern "C" fn jit_fill_window(cpu: *mut Cpu, va: i64, write: i64, _: i64) -> i64 {
+    (*cpu).jw_fill(va, write != 0);
+    OK
+}
+
 /// Any non-control instruction, by the interpreter (its registers and the
 /// flags are in `cpu` around the call).
 unsafe extern "C" fn jit_exec_one(cpu: *mut Cpu, mem: *mut Memory, d: *const Dec, pc: i64) -> i64 {
@@ -165,6 +215,10 @@ unsafe extern "C" fn jit_exec_one(cpu: *mut Cpu, mem: *mut Memory, d: *const Dec
 
 type IrBlock = cranelift_codegen::ir::Block;
 
+/// From fpu_inline: the slow block, the block both paths go on to, and the
+/// address of a load or store (true: a store) for the slow path to open.
+type FpuInline = (IrBlock, IrBlock, Option<(Value, bool)>);
+
 /// What one region's code generation needs at hand.
 struct Gen<'a> {
     b: FunctionBuilder<'a>,
@@ -178,6 +232,9 @@ struct Gen<'a> {
     exit_pc: Variable,
     exit_unrun: Variable,
     flags_live: bool,
+    fcmp: FuncRef,
+    real_words: FuncRef,
+    words_slot: StackSlot,
 }
 
 const FL: MemFlagsData = MemFlagsData::trusted();
@@ -391,16 +448,18 @@ impl Gen<'_> {
         (ok, self.b.ins().iadd(ptr, byte), r)
     }
 
-    /// The window test for `words` consecutive words from `va` (all in the
-    /// read window's page): (covered?, the first word's host address).
-    fn window_span(&mut self, va: Value, words: i64) -> (Value, Value) {
+    /// The window test for `words` consecutive words from `va` (all in one
+    /// window's page; `write`: the write window): (covered?, the first
+    /// word's host address).
+    fn window_span(&mut self, va: Value, words: i64, write: bool) -> (Value, Value) {
         const INV3: i64 = 0xAAAA_AAAA_AAAA_AAABu64 as i64;
         let k = self.b.ins().sshr_imm_s(va, JW_SHIFT);
         let k = self.b.ins().band_imm_s(k, (JW - 1) as i64);
         let k = self.b.ins().ishl_imm_s(k, 4);
         let entry = self.b.ins().iadd(self.cpu, k);
-        let lo = self.b.ins().load(I64, FL, entry, OFF_JWIN as i32);
-        let ptr = self.b.ins().load(I64, FL, entry, OFF_JWIN as i32 + 8);
+        let base = (OFF_JWIN + if write { 16 * JW } else { 0 }) as i32;
+        let lo = self.b.ins().load(I64, FL, entry, base);
+        let ptr = self.b.ins().load(I64, FL, entry, base + 8);
         let off = self.b.ins().isub(va, lo);
         let off = self.b.ins().iadd_imm_s(off, -1);
         let q = self.b.ins().imul_imm_s(off, INV3);
@@ -411,22 +470,64 @@ impl Gen<'_> {
         (ok, self.b.ins().iadd(ptr, byte))
     }
 
-    /// FMOV, FLDD and FLDS natively (other FPU instructions: None). The
-    /// checks (the FPU enabled; a load's words in the read window) branch
-    /// to the slow block, where the caller emits the interpreter's code;
-    /// returns that block, the one both paths go on to, and for a load
-    /// its address (the slow path then fills the window table with it).
-    fn fpu_inline(&mut self, d: &Dec) -> Option<(IrBlock, IrBlock, Option<Value>)> {
+    /// FMOV, FLDD, FLDS, FSTD and FCMP natively (other FPU instructions:
+    /// None). The checks (the FPU enabled; an access's words in a window)
+    /// branch to the slow block, where the caller emits the interpreter's
+    /// code; returns that block, the one both paths go on to, and for a
+    /// load or store its address and which (the slow path then fills the
+    /// window table with it).
+    fn fpu_inline(&mut self, d: &Dec) -> Option<FpuInline> {
         let (a, f) = (d.a as i64, d.f as i64);
         let fmov = a == op::FCVT && f == fcvt::FMOV;
         let load = (a == op::FMEM || a == op::FMEMD) && (f == 1 || f == 2);
-        if !(fmov || load) || d.x == 0 {
+        let store = (a == op::FMEM || a == op::FMEMD) && f == -2; // a real81 (a real27 may trap)
+        let fcmp = a == op::FALU && f == falu::FCMP;
+        if !(fmov || load || store || fcmp) || ((fmov || load) && d.x == 0) {
             return None; // (f0 is not written)
         }
         let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
         self.b.set_cold_block(slow);
         let fe = self.b.ins().sload8(I64, FL, self.cpu, (OFF_MODE + mode::FE) as i32);
         let mut ok = self.b.ins().icmp_imm_s(IntCC::Equal, fe, 1);
+        if fcmp {
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.enter(fast);
+            let (y, z) = (self.b.ins().iconst(I64, d.y as i64), self.b.ins().iconst(I64, d.z as i64));
+            let call = self.b.ins().call(self.fcmp, &[self.cpu, y, z, y]);
+            let r = self.b.inst_results(call)[0];
+            // S the order (0 when unordered), C 1 when unordered
+            let unordered = self.b.ins().icmp_imm_s(IntCC::Equal, r, 2);
+            let zero = self.b.ins().iconst(I64, 0);
+            let s = self.b.ins().select(unordered, zero, r);
+            let carry = self.b.ins().iconst(I64, W_MAX + 1);
+            let c = self.b.ins().select(unordered, carry, zero);
+            self.b.def_var(self.s_var, s);
+            self.b.def_var(self.c_var, c);
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(slow);
+            self.b.seal_block(slow);
+            return Some((slow, done, None));
+        }
+        if store {
+            let off = if a == op::FMEM { 9 * d.z as i64 } else { d.imm };
+            let base = self.get(d.y as i64);
+            let va = self.b.ins().iadd_imm_s(base, off);
+            let (inw, addr) = self.window_span(va, 3, true);
+            ok = self.b.ins().band(ok, inw);
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.enter(fast);
+            let x = self.b.ins().iconst(I64, d.x as i64);
+            let out = self.b.ins().stack_addr(I64, self.words_slot, 0);
+            self.b.ins().call(self.real_words, &[self.cpu, x, out, x]);
+            for k in 0..3 {
+                let w = self.b.ins().stack_load(I64, I64, self.words_slot, 8 * k);
+                self.b.ins().store(FL, w, addr, 8 * k);
+            }
+            self.b.ins().jump(done, &[]);
+            self.b.switch_to_block(slow);
+            self.b.seal_block(slow);
+            return Some((slow, done, Some((va, true))));
+        }
         let dst = (OFF_FREGS + REAL_SIZE * idx(d.x as i64)) as i32;
         let mut load_va = None;
         let (e, m) = if fmov {
@@ -445,8 +546,8 @@ impl Gen<'_> {
             let off = if a == op::FMEM { 3 * words * d.z as i64 } else { d.imm };
             let base = self.get(d.y as i64);
             let va = self.b.ins().iadd_imm_s(base, off);
-            load_va = Some(va);
-            let (inw, addr) = self.window_span(va, words);
+            load_va = Some((va, false));
+            let (inw, addr) = self.window_span(va, words, false);
             ok = self.b.ins().band(ok, inw);
             self.b.ins().brif(ok, fast, &[], slow, &[]);
             self.enter(fast);
@@ -533,21 +634,29 @@ impl Jit {
         jb.symbol("jit_load_tryte", jit_load_tryte as *const u8);
         jb.symbol("jit_store_tryte", jit_store_tryte as *const u8);
         jb.symbol("jit_exec_one", jit_exec_one as *const u8);
+        jb.symbol("jit_alu", jit_alu as *const u8);
+        jb.symbol("jit_fcmp", jit_fcmp as *const u8);
+        jb.symbol("jit_real_words", jit_real_words as *const u8);
+        jb.symbol("jit_fill_window", jit_fill_window as *const u8);
         let mut module = JITModule::new(jb);
         let ptr = module.target_config().pointer_type();
-        let mut decl = |name: &str, params: [cranelift_codegen::ir::Type; 4]| -> Option<FuncId> {
+        let mut decl = |name: &str, params: &[cranelift_codegen::ir::Type]| -> Option<FuncId> {
             let mut sig = module.make_signature();
-            for t in params {
+            for &t in params {
                 sig.params.push(AbiParam::new(t));
             }
             sig.returns.push(AbiParam::new(I64));
             module.declare_function(name, Linkage::Import, &sig).ok()
         };
-        let load_word = decl("jit_load_word", [ptr, ptr, I64, ptr])?;
-        let store_word = decl("jit_store_word", [ptr, ptr, I64, I64])?;
-        let load_tryte = decl("jit_load_tryte", [ptr, ptr, I64, ptr])?;
-        let store_tryte = decl("jit_store_tryte", [ptr, ptr, I64, I64])?;
-        let exec_one = decl("jit_exec_one", [ptr, ptr, ptr, I64])?;
+        let load_word = decl("jit_load_word", &[ptr, ptr, I64, ptr])?;
+        let store_word = decl("jit_store_word", &[ptr, ptr, I64, I64])?;
+        let load_tryte = decl("jit_load_tryte", &[ptr, ptr, I64, ptr])?;
+        let store_tryte = decl("jit_store_tryte", &[ptr, ptr, I64, I64])?;
+        let exec_one = decl("jit_exec_one", &[ptr, ptr, ptr, I64])?;
+        let alu = decl("jit_alu", &[I64, I64, I64])?;
+        let fcmp = decl("jit_fcmp", &[ptr, I64, I64, I64])?;
+        let real_words = decl("jit_real_words", &[ptr, I64, ptr, I64])?;
+        let fill_window = decl("jit_fill_window", &[ptr, I64, I64, I64])?;
         Some(Jit {
             ctx: module.make_context(),
             module,
@@ -557,6 +666,10 @@ impl Jit {
             load_tryte,
             store_tryte,
             exec_one,
+            alu,
+            fcmp,
+            real_words,
+            fill_window,
             next_id: 0,
         })
     }
@@ -586,6 +699,10 @@ impl Jit {
         let lt = self.module.declare_func_in_func(load_tryte, b.func);
         let st = self.module.declare_func_in_func(store_tryte, b.func);
         let ex = self.module.declare_func_in_func(exec_one, b.func);
+        let alu_f = self.module.declare_func_in_func(self.alu, b.func);
+        let fcmp = self.module.declare_func_in_func(self.fcmp, b.func);
+        let real_words = self.module.declare_func_in_func(self.real_words, b.func);
+        let fill = self.module.declare_func_in_func(self.fill_window, b.func);
 
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -594,6 +711,7 @@ impl Jit {
         let p = b.block_params(entry).to_vec();
         let (cpu, mem, va_base, budget, entry_off) = (p[0], p[1], p[2], p[3], p[4]);
         let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let words_slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3));
 
         // which registers the region uses
         let mut used = [false; 27];
@@ -624,7 +742,7 @@ impl Jit {
         let exit = b.create_block();
         let exit_pc = b.declare_var(I64);
         let exit_unrun = b.declare_var(I64);
-        let mut g = Gen { b, cpu, va_base, reg, s_var, c_var, left, exit, exit_pc, exit_unrun, flags_live };
+        let mut g = Gen { b, cpu, va_base, reg, s_var, c_var, left, exit, exit_pc, exit_unrun, flags_live, fcmp, real_words, words_slot };
         g.flags_from_cpu();
 
         let mut blocks = HashMap::new();
@@ -726,6 +844,25 @@ impl Jit {
                         g.leave(pc, unrun);
                         g.enter(divide);
                         let r = if d.f as i64 == alu::DIV { g.b.ins().sdiv(a, c) } else { g.b.ins().srem(a, c) };
+                        g.b.def_var(g.s_var, r);
+                        g.set(x, r);
+                    }
+                    Op::AluR | Op::AluK if alu_by_helper(d.f as i64) => {
+                        let a = g.get(y);
+                        let c = if d.op == Op::AluR { g.get(z) } else { g.b.ins().iconst(I64, d.imm) };
+                        let f = g.b.ins().iconst(I64, d.f as i64);
+                        let call = g.b.ins().call(alu_f, &[f, a, c]);
+                        let r = g.b.inst_results(call)[0];
+                        g.b.def_var(g.s_var, r);
+                        g.set(x, r);
+                    }
+                    Op::AluR | Op::AluK if matches!(d.f as i64, alu::NEG | alu::SGN | alu::ABS) => {
+                        let a = g.get(y);
+                        let r = match d.f as i64 {
+                            alu::NEG => g.b.ins().ineg(a),
+                            alu::SGN => g.sign(a),
+                            _ => g.b.ins().iabs(a),
+                        };
                         g.b.def_var(g.s_var, r);
                         g.set(x, r);
                     }
@@ -952,11 +1089,11 @@ impl Jit {
                         g.leave(pc, unrun - 1);
                         g.enter(on);
                         if let Some((_, done, va)) = inline {
-                            if let Some(va) = va {
-                                // the load went through: its page into the
+                            if let Some((va, write)) = va {
+                                // the access went through: its page into the
                                 // window table, for the native path next time
-                                let out = g.b.ins().stack_addr(ptr, slot, 0);
-                                g.b.ins().call(lw, &[cpu, mem, va, out]);
+                                let w = g.b.ins().iconst(I64, write as i64);
+                                g.b.ins().call(fill, &[cpu, va, w, w]);
                             }
                             g.b.ins().jump(done, &[]);
                             g.enter(done);

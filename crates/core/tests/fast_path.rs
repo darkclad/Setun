@@ -725,37 +725,114 @@ fn compiled_fpu_code_traps_once_the_fpu_is_off() {
     // the loop turns the FPU off (MODE's FE trit, weight 27) in its ninth
     // round, when it runs compiled: the next FPU instruction must trap
     // (FPU unavailable)
-    use setun_core::isa::{fcvt, fmem};
+    use setun_core::isa::{falu, fcvt, fmem};
+    // FMOV or FCMP first: they use no window, so only the FE check stops
+    // them (a write to MODE also drops the windows, which sends FLDD the
+    // slow way)
+    for first in [isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0), isa::rrr(op::FALU, falu::FCMP, 0, 1, 3)] {
+        let mut prog = Vec::new();
+        prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
+        prog.push(isa::s6(op::LIQ, 0, 9, 12));
+        let top = prog.len() as i64;
+        prog.push(first);
+        prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0));
+        prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 5, 1));
+        prog.push(isa::rrr(op::ALUQ, alu::CMP, 0, 9, 4));
+        prog.push(isa::s6(op::BRQ, 0, cond::NE, 5)); // not the ninth round: skip the switch
+        prog.push(isa::rrr(op::SYS, sys::MFC, 1, cr::MODE, 0));
+        prog.extend(isa::wide(op::ALUI, alu::SUB, 1, 1, 27));
+        prog.push(isa::rrr(op::SYS, sys::MTC, cr::MODE, 1, 0));
+        prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+        let here = prog.len() as i64;
+        prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let setup = |m: &mut Machine| {
+            m.mem.load_words(PAGE + 300, &[w(5 * 387_420_489 + 7), w(11), w(-13)]);
+        };
+        for threshold in [u32::MAX, 1] {
+            let (st, f) = both_ways_jit(threshold, setup, &prog, 200);
+            if threshold == 1 {
+                assert!(f.cpu.jit_stats()[2] > 30, "the loop ran compiled: {:?}", f.cpu.jit_stats());
+            }
+            assert_eq!(reg_in(&st, 5), 9, "nine rounds ran, the tenth trapped at its first FPU instruction (threshold {threshold})");
+            // FCAUSE's low five trits are the vector
+            let cause = st[5 * (cr::FCAUSE + 13) as usize + 1].rem_euclid(243);
+            let vector = if cause > 121 { cause - 243 } else { cause };
+            assert_eq!(vector, setun_core::isa::vector::FPU_UNAVAILABLE, "FPU unavailable");
+        }
+    }
+}
+
+#[test]
+fn compares_stores_and_tritwise_ops_compiled_agree() {
+    // a compiled loop compares neighbouring reals (FCMP: less, equal,
+    // greater, and unordered with a NaN, which sets C), reads the flags
+    // back (MFC MODE), runs the tritwise ALU functions and NEG/SGN/ABS on
+    // what it read, and stores each real (FSTD) further up the page:
+    // through the write window once the first store has opened it
+    use setun_core::isa::{falu, fmem};
+    const T18: i64 = 387_420_489;
+    let base = PAGE + 300;
+    let nan = [9841 * T18, 0, 0];
+    let reals: [[i64; 3]; 13] = [
+        [5 * T18 + 123_456, 7_000_000_000, -3],
+        [5 * T18 + 123_456, 7_000_000_000, -3], // equal to the one before
+        [-2 * T18 - 99, -1_234_567, 9_876_543_210],
+        nan,
+        [3 * T18 + 1, 0, 1],
+        nan,
+        nan,
+        [-9000 * T18 - 193_710_244, 3_812_798_742_493, -3_812_798_742_493],
+        [9000 * T18 + 193_710_244, 42, -42],
+        [0, 0, 0],
+        [-T18, 1_000_000_007, 777],
+        [-T18, 1_000_000_007, 778],
+        [7 * T18 - 5, -1, 1],
+    ];
     let mut prog = Vec::new();
-    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
+    prog.extend(isa::wide(op::LI, 0, 2, 0, base));
     prog.push(isa::s6(op::LIQ, 0, 9, 12));
     let top = prog.len() as i64;
-    // FMOV first: it uses no window, so only the FE check stops it (a
-    // write to MODE also drops the windows, which sends FLDD the slow way)
-    prog.push(isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0));
     prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0));
-    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 5, 1));
-    prog.push(isa::rrr(op::ALUQ, alu::CMP, 0, 9, 4));
-    prog.push(isa::s6(op::BRQ, 0, cond::NE, 5)); // not the ninth round: skip the switch
+    prog.push(isa::rrr(op::FMEM, fmem::FLDD, 2, 2, 1));
+    prog.push(isa::rrr(op::FALU, falu::FCMP, 0, 1, 2));
     prog.push(isa::rrr(op::SYS, sys::MFC, 1, cr::MODE, 0));
-    prog.extend(isa::wide(op::ALUI, alu::SUB, 1, 1, 27));
-    prog.push(isa::rrr(op::SYS, sys::MTC, cr::MODE, 1, 0));
+    prog.extend(isa::wide(op::MEMD, mem::STW, 1, 2, 6000));
+    prog.push(isa::rrr(op::ALU, alu::MIN, 6, 1, 2));
+    prog.push(isa::rrr(op::ALU, alu::MAX, 7, 1, 9));
+    prog.extend(isa::wide(op::ALUI, alu::TMUL, 8, 1, -5_000_000_007));
+    prog.extend(isa::wide(op::ALUI, alu::TSAT, 10, 7, 1_234_567_890));
+    prog.push(isa::rrr(op::ALU, alu::CONS, 11, 6, 8));
+    prog.extend(isa::wide(op::ALUI, alu::SH, 12, 10, -4));
+    prog.push(isa::rrr(op::ALU, alu::NEG, 3, 11, 0));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 3));
+    prog.push(isa::rrr(op::ALU, alu::ABS, 3, 12, 0));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 3));
+    prog.push(isa::rrr(op::ALU, alu::SGN, 4, 8, 0));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 4));
+    prog.extend(isa::wide(op::ALUI, alu::TLZ, 4, 6, 0));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 4));
+    prog.extend(isa::wide(op::ALUI, alu::TRIT, 4, 7, 3));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 5, 5, 4));
+    prog.extend(isa::wide(op::MEMD, mem::STW, 5, 2, 6003));
+    prog.extend(isa::wide(op::FMEMD, fmem::FSTD, 1, 2, 3000));
+    prog.extend(isa::wide(op::ALUI, alu::ADD, 2, 2, 9));
     prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
     let here = prog.len() as i64;
     prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
     prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
-    let setup = |m: &mut Machine| {
-        m.mem.load_words(PAGE + 300, &[w(5 * 387_420_489 + 7), w(11), w(-13)]);
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        for (k, r) in reals.iter().enumerate() {
+            let ws: Vec<Word> = r.iter().map(|&v| w(v)).collect();
+            m.mem.load_words(base + 9 * k as i64, &ws);
+        }
     };
     for threshold in [u32::MAX, 1] {
-        let (st, f) = both_ways_jit(threshold, setup, &prog, 200);
+        let (st, fast) = both_ways_jit(threshold, setup, &prog, 600);
         if threshold == 1 {
-            assert!(f.cpu.jit_stats()[2] > 30, "the loop ran compiled: {:?}", f.cpu.jit_stats());
+            assert!(fast.cpu.jit_stats()[2] > 200, "the loop ran compiled: {:?}", fast.cpu.jit_stats());
         }
-        assert_eq!(reg_in(&st, 5), 9, "nine rounds ran, the tenth trapped at its FMOV (threshold {threshold})");
-        // FCAUSE's low five trits are the vector
-        let cause = st[5 * (cr::FCAUSE + 13) as usize + 1].rem_euclid(243);
-        let vector = if cause > 121 { cause - 243 } else { cause };
-        assert_eq!(vector, setun_core::isa::vector::FPU_UNAVAILABLE, "FPU unavailable");
+        assert_eq!(reg_in(&st, 9), 0, "all twelve rounds ran");
     }
 }
