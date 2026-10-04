@@ -71,6 +71,21 @@ const DISPLAY_HWC_X: int = 251;
 const DISPLAY_HWC_Y: int = 252;
 const DISPLAY_HWC_ON: int = 253;
 
+// Network card TNIC (block 10): Ethernet frames, one octet per tryte
+const NIC_CMD: int = 270;             // +1 send, -1 receive into RX_ADDR, 0 drop the oldest
+const NIC_STATUS: int = 271;          // 0 ok, -1 failed (see NIC_ERROR)
+const NIC_TX_ADDR: int = 272;
+const NIC_TX_LEN: int = 273;
+const NIC_RX_ADDR: int = 274;
+const NIC_RX_LEN: int = 275;          // length of the oldest received frame, 0 if none
+const NIC_RX_COUNT: int = 276;
+const NIC_CTRL: int = 277;            // +1 IRQ on receive
+const NIC_MAC_HI: int = 278;          // octets 0..2 as o0*65536 + o1*256 + o2
+const NIC_MAC_LO: int = 279;
+const NIC_LINK: int = 280;
+const NIC_ERROR: int = 281;
+const NIC_DROPS: int = 282;
+
 // IRQ lines (vector = IRQ + 1)
 const IRQ_TIMER: int = 0;
 const IRQ_KEYBOARD: int = 1;
@@ -79,6 +94,8 @@ const IRQ_SERIAL: int = 3;
 const IRQ_DISK0: int = 4;
 const IRQ_RTC: int = 5;
 const IRQ_DISPLAY: int = 6;
+const IRQ_DISK1: int = 7;
+const IRQ_NIC: int = 8;
 
 // Memory
 const FB_BASE: int = -1604164;        // first framebuffer tryte

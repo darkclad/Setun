@@ -481,6 +481,7 @@ A kernel must save `EPC`/`EMODE` before re-enabling interrupts if it wants neste
 | 7 | 189 | disk 0 | 4 |
 | 8 | 216 | disk 1 (reserved) | 7 |
 | 9 | 243 | display controller | 6 |
+| 10 | 270 | network card (`TNIC`) | 8 |
 
 ### 8.2 Registers (offset from the block base)
 
@@ -586,6 +587,24 @@ Control values are ternary wherever that is natural.
 | 8 | `HWC_X` (hardware mouse cursor) |
 | 9 | `HWC_Y` |
 | 10 | `HWC_ON` |
+
+**Network card (270), `TNIC`.** Ethernet II frames without the FCS, 14..1514 octets, **one octet (0..255) per tryte**. DMA uses physical tryte addresses of any alignment and bypasses the MMU. Every command completes before the next instruction. Details and rationale: [`NETWORK.md`](NETWORK.md) §1.
+
+| Offset | Register |
+|---|---|
+| 0 | `CMD`: +1 send `TX_LEN` octets from `TX_ADDR`; −1 copy the oldest received frame to `RX_ADDR` and drop it from the queue; 0 drop it without copying |
+| 1 | `STATUS`: 0 ok, −1 the last command failed |
+| 2 | `TX_ADDR` |
+| 3 | `TX_LEN` |
+| 4 | `RX_ADDR` |
+| 5 | `RX_LEN` (read-only): length of the oldest received frame, 0 if none |
+| 6 | `RX_COUNT` (read-only): frames queued (at most 27) |
+| 7 | `CTRL`: +1 IRQ 8 when a frame arrives |
+| 8 | `MAC_HI` (read-only): MAC octets 0..2 as `o0·65536 + o1·256 + o2` |
+| 9 | `MAC_LO` (read-only): octets 3..5 |
+| 10 | `LINK` (read-only): +1 a network is attached |
+| 11 | `ERROR`: 0 none, 1 no link, 2 bad length, 3 a tryte outside 0..255, 4 bus error during DMA, 5 nothing received, 6 bad command, 7 transmit queue (27 frames) full |
+| 12 | `DROPS` (read-only): received frames lost to a full queue |
 
 ### 8.3 Framebuffer formats
 

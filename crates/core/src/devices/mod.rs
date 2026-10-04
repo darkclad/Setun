@@ -8,6 +8,7 @@ mod disk;
 mod display;
 mod font;
 mod input;
+mod nic;
 mod pic;
 mod timer;
 
@@ -17,6 +18,8 @@ pub use disk::FileDisk;
 pub use display::{Display, FRAME_US};
 pub use font::{glyph8x8, overlined, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
 pub use input::{Keyboard, Mouse, Serial};
+pub use nic::{Nic, DEFAULT_MAC, MAX_FRAME, MIN_FRAME, NIC_QUEUE};
+pub use nic::error as nic_error;
 pub use pic::Pic;
 pub use timer::{Rtc, Timer};
 
@@ -36,6 +39,7 @@ pub mod block {
     pub const DISK0: i64 = 7;
     pub const DISK1: i64 = 8;
     pub const DISPLAY: i64 = 9;
+    pub const NIC: i64 = 10;
 }
 
 /// IRQ line numbers (ISA §8.1).
@@ -48,6 +52,7 @@ pub mod irq {
     pub const RTC: usize = 5;
     pub const DISPLAY: usize = 6;
     pub const DISK1: usize = 7;
+    pub const NIC: usize = 8;
 }
 
 /// Value of `SYSCTL.SYSID`: the machine number.
@@ -74,6 +79,7 @@ pub struct Devices {
     pub serial: Serial,
     pub disks: [Disk; 2],
     pub display: Display,
+    pub nic: Nic,
     /// Trytes written to `SYSCTL.DEBUG`, for the host log.
     pub debug_log: Vec<i64>,
     ram_frames: i64,
@@ -94,6 +100,7 @@ impl Devices {
             serial: Serial::default(),
             disks: [Disk::default(), Disk::default()],
             display: Display::new(),
+            nic: Nic::default(),
             debug_log: Vec::new(),
             ram_frames,
             power: None,
@@ -110,6 +117,7 @@ impl Devices {
         for d in &mut self.disks {
             d.reset();
         }
+        self.nic.reset();
     }
 
     /// Emulated microseconds since power-on.
@@ -177,6 +185,7 @@ impl Devices {
                 self.pic.raise(line);
             }
         }
+        self.nic.service(mem);
     }
 
     // ---- host-side input -------------------------------------------------
@@ -225,6 +234,19 @@ impl Devices {
         }
     }
 
+    /// A frame from the network for the card (dropped if there is no link,
+    /// it has a bad length, or the receive queue is full).
+    pub fn net_receive(&mut self, frame: &[u8]) {
+        if self.nic.receive(frame) {
+            self.pic.raise(irq::NIC);
+        }
+    }
+
+    /// Frames the card has sent since the last call.
+    pub fn net_take_tx(&mut self) -> Vec<Vec<u8>> {
+        self.nic.take_tx()
+    }
+
     // ---- ports -----------------------------------------------------------
 
     fn sysctl_in(&self, r: i64) -> i64 {
@@ -265,6 +287,7 @@ impl Io for Devices {
             block::DISK0 => self.disks[0].read(r),
             block::DISK1 => self.disks[1].read(r),
             block::DISPLAY => self.display.read(r),
+            block::NIC => self.nic.read(r),
             _ => 0,
         };
         word(v)
@@ -284,6 +307,7 @@ impl Io for Devices {
             block::DISK0 => self.disks[0].write(r, v),
             block::DISK1 => self.disks[1].write(r, v),
             block::DISPLAY => self.display.write(r, v),
+            block::NIC => self.nic.write(r, v),
             _ => {}
         }
     }
