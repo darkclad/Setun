@@ -1248,6 +1248,14 @@ impl Compiler {
             }
             StmtKind::Block(b) => self.block(b)?,
             StmtKind::If(c, t, e) => {
+                // `if (c) break;` / `continue;`: one jump when c holds
+                if let Some(target) = self.jump_of(t) {
+                    self.cond_jump_true(c, &target)?;
+                    if let Some(e) = e {
+                        self.block(std::slice::from_ref(e))?;
+                    }
+                    return Ok(());
+                }
                 let (lelse, lend) = (self.new_label(), self.new_label());
                 self.cond_jump_false(c, &lelse)?;
                 self.block(std::slice::from_ref(t))?;
@@ -1259,6 +1267,19 @@ impl Compiler {
                 } else {
                     self.label(&lelse);
                 }
+            }
+            StmtKind::While(c, body) if self.cheap_test(c) => {
+                // rotated: the test at the bottom, entered once from the top
+                // (one jump per round fewer)
+                let (top, test, end) = (self.new_label(), self.new_label(), self.new_label());
+                self.emit(format!("b {test}"));
+                self.label(&top);
+                self.loops.push((Some(test.clone()), end.clone()));
+                self.block(std::slice::from_ref(body))?;
+                self.loops.pop();
+                self.label(&test);
+                self.cond_jump_true(c, &top)?;
+                self.label(&end);
             }
             StmtKind::While(c, body) => {
                 let (top, end) = (self.new_label(), self.new_label());
@@ -1286,8 +1307,14 @@ impl Compiler {
                     self.stmt(i)?;
                 }
                 let (top, cont, end) = (self.new_label(), self.new_label(), self.new_label());
+                let rotated = cond.as_ref().is_some_and(|c| self.cheap_test(c));
+                let test = self.new_label();
+                if rotated {
+                    // as for `while`: the test at the bottom
+                    self.emit(format!("b {test}"));
+                }
                 self.label(&top);
-                if let Some(c) = cond {
+                if let (Some(c), false) = (cond, rotated) {
                     self.cond_jump_false(c, &end)?;
                 }
                 self.loops.push((Some(cont.clone()), end.clone()));
@@ -1297,7 +1324,13 @@ impl Compiler {
                 if let Some(st) = step {
                     self.expr(st)?;
                 }
-                self.emit(format!("b {top}"));
+                match (cond, rotated) {
+                    (Some(c), true) => {
+                        self.label(&test);
+                        self.cond_jump_true(c, &top)?;
+                    }
+                    _ => self.emit(format!("b {top}")),
+                }
                 self.label(&end);
                 let start = self.scopes.pop().unwrap();
                 self.locals.truncate(start);
@@ -1399,6 +1432,33 @@ impl Compiler {
     }
 
     /// Jump to `target` when `c` is false (zero).
+    /// A loop test worth moving to the bottom of its loop (optimizing): a
+    /// comparison of register locals and constants, or one of them alone.
+    /// Not a test that reads memory or has && or ||: at the top it
+    /// leaves values the body reuses, and inverted it costs a branch more.
+    fn cheap_test(&self, c: &Expr) -> bool {
+        let plain = |e: &Expr| self.reg_local(e).is_some() || self.const_eval(e).is_some();
+        self.optimize
+            && match &c.kind {
+                ExprKind::Binary(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne, a, b) => plain(a) && plain(b),
+                _ => plain(c),
+            }
+    }
+
+    /// The label a statement that is only `break` or `continue` (alone or
+    /// in a block of its own) jumps to, when optimizing.
+    fn jump_of(&self, s: &Stmt) -> Option<String> {
+        if !self.optimize {
+            return None;
+        }
+        match &s.kind {
+            StmtKind::Block(b) if b.len() == 1 => self.jump_of(&b[0]),
+            StmtKind::Break => self.loops.last().map(|(_, b)| b.clone()),
+            StmtKind::Continue => self.loops.iter().rev().find_map(|(c, _)| c.clone()),
+            _ => None,
+        }
+    }
+
     fn cond_jump_false(&mut self, c: &Expr, target: &str) -> R<()> {
         // && || ! jump straight to where they lead (no 0/1 is built)
         if self.optimize {

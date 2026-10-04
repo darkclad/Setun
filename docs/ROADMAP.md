@@ -41,11 +41,11 @@ In rough order of payoff for effort (estimates from the benchmarks):
 |---|---|---|---|
 | P1 | Word-at-a-time `memcpy`, `memset`, `strlen`, `strcmp` in the runtime (today one tryte per step) | Trine runtime | 2–3× on string-heavy code (int benchmark, shell tools, kernel copies) |
 | P2 | ~~Division by a constant as a multiplication by its reciprocal~~ | JIT | not needed: Cranelift already multiplies (measured with `setun-bench --micro`) |
-| P3 | `char` and tryte locals in registers (with a wrap on narrowing) | Trine | 10–20% on string and parser code |
+| P3 | ~~`char` and tryte locals in registers~~ | Trine | dropped: built and measured, 0.04% on the text tools (their strings go through arrays and pointers, not `char` locals) |
 | P4 | ✅ Leaf functions use six more caller-saved registers, unsaved | Trine | done |
 | P5 | ~~Staying native across calls and returns~~ | JIT | dropped: at most about 5% measured (the calls that matter are inlined now) |
 | P6 | Inline tryte loads and stores, and FPU instructions, in compiled code | JIT | strings and floating point |
-| P7 | Branch inversion, constants on the left of `*`/`+` (inlining ✅ done, with a cost model) | Trine | 5–10% |
+| P7 | ✅ Inlining (cost model), `a[i ± k]` folded into the address, local value numbering, `if (c) break/continue` as one jump, loops with a register test rotated | Trine | done: sieve+sort 13.3M → 5.5M instructions, mandel 70.9M → 67.7M |
 | P8 | ~~Two-tier compilation~~: IR per instruction cut by a fifth ✅; tiers dropped: region size (4–32 blocks) and acceptance thresholds made no measurable difference, compiles run in the background | JIT | — |
 | P9 | A WebAssembly JIT for the browser build, which only interprets | Web | several times in the artifact |
 | P10 | Fewer interpreted instructions: about a fifth of the shell workload still runs in the block interpreter (cold blocks, and short regions without loops); each new process's code starts cold | JIT, kernel | up to about 1.5× on the shell workload |

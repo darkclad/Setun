@@ -125,8 +125,8 @@ checked equal; best of several runs, Ryzen 9 5950X):
 
 | Program | Native | Setun | Setun instructions | Overhead |
 |---|---:|---:|---:|---:|
-| mandel (fixed-point arithmetic, framebuffer) | 9.5 ms | 99 ms | 70.9M | 10× |
-| sieve + insertion sort (tryte array, word array) | 0.2 ms | 8 ms | 5.5M | 38× (180–240× before constant index offsets and value numbering) |
+| mandel (fixed-point arithmetic, framebuffer) | 9.8 ms | 97 ms | 67.7M | 10× |
+| sieve + insertion sort (tryte array, word array) | 0.2 ms | 7.7 ms | 5.5M | 37× (180–240× before constant index offsets and value numbering) |
 
 Mandelbrot is arithmetic in registers, where compiled Setun code runs at
 about 700 MIPS. The sieve and sort are memory loops, where the host compiler

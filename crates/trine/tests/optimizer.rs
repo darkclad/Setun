@@ -316,3 +316,69 @@ fn indexes_with_constant_offsets_the_same_way() {
     "#;
     same_both_ways_src("offsets.tri", src, 80_000_000);
 }
+
+#[test]
+fn loops_and_jumps_the_same_way() {
+    // rotated loops (the test at the bottom) and `if (c) break/continue`
+    // as one jump: loops that never run, continue in a for (the step still
+    // runs), break/continue with an else, break inside a switch inside a
+    // loop, nested loops, a for without a test, a test that reads memory
+    let src = r#"
+        import "console.tri";
+        var g: int = 3;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn main() -> int {
+            var s: int = 0;
+            var i: int = 0;
+            while (i < 0) { s += 1000; }                      // never runs
+            for (i = 5; i < 5; i += 1) { s += 1000; }         // never runs
+            i = 0;
+            while (i < 30) {
+                i += 1;
+                if (i % 3 == 0) continue;
+                if (i > 25) break;
+                s = s * 3 + i;
+            }
+            put(s % 1000003);
+            // continue in the round where the test must end the loop
+            var c: int = 0;
+            var cs: int = 0;
+            while (c < 10) { c += 1; if (c % 2 == 0) continue; cs += c; }
+            put(cs);
+            var t: int = 0;
+            for (var j: int = 0; j < 40; j += 2) {
+                if (j % 6 == 0) { continue; }
+                if (j == 34) { break; } else { t = t * 3 + j; }
+                t += 1;
+            }
+            put(t % 1000003);
+            var u: int = 0;
+            var k: int = 0;
+            while (k != 20) {
+                k += 1;
+                switch (k % 4) {
+                    case 0: u += 1; break;
+                    case 1: if (k > 10) break; u += 10;
+                    default: u += 100;
+                }
+                if (k == 17) continue; else u = u * 2 % 999983;
+            }
+            put(u);
+            var n: int = 0;
+            var a: int = 0;
+            while (a < 6) {
+                var b: int = a;
+                while (b > 0) { if (b == 2) break; n = n * 3 + b; b -= 1; }
+                a += 1;
+            }
+            put(n % 1000003);
+            var m: int = 0;
+            for (;;) { m += 1; if (m == 7) break; }
+            put(m);
+            while (g < 50) { g = g * 2 + 1; }                // the test reads memory
+            put(g);
+            return (s + cs + t + u + n + m + g) % 9841;
+        }
+    "#;
+    same_both_ways_src("loops.tri", src, 50_000_000);
+}

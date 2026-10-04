@@ -336,12 +336,16 @@ fn k5_job_control() {
         "$ echo $?\n130\n",
         "$ cat | cat\n^C\n$ ",
         "$ abc^C\n$ echo after\nafter\n",                       // ^C at the prompt drops the line
-        "$ true\n[1]  Stopped                 cat\n",             // SIGTTIN for a background read
         "[1]  Killed                  cat\n",
         "init: login session exited with 3",
     ] {
         assert!(out.contains(want), "missing {want:?} in:\n{out}");
     }
+    // SIGTTIN for a background read: reported once cat reaches its read,
+    // before or after the next prompt (that depends on how fast cat gets
+    // there), but before it is killed
+    let (bg, stop, kill) = (out.find("$ cat &\n[1] 7\n"), out.find("[1]  Stopped                 cat\n"), out.find("$ kill -9 %1"));
+    assert!(matches!((bg, stop, kill), (Some(b), Some(s), Some(k)) if b < s && s < k), "cat stopped for its read:\n{out}");
 }
 
 #[test]
