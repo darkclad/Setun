@@ -15,6 +15,7 @@
 
 mod micro;
 mod profile;
+mod vs_native;
 
 use setun_core::Machine;
 use std::path::{Path, PathBuf};
@@ -234,6 +235,10 @@ fn main() {
     }
     if args.first().map(String::as_str) == Some("--profile") {
         profile::run(Path::new(&args[1]));
+        return;
+    }
+    if args.iter().any(|a| a == "--vs-native") {
+        vs_native::run(&root());
         return;
     }
     if args.iter().any(|a| a == "--micro") {
