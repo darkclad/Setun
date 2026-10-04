@@ -662,3 +662,100 @@ fn compiled_regions_entered_at_any_block_agree() {
         assert!(st[2] > least, "compiled code entered mid-loop (slices of {slice}): {st:?}");
     }
 }
+
+#[test]
+fn fpu_loads_and_moves_compiled_agree() {
+    // a compiled loop walks six reals in frame 1 (FLDD), a real27 beside
+    // each (FLDS), copies one (FMOV), adds and stores; the words are
+    // varied (negative, large exponents, unnormalized), and the last real
+    // straddles into page 2, mapped to frame 5: its words must not be read
+    // through page 1's window
+    use setun_core::isa::{falu, fcvt, fmem};
+    let base = PAGE + 9837 - 5 * 18; // the 6th real's words: 29520, 29523 | 29526
+    assert_eq!((base + 5 * 18 + 6 + 9841).div_euclid(PAGE), 2);
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, base));
+    prog.push(isa::s6(op::LIQ, 0, 9, 6));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0));
+    prog.extend(isa::wide(op::FMEMD, fmem::FLDS, 2, 2, 9));
+    prog.push(isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0));
+    prog.push(isa::rrr(op::FALU, falu::FADD, 4, 3, 2));
+    prog.push(isa::rrr(op::FALU, falu::FADD, 5, 5, 3));
+    prog.extend(isa::wide(op::FMEMD, fmem::FSTD, 4, 2, 12));
+    prog.extend(isa::wide(op::ALUI, alu::ADD, 2, 2, 18));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let words: [i64; 18] = [
+        5 * 387_420_489 + 123_456, 7_000_000_000, -3_000_000_000,
+        -2 * 387_420_489 - 99, -1_234_567, 9_876_543_210,
+        9000 * 387_420_489 + 1, 0, 1,
+        -9000 * 387_420_489 - 193_710_244, 3_812_798_742_493, -3_812_798_742_493,
+        193_710_244, 42, -42,
+        -387_420_489, 1_000_000_007, 777,
+    ];
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(5, 1, 1, -1))).unwrap(); // page 2 -> frame 5
+        for k in 0..6 {
+            let at = base + 18 * k as i64;
+            for j in 0..3 {
+                let pa = if at + 3 * j as i64 > PAGE + 9841 { at + 3 * j as i64 + 3 * PAGE } else { at + 3 * j as i64 };
+                m.mem.write_word(pa, w(words[3 * k + j])).unwrap();
+            }
+            let s = at + 9;
+            let pa = if s > PAGE + 9841 { s + 3 * PAGE } else { s };
+            m.mem.write_word(pa, w(words[(3 * k + 7) % 18])).unwrap();
+        }
+        // what frame 2 holds where page 2's words would be: not to be read
+        m.mem.load_words(2 * PAGE - 9840, &[w(111), w(222), w(333)]);
+    };
+    for threshold in [u32::MAX, 1] {
+        let (_, fast) = both_ways_jit(threshold, setup, &prog, 120);
+        if threshold == 1 {
+            assert!(fast.cpu.jit_stats()[2] > 30, "the loop ran compiled: {:?}", fast.cpu.jit_stats());
+        }
+    }
+}
+
+#[test]
+fn compiled_fpu_code_traps_once_the_fpu_is_off() {
+    // the loop turns the FPU off (MODE's FE trit, weight 27) in its ninth
+    // round, when it runs compiled: the next FPU instruction must trap
+    // (FPU unavailable)
+    use setun_core::isa::{fcvt, fmem};
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
+    prog.push(isa::s6(op::LIQ, 0, 9, 12));
+    let top = prog.len() as i64;
+    // FMOV first: it uses no window, so only the FE check stops it (a
+    // write to MODE also drops the windows, which sends FLDD the slow way)
+    prog.push(isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0));
+    prog.push(isa::rrr(op::FMEM, fmem::FLDD, 1, 2, 0));
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 5, 1));
+    prog.push(isa::rrr(op::ALUQ, alu::CMP, 0, 9, 4));
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, 5)); // not the ninth round: skip the switch
+    prog.push(isa::rrr(op::SYS, sys::MFC, 1, cr::MODE, 0));
+    prog.extend(isa::wide(op::ALUI, alu::SUB, 1, 1, 27));
+    prog.push(isa::rrr(op::SYS, sys::MTC, cr::MODE, 1, 0));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = |m: &mut Machine| {
+        m.mem.load_words(PAGE + 300, &[w(5 * 387_420_489 + 7), w(11), w(-13)]);
+    };
+    for threshold in [u32::MAX, 1] {
+        let (st, f) = both_ways_jit(threshold, setup, &prog, 200);
+        if threshold == 1 {
+            assert!(f.cpu.jit_stats()[2] > 30, "the loop ran compiled: {:?}", f.cpu.jit_stats());
+        }
+        assert_eq!(reg_in(&st, 5), 9, "nine rounds ran, the tenth trapped at its FMOV (threshold {threshold})");
+        // FCAUSE's low five trits are the vector
+        let cause = st[5 * (cr::FCAUSE + 13) as usize + 1].rem_euclid(243);
+        let vector = if cause > 121 { cause - 243 } else { cause };
+        assert_eq!(vector, setun_core::isa::vector::FPU_UNAVAILABLE, "FPU unavailable");
+    }
+}

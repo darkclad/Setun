@@ -30,7 +30,7 @@
 
 use super::*;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I64, I8};
+use cranelift_codegen::ir::types::{I128, I64, I8};
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, UserFuncName, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
@@ -389,6 +389,109 @@ impl Gen<'_> {
         let r = self.b.ins().isub(off, q3);
         let byte = self.b.ins().ishl_imm_s(q, 3);
         (ok, self.b.ins().iadd(ptr, byte), r)
+    }
+
+    /// The window test for `words` consecutive words from `va` (all in the
+    /// read window's page): (covered?, the first word's host address).
+    fn window_span(&mut self, va: Value, words: i64) -> (Value, Value) {
+        const INV3: i64 = 0xAAAA_AAAA_AAAA_AAABu64 as i64;
+        let k = self.b.ins().sshr_imm_s(va, JW_SHIFT);
+        let k = self.b.ins().band_imm_s(k, (JW - 1) as i64);
+        let k = self.b.ins().ishl_imm_s(k, 4);
+        let entry = self.b.ins().iadd(self.cpu, k);
+        let lo = self.b.ins().load(I64, FL, entry, OFF_JWIN as i32);
+        let ptr = self.b.ins().load(I64, FL, entry, OFF_JWIN as i32 + 8);
+        let off = self.b.ins().isub(va, lo);
+        let off = self.b.ins().iadd_imm_s(off, -1);
+        let q = self.b.ins().imul_imm_s(off, INV3);
+        let in_window = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, q, PAGE / 3 - (words - 1));
+        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, ptr, 0);
+        let ok = self.b.ins().band(in_window, has);
+        let byte = self.b.ins().ishl_imm_s(q, 3);
+        (ok, self.b.ins().iadd(ptr, byte))
+    }
+
+    /// FMOV, FLDD and FLDS natively (other FPU instructions: None). The
+    /// checks (the FPU enabled; a load's words in the read window) branch
+    /// to the slow block, where the caller emits the interpreter's code;
+    /// returns that block, the one both paths go on to, and for a load
+    /// its address (the slow path then fills the window table with it).
+    fn fpu_inline(&mut self, d: &Dec) -> Option<(IrBlock, IrBlock, Option<Value>)> {
+        let (a, f) = (d.a as i64, d.f as i64);
+        let fmov = a == op::FCVT && f == fcvt::FMOV;
+        let load = (a == op::FMEM || a == op::FMEMD) && (f == 1 || f == 2);
+        if !(fmov || load) || d.x == 0 {
+            return None; // (f0 is not written)
+        }
+        let (fast, slow, done) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+        self.b.set_cold_block(slow);
+        let fe = self.b.ins().sload8(I64, FL, self.cpu, (OFF_MODE + mode::FE) as i32);
+        let mut ok = self.b.ins().icmp_imm_s(IntCC::Equal, fe, 1);
+        let dst = (OFF_FREGS + REAL_SIZE * idx(d.x as i64)) as i32;
+        let mut load_va = None;
+        let (e, m) = if fmov {
+            let src = (OFF_FREGS + REAL_SIZE * idx(d.y as i64)) as i32;
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.enter(fast);
+            let e = self.b.ins().load(I64, FL, self.cpu, src + REAL_E as i32);
+            let m = self.b.ins().load(I128, FL, self.cpu, src + REAL_M as i32);
+            (e, m)
+        } else {
+            // the address as exec_fpu forms it (unwrapped: outside every
+            // window if it would wrap)
+            // the function is the size class: 1 a real27 (one word), 2 a
+            // real81 (three)
+            let words = if f == 2 { 3 } else { 1 };
+            let off = if a == op::FMEM { 3 * words * d.z as i64 } else { d.imm };
+            let base = self.get(d.y as i64);
+            let va = self.b.ins().iadd_imm_s(base, off);
+            load_va = Some(va);
+            let (inw, addr) = self.window_span(va, words);
+            ok = self.b.ins().band(ok, inw);
+            self.b.ins().brif(ok, fast, &[], slow, &[]);
+            self.enter(fast);
+            let w0 = self.b.ins().load(I64, FL, addr, 0);
+            let zero = self.b.ins().iconst(I64, 0);
+            let (w1, w2) = if words == 3 {
+                (self.b.ins().load(I64, FL, addr, 8), self.b.ins().load(I64, FL, addr, 16))
+            } else {
+                (zero, zero)
+            };
+            // Real::from_words: hi = w0 mod 3^18 (balanced), e = (w0 - hi) / 3^18,
+            // m = (hi * 3^27 + w1) * 3^27 + w2
+            const T18: i64 = 387_420_489;
+            const H18: i64 = (T18 - 1) / 2;
+            const T18_INV: i64 = {
+                let mut x: u64 = 1;
+                let mut i = 0;
+                while i < 6 {
+                    x = x.wrapping_mul(2u64.wrapping_sub((T18 as u64).wrapping_mul(x)));
+                    i += 1;
+                }
+                x as i64
+            };
+            let c = self.b.ins().iadd_imm_s(w0, H18 + T18 * (1 << 14));
+            let u = self.b.ins().urem_imm_u(c, T18);
+            let hi = self.b.ins().iadd_imm_s(u, -H18);
+            let top = self.b.ins().isub(w0, hi);
+            let e = self.b.ins().imul_imm_s(top, T18_INV);
+            let t27 = self.b.ins().iconst(I64, W_MOD);
+            let t27 = self.b.ins().sextend(I128, t27);
+            let hi = self.b.ins().sextend(I128, hi);
+            let w1 = self.b.ins().sextend(I128, w1);
+            let w2 = self.b.ins().sextend(I128, w2);
+            let m = self.b.ins().imul(hi, t27);
+            let m = self.b.ins().iadd(m, w1);
+            let m = self.b.ins().imul(m, t27);
+            let m = self.b.ins().iadd(m, w2);
+            (e, m)
+        };
+        self.b.ins().store(FL, e, self.cpu, dst + REAL_E as i32);
+        self.b.ins().store(FL, m, self.cpu, dst + REAL_M as i32);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(slow);
+        self.b.seal_block(slow);
+        Some((slow, done, load_va))
     }
 
     /// The low tryte of a word, balanced: v mod 3^9 in -9841..9841.
@@ -813,6 +916,9 @@ impl Jit {
                         ended = true;
                     }
                     _ => {
+                        // FMOV / FLDD / FLDS natively when they can be; the
+                        // interpreter's code below is then their slow path
+                        let inline = if d.op == Op::Fpu { g.fpu_inline(d) } else { None };
                         // the interpreter's code for this one instruction
                         // (registers and C are already in the CPU)
                         g.s_to_cpu();
@@ -843,6 +949,16 @@ impl Jit {
                         let pc = g.pc_in_page(next_off);
                         g.leave(pc, unrun - 1);
                         g.enter(on);
+                        if let Some((_, done, va)) = inline {
+                            if let Some(va) = va {
+                                // the load went through: its page into the
+                                // window table, for the native path next time
+                                let out = g.b.ins().stack_addr(ptr, slot, 0);
+                                g.b.ins().call(lw, &[cpu, mem, va, out]);
+                            }
+                            g.b.ins().jump(done, &[]);
+                            g.enter(done);
+                        }
                     }
                 }
                 if ended {

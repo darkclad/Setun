@@ -28,6 +28,8 @@ const CASES: &[(&str, &str)] = &[
     ("fdiv", "fdiv f1, f1, f3"),
     ("fsqrt", "fsqrt f4, f2"),
     ("fldd", "fldd f4, [sp+9]"),
+    ("flds", "flds f4, [sp+3]"),
+    ("fmov", "fmov f4, f2"),
     ("fstd", "fstd f2, [sp+9]"),
     ("fcvtif", "fcvtif f4, r2"),
     ("fcmp", "fcmp f1, f2"),

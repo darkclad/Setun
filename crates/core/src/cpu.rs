@@ -153,6 +153,10 @@ const OFF_REGS: usize = std::mem::offset_of!(Cpu, regs);
 const OFF_MODE: usize = std::mem::offset_of!(Cpu, mode_trits);
 const OFF_PC: usize = std::mem::offset_of!(Cpu, pc);
 const OFF_JWIN: usize = std::mem::offset_of!(Cpu, jwin);
+const OFF_FREGS: usize = std::mem::offset_of!(Cpu, fregs);
+const REAL_SIZE: usize = std::mem::size_of::<Real>();
+const REAL_E: usize = std::mem::offset_of!(Real, e);
+const REAL_M: usize = std::mem::offset_of!(Real, m);
 
 /// Compiled code's data windows of each kind (a power of 2), and the
 /// address bits that pick one: 2^15 > PAGE, so a page has at most two.
