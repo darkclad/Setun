@@ -137,9 +137,11 @@ pub extern "C" fn setun_run(n: u32) -> u32 {
 }
 
 /// Render the display into RGBA bytes; returns a pointer to them.
+/// `now_ms` is the page clock (`performance.now()`), which drives blinking.
 #[no_mangle]
-pub extern "C" fn setun_render() -> *const u8 {
+pub extern "C" fn setun_render(now_ms: f64) -> *const u8 {
     with(|e| {
+        e.m.dev.display.set_wall_ms(now_ms.is_finite().then(|| now_ms.max(0.0) as u64));
         e.size = e.m.dev.display.render(&e.m.mem, &mut e.px);
         e.rgba.resize(e.px.len() * 4, 255);
         for (o, &p) in e.rgba.chunks_exact_mut(4).zip(&e.px) {
@@ -314,7 +316,7 @@ mod tests {
     fn the_demo_rom_is_still_there() {
         setun_boot(KIND_DEMO, 729, 1_790_000_000.0);
         assert_eq!(setun_run(300_000), 0);
-        let ptr = setun_render();
+        let ptr = setun_render(0.0);
         assert!(!ptr.is_null());
         assert_eq!((setun_width(), setun_height()), (640, 480));
         assert!(output().starts_with("Setun-11̅ demo ROM ready"));

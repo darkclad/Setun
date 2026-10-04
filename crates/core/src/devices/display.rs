@@ -14,6 +14,9 @@ use ternary::{wrap_trits, Tryte};
 /// Microseconds per video frame (60 Hz).
 pub const FRAME_US: i64 = 16_667;
 
+/// Text-mode blink half-period in host milliseconds.
+pub const BLINK_MS: u64 = 500;
+
 pub const TEXT_COLS: usize = 80;
 pub const TEXT_ROWS: usize = 30;
 
@@ -24,6 +27,11 @@ pub struct Display {
     cursor: i64,
     hwc: (i64, i64, i64),
     next_vsync_us: i64,
+    /// Host wall-clock time in milliseconds, set by the front end before
+    /// rendering. Blinking follows it when present, so the cursor blinks at
+    /// a steady rate however fast the emulator runs; without it (headless,
+    /// tests) blinking follows emulated frames.
+    wall_ms: Option<u64>,
 }
 
 impl Default for Display {
@@ -34,7 +42,7 @@ impl Default for Display {
 
 impl Display {
     pub fn new() -> Self {
-        Display { mode: -1, frame: 0, irq_on: false, cursor: 0, hwc: (0, 0, 0), next_vsync_us: FRAME_US }
+        Display { mode: -1, frame: 0, irq_on: false, cursor: 0, hwc: (0, 0, 0), next_vsync_us: FRAME_US, wall_ms: None }
     }
 
     /// Physical address of the first framebuffer tryte.
@@ -110,6 +118,19 @@ impl Display {
         }
     }
 
+    /// Tie blinking to the host clock (`Some(ms)`) or to emulated frames (`None`).
+    pub fn set_wall_ms(&mut self, ms: Option<u64>) {
+        self.wall_ms = ms;
+    }
+
+    /// Blink phase: half a second on, half a second off.
+    fn blink_off(&self) -> bool {
+        match self.wall_ms {
+            Some(ms) => (ms / BLINK_MS) % 2 == 1,
+            None => (self.frame / 30) % 2 == 1,
+        }
+    }
+
     /// Render the current screen into `out` (0xRRGGBB, row-major).
     /// Returns (width, height) in pixels.
     pub fn render(&self, mem: &Memory, out: &mut Vec<u32>) -> (usize, usize) {
@@ -136,7 +157,7 @@ impl Display {
     }
 
     fn render_text(&self, fb: &[i16], out: &mut [u32], w: usize) {
-        let blink_off = (self.frame / 30) % 2 == 1;
+        let blink_off = self.blink_off();
         for row in 0..TEXT_ROWS {
             for col in 0..TEXT_COLS {
                 let cell = row * TEXT_COLS + col;

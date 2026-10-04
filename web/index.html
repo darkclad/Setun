@@ -325,7 +325,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       }
       executed += n;
 
-      const ptr = wasm.setun_render();
+      const ptr = wasm.setun_render(performance.now());
       const w = wasm.setun_width(), h = wasm.setun_height();
       if (canvas.width !== w || canvas.height !== h || !img) { canvas.width = w; canvas.height = h; img = ctx.createImageData(w, h); }
       img.data.set(new Uint8Array(wasm.memory.buffer, ptr, w * h * 4));

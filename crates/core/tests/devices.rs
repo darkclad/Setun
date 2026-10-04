@@ -455,3 +455,37 @@ fn rom_boots_prints_and_powers_off() {
     assert_eq!(n, 7);
     assert_eq!(m.dev.serial.take_output(), "OK");
 }
+
+/// The text cursor blinks every 500 ms of host time when the front end
+/// supplies a wall clock, regardless of how many emulated frames pass.
+#[test]
+fn cursor_blink_follows_wall_clock() {
+    let mut m = machine();
+    let attr: Tryte = "111TTT000".parse().unwrap(); // white on black
+    m.mem.write_tryte(Display::fb_base() + 1, attr).unwrap();
+    m.dev.display.write(7, 0); // cursor at cell 0
+    let lit = |m: &Machine| {
+        let mut buf = Vec::new();
+        m.dev.display.render(&m.mem, &mut buf);
+        buf[15 * 640] == 0xFFFFFF // cursor bar on the bottom scanline
+    };
+    m.dev.display.set_wall_ms(Some(0));
+    assert!(lit(&m));
+    m.dev.display.set_wall_ms(Some(499));
+    assert!(lit(&m));
+    m.dev.display.set_wall_ms(Some(500));
+    assert!(!lit(&m));
+    m.dev.display.set_wall_ms(Some(1000));
+    assert!(lit(&m));
+    // Negative: a burst of emulated frames (a fast emulator) must not move the phase.
+    m.dev.display.set_wall_ms(Some(250));
+    for k in 1..=10 {
+        m.dev.display.advance(k * 30 * devices::FRAME_US);
+        assert!(lit(&m), "phase changed after {} emulated frames", k * 30);
+    }
+    // Without a wall clock it falls back to emulated frames (30 per phase).
+    m.dev.display.set_wall_ms(None);
+    let now = m.dev.display.read(5);
+    let flip = (now / 30) % 2 == 1;
+    assert_eq!(lit(&m), !flip);
+}

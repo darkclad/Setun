@@ -248,6 +248,7 @@ fn main() {
     let mut stdout = std::io::stdout();
     let mut frames = 0u64;
     let mut t0 = std::time::Instant::now();
+    let start = std::time::Instant::now();
 
     while window.is_open() && !m.powered_off {
         // Input.
@@ -292,6 +293,7 @@ fn main() {
             print!("{out}");
             let _ = stdout.flush();
         }
+        m.dev.display.set_wall_ms(Some(start.elapsed().as_millis() as u64));
         let (w, h) = m.dev.display.render(&m.mem, &mut px);
         if window.update_with_buffer(&px, w, h).is_err() {
             break;
