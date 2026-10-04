@@ -137,9 +137,15 @@ const LOCAL_REGS: [&str; 9] = ["r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", 
 const LEAF_REGS: [&str; 8] = ["r9", "r10", "r-10", "r-11", "r-12", "r-13", "r7", "r8"];
 
 /// Names whose address is taken (`&x`) anywhere in `stmts`, and whether
-/// there is inline assembly (which may use any register).
+/// there is inline assembly (which may use any register). Names assigned
+/// to (`x = ...`, `x += ...`) go in as `=x` (no name starts with `=`).
 fn scan_body(stmts: &[Stmt], taken: &mut HashSet<String>, asm: &mut bool) {
     fn ex(e: &Expr, taken: &mut HashSet<String>) {
+        if let ExprKind::Assign(_, a, _) = &e.kind {
+            if let ExprKind::Name(n) = &a.kind {
+                taken.insert(format!("={n}"));
+            }
+        }
         match &e.kind {
             ExprKind::Unary(UnOp::Addr, inner) => {
                 if let ExprKind::Name(n) = &inner.kind {
@@ -2651,6 +2657,17 @@ impl Compiler {
                     self.real_op(op);
                     return Ok(Ty::Real);
                 }
+                // a constant on the left of a commutative operator: on the
+                // right, it is an immediate (256 * x is x * 256)
+                if self.optimize
+                    && matches!(op, BinOp::Add | BinOp::Mul | BinOp::Min | BinOp::Max)
+                    && self.const_eval(a).is_some()
+                    && self.const_eval(b).is_none()
+                    && self.peek_type(a)? == Ty::Int
+                    && self.peek_type(b)? == Ty::Int
+                {
+                    return self.binary(op, b, a, pos);
+                }
                 let b_const = self.const_eval(b);
                 if b_const.is_some() || self.is_simple_operand(b) {
                     let (left, lt) = self.left_operand(a)?;
@@ -3194,7 +3211,24 @@ impl Compiler {
         // each argument straight into its parameter, which stays nameless
         // until all are evaluated (later arguments see the caller's names)
         let first = self.locals.len();
+        let mut shared = Vec::new();
         for (k, ((a, p), t)) in args.iter().zip(&f.params).zip(params).enumerate() {
+            // a register local that neither the body nor a later argument
+            // can change: the parameter shares its register
+            if self.optimize
+                && !asm
+                && self.reg_eligible(&p.name, t)
+                && !self.addr_taken.contains(&format!("={}", p.name))
+                && args[k + 1..].iter().all(|x| !has_effects(x))
+            {
+                if let Some((src, st)) = self.reg_local(a) {
+                    if st == *t {
+                        self.locals.push(Local { name: format!("#arg{k}"), ty: st, off: 0, reg: Some(src) });
+                        shared.push(src);
+                        continue;
+                    }
+                }
+            }
             let at = self.expr(a)?;
             self.check_assign(t, &at, a)?;
             let hidden = format!("#arg{k}");
@@ -3225,7 +3259,10 @@ impl Compiler {
         let start = self.scopes.pop().unwrap();
         let regs: Vec<&'static str> = self.locals[start..].iter().filter_map(|l| l.reg).collect();
         for r in regs {
-            self.release_reg(r);
+            // a shared register stays with the caller's local
+            if !shared.contains(&r) {
+                self.release_reg(r);
+            }
         }
         self.locals.truncate(start);
         self.next_slot = saved_slot;

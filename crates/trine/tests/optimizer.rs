@@ -652,3 +652,41 @@ fn temporaries_not_held_across_an_inlined_syscall() {
         assert!(!["r4", "r5", "r6"].iter().any(|r| l.contains(r)), "r4..r6 read after the syscall: {l}\n{}", body.join("\n"));
     }
 }
+
+#[test]
+fn shared_parameter_registers_the_same_way() {
+    // an inlined parameter shares the register of a local passed to it
+    // unless the body assigns the parameter, or a later argument changes
+    // the local; passed on to a nested inlined call; locals declared after
+    // the call (the register must stay the caller's); constants on the left
+    let src = r#"
+        import "console.tri";
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn twice(x: int) -> int { return 2 * x + 1; }
+        fn mix(x: int, y: int) -> int { return twice(x) * 7 + 3 * twice(y) - x; }
+        fn bump(x: int) -> int { x += 5; x = x * 3; return x; }        // assigns its parameter
+        fn pair(x: int, y: int) -> int { return x * 1000 + y; }
+        fn work(n: int) -> int {
+            var a: int = n;
+            var s: int = 0;
+            var k: int = 0;
+            while (k < 12) {
+                s = s * 3 + mix(a, k) + bump(a) + a;                   // a unchanged by bump
+                s = s % 99991 + pair(a, a = a + 1) + 7 * a;            // a later argument changes a
+                var t: int = twice(k) + 100 * twice(a);
+                var u: int = mix(t, s) - t;
+                s = (s + u + 2 * t + (5 + a) * 3) % 1000003;
+                k += 1;
+            }
+            return s + a;
+        }
+        fn main() -> int {
+            var r: int = 0;
+            var q: int = 1;
+            while (q < 6) { r = (r * 3 + work(q * 11)) % 1000003; q += 1; }
+            put(r);
+            return r % 9841;
+        }
+    "#;
+    same_both_ways_src("sharedparams.tri", src, 80_000_000);
+}
