@@ -1,15 +1,26 @@
 // tls.tri: a TLS 1.3 client (RFC 8446) over a connected socket.
 //
-// One cipher suite, TLS_CHACHA20_POLY1305_SHA256, and one key exchange,
-// X25519. The server proves itself with its certificate chain (x509.tri,
-// checked against the trust store and the host name) and a CertificateVerify
-// signature: ECDSA P-256/P-384, RSA-PSS or Ed25519. No session resumption,
-// no early data, no TLS 1.2: a server that cannot speak TLS 1.3 with this
-// suite is refused. A server that asks for a client certificate gets none.
+// Cipher suites TLS_CHACHA20_POLY1305_SHA256 (preferred: fastest here),
+// TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384. Key exchange X25519;
+// the first ClientHello carries only an X25519 key share but offers
+// secp256r1 and secp384r1 too, so a server that wants one of those asks
+// again (HelloRetryRequest) and gets its share then. The server proves
+// itself with its certificate chain (x509.tri, checked against the trust
+// store and the host name) and a CertificateVerify signature: ECDSA
+// P-256/P-384, RSA-PSS or Ed25519. No session resumption, no early data,
+// no TLS 1.2. A server that asks for a client certificate gets none.
 
 import "x509.tri";
 import "hmac.tri";
 import "chacha.tri";
+import "aes.tri";
+
+const TLS_CHACHA20_POLY1305_SHA256: int = 4867;     // 0x1303
+const TLS_AES_128_GCM_SHA256: int = 4865;           // 0x1301
+const TLS_AES_256_GCM_SHA384: int = 4866;           // 0x1302
+const TLS_X25519: int = 29;
+const TLS_SECP256R1: int = 23;
+const TLS_SECP384R1: int = 24;
 
 const TLS_E_FAIL: int = -1;                 // the handshake or a record failed
 const TLS_E_CERT: int = -2;                 // the certificate did not verify
@@ -28,9 +39,17 @@ struct tls {
     eof: int;                               // close_notify came
     unclean: int;                           // the connection ended without close_notify
     th: hash_ctx;                           // the transcript
+    suite: int;                             // the cipher suite chosen,
+    hid: int;                               // its hash,
+    hlen: int;                              // the hash's length
+    klen: int;                              // and the key's
+    group: int;                             // the key exchange
+    hrr: int;                               // the server asked again
     // traffic secrets and record keys
-    rsec: [32]tryte;
-    wsec: [32]tryte;
+    rsec: [48]tryte;
+    wsec: [48]tryte;
+    rgcm: gcm;
+    wgcm: gcm;
     rkey: [32]tryte;
     riv: [12]tryte;
     rseq: int;
@@ -157,7 +176,8 @@ fn _send_record(t: *tls, type: int, p: *tryte, n: int) -> int {
     if (t.wprot) {
         var nonce: [12]tryte;
         _nonce(&nonce[0], &t.wiv[0], t.wseq);
-        aead_seal(&t.wkey[0], &nonce[0], o, 5, o + 5, n + 1);
+        if (t.suite == TLS_CHACHA20_POLY1305_SHA256) { aead_seal(&t.wkey[0], &nonce[0], o, 5, o + 5, n + 1); }
+        else { gcm_seal(&t.wgcm, &nonce[0], o, 5, o + 5, n + 1); }
         t.wseq += 1;
     }
     return _write_all(t.fd, o, 5 + len);
@@ -192,7 +212,10 @@ fn _record_in(t: *tls) -> int {
             if (len < 17) { return _fail(t, 50, "a record too short"); }
             var nonce: [12]tryte;
             _nonce(&nonce[0], &t.riv[0], t.rseq);
-            if (!aead_open(&t.rkey[0], &nonce[0], &h[0], 5, &t.rec[0], len - 16)) {
+            var good: int = 0;
+            if (t.suite == TLS_CHACHA20_POLY1305_SHA256) { good = aead_open(&t.rkey[0], &nonce[0], &h[0], 5, &t.rec[0], len - 16); }
+            else { good = gcm_open(&t.rgcm, &nonce[0], &h[0], 5, &t.rec[0], len - 16); }
+            if (!good) {
                 return _fail(t, 20, "bad record MAC");
             }
             t.rseq += 1;
@@ -250,39 +273,42 @@ fn _hs_msg(t: *tls) -> int {
 
 // ---- the key schedule -------------------------------------------------------------------------
 
-fn _derive(secret: *tryte, label: *char, th: *tryte, out: *tryte) {
-    hkdf_expand_label(HASH_SHA256, secret, label, th, th == null ? 0 : 32, out, 32);
+// Derive-Secret: HKDF-Expand-Label(secret, label, transcript hash), a hash long
+fn _derive(t: *tls, secret: *tryte, label: *char, th: *tryte, out: *tryte) {
+    hkdf_expand_label(t.hid, secret, label, th, t.hlen, out, t.hlen);
 }
 
 // Record keys from a traffic secret.
-fn _keys(sec: *tryte, key: *tryte, iv: *tryte) {
+fn _keys(t: *tls, sec: *tryte, key: *tryte, iv: *tryte) {
     var none: [1]tryte;
-    hkdf_expand_label(HASH_SHA256, sec, "key", &none[0], 0, key, 32);
-    hkdf_expand_label(HASH_SHA256, sec, "iv", &none[0], 0, iv, 12);
+    hkdf_expand_label(t.hid, sec, "key", &none[0], 0, key, t.klen);
+    hkdf_expand_label(t.hid, sec, "iv", &none[0], 0, iv, 12);
 }
 
 fn _set_read(t: *tls, sec: *tryte) {
     var k: int = 0;
-    while (k < 32) { t.rsec[k] = sec[k]; k += 1; }
-    _keys(&t.rsec[0], &t.rkey[0], &t.riv[0]);
+    while (k < t.hlen) { t.rsec[k] = sec[k]; k += 1; }
+    _keys(t, &t.rsec[0], &t.rkey[0], &t.riv[0]);
+    if (t.suite != TLS_CHACHA20_POLY1305_SHA256) { gcm_setkey(&t.rgcm, &t.rkey[0], t.klen); }
     t.rseq = 0;
     t.rprot = 1;
 }
 
 fn _set_write(t: *tls, sec: *tryte) {
     var k: int = 0;
-    while (k < 32) { t.wsec[k] = sec[k]; k += 1; }
-    _keys(&t.wsec[0], &t.wkey[0], &t.wiv[0]);
+    while (k < t.hlen) { t.wsec[k] = sec[k]; k += 1; }
+    _keys(t, &t.wsec[0], &t.wkey[0], &t.wiv[0]);
+    if (t.suite != TLS_CHACHA20_POLY1305_SHA256) { gcm_setkey(&t.wgcm, &t.wkey[0], t.klen); }
     t.wseq = 0;
     t.wprot = 1;
 }
 
 // HMAC(finished_key(base), transcript hash)
-fn _finished(base: *tryte, th: *tryte, out: *tryte) {
-    var fk: [32]tryte;
+fn _finished(t: *tls, base: *tryte, th: *tryte, out: *tryte) {
+    var fk: [48]tryte;
     var none: [1]tryte;
-    hkdf_expand_label(HASH_SHA256, base, "finished", &none[0], 0, &fk[0], 32);
-    hmac(HASH_SHA256, &fk[0], 32, th, 32, out);
+    hkdf_expand_label(t.hid, base, "finished", &none[0], 0, &fk[0], t.hlen);
+    hmac(t.hid, &fk[0], t.hlen, th, t.hlen, out);
 }
 
 // ---- building messages ------------------------------------------------------------------------
@@ -307,20 +333,22 @@ fn _is_ipv4(h: *char) -> int {
     return k > 0;
 }
 
-fn _client_hello(t: *tls, buf: *tryte, pub: *tryte, sid: *tryte) -> int {
+// A ClientHello with one key share (group, share: shlen octets) and, after
+// a HelloRetryRequest, the server's cookie (clen > 0).
+fn _client_hello(t: *tls, buf: *tryte, random: *tryte, sid: *tryte, group: int, share: *tryte, shlen: int, cookie: *tryte, clen: int) -> int {
     _b = buf;
     _bn = 0;
     _p8(1);
     var hl: int = _bn;
     _p24(0);
     _p16(771);                                  // legacy_version 0x0303
-    var random: [32]tryte;
-    getrandom(&random[0], 32, 0);
-    _pn(&random[0], 32);
+    _pn(random, 32);
     _p8(32);                                     // a session id, for middleboxes
     _pn(sid, 32);
-    _p16(2);
-    _p16(4867);                                  // TLS_CHACHA20_POLY1305_SHA256 0x1303
+    _p16(6);
+    _p16(TLS_CHACHA20_POLY1305_SHA256);
+    _p16(TLS_AES_128_GCM_SHA256);
+    _p16(TLS_AES_256_GCM_SHA384);
     _p8(1);
     _p8(0);                                      // no compression
     var el: int = _bn;
@@ -335,10 +363,12 @@ fn _client_hello(t: *tls, buf: *tryte, pub: *tryte, sid: *tryte) -> int {
         var k: int = 0;
         while (k < n) { _p8(t.host[k]); k += 1; }
     }
-    _p16(10);                                    // supported_groups: x25519
-    _p16(4);
-    _p16(2);
-    _p16(29);
+    _p16(10);                                    // supported_groups
+    _p16(8);
+    _p16(6);
+    _p16(TLS_X25519);
+    _p16(TLS_SECP256R1);
+    _p16(TLS_SECP384R1);
     _p16(13);                                    // signature_algorithms
     var algs: [9]int = { 1027, 1283, 2052, 2053, 2054, 2055, 1025, 1281, 1537 };
     _p16(20);
@@ -349,12 +379,17 @@ fn _client_hello(t: *tls, buf: *tryte, pub: *tryte, sid: *tryte) -> int {
     _p16(3);
     _p8(2);
     _p16(772);
-    _p16(51);                                    // key_share: x25519
-    _p16(38);
-    _p16(36);
-    _p16(29);
-    _p16(32);
-    _pn(pub, 32);
+    _p16(51);                                    // key_share: one
+    _p16(shlen + 6);
+    _p16(shlen + 4);
+    _p16(group);
+    _p16(shlen);
+    _pn(share, shlen);
+    if (clen > 0) {                              // cookie, echoed
+        _p16(44);
+        _p16(clen);
+        _pn(cookie, clen);
+    }
     _len16(el);
     _len24(hl);
     return _bn;
@@ -383,16 +418,17 @@ fn _mstart(t: *tls) {
     _mbad = 0;
 }
 
-// ServerHello: the server's X25519 key into spub; 0 or TLS_E_FAIL.
-fn _server_hello(t: *tls, sid: *tryte, spub: *tryte) -> int {
+// ServerHello or HelloRetryRequest (t.hrr): the suite into t.suite (and
+// its hash), the group into t.group; a ServerHello's key share into spub
+// (*splen octets), a HelloRetryRequest's cookie into cookie (*clen). 0 or
+// TLS_E_FAIL.
+fn _server_hello(t: *tls, sid: *tryte, spub: *tryte, splen: *int, cookie: *tryte, clen: *int) -> int {
     _mstart(t);
     var ver: int = _g16();
     var random: *tryte = _m + _mp;
     _skip(32);
     // a HelloRetryRequest has this "random" (SHA-256 of "HelloRetryRequest")
-    if (der_is(random, 32, "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")) {
-        return _fail(t, 40, "the server asked for a key exchange other than X25519");
-    }
+    t.hrr = der_is(random, 32, "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c");
     var sl: int = _g8();
     if (sl != 32 || !octets_equal(_m + _mp, sid, 32)) { return _fail(t, 47, "a bad session id echo"); }
     _skip(32);
@@ -400,6 +436,7 @@ fn _server_hello(t: *tls, sid: *tryte, spub: *tryte) -> int {
     var comp: int = _g8();
     var have_ver: int = 0;
     var have_key: int = 0;
+    clen[0] = 0;
     if (_mp == _mend) {
         // no extensions: TLS 1.2 or older
         return _fail(t, 70, "the server does not speak TLS 1.3");
@@ -415,10 +452,25 @@ fn _server_hello(t: *tls, sid: *tryte, spub: *tryte) -> int {
             if (len != 2 || _g16() != 772) { return _fail(t, 47, "the server chose another TLS version"); }
             have_ver = 1;
         } else if (et == 51) {
-            if (_g16() != 29 || _g16() != 32 || len != 36) { return _fail(t, 47, "the server chose another key exchange"); }
-            var k: int = 0;
-            while (k < 32) { spub[k] = _m[_mp + k]; k += 1; }
+            var g: int = _g16();
+            if (g != TLS_X25519 && g != TLS_SECP256R1 && g != TLS_SECP384R1) { return _fail(t, 47, "the server chose a key exchange not offered"); }
+            t.group = g;
+            if (t.hrr) {
+                if (len != 2) { return _fail(t, 50, "a malformed HelloRetryRequest"); }
+            } else {
+                var kl: int = _g16();
+                if (kl != len - 4 || kl > 97) { return _fail(t, 50, "a malformed key share"); }
+                var k: int = 0;
+                while (k < kl) { spub[k] = _m[_mp + k]; k += 1; }
+                splen[0] = kl;
+            }
             have_key = 1;
+        } else if (et == 44 && t.hrr) {
+            var cl: int = _g16();
+            if (cl != len - 2 || cl < 1 || cl > 243) { return _fail(t, 50, "a malformed cookie"); }
+            var k2: int = 0;
+            while (k2 < cl) { cookie[k2] = _m[_mp + k2]; k2 += 1; }
+            clen[0] = cl;
         } else {
             return _fail(t, 110, "an unexpected ServerHello extension");
         }
@@ -427,8 +479,14 @@ fn _server_hello(t: *tls, sid: *tryte, spub: *tryte) -> int {
     if (_mbad) { return _fail(t, 50, "a malformed ServerHello"); }
     if (!have_ver) { return _fail(t, 70, "the server does not speak TLS 1.3"); }
     if (ver != 771 || comp != 0) { return _fail(t, 47, "a bad ServerHello"); }
-    if (suite != 4867) { return _fail(t, 47, "the server chose another cipher suite"); }
+    if (suite != TLS_CHACHA20_POLY1305_SHA256 && suite != TLS_AES_128_GCM_SHA256 && suite != TLS_AES_256_GCM_SHA384) {
+        return _fail(t, 47, "the server chose a cipher suite not offered");
+    }
     if (!have_key) { return _fail(t, 109, "no key share from the server"); }
+    t.suite = suite;
+    t.hid = suite == TLS_AES_256_GCM_SHA384 ? HASH_SHA384 : HASH_SHA256;
+    t.hlen = hash_len(t.hid);
+    t.klen = suite == TLS_AES_128_GCM_SHA256 ? 16 : 32;
     return 0;
 }
 
@@ -516,7 +574,7 @@ fn _certificate_verify(t: *tls, th: *tryte) -> int {
     if (sig == 0 || leaf.key != key) { return _fail(t, 47, "a CertificateVerify scheme not offered or not the key's"); }
     t.sigscheme = scheme;
     // 64 spaces, the context string, a zero, the transcript hash
-    var content: [130]tryte;
+    var content: [146]tryte;
     var k: int = 0;
     while (k < 64) { content[k] = 32; k += 1; }
     var ctx: *char = "TLS 1.3, server CertificateVerify";
@@ -524,8 +582,8 @@ fn _certificate_verify(t: *tls, th: *tryte) -> int {
     while (k < 33) { content[64 + k] = ctx[k] as tryte; k += 1; }
     content[97] = 0;
     k = 0;
-    while (k < 32) { content[98 + k] = th[k]; k += 1; }
-    if (!pk_verify(leaf, sig, id, &content[0], 130, _m + _mp, sl)) {
+    while (k < t.hlen) { content[98 + k] = th[k]; k += 1; }
+    if (!pk_verify(leaf, sig, id, &content[0], 98 + t.hlen, _m + _mp, sl)) {
         return _fail(t, 51, "the server's CertificateVerify signature is wrong");
     }
     return 0;
@@ -550,51 +608,106 @@ fn tls_connect(t: *tls, fd: int, host: *char, verify: int, now: int) -> int {
     t.rpos = 0;
     t.rn = 0;
     t.sigscheme = 0;
+    t.hrr = 0;
+    t.suite = 0;
     tls_ncerts = 0;
     bin32_init();
-    hash_init(&t.th, HASH_SHA256);
-    // ClientHello
-    var priv: [32]tryte;
-    var pub: [32]tryte;
+    // ClientHello, with an X25519 share
+    var random: [32]tryte;
     var sid: [32]tryte;
-    getrandom(&priv[0], 32, 0);
+    var priv: [48]tryte;
+    var pub: [97]tryte;
+    getrandom(&random[0], 32, 0);
     getrandom(&sid[0], 32, 0);
+    getrandom(&priv[0], 32, 0);
     x25519_base(&pub[0], &priv[0]);
-    var n: int = _client_hello(t, &t.msg[0], &pub[0], &sid[0]);
-    hash_update(&t.th, &t.msg[0], n);
-    if (_send_record(t, 22, &t.msg[0], n) < 0) { return _fail(t, 0, "the connection broke"); }
-    // ServerHello
+    var ch: [729]tryte;
+    var chn: int = _client_hello(t, &ch[0], &random[0], &sid[0], TLS_X25519, &pub[0], 32, &pub[0], 0);
+    if (_send_record(t, 22, &ch[0], chn) < 0) { return _fail(t, 0, "the connection broke"); }
+    // ServerHello, or HelloRetryRequest
     var type: int = _hs_msg(t);
     if (type < 0) { return type; }
     if (type != 2) { return _fail(t, 10, "no ServerHello"); }
-    var spub: [32]tryte;
-    if (_server_hello(t, &sid[0], &spub[0]) < 0) { return TLS_E_FAIL; }
+    var spub: [97]tryte;
+    var splen: int = 0;
+    var cookie: [243]tryte;
+    var clen: int = 0;
+    if (_server_hello(t, &sid[0], &spub[0], &splen, &cookie[0], &clen) < 0) { return TLS_E_FAIL; }
     if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after the ServerHello"); }
-    hash_update(&t.th, &t.msg[0], t.mlen);
-    var shared: [32]tryte;
-    x25519(&shared[0], &priv[0], &spub[0]);
-    var z: int = 0;
+    var hash1: [48]tryte;
+    if (t.hrr) {
+        // the transcript starts again from message_hash(ClientHello1), the
+        // HelloRetryRequest and a new ClientHello with the share asked for
+        if (t.group == TLS_X25519) { return _fail(t, 47, "a HelloRetryRequest for the share already sent"); }
+        var hrr_suite: int = t.suite;
+        hash_octets(t.hid, &ch[0], chn, &hash1[0]);
+        hash_init(&t.th, t.hid);
+        var mh: [4]tryte;
+        mh[0] = 254;
+        mh[1] = 0;
+        mh[2] = 0;
+        mh[3] = t.hlen as tryte;
+        hash_update(&t.th, &mh[0], 4);
+        hash_update(&t.th, &hash1[0], t.hlen);
+        hash_update(&t.th, &t.msg[0], t.mlen);
+        var cid: int = t.group == TLS_SECP256R1 ? CURVE_P256 : CURVE_P384;
+        if (!ec_keygen(cid, &priv[0], &pub[0])) { return _fail(t, 80, "no key pair"); }
+        var publen: int = t.group == TLS_SECP256R1 ? 65 : 97;
+        chn = _client_hello(t, &ch[0], &random[0], &sid[0], t.group, &pub[0], publen, &cookie[0], clen);
+        hash_update(&t.th, &ch[0], chn);
+        // (the compatibility ChangeCipherSpec goes before the second ClientHello)
+        var ccs1: [1]tryte;
+        ccs1[0] = 1;
+        if (_send_record(t, 20, &ccs1[0], 1) < 0) { return _fail(t, 0, "the connection broke"); }
+        if (_send_record(t, 22, &ch[0], chn) < 0) { return _fail(t, 0, "the connection broke"); }
+        var asked: int = t.group;
+        type = _hs_msg(t);
+        if (type < 0) { return type; }
+        if (type != 2) { return _fail(t, 10, "no ServerHello"); }
+        if (_server_hello(t, &sid[0], &spub[0], &splen, &cookie[0], &clen) < 0) { return TLS_E_FAIL; }
+        if (t.hrr) { return _fail(t, 10, "a second HelloRetryRequest"); }
+        if (t.suite != hrr_suite || t.group != asked) { return _fail(t, 47, "the ServerHello does not match the HelloRetryRequest"); }
+        if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after the ServerHello"); }
+        hash_update(&t.th, &t.msg[0], t.mlen);
+    } else {
+        hash_init(&t.th, t.hid);
+        hash_update(&t.th, &ch[0], chn);
+        hash_update(&t.th, &t.msg[0], t.mlen);
+    }
+    // the shared secret
+    var shared: [48]tryte;
+    var shlen: int = 32;
     var k: int = 0;
-    while (k < 32) { z = z + shared[k]; k += 1; }
-    if (z == 0) { return _fail(t, 47, "a degenerate X25519 key"); }
+    if (t.group == TLS_X25519) {
+        if (splen != 32) { return _fail(t, 47, "a bad X25519 key share"); }
+        x25519(&shared[0], &priv[0], &spub[0]);
+        var z: int = 0;
+        while (k < 32) { z = z + shared[k]; k += 1; }
+        if (z == 0) { return _fail(t, 47, "a degenerate X25519 key"); }
+    } else {
+        var cv: int = t.group == TLS_SECP256R1 ? CURVE_P256 : CURVE_P384;
+        shlen = t.group == TLS_SECP256R1 ? 32 : 48;
+        if (!ecdh(cv, &priv[0], &spub[0], splen, &shared[0])) { return _fail(t, 47, "a bad ECDH key share"); }
+    }
     // the handshake secrets
-    var zero: [32]tryte;
+    var hl: int = t.hlen;
+    var zero: [48]tryte;
     k = 0;
-    while (k < 32) { zero[k] = 0; k += 1; }
-    var early: [32]tryte;
-    hkdf_extract(HASH_SHA256, &zero[0], 32, &zero[0], 32, &early[0]);
-    var empty: [32]tryte;
-    sha256(&zero[0], 0, &empty[0]);
-    var derived: [32]tryte;
-    _derive(&early[0], "derived", &empty[0], &derived[0]);
-    var hs: [32]tryte;
-    hkdf_extract(HASH_SHA256, &derived[0], 32, &shared[0], 32, &hs[0]);
-    var th: [32]tryte;
+    while (k < 48) { zero[k] = 0; k += 1; }
+    var early: [48]tryte;
+    hkdf_extract(t.hid, &zero[0], hl, &zero[0], hl, &early[0]);
+    var empty: [48]tryte;
+    hash_octets(t.hid, &zero[0], 0, &empty[0]);
+    var derived: [48]tryte;
+    _derive(t, &early[0], "derived", &empty[0], &derived[0]);
+    var hs: [48]tryte;
+    hkdf_extract(t.hid, &derived[0], hl, &shared[0], shlen, &hs[0]);
+    var th: [48]tryte;
     hash_peek(&t.th, &th[0]);
-    var chs: [32]tryte;
-    var shs: [32]tryte;
-    _derive(&hs[0], "c hs traffic", &th[0], &chs[0]);
-    _derive(&hs[0], "s hs traffic", &th[0], &shs[0]);
+    var chs: [48]tryte;
+    var shs: [48]tryte;
+    _derive(t, &hs[0], "c hs traffic", &th[0], &chs[0]);
+    _derive(t, &hs[0], "s hs traffic", &th[0], &shs[0]);
     _set_read(t, &shs[0]);
     // EncryptedExtensions
     type = _hs_msg(t);
@@ -631,26 +744,29 @@ fn tls_connect(t: *tls, fd: int, host: *char, verify: int, now: int) -> int {
     // the server's Finished
     type = _hs_msg(t);
     if (type < 0) { return type; }
-    if (type != 20 || t.mlen != 36) { return _fail(t, 10, "no Finished"); }
+    if (type != 20 || t.mlen != 4 + hl) { return _fail(t, 10, "no Finished"); }
     hash_peek(&t.th, &th[0]);
-    var want: [32]tryte;
-    _finished(&shs[0], &th[0], &want[0]);
-    if (!octets_equal(&want[0], &t.msg[4], 32)) { return _fail(t, 51, "the server's Finished is wrong"); }
+    var want: [48]tryte;
+    _finished(t, &shs[0], &th[0], &want[0]);
+    if (!octets_equal(&want[0], &t.msg[4], hl)) { return _fail(t, 51, "the server's Finished is wrong"); }
     if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after the Finished"); }
     hash_update(&t.th, &t.msg[0], t.mlen);
     // the application secrets, from the transcript up to here
     hash_peek(&t.th, &th[0]);
-    _derive(&hs[0], "derived", &empty[0], &derived[0]);
-    var master: [32]tryte;
-    hkdf_extract(HASH_SHA256, &derived[0], 32, &zero[0], 32, &master[0]);
-    var cap: [32]tryte;
-    var sap: [32]tryte;
-    _derive(&master[0], "c ap traffic", &th[0], &cap[0]);
-    _derive(&master[0], "s ap traffic", &th[0], &sap[0]);
-    // our flight: (a compatibility ChangeCipherSpec), [an empty Certificate], Finished
-    var ccs: [1]tryte;
-    ccs[0] = 1;
-    if (_send_record(t, 20, &ccs[0], 1) < 0) { return _fail(t, 0, "the connection broke"); }
+    _derive(t, &hs[0], "derived", &empty[0], &derived[0]);
+    var master: [48]tryte;
+    hkdf_extract(t.hid, &derived[0], hl, &zero[0], hl, &master[0]);
+    var cap: [48]tryte;
+    var sap: [48]tryte;
+    _derive(t, &master[0], "c ap traffic", &th[0], &cap[0]);
+    _derive(t, &master[0], "s ap traffic", &th[0], &sap[0]);
+    // our flight: (a compatibility ChangeCipherSpec, unless sent already),
+    // [an empty Certificate], Finished
+    if (!t.hrr) {
+        var ccs: [1]tryte;
+        ccs[0] = 1;
+        if (_send_record(t, 20, &ccs[0], 1) < 0) { return _fail(t, 0, "the connection broke"); }
+    }
     _set_write(t, &chs[0]);
     var out: [300]tryte;
     if (creqlen >= 0) {
@@ -668,9 +784,9 @@ fn tls_connect(t: *tls, fd: int, host: *char, verify: int, now: int) -> int {
     out[0] = 20;
     out[1] = 0;
     out[2] = 0;
-    out[3] = 32;
-    _finished(&chs[0], &th[0], &out[4]);
-    if (_send_record(t, 22, &out[0], 36) < 0) { return _fail(t, 0, "the connection broke"); }
+    out[3] = hl as tryte;
+    _finished(t, &chs[0], &th[0], &out[4]);
+    if (_send_record(t, 22, &out[0], 4 + hl) < 0) { return _fail(t, 0, "the connection broke"); }
     _set_read(t, &sap[0]);
     _set_write(t, &cap[0]);
     t.done = 1;
@@ -687,16 +803,16 @@ fn _post_handshake(t: *tls) -> int {
     if (type == 24) {                            // KeyUpdate
         if (t.mlen != 5 || t.msg[4] > 1) { return _fail(t, 50, "a malformed KeyUpdate"); }
         if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after a KeyUpdate"); }
-        var next: [32]tryte;
+        var next: [48]tryte;
         var none: [1]tryte;
-        hkdf_expand_label(HASH_SHA256, &t.rsec[0], "traffic upd", &none[0], 0, &next[0], 32);
+        hkdf_expand_label(t.hid, &t.rsec[0], "traffic upd", &none[0], 0, &next[0], t.hlen);
         _set_read(t, &next[0]);
         if (t.msg[4] == 1) {
             // update_requested: answer with ours, then change our keys
             var ku: [5]tryte;
             ku[0] = 24; ku[1] = 0; ku[2] = 0; ku[3] = 1; ku[4] = 0;
             if (_send_record(t, 22, &ku[0], 5) < 0) { return _fail(t, 0, "the connection broke"); }
-            hkdf_expand_label(HASH_SHA256, &t.wsec[0], "traffic upd", &none[0], 0, &next[0], 32);
+            hkdf_expand_label(t.hid, &t.wsec[0], "traffic upd", &none[0], 0, &next[0], t.hlen);
             _set_write(t, &next[0]);
         }
         return 0;
@@ -753,5 +869,19 @@ fn tls_signature_name(scheme: int) -> *char {
     if (scheme == 2053) { return "rsa_pss_rsae_sha384"; }
     if (scheme == 2054) { return "rsa_pss_rsae_sha512"; }
     if (scheme == 2055) { return "ed25519"; }
+    return "?";
+}
+
+fn tls_suite_name(suite: int) -> *char {
+    if (suite == TLS_CHACHA20_POLY1305_SHA256) { return "TLS_CHACHA20_POLY1305_SHA256"; }
+    if (suite == TLS_AES_128_GCM_SHA256) { return "TLS_AES_128_GCM_SHA256"; }
+    if (suite == TLS_AES_256_GCM_SHA384) { return "TLS_AES_256_GCM_SHA384"; }
+    return "?";
+}
+
+fn tls_group_name(group: int) -> *char {
+    if (group == TLS_X25519) { return "x25519"; }
+    if (group == TLS_SECP256R1) { return "secp256r1"; }
+    if (group == TLS_SECP384R1) { return "secp384r1"; }
     return "?";
 }

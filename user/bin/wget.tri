@@ -171,7 +171,9 @@ fn main(argc: int, argv: **char) -> int {
             say("WARNING: the certificate of ", &host[0]);
             say(" was not checked.\n", "");
         }
-        say("TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, ", tls_signature_name(tl.sigscheme));
+        say("TLS 1.3, ", tls_suite_name(tl.suite));
+        say(", ", tls_group_name(tl.group));
+        say(", ", tls_signature_name(tl.sigscheme));
         say("\n", "");
     }
     // the request (ASCII: the path's own characters must be octets too)

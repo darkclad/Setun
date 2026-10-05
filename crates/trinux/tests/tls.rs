@@ -234,7 +234,7 @@ fn wget_fetches_over_tls() {
     let p = srv.port;
     let o = wget(&mut s, &format!("{CA} -O - https://web.test:{p}/hello.txt"));
     has(&o, &[
-        "Connecting to web.test (203.0.113.8)... connected.\nTLS 1.3, TLS_CHACHA20_POLY1305_SHA256, ecdsa_secp256r1_sha256\n",
+        "Connecting to web.test (203.0.113.8)... connected.\nTLS 1.3, TLS_CHACHA20_POLY1305_SHA256, x25519, ecdsa_secp256r1_sha256\n",
         "HTTP request sent, awaiting response... 200 ok\n",
         "привет по TLS\n",
         "status 0",
@@ -254,8 +254,34 @@ fn wget_tls_with_each_kind_of_server_key() {
     for (name, scheme) in [("rsa", "rsa_pss_rsae_sha"), ("ed", "ed25519"), ("p384", "ecdsa_secp384r1_sha384")] {
         let srv = tls_server(name, &[]);
         let o = wget(&mut s, &format!("{CA} -O - https://{name}.test:{}/hello.txt", srv.port));
-        has(&o, &[&format!("TLS_CHACHA20_POLY1305_SHA256, {scheme}"), "привет по TLS\n", "status 0"]);
+        has(&o, &[&format!("TLS_CHACHA20_POLY1305_SHA256, x25519, {scheme}"), "привет по TLS\n", "status 0"]);
     }
+}
+
+#[test]
+fn wget_tls_with_aes_gcm_and_other_groups() {
+    if !have_openssl() {
+        return;
+    }
+    let mut s = tls_session();
+    // a server that will not use ChaCha20 or X25519 gets AES-GCM, and its
+    // group after a HelloRetryRequest
+    for (opts, line) in [
+        (&["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"][..], "TLS_AES_128_GCM_SHA256, x25519, ecdsa_secp256r1_sha256"),
+        (&["-tls1_3", "-ciphersuites", "TLS_AES_256_GCM_SHA384"][..], "TLS_AES_256_GCM_SHA384, x25519, ecdsa_secp256r1_sha256"),
+        (&["-tls1_3", "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-groups", "P-256"][..], "TLS_CHACHA20_POLY1305_SHA256, secp256r1, ecdsa_secp256r1_sha256"),
+        (&["-tls1_3", "-ciphersuites", "TLS_AES_256_GCM_SHA384", "-groups", "P-384"][..], "TLS_AES_256_GCM_SHA384, secp384r1, ecdsa_secp256r1_sha256"),
+        // a stateless server: its HelloRetryRequest carries a cookie to echo
+        (&["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "P-256", "-stateless"][..], "TLS_AES_128_GCM_SHA256, secp256r1, ecdsa_secp256r1_sha256"),
+    ] {
+        let srv = tls_server("web", opts);
+        let o = wget(&mut s, &format!("{CA} -O - https://web.test:{}/hello.txt", srv.port));
+        has(&o, &[&format!("TLS 1.3, {line}\n"), "привет по TLS\n", "status 0"]);
+    }
+    // many records each way through AES-GCM
+    let srv = tls_server("web", &["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"]);
+    let o = wget(&mut s, &format!("{CA} -q -O /tmp/big https://web.test:{}/big; wc -l /tmp/big; tail -n 1 /tmp/big", srv.port));
+    has(&o, &["20000 /tmp/big\n20000\nstatus 0"]);
 }
 
 #[test]
@@ -285,10 +311,13 @@ fn wget_tls_with_servers_it_cannot_agree_with() {
         return;
     }
     let mut s = tls_session();
-    // TLS 1.2 only; AES-GCM only
+    // TLS 1.2 only
     let srv = tls_server("web", &["-tls1_2"]);
     has(&wget(&mut s, &format!("{CA} https://web.test:{}/", srv.port)), &["wget: TLS: the server sent an alert: protocol version\nstatus 4"]);
-    let srv = tls_server("web", &["-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256"]);
+    // no suite in common (CCM), no group in common (X448)
+    let srv = tls_server("web", &["-tls1_3", "-ciphersuites", "TLS_AES_128_CCM_SHA256"]);
+    has(&wget(&mut s, &format!("{CA} https://web.test:{}/", srv.port)), &["wget: TLS: the server sent an alert: handshake failure\nstatus 4"]);
+    let srv = tls_server("web", &["-tls1_3", "-groups", "X448"]);
     has(&wget(&mut s, &format!("{CA} https://web.test:{}/", srv.port)), &["wget: TLS: the server sent an alert: handshake failure\nstatus 4"]);
     // a client certificate: asked for (none is sent, fine) and required (refused)
     let srv = tls_server("web", &["-tls1_3", "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-verify", "1"]);
@@ -314,21 +343,23 @@ fn tls_records_changed_on_the_way_are_refused() {
         return;
     }
     let mut s = tls_session();
-    let srv = tls_server("web", &[]);
-    // the last octet of the server's first big segment: inside a protected record
-    let mut done = false;
-    s.net.set_mangle(move |d, f| {
-        if d != setun_net::Dir::ToGuest || done {
-            return;
-        }
-        let Some(r) = setun_net::tcp_payload(f) else { return };
-        if r.len() > 300 {
-            f[r.end - 1] ^= 0x40;
-            setun_net::fix_checksums(f);
-            done = true;
-        }
-    });
-    has(&wget(&mut s, &format!("{CA} https://web.test:{}/hello.txt", srv.port)), &["wget: TLS: bad record MAC\nstatus 4"]);
+    for suite in ["TLS_CHACHA20_POLY1305_SHA256", "TLS_AES_128_GCM_SHA256"] {
+        let srv = tls_server("web", &["-tls1_3", "-ciphersuites", suite]);
+        // the last octet of the server's first big segment: inside a protected record
+        let mut done = false;
+        s.net.set_mangle(move |d, f| {
+            if d != setun_net::Dir::ToGuest || done {
+                return;
+            }
+            let Some(r) = setun_net::tcp_payload(f) else { return };
+            if r.len() > 300 {
+                f[r.end - 1] ^= 0x40;
+                setun_net::fix_checksums(f);
+                done = true;
+            }
+        });
+        has(&wget(&mut s, &format!("{CA} https://web.test:{}/hello.txt", srv.port)), &["wget: TLS: bad record MAC\nstatus 4"]);
+    }
 }
 
 /// Real sites, through the host's network (run by hand: `--ignored`).

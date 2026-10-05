@@ -160,7 +160,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N10 | `scp` and `sftp` clients in Trinux (§12) ✅ | both against Trinux's sshd: Russian text and 2000 lines both ways with equal MD5s, several sources into a directory, missing files on either side, a file as the target of several, local-to-local; an sftp batch with mkdir, put, ls, get, rename, rm, rmdir, a `-` command that may fail, and one that may not |
 | N11 | UDP through the NAT; `clock_settime`; `ntpdate` (§13) ✅ | a host echo server reached as 10.0.2.2 and as an outside address, text both ways, DNS and test ports untouched, the NAT off; ntpdate querying, setting the clock, refused to a user, a wrong originate time, kiss-o'-death, an unknown name, usage |
 | N12 | `scp -r`, `sftp` `put -r`/`get -r` (§12) ✅ | a tree with Russian text, nested and empty directories out and back by `scp -r` and by `sftp`, into an existing directory, refused without `-r`, partly unwritable; the host's `scp -r` into Trinux and back, binary and text identical |
-| N13 | TLS 1.3 for `wget`; X.509 chains and a trust store; `x509` (§14) ✅ | RFC and FIPS vectors, signatures from Python's `cryptography` and forged ones; good chains for each key type and ten kinds of bad one, broken PEM; `wget` against OpenSSL's `s_server` with each key type, and refusals of a wrong name, an unknown CA, an expired certificate, TLS 1.2, AES-only, a required client certificate, a non-TLS server, a changed record |
+| N13 | TLS 1.3 for `wget`; X.509 chains and a trust store; `x509`; then AES-GCM, P-256/P-384 key exchange and HelloRetryRequest (§14) ✅ | RFC and FIPS vectors, signatures from Python's `cryptography` and forged ones; good chains for each key type and ten kinds of bad one, broken PEM; `wget` against OpenSSL's `s_server` with each key type, and refusals of a wrong name, an unknown CA, an expired certificate, TLS 1.2, AES-only, a required client certificate, a non-TLS server, a changed record |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They were first done in software (256×256 tables for XOR and AND).
@@ -499,14 +499,15 @@ verify: ok
 ```
 
 **The client** (`user/lib/tls.tri`) is TLS 1.3 (RFC 8446) and nothing else:
-- one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`, and one group, X25519 (the ChaCha20, Poly1305 and X25519 of §8, with the IETF 96-bit nonce);
+- cipher suites `TLS_CHACHA20_POLY1305_SHA256` (offered first: the fastest here), `TLS_AES_128_GCM_SHA256` and `TLS_AES_256_GCM_SHA384` (SHA-384 key schedule);
+- groups X25519, secp256r1 and secp384r1. The first ClientHello carries only an X25519 key share, so P-256/P-384 key generation (1.5–5 s) is spent only on a server that asks for it with a HelloRetryRequest. Its cookie is echoed, and the transcript restarts from `message_hash` as RFC 8446 §4.4.1 says;
 - the server signs with ECDSA P-256 or P-384, RSA-PSS (SHA-256/384/512) or Ed25519; certificates may also use RSA PKCS #1 v1.5;
 - the ClientHello carries SNI (not for an address), a session id and the compatibility ChangeCipherSpec, as browsers do;
 - after the handshake: NewSessionTicket is ignored (no resumption), KeyUpdate is followed (and answered when asked), close_notify ends the stream;
 - a server that asks for a client certificate gets an empty one;
 - any failure sends the matching alert, and the reason is kept for the caller.
 
-Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, early data, OCSP and revocation. A server that needs one of them is refused with the alert it sends or the reason found.
+Not there: TLS 1.2, AES-CCM, X448 and finite-field groups, resumption, early data, OCSP and revocation. A server that needs one of them is refused with the alert it sends or the reason found.
 
 **Certificates** (`user/lib/x509.tri`):
 - a DER reader (definite lengths, no high tag numbers, the shortest length form);
@@ -514,6 +515,10 @@ Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, 
 - an unknown critical extension fails the chain that uses it, an unknown signature algorithm (SHA-1, say) only where that signature has to be checked, so old roots still load;
 - chains are built from the server's certificate: a trusted root that names and signed the current one ends the walk, otherwise a CA the server sent (it must be a v3 CA with keyCertSign and room in its path length). At most 9 certificates;
 - every certificate on the way must be valid at the time of the check; the leaf must name the host in its subject alternative names (one leftmost wildcard label, never `*.tld`; IPv4 addresses as iPAddress), and allow serverAuth and digitalSignature when it says what it is for. The common name is not used.
+
+**AES** (`user/lib/aes.tri`): AES-128/256 encryption with 32-bit T-tables on the binary instructions, GCM with Shoup's 4-bit GHASH tables (as in mbed TLS). About 1.6 s of emulated time for a full 16 KB record; ChaCha20-Poly1305 is several times faster, which is why it is offered first.
+
+**ECDH** (`user/lib/ecdsa.tri`): key generation and the shared secret on P-256/P-384 by double-and-add. That is not constant-time, which is acceptable only for the one-off ephemeral keys TLS uses.
 
 **Bignums** (`user/lib/bignum.tri`): 16-bit limbs in words, Montgomery multiplication by product scanning (each column of 16-bit products summed whole, a word holds 887 of them, one carry per column), written out in full for 16 and 24 limbs (P-256, P-384), up to 4096 bits. R mod m is R − m for a modulus with its top bit set; R² takes about 64 doublings and a few Montgomery squarings. On top: ECDSA verification on P-256 and P-384 (Jacobian coordinates, Shamir's trick), RSA verification (PKCS #1 v1.5 and PSS), and SHA-384, HMAC and HKDF with TLS's `HKDF-Expand-Label`.
 
@@ -528,4 +533,5 @@ Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, 
 **Tests** (`crates/trinux/tests/tls.rs`; the TLS ones skipped without an `openssl` on the host):
 - `pktest` checks the primitives against RFC 4231, RFC 5869, RFC 8439 and FIPS 180-4, and against signatures made by Python's `cryptography`, including forged and mismatched ones;
 - `x509` checks chains made by Python's `cryptography` (`tests/fixtures/tls`): good ones with each key type, and expired, not yet valid, self-signed, issued by a non-CA, too deep, a changed signature, an unknown critical extension, client-only, an impostor root, the wrong names, broken PEM;
-- `wget` against OpenSSL's `s_server` with each key type; refusals for the wrong host, an unknown CA, an expired certificate, a TLS 1.2 server, an AES-only server, a server that requires a client certificate, a server that is not TLS, and a record changed on the way.
+- `wget` against OpenSSL's `s_server` with each key type, each cipher suite, and P-256/P-384 after a HelloRetryRequest (with a cookie from `-stateless`); refusals for the wrong host, an unknown CA, an expired certificate, a TLS 1.2 server, a CCM-only server, an X448-only server, a server that requires a client certificate, a server that is not TLS, and a record changed on the way under ChaCha20-Poly1305 and under AES-GCM.
+- `pktest` also checks AES-128/256 against FIPS 197, AES-GCM in six shapes against `cryptography` (with changed tags, ciphertexts, associated data and nonces refused), and ECDH on P-256/P-384 both ways, refusing points that are off the curve, short, compressed or out of range.
