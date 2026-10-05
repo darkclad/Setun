@@ -439,7 +439,7 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
 - **Input:** the keyboard (USB HID codes with shift and ctrl) and the serial port, on IRQs 1 and 3. Keys become characters through `keymap.tri` (in the Trine standard library, shared with `trwm`):
   - two layouts, US and Russian ЙЦУКЕН (as on Windows: `ё` on the backquote key, `№;:?` on Shift+3/4/6/7, `.`/`,` on the slash key);
   - **Alt+Shift** switches layout, whichever key is pressed first. Caps Lock flips the case of letters in both layouts, and Ctrl+letter gives the control code of the key's position, so `^C` stays on the same key in Russian;
-  - in the US layout `` ` `` is a **dead key**. `` ` `` then a digit or letter types it overlined (the negated code point, ISA §1.1); `` ` `` then Space, or `` ` `` twice, types `` ` ``; anything else types the backquote and then itself;
+  - **Right Alt (AltGr)** held with a digit or a letter (Latin or Cyrillic) types it overlined (the negated code point, ISA §1.1); with any other key it changes nothing. AltGr wins over a Left Ctrl that comes with it (as Windows sends AltGr). `` ` `` is a plain backquote, as over ssh, where an overlined character arrives as the character followed by U+0305;
   - the console and `trwm` each keep their own layout, and `trwm` shows its layout (`EN`/`RU`) at the right end of the panel. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
 - **Canonical mode:** erase (`^H`, DEL), kill (`^U`), EOF (`^D`), `ICRNL`, echo (control characters as `^X`). A read returns at most one line.
 - **Raw mode:** clear `ICANON` and characters pass straight through.

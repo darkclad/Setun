@@ -354,28 +354,50 @@ fn arrow_keys_edit_the_shell_line() {
     assert!(text.contains(&"oxne".to_string()), "{text:#?}");
 }
 
+impl Session {
+    /// Keys pressed while Right Alt (AltGr) is held, with Left Ctrl too if
+    /// `ctrl` (as Windows sends AltGr).
+    fn altgr(&mut self, codes: &[i64], ctrl: bool) {
+        if ctrl {
+            self.m.dev.key(224, true);
+        }
+        self.m.dev.key(ALTGR, true);
+        for &c in codes {
+            self.m.dev.key(c, true);
+            self.m.dev.key(c, false);
+        }
+        self.m.dev.key(ALTGR, false);
+        if ctrl {
+            self.m.dev.key(224, false);
+        }
+        self.run(1);
+    }
+}
+
+const ALTGR: i64 = 230;
+
 #[test]
-fn the_dead_key_types_overlined_digits() {
+fn altgr_types_overlined_characters() {
     const BACKQUOTE: i64 = 53;
     let mut s = Session::boot();
     s.mark = s.out.len();
     s.type_text("echo '0z"); // quoted: the shell runs `...` as a command
-    s.keys(&[BACKQUOTE, 30]); // ` 1: an overlined 1 (the code point -'1')
+    s.altgr(&[30], false); // AltGr 1: an overlined 1 (the code point -'1')
     s.key(7, true, false); // D
-    s.keys(&[BACKQUOTE, 44]); // ` Space: a plain backquote
-    s.keys(&[BACKQUOTE, BACKQUOTE]); // ` `: a plain backquote too
-    s.keys(&[BACKQUOTE, 55]); // ` .: the backquote, then the dot
-    s.keys(&[BACKQUOTE, 80, 79]); // ` then an arrow: the backquote is dropped (Left, then Right back)
-    s.keys(&[BACKQUOTE, 7]); // ` d: letters work too
+    s.keys(&[BACKQUOTE]); // ` is a plain backquote, typed at once
+    s.altgr(&[7, 55], false); // AltGr d: letters too; AltGr .: just the dot
+    s.altgr(&[4], true); // Ctrl+AltGr a (Windows): an overlined a, not ^A
+    s.keys(&[30]); // AltGr let go: a plain 1
     s.type_text("'\n");
     // the serial port shows an overlined character as itself plus U+0305
-    s.expect("\n0z1\u{305}D```.d\u{305}\n", 60);
-    // in the Russian layout the key is ё, not a dead key
+    s.expect("\n0z1\u{305}D`d\u{305}.a\u{305}1\n", 60);
+    // in the Russian layout: the key is ё, and AltGr overlines Cyrillic letters
     s.switch_layout(ALT);
     s.keys(&[BACKQUOTE]);
+    s.altgr(&[4], false); // the a key: ф
     s.switch_layout(ALT);
     s.type_text(" x\n");
-    s.expect("ё x\n", 60);
+    s.expect("ёф\u{305} x\n", 60);
 }
 
 #[test]

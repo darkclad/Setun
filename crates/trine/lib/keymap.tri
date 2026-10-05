@@ -3,9 +3,9 @@
 // key first), Caps Lock flips the case of letters, and Ctrl+letter gives a
 // control code by key position in either layout. The arrows, Home, End,
 // Insert, Delete, Page Up and Page Down type VT100 escape sequences instead
-// (km_seq). In the US layout ` is a dead key that overlines the next digit
-// or letter (keymap_dead). Each program that imports this keeps its own
-// keyboard state.
+// (km_seq). Right Alt (AltGr) held with a digit or a letter types it
+// overlined (keymap_overline). Each program that imports this keeps its
+// own keyboard state.
 
 const KM_US: int = 0;
 const KM_RU: int = 1;
@@ -15,9 +15,8 @@ var km_ctrl: int;
 var km_alt: int;
 var km_caps: int;
 var km_layout: int;
+var km_altgr: int;                    // Right Alt, held: overline
 var km_seq: *char;                    // the sequence the last key typed, if any
-var km_dead: int;                     // the overline dead key (`) is waiting
-var km_seqbuf: [3]char;
 
 fn keymap_set_layout(l: int) { km_layout = l == KM_RU ? KM_RU : KM_US; }
 
@@ -116,32 +115,29 @@ fn keymap_event(ev: int) -> int {
     if (code == 226 || code == 230) {                   // Alt
         if (down && !km_alt && km_shift) { km_layout = 1 - km_layout; }
         km_alt = down;
+        if (code == 230) { km_altgr = down; }
         return 0;
     }
     if (code == 224 || code == 228) { km_ctrl = down; return 0; }
     if (!down) { return 0; }
     if (code == 57) { km_caps = !km_caps; return 0; }  // Caps Lock
     km_seq = keymap_sequence(code);
-    var c: int = keymap_char(code);
-    if (km_dead) {
-        km_dead = 0;
-        if (c == 0) { return 0; }                       // an arrow or the like: the backquote is dropped
-        return keymap_dead(c);
+    if (km_altgr) {
+        // (AltGr may come with a Left Ctrl of its own, as on Windows)
+        var ctrl: int = km_ctrl;
+        km_ctrl = 0;
+        var o: int = keymap_overline(keymap_char(code));
+        km_ctrl = ctrl;
+        return o;
     }
-    if (c == '`' && km_layout == KM_US) { km_dead = 1; return 0; }
-    return c;
+    return keymap_char(code);
 }
 
-// The overline dead key: ` then a digit or a letter types it overlined,
-// which the machine's character set writes as the negated code point (a
-// negative base-27 digit). ` then Space, or ` twice, types `; anything
-// else types the backquote and then itself.
-fn keymap_dead(c: int) -> int {
-    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) { return -c; }
-    if (c == ' ' || c == '`') { return '`'; }
-    km_seqbuf[0] = '`';
-    km_seqbuf[1] = c as char;
-    km_seqbuf[2] = 0;
-    km_seq = &km_seqbuf[0];
-    return 0;
+// AltGr with a digit or a letter (Latin or Cyrillic) types it overlined,
+// which the machine's character set writes as the negated code point (for
+// a digit, a negative base-27 digit). Other keys type as without it.
+fn keymap_overline(c: int) -> int {
+    var letter: int = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= 'Ё' && c <= 'ё');
+    if ((c >= '0' && c <= '9') || letter) { return -c; }
+    return c;
 }

@@ -24,7 +24,8 @@ How Setun-11̅ numbers are written: in source code, on the screen, in dumps and 
 | Inside the machine | the **negated code point**: overlined `1` is −`'1'` = −49, one tryte |
 | Screen and window system | the glyph one row lower, under a bar |
 | Serial port | converted to and from character + U+0305, both ways |
-| Keyboard (US layout) | the dead key `` ` `` and then the character; `` ` `` Space or `` ` `` `` ` `` types a plain backquote |
+| Keyboard | Right Alt (AltGr) held with the digit or letter |
+| ssh, telnet | the character followed by U+0305, as on the serial port |
 
 Code points −1…−32 (overlined control characters) mean nothing: they show blank, and the serial port sends U+FFFD for them.
 

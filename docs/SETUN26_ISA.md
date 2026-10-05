@@ -90,7 +90,7 @@ A negative digit is the positive one with a bar over it, as on the Setun. Negati
 - **In the machine:** an overlined character is the **negated code point**: overlined `1` is −49, overlined `D` is −68. So an overlined digit is still one tryte, one glyph and one screen cell, and "overline" is the same negation as on the number itself. Only code points below −32 are overlined characters; −1…−32 mean nothing.
   - **Screen:** the glyph moved down one row, under a bar.
   - **Serial port:** the character followed by U+0305, both ways.
-  - **Keyboard:** the dead key `` ` `` (US layout) and then the character.
+  - **Keyboard:** Right Alt (AltGr) held with the character.
 - **Refused in literals:**
   - a bar on `0` (there is no −0), on `T`, on a letter beyond `D`, or on a separator;
   - two bars on one digit, or a bar with no digit before it;
