@@ -1,0 +1,82 @@
+// hmac.tri: HMAC (RFC 2104) and HKDF (RFC 5869) over SHA-256/384/512,
+// with TLS 1.3's HKDF-Expand-Label (RFC 8446 §7.1).
+
+import "sha2.tri";
+
+// out = HMAC(key, m)
+fn hmac(id: int, key: *tryte, klen: int, m: *tryte, mlen: int, out: *tryte) {
+    var b: int = hash_block(id);
+    var k0: [128]tryte;
+    var i: int = 0;
+    while (i < 128) { k0[i] = 0; i += 1; }
+    if (klen > b) { hash_octets(id, key, klen, &k0[0]); }
+    else { i = 0; while (i < klen) { k0[i] = key[i]; i += 1; } }
+    var pad: [128]tryte;
+    i = 0;
+    while (i < b) { pad[i] = xor8(k0[i], 54) as tryte; i += 1; }    // ipad 0x36
+    var h: hash_ctx;
+    hash_init(&h, id);
+    hash_update(&h, &pad[0], b);
+    hash_update(&h, m, mlen);
+    var inner: [64]tryte;
+    hash_final(&h, &inner[0]);
+    i = 0;
+    while (i < b) { pad[i] = xor8(k0[i], 92) as tryte; i += 1; }    // opad 0x5c
+    hash_init(&h, id);
+    hash_update(&h, &pad[0], b);
+    hash_update(&h, &inner[0], hash_len(id));
+    hash_final(&h, out);
+}
+
+fn hkdf_extract(id: int, salt: *tryte, slen: int, ikm: *tryte, ilen: int, prk: *tryte) {
+    var zero: [64]tryte;
+    var i: int = 0;
+    while (i < 64) { zero[i] = 0; i += 1; }
+    if (slen == 0) { hmac(id, &zero[0], hash_len(id), ikm, ilen, prk); }
+    else { hmac(id, salt, slen, ikm, ilen, prk); }
+}
+
+// out = the first len octets of HKDF-Expand(prk, info).
+fn hkdf_expand(id: int, prk: *tryte, info: *tryte, ilen: int, out: *tryte, len: int) {
+    var hl: int = hash_len(id);
+    var t: [64]tryte;
+    var tlen: int = 0;
+    var msg: [400]tryte;
+    var done: int = 0;
+    var ctr: int = 1;
+    while (done < len) {
+        var m: int = 0;
+        var i: int = 0;
+        while (i < tlen) { msg[m] = t[i]; m += 1; i += 1; }
+        i = 0;
+        while (i < ilen) { msg[m] = info[i]; m += 1; i += 1; }
+        msg[m] = ctr as tryte;
+        m += 1;
+        hmac(id, prk, hl, &msg[0], m, &t[0]);
+        tlen = hl;
+        i = 0;
+        while (i < hl && done < len) { out[done] = t[i]; done += 1; i += 1; }
+        ctr += 1;
+    }
+}
+
+// HKDF-Expand-Label(secret, "tls13 " + label, context, len).
+fn hkdf_expand_label(id: int, secret: *tryte, label: *char, ctx: *tryte, clen: int, out: *tryte, len: int) {
+    var info: [300]tryte;
+    var n: int = 0;
+    info[0] = (len / 256) as tryte;
+    info[1] = (len % 256) as tryte;
+    var ll: int = 6 + strlen(label);
+    info[2] = ll as tryte;
+    n = 3;
+    var pre: *char = "tls13 ";
+    var i: int = 0;
+    while (i < 6) { info[n] = pre[i] as tryte; n += 1; i += 1; }
+    i = 0;
+    while (label[i] != 0) { info[n] = label[i] as tryte; n += 1; i += 1; }
+    info[n] = clen as tryte;
+    n += 1;
+    i = 0;
+    while (i < clen) { info[n] = ctx[i]; n += 1; i += 1; }
+    hkdf_expand(id, secret, &info[0], n, out, len);
+}

@@ -349,3 +349,67 @@ fn sha512(p: *tryte, n: int, out: *tryte) {
     sha512_update(&c, p, n);
     sha512_final(&c, out);
 }
+
+// ---- SHA-384: SHA-512 with other initial values, cut to 48 octets ------------------------
+
+var _h384hi: [8]int = { 3418070365, 1654270250, 2438529370, 355462360, 1731405415, 2394180231, 3675008525, 1203062813 };
+var _h384lo: [8]int = { 3238371032, 914150663, 812702999, 4144912697, 4290775857, 1750603025, 1694076839, 3204075428 };
+
+fn sha384_init(c: *sha512_ctx) {
+    sha512_init(c);
+    var k: int = 0;
+    while (k < 8) { c.hi[k] = _h384hi[k]; c.lo[k] = _h384lo[k]; k += 1; }
+}
+
+fn sha384_final(c: *sha512_ctx, out: *tryte) {
+    var full: [64]tryte;
+    sha512_final(c, &full[0]);
+    var k: int = 0;
+    while (k < 48) { out[k] = full[k]; k += 1; }
+}
+
+fn sha384(p: *tryte, n: int, out: *tryte) {
+    var c: sha512_ctx;
+    sha384_init(&c);
+    sha512_update(&c, p, n);
+    sha384_final(&c, out);
+}
+
+// ---- one interface for the three -------------------------------------------------------------
+
+const HASH_SHA256: int = 1;
+const HASH_SHA384: int = 2;
+const HASH_SHA512: int = 3;
+
+fn hash_len(id: int) -> int { return id == HASH_SHA256 ? 32 : id == HASH_SHA384 ? 48 : 64; }
+fn hash_block(id: int) -> int { return id == HASH_SHA256 ? 64 : 128; }
+
+fn hash_octets(id: int, p: *tryte, n: int, out: *tryte) {
+    if (id == HASH_SHA256) { sha256(p, n, out); }
+    else if (id == HASH_SHA384) { sha384(p, n, out); }
+    else { sha512(p, n, out); }
+}
+
+// A running hash of any of the three.
+struct hash_ctx {
+    id: int;
+    s256: sha256_ctx;
+    s512: sha512_ctx;
+}
+
+fn hash_init(h: *hash_ctx, id: int) {
+    h.id = id;
+    if (id == HASH_SHA256) { sha256_init(&h.s256); }
+    else if (id == HASH_SHA384) { sha384_init(&h.s512); }
+    else { sha512_init(&h.s512); }
+}
+
+fn hash_update(h: *hash_ctx, p: *tryte, n: int) {
+    if (h.id == HASH_SHA256) { sha256_update(&h.s256, p, n); } else { sha512_update(&h.s512, p, n); }
+}
+
+fn hash_final(h: *hash_ctx, out: *tryte) {
+    if (h.id == HASH_SHA256) { sha256_final(&h.s256, out); }
+    else if (h.id == HASH_SHA384) { sha384_final(&h.s512, out); }
+    else { sha512_final(&h.s512, out); }
+}

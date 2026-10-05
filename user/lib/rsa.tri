@@ -1,0 +1,129 @@
+// rsa.tri: RSA signature verification (RFC 8017): PKCS #1 v1.5 and PSS
+// (MGF1, salt as long as the hash), with SHA-256/384/512. Moduli up to
+// 4096 bits.
+
+import "bignum.tri";
+import "sha2.tri";
+
+const RSA_PKCS1: int = 1;
+const RSA_PSS: int = 2;
+
+var _rsa_m: mont;
+var _rsa_em: [520]tryte;
+
+// s^e mod n, as k octets (k = the modulus's length): 0, or -1 if s >= n.
+fn _rsa_public(n: *tryte, nlen: int, e: *tryte, elen: int, s: *tryte, slen: int, out: *tryte) -> int {
+    var limbs: int = (nlen + 1) / 2;
+    if (limbs > BN_MAX - 2 || elen > 8) { return -1; }
+    var nn: [260]int;
+    var ss: [260]int;
+    var ee: [4]int;
+    if (!bn_from_octets(&nn[0], limbs, n, nlen) || !bn_from_octets(&ss[0], limbs, s, slen)) { return -1; }
+    if (nn[0] % 2 == 0 || bn_cmp(&ss[0], &nn[0], limbs) >= 0) { return -1; }
+    if (!bn_from_octets(&ee[0], 4, e, elen)) { return -1; }
+    mont_init(&_rsa_m, &nn[0], limbs);
+    var sm: [260]int;
+    mont_to(&_rsa_m, &sm[0], &ss[0]);
+    mont_pow(&_rsa_m, &sm[0], &sm[0], &ee[0], 4);
+    mont_from(&_rsa_m, &ss[0], &sm[0]);
+    bn_to_octets(out, nlen, &ss[0], limbs);
+    return 0;
+}
+
+// The DER DigestInfo prefixes (RFC 8017 §9.2, note 1).
+fn _digest_prefix(id: int, out: *tryte) -> int {
+    var p256: [19]int = { 48, 49, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 1, 5, 0, 4, 32 };
+    var p384: [19]int = { 48, 65, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 2, 5, 0, 4, 48 };
+    var p512: [19]int = { 48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 3, 5, 0, 4, 64 };
+    var src: *int = id == HASH_SHA256 ? &p256[0] : id == HASH_SHA384 ? &p384[0] : &p512[0];
+    var k: int = 0;
+    while (k < 19) { out[k] = src[k] as tryte; k += 1; }
+    return 19;
+}
+
+// mask = MGF1(seed, len) XORed into p.
+fn _mgf1_xor(id: int, seed: *tryte, slen: int, p: *tryte, len: int) {
+    var hl: int = hash_len(id);
+    var buf: [80]tryte;
+    var k: int = 0;
+    while (k < slen) { buf[k] = seed[k]; k += 1; }
+    var ctr: int = 0;
+    var done: int = 0;
+    while (done < len) {
+        buf[slen] = (ctr / 16777216 % 256) as tryte;
+        buf[slen + 1] = (ctr / 65536 % 256) as tryte;
+        buf[slen + 2] = (ctr / 256 % 256) as tryte;
+        buf[slen + 3] = (ctr % 256) as tryte;
+        var h: [64]tryte;
+        hash_octets(id, &buf[0], slen + 4, &h[0]);
+        var i: int = 0;
+        while (i < hl && done < len) {
+            p[done] = xor8(p[done], h[i]) as tryte;
+            done += 1;
+            i += 1;
+        }
+        ctr += 1;
+    }
+}
+
+// 1 if sig is the RSA signature (scheme RSA_PKCS1 or RSA_PSS, hash id)
+// of the message whose hash is h, by the key (n, e).
+fn rsa_verify(scheme: int, id: int, n: *tryte, nlen: int, e: *tryte, elen: int, sig: *tryte, slen: int, h: *tryte) -> int {
+    // the modulus as given may carry a leading zero octet
+    while (nlen > 0 && n[0] == 0) { n = n + 1; nlen -= 1; }
+    if (nlen < 128 || nlen > 512 || slen != nlen) { return 0; }      // 1024..4096 bits
+    var em: *tryte = &_rsa_em[0];
+    if (_rsa_public(n, nlen, e, elen, sig, slen, em) < 0) { return 0; }
+    var hl: int = hash_len(id);
+    if (scheme == RSA_PKCS1) {
+        // 00 01 FF..FF 00 DigestInfo(hash)
+        var di: [19]tryte;
+        var dl: int = _digest_prefix(id, &di[0]);
+        var tlen: int = dl + hl;
+        if (nlen < tlen + 11 || em[0] != 0 || em[1] != 1) { return 0; }
+        var k: int = 2;
+        while (k < nlen - tlen - 1) {
+            if (em[k] != 255) { return 0; }
+            k += 1;
+        }
+        if (em[nlen - tlen - 1] != 0) { return 0; }
+        return octets_equal(em + nlen - tlen, &di[0], dl) && octets_equal(em + nlen - hl, h, hl);
+    }
+    // PSS: EM = maskedDB || H || BC, emBits = modBits - 1
+    var bits: int = 8 * nlen;
+    var top: int = n[0];
+    var lead: int = 0;
+    while (top < 128) { top *= 2; lead += 1; }
+    bits -= lead;
+    var embits: int = bits - 1;
+    var emlen: int = (embits + 7) / 8;
+    var off: int = nlen - emlen;                  // em starts here (a zero octet first if emBits % 8 == 0)
+    if (off == 1 && em[0] != 0) { return 0; }
+    var e2: *tryte = em + off;
+    if (emlen < hl + hl + 2 || e2[emlen - 1] != 188) { return 0; }        // 0xbc
+    var dblen: int = emlen - hl - 1;
+    var hh: *tryte = e2 + dblen;
+    // the top bits beyond emBits must be zero
+    var unused: int = 8 * emlen - embits;
+    var limit: int = 256;
+    var u: int = 0;
+    while (u < unused) { limit = limit / 2; u += 1; }
+    if (e2[0] >= limit) { return 0; }
+    _mgf1_xor(id, hh, hl, e2, dblen);
+    e2[0] = (e2[0] % limit) as tryte;
+    // DB = PS (zeros) || 01 || salt (hl octets)
+    var k: int = 0;
+    while (k < dblen - hl - 1) {
+        if (e2[k] != 0) { return 0; }
+        k += 1;
+    }
+    if (e2[dblen - hl - 1] != 1) { return 0; }
+    var mp: [136]tryte;                            // 8 zeros || mHash || salt
+    k = 0;
+    while (k < 8) { mp[k] = 0; k += 1; }
+    k = 0;
+    while (k < hl) { mp[8 + k] = h[k]; mp[8 + hl + k] = e2[dblen - hl + k]; k += 1; }
+    var h2: [64]tryte;
+    hash_octets(id, &mp[0], 8 + 2 * hl, &h2[0]);
+    return octets_equal(&h2[0], hh, hl);
+}

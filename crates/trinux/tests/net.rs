@@ -495,6 +495,14 @@ fn crypto_test_vectors() {
 }
 
 #[test]
+fn public_key_test_vectors() {
+    let mut s = Session::boot();
+    let o = s.cmd_max("pktest", 200_000_000_000);
+    println!("{o}");
+    assert!(o.contains("pktest: all passed") && !o.contains("FAIL"), "{o}");
+}
+
+#[test]
 fn tcp_bulk_from_the_gateway_into_trinux() {
     let mut s = Session::boot();
     s.cmd("nc -l 2400 < /dev/null > /tmp/in &");

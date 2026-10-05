@@ -16,6 +16,11 @@ fn _qr(a: int, b: int, c: int, d: int) {
 
 // One 64-octet block of key stream: key 32 octets, nonce 8 octets.
 fn chacha20_block(out: *tryte, key: *tryte, nonce: *tryte, counter: int) {
+    _chacha_core(out, key, counter % TWO32, counter / TWO32, le32(nonce), le32(nonce + 4));
+}
+
+// The block function with state words 12..15 given.
+fn _chacha_core(out: *tryte, key: *tryte, w12: int, w13: int, w14: int, w15: int) {
     bin32_init();
     _cs[0] = 1634760805;
     _cs[1] = 857760878;
@@ -23,10 +28,10 @@ fn chacha20_block(out: *tryte, key: *tryte, nonce: *tryte, counter: int) {
     _cs[3] = 1797285236;
     var i: int = 0;
     while (i < 8) { _cs[4 + i] = le32(key + 4 * i); i += 1; }
-    _cs[12] = counter % TWO32;
-    _cs[13] = counter / TWO32;
-    _cs[14] = le32(nonce);
-    _cs[15] = le32(nonce + 4);
+    _cs[12] = w12;
+    _cs[13] = w13;
+    _cs[14] = w14;
+    _cs[15] = w15;
     i = 0;
     while (i < 16) { _cx[i] = _cs[i]; i += 1; }
     i = 0;
@@ -149,4 +154,61 @@ fn poly1305(out: *tryte, m: *tryte, n: int, k: *tryte) {
     _add1305(&h[0], &c[0]);
     j = 0;
     while (j < 16) { out[j] = h[j] as tryte; j += 1; }
+}
+
+// ---- the IETF layout and the AEAD (RFC 8439 §2.8), for TLS ---------------------------------
+
+// A key-stream block with a 32-bit counter and a 96-bit nonce.
+fn chacha20_block_ietf(out: *tryte, key: *tryte, nonce: *tryte, counter: int) {
+    _chacha_core(out, key, counter % TWO32, le32(nonce), le32(nonce + 4), le32(nonce + 8));
+}
+
+fn chacha20_xor_ietf(out: *tryte, in: *tryte, n: int, key: *tryte, nonce: *tryte, counter: int) {
+    var ks: [64]tryte;
+    var k: int = 0;
+    while (k < n) {
+        chacha20_block_ietf(&ks[0], key, nonce, counter);
+        counter += 1;
+        var j: int = 0;
+        while (j < 64 && k < n) {
+            out[k] = xor8(in[k], ks[j]) as tryte;
+            k += 1;
+            j += 1;
+        }
+    }
+}
+
+var _aead_mac: [17000]tryte;
+
+// The Poly1305 tag over aad and ciphertext, padded as §2.8 says.
+fn _aead_tag(tag: *tryte, key: *tryte, nonce: *tryte, aad: *tryte, alen: int, ct: *tryte, clen: int) {
+    var pk: [64]tryte;
+    chacha20_block_ietf(&pk[0], key, nonce, 0);
+    var m: *tryte = &_aead_mac[0];
+    var n: int = 0;
+    var k: int = 0;
+    while (k < alen) { m[n] = aad[k]; n += 1; k += 1; }
+    while (n % 16 != 0) { m[n] = 0; n += 1; }
+    k = 0;
+    while (k < clen) { m[n] = ct[k]; n += 1; k += 1; }
+    while (n % 16 != 0) { m[n] = 0; n += 1; }
+    put_le32(m + n, alen % TWO32); put_le32(m + n + 4, alen / TWO32);
+    put_le32(m + n + 8, clen % TWO32); put_le32(m + n + 12, clen / TWO32);
+    n += 16;
+    poly1305(tag, m, n, &pk[0]);
+}
+
+// Seal n octets in place (at most 16 384 + 256); the 16-octet tag after them.
+fn aead_seal(key: *tryte, nonce: *tryte, aad: *tryte, alen: int, p: *tryte, n: int) {
+    chacha20_xor_ietf(p, p, n, key, nonce, 1);
+    _aead_tag(p + n, key, nonce, aad, alen, p, n);
+}
+
+// Open n octets (the tag follows them) in place: 1 if the tag is right.
+fn aead_open(key: *tryte, nonce: *tryte, aad: *tryte, alen: int, p: *tryte, n: int) -> int {
+    var tag: [16]tryte;
+    _aead_tag(&tag[0], key, nonce, aad, alen, p, n);
+    if (!octets_equal(&tag[0], p + n, 16)) { return 0; }
+    chacha20_xor_ietf(p, p, n, key, nonce, 1);
+    return 1;
 }

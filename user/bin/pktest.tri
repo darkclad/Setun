@@ -1,0 +1,154 @@
+// /bin/pktest: the public-key and TLS crypto against published vectors
+// (RFC 4231, RFC 5869, RFC 8439, FIPS 180-4) and signatures made by
+// another implementation (pkvectors.inc.tri, from Python's cryptography),
+// one line per check with its time.
+
+import "../lib/tlibc.tri";
+import "../lib/ecdsa.tri";
+import "../lib/rsa.tri";
+import "../lib/hmac.tri";
+import "../lib/chacha.tri";
+import "pkvectors.inc.tri";
+
+var failures: int;
+var t0: int;
+
+fn ms() -> int {
+    var ts: timespec;
+    clock_gettime(1, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+fn ok(what: *char, cond: int) {
+    puts("pktest: ");
+    puts(what);
+    puts(cond ? " ok" : " FAILED");
+    puts(" (");
+    put_int(ms() - t0);
+    puts(" ms)\n");
+    if (!cond) { failures += 1; }
+    t0 = ms();
+}
+
+fn hv(c: int) -> int { return c <= '9' ? c - '0' : c - 'a' + 10; }
+
+fn unhex(s: *char, p: *tryte) -> int {
+    var n: int = 0;
+    while (s[2 * n] != 0) {
+        p[n] = (hv(s[2 * n]) * 16 + hv(s[2 * n + 1])) as tryte;
+        n += 1;
+    }
+    return n;
+}
+
+fn is_hex(p: *tryte, s: *char) -> int {
+    var want: [600]tryte;
+    var n: int = unhex(s, &want[0]);
+    return octets_equal(p, &want[0], n);
+}
+
+var a: [600]tryte;
+var b: [600]tryte;
+var c: [600]tryte;
+var d: [600]tryte;
+var out: [600]tryte;
+
+fn ecdsa_case(curve: int, pub: *char, h: *char, r: *char, s: *char) -> int {
+    var pl: int = unhex(pub, &a[0]);
+    var hl: int = unhex(h, &b[0]);
+    var rl: int = unhex(r, &c[0]);
+    var sl: int = unhex(s, &d[0]);
+    return ecdsa_verify(curve, &a[0], pl, &b[0], hl, &c[0], rl, &d[0], sl);
+}
+
+var e65537: [3]tryte;
+
+fn rsa_case(scheme: int, id: int, n: *char, sig: *char, h: *char) -> int {
+    var nl: int = unhex(n, &a[0]);
+    var sl: int = unhex(sig, &b[0]);
+    unhex(h, &c[0]);
+    return rsa_verify(scheme, id, &a[0], nl, &e65537[0], 3, &b[0], sl, &c[0]);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    t0 = ms();
+    e65537[0] = 1; e65537[1] = 0; e65537[2] = 1;
+    bin32_init();
+    var n: int = 0;
+    a[0] = 'a'; a[1] = 'b'; a[2] = 'c';
+    sha384(&a[0], 3, &out[0]);
+    ok("SHA-384 abc", is_hex(&out[0], "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"));
+    // RFC 4231 test 1
+    var k: int = 0;
+    while (k < 20) { a[k] = 11; k += 1; }
+    var hi: *char = "Hi There";
+    k = 0;
+    while (k < 8) { b[k] = hi[k] as tryte; k += 1; }
+    hmac(HASH_SHA256, &a[0], 20, &b[0], 8, &out[0]);
+    ok("HMAC-SHA256 RFC 4231 1", is_hex(&out[0], "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+    hmac(HASH_SHA384, &a[0], 20, &b[0], 8, &out[0]);
+    ok("HMAC-SHA384 RFC 4231 1", is_hex(&out[0], "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"));
+    // RFC 5869 test 1
+    k = 0;
+    while (k < 22) { a[k] = 11; k += 1; }
+    unhex("000102030405060708090a0b0c", &b[0]);
+    unhex("f0f1f2f3f4f5f6f7f8f9", &c[0]);
+    var prk: [64]tryte;
+    hkdf_extract(HASH_SHA256, &b[0], 13, &a[0], 22, &prk[0]);
+    hkdf_expand(HASH_SHA256, &prk[0], &c[0], 10, &out[0], 42);
+    ok("HKDF RFC 5869 1", is_hex(&prk[0], "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+        && is_hex(&out[0], "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"));
+    // RFC 8439 2.8.2
+    var key: [32]tryte;
+    k = 0;
+    while (k < 32) { key[k] = (128 + k) as tryte; k += 1; }
+    var nonce: [12]tryte;
+    unhex("070000004041424344454647", &nonce[0]);
+    var aad: [12]tryte;
+    unhex("50515253c0c1c2c3c4c5c6c7", &aad[0]);
+    var pt: *char = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    n = strlen(pt);
+    k = 0;
+    while (k < n) { out[k] = pt[k] as tryte; k += 1; }
+    aead_seal(&key[0], &nonce[0], &aad[0], 12, &out[0], n);
+    ok("ChaCha20-Poly1305 seal (RFC 8439 2.8.2)", is_hex(&out[0], V_AEAD_CT));
+    ok("ChaCha20-Poly1305 open", aead_open(&key[0], &nonce[0], &aad[0], 12, &out[0], n) && out[0] == 'L' && out[n - 1] == '.');
+    aead_seal(&key[0], &nonce[0], &aad[0], 12, &out[0], n);
+    out[5] = xor8(out[5], 1) as tryte;
+    ok("ChaCha20-Poly1305 refuses a changed ciphertext", !aead_open(&key[0], &nonce[0], &aad[0], 12, &out[0], n));
+    aead_seal(&key[0], &nonce[0], &aad[0], 12, &out[0], n);
+    aad[0] = 0;
+    ok("ChaCha20-Poly1305 refuses changed associated data", !aead_open(&key[0], &nonce[0], &aad[0], 12, &out[0], n));
+
+    ok("ECDSA P-256 SHA-256", ecdsa_case(CURVE_P256, V_P256_PUB, V_P256_H, V_P256_R, V_P256_S));
+    ok("ECDSA P-384 SHA-384", ecdsa_case(CURVE_P384, V_P384_PUB, V_P384_H, V_P384_R, V_P384_S));
+    ok("ECDSA P-256 with SHA-384 (the hash cut)", ecdsa_case(CURVE_P256, V_P256X_PUB, V_P256X_H, V_P256X_R, V_P256X_S));
+    ok("ECDSA refuses another hash", !ecdsa_case(CURVE_P256, V_P256_PUB, V_H384, V_P256_R, V_P256_S));
+    ok("ECDSA refuses swapped r and s", !ecdsa_case(CURVE_P256, V_P256_PUB, V_P256_H, V_P256_S, V_P256_R));
+    ok("ECDSA refuses the other curve's key", !ecdsa_case(CURVE_P384, V_P256_PUB, V_P256_H, V_P256_R, V_P256_S));
+    // a public key moved off the curve
+    var pl: int = unhex(V_P256_PUB, &a[0]);
+    a[pl - 1] = xor8(a[pl - 1], 1) as tryte;
+    unhex(V_P256_H, &b[0]);
+    unhex(V_P256_R, &c[0]);
+    unhex(V_P256_S, &d[0]);
+    ok("ECDSA refuses a point not on the curve", !ecdsa_verify(CURVE_P256, &a[0], pl, &b[0], 32, &c[0], 32, &d[0], 32));
+    ok("ECDSA refuses r = 0", !ecdsa_case(CURVE_P256, V_P256_PUB, V_P256_H, "00", V_P256_S));
+
+    ok("RSA-2048 PKCS#1 v1.5 SHA-256", rsa_case(RSA_PKCS1, HASH_SHA256, V_R2048_N, V_R2048_PKCS1_256, V_H256));
+    ok("RSA-2048 PSS SHA-256", rsa_case(RSA_PSS, HASH_SHA256, V_R2048_N, V_R2048_PSS_256, V_H256));
+    ok("RSA-2048 PKCS#1 v1.5 SHA-384", rsa_case(RSA_PKCS1, HASH_SHA384, V_R2048_N, V_R2048_PKCS1_384, V_H384));
+    ok("RSA-2048 PSS SHA-384", rsa_case(RSA_PSS, HASH_SHA384, V_R2048_N, V_R2048_PSS_384, V_H384));
+    ok("RSA-4096 PKCS#1 v1.5 SHA-256", rsa_case(RSA_PKCS1, HASH_SHA256, V_R4096_N, V_R4096_PKCS1_256, V_H256));
+    ok("RSA-4096 PSS SHA-384", rsa_case(RSA_PSS, HASH_SHA384, V_R4096_N, V_R4096_PSS_384, V_H384));
+    ok("RSA refuses another hash", !rsa_case(RSA_PKCS1, HASH_SHA256, V_R2048_N, V_R2048_PKCS1_256, V_H384));
+    ok("RSA refuses PKCS#1 read as PSS", !rsa_case(RSA_PSS, HASH_SHA256, V_R2048_N, V_R2048_PKCS1_256, V_H256));
+    ok("RSA refuses another key", !rsa_case(RSA_PKCS1, HASH_SHA256, V_R4096_N, V_R2048_PKCS1_256, V_H256));
+    var nl: int = unhex(V_R2048_N, &a[0]);
+    var sl: int = unhex(V_R2048_PSS_256, &b[0]);
+    b[100] = xor8(b[100], 4) as tryte;
+    unhex(V_H256, &c[0]);
+    ok("RSA refuses a changed signature", !rsa_verify(RSA_PSS, HASH_SHA256, &a[0], nl, &e65537[0], 3, &b[0], sl, &c[0]));
+    puts(failures == 0 ? "pktest: all passed\n" : "pktest: some checks FAILED\n");
+    return failures != 0;
+}
