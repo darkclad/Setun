@@ -35,7 +35,8 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
 
 11. **Networking** ([`NETWORK.md`](NETWORK.md)): the `TNIC` Ethernet card (one octet per tryte), `setun-net` (a user-mode gateway on smoltcp with port forwards, `setun --net`), and in Trinux: ARP, IPv4, ICMP, UDP, TCP (in order, go-back-N retransmission, RFC 6298 timers), BSD sockets with Linux's calls, `/proc/net`; `ifconfig`, `ping`, `nc`, `netstat`, `telnetd`
     - N1–N5 ✅: tested against smoltcp both ways, over a lossy link, through a real host socket, and with hand-made broken packets; `nettest` checks the socket calls and their errors
-    - N6: outbound NAT and DNS; then SSH, which needs a decision about binary operations for SHA-2 and ChaCha20 (NETWORK.md §6)
+    - N6 ✅ SSH: a random-number device (`TRNG`, block 11), `/dev/urandom` and `getrandom`; SHA-256/512, ChaCha20-Poly1305, X25519 and Ed25519 in Trine (binary XOR/AND by table, no ISA change); `sshd` with curve25519-sha256, ssh-ed25519, chacha20-poly1305@openssh.com, strict KEX, password login, pty and exec sessions; tested with the host's OpenSSH (NETWORK.md §8)
+    - N7: outbound NAT and DNS; public-key login for `sshd`; an `ssh` client in Trinux
 
 ## Next: performance
 

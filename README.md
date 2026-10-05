@@ -70,6 +70,7 @@ cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
 cargo run --release -p setun-native -- --console              # no window: this terminal is the console (ssh); Ctrl-] leaves
 cargo run --release -p setun-native -- --console --net 2323:23 # with a network; then `telnet localhost 2323` logs in
+cargo run --release -p setun-native -- --console --net 2222:22 # then `ssh -p 2222 root@localhost` (password root)
 sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
 python -m http.server 8026 --directory web     # then open http://localhost:8026
 ```

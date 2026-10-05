@@ -74,7 +74,7 @@ The emulator stays deterministic: the card only exchanges frames with queues, an
 - **Test connections**: the same thing without a host socket, for deterministic tests: `connect(guest_port)`, `send`, `recv`, `state`.
 - **Loss injection** for tests: drop chosen frames in either direction.
 - Time is the emulator's clock, so a test run is reproducible.
-- Later (N6): outbound connections (NAT to host sockets) and DNS at `10.0.2.3`.
+- Later (N7): outbound connections (NAT to host sockets) and DNS at `10.0.2.3`.
 
 The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`). Then `telnet localhost 2323` reaches Trinux's `telnetd`. The web build has no network yet: `LINK` reads 0.
 
@@ -153,13 +153,13 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N3 | sockets, UDP, raw ICMP; tlibc | a UDP echo through the gateway and on loopback; `bind` conflicts, bad `addrlen`, bad family, privileged ports |
 | N4 | TCP | a guest server with a smoltcp client; a guest client to a host-side listener; loopback; RST on a closed port; retransmission under loss; full buffers and flow control; every close path; malformed segments |
 | N5 | `nc`, `netstat`, `telnetd`; docs | log in through `setun --net` with a real host socket; many sessions at once |
-| N6 | outbound NAT and DNS; then SSH (crypto: see below) | |
+| N6 | SSH: a random-number device, the crypto library, `sshd` (§8) ✅ | RFC test vectors; the host's OpenSSH logs in, runs commands and a pty session, moves 120 KB each way; refusals of other algorithms, wrong passwords, a non-SSH-2 client, an overlong line and a tampered packet |
+| N7 | outbound NAT and DNS | |
 
-**SSH**: an `sshd` needs SHA-2, ChaCha20, X25519 and Ed25519. X25519 and Ed25519's
-field arithmetic are plain modular arithmetic, which a ternary machine does well.
-SHA-2 and ChaCha20 need binary XOR, AND and rotate. They can be done bit by bit
-(md5 does that) or with binary-integer instructions added to the ISA. That
-choice belongs with N6.
+**SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
+rotate. They are done in software, with no change to the ISA (§8): rotates
+and shifts are plain arithmetic, and XOR and AND go through 256×256 tables.
+Binary-integer instructions could still come later, as a speed-up.
 
 ## 7. As built (N1–N5)
 
@@ -234,3 +234,79 @@ telnet localhost 2323          # from another terminal: Trinux's login prompt
   - a link that drops every fourth frame each way;
   - a forward from a real host socket;
   - telnet: two sessions at once, a refused password, Ctrl-C, logout, and a client hang-up.
+  - TCP bulk from the gateway into Trinux: 108 894 octets arrive with the right MD5.
+
+## 8. SSH (N6)
+
+```
+cargo run --release -p setun-native -- --console --net 2222:22
+ssh -p 2222 root@localhost          # password root; or user/user
+```
+
+When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `--disk`, `--console` boots a fresh disk every time, which means a new host key every time, so a client warns about a changed key. Use a disk file (`mkdisk -o trinux.disk`, `--disk trinux.disk`) to keep the key.
+
+### Randomness: the `TRNG` device (ISA §8.2, block 11, port 297)
+
+| Offset | Register |
+|---|---|
+| 0 | `DATA` (read): the next random octet, 0..255 |
+| 1 | `SOURCE` (read-only): +1 seeded from the host's entropy, 0 a fixed seed |
+
+- The octets are a ChaCha20 key stream (RFC 8439 block function) under a 256-bit seed.
+- `setun` seeds it from the operating system: 256 bits through the standard library's randomly keyed hasher, so no extra dependency is needed.
+- Without a seed (in tests, and in the web build) the key is all zeros. A run is then reproducible, and the kernel says at boot that the numbers are not for keys.
+- Trinux exposes the device as `/dev/random`, `/dev/urandom` (1,8 and 1,9) and `getrandom(2)` (278).
+
+### Crypto in Trine (`user/lib/`)
+
+| File | What | Cost (instructions) |
+|---|---|---|
+| `bin32.tri` | 32-bit binary arithmetic: add, shift and rotate are plain arithmetic on words; XOR and AND go through two 256×256 tables made at start-up on the heap | tables: about 1.3 M once |
+| `sha2.tri` | SHA-256; SHA-512 with each 64-bit value as two 32-bit halves | about 50 k per SHA-256 block, 0.2 M per SHA-512 block |
+| `chacha.tri` | ChaCha20 (64-bit counter and nonce, as SSH uses it) and Poly1305 (TweetNaCl's 17 limbs of 8 bits) | about 0.1 M per 64 octets |
+| `c25519.tri` | X25519 and Ed25519 signing, after TweetNaCl | X25519 ≈ 38 M, an Ed25519 signature ≈ 65 M |
+| `base64.tri` | RFC 4648, for public keys and fingerprints | |
+
+- The field elements of 2^255 − 19 are 16 **balanced** limbs of 16 bits. Carries use `divr` (round to nearest), so a limb ends in −2^15..2^15, and every intermediate value stays far inside a 27-trit word:
+  - products under 2^34;
+  - sums of 16 products under 2^38;
+  - carried before the top half is folded down times 38.
+- `/bin/cryptotest` checks the vectors of FIPS 180-4, RFC 7748, RFC 8032 and RFC 8439, plus values from another implementation (Python's `cryptography`).
+
+### `sshd`
+
+| | |
+|---|---|
+| Key exchange | `curve25519-sha256` (also `@libssh.org`), RFC 8731; strict KEX (`kex-strict-s-v00@openssh.com`, the Terrapin fix): sequence numbers restart after NEWKEYS and nothing else may come during the first exchange; re-keying when the client asks |
+| Host key | `ssh-ed25519`, made on first start: `/etc/ssh/ssh_host_ed25519_key` (the 32-octet seed in hex, mode 0600) and `.pub` in OpenSSH's format; the boot log shows its `SHA256:` fingerprint |
+| Cipher | `chacha20-poly1305@openssh.com`. The tag is checked before anything is decrypted; a bad tag ends the connection |
+| Login | `password`, checked against `/etc/shadow` like `login(1)`. Empty passwords are never accepted; an unknown user is refused the same way as a wrong password; after 6 failures the server disconnects |
+| Sessions | one `session` channel per connection; `pty-req`, `shell`, `exec`, `window-change`; the exit code goes back as `exit-status` (or `exit-signal`) |
+| Windows | 3^10 octets in, 3^9 per packet; output waits for the client's window |
+
+- Each connection runs in its own process. The child that runs the shell or command becomes the user (groups, gid, uid), changes to the home directory, and gets `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` and `TERM`. A shell is a login shell (`-sh`) and prints `/etc/motd` first.
+- Text is UTF-8 on the wire. A character followed by U+0305 becomes the overlined (negative) tryte, as on the serial console. On a pty, `\n` goes out as CR LF.
+- Trine has no bounds checks, so every buffer the client can reach has an explicit limit:
+  - packet length ≤ 35 000;
+  - KEXINIT ≤ 4096;
+  - a version line ≤ 255 characters, with at most 20 lines before it;
+  - names and commands bounded by their buffers;
+  - channel data decoded in pieces of 2187 octets.
+- Not yet supported: public-key login; `env`, `subsystem` (sftp) and port forwarding requests, which get `CHANNEL_FAILURE`; and more than one channel per connection.
+
+### What a login costs
+
+- A key exchange takes about 140 M instructions: an X25519 key pair, the shared secret, and an Ed25519 signature.
+- `--console` runs a busy guest as fast as the host allows (about 200–400 MIPS with the JIT), so that is under a second.
+- At the window front end's default 10 MIPS it would be about 14 s.
+
+### Tests (`crates/trinux/tests/ssh.rs`; skipped without an `ssh` on the host, `SETUN_SSH` picks one)
+
+They drive the host's real OpenSSH client (10.2 here) through a port forward, with the password given by `SSH_ASKPASS`. They cover:
+- commands with exit codes, UTF-8 output and the user's identity;
+- a `-tt` interactive session (motd, UTF-8 typed and echoed, CR LF, exit code);
+- 108 894 octets out and 120 000 in, through both windows;
+- `Ciphers`, `KexAlgorithms` and `HostKeyAlgorithms` the server doesn't offer;
+- 7 wrong passwords (disconnected at 6), an unknown user, a missing command (127);
+- an SSH-1.5 client and an overlong line before the version;
+- a packet altered in flight with its TCP checksum fixed up, which SSH's MAC catches.
