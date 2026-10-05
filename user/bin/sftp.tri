@@ -1,7 +1,7 @@
 // sftp [-P PORT] [-i KEY] [-b BATCHFILE] [USER@]HOST: browse and copy
 // files on another machine over SSH. Commands, one per line:
 //
-//   ls [path]   cd path   pwd   get remote [local]   put local [remote]
+//   ls [path]   cd path   pwd   get [-r] remote [local]   put [-r] local [remote]
 //   mkdir path  rmdir path  rm path  rename old new
 //   lcd path    lpwd      lls [path]    help    bye / quit / exit
 //
@@ -37,13 +37,13 @@ fn base_name(p: *char) -> *char {
     return b == null ? p : &b[1];
 }
 
-// The words of a line (at most 3), in place.
-var words: [3]*char;
+// The words of a line (at most 4), in place.
+var words: [4]*char;
 
 fn split(s: *char) -> int {
     var n: int = 0;
     var k: int = 0;
-    while (s[k] != 0 && n < 3) {
+    while (s[k] != 0 && n < 4) {
         while (s[k] == ' ' || s[k] == '\t') { k += 1; }
         if (s[k] == 0) { break; }
         words[n] = &s[k];
@@ -72,7 +72,7 @@ fn command(s: *char) -> int {
     var b: [500]char;
     if (streq(w, "bye") || streq(w, "quit") || streq(w, "exit")) { return 2; }
     if (streq(w, "help") || streq(w, "?")) {
-        print_line("ls [path]  cd path  pwd  get remote [local]  put local [remote]");
+        print_line("ls [path]  cd path  pwd  get [-r] remote [local]  put [-r] local [remote]");
         print_line("mkdir path  rmdir path  rm path  rename old new  lcd path  lpwd  lls [path]  bye");
         return 0;
     }
@@ -114,6 +114,19 @@ fn command(s: *char) -> int {
         var st: int = 0;
         waitpid(pid, &st, 0);
         return 0;
+    }
+    if ((streq(w, "get") || streq(w, "put")) && n > 1 && streq(words[1], "-r")) {
+        // get -r remote [local], put -r local [remote]
+        var src: *char = n > 2 ? words[2] : ".";
+        tree_errors = 0;
+        if (streq(w, "get")) {
+            remote_path(src, &a[0]);
+            sftp_get_tree(&a[0], n > 3 ? words[3] : base_name(src), 0);
+        } else {
+            remote_path(n > 3 ? words[3] : base_name(src), &a[0]);
+            sftp_put_tree(src, &a[0], 0);
+        }
+        return tree_errors > 0;
     }
     if (streq(w, "get")) {
         if (n < 2) { return report("get", -SFX_FAILURE); }

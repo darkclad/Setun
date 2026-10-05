@@ -73,3 +73,44 @@ fn sftp_in_batch() {
     has(&o, &["Couldn't delete file: No such file or directory\nstatus 1"]);
     assert!(!o.contains("Remote working directory"), "it stopped: {o}");
 }
+
+const TREE: &str = "mkdir /tmp/tree; mkdir /tmp/tree/sub; mkdir /tmp/tree/sub/deeper; mkdir /tmp/tree/empty; echo 'Сетунь' > /tmp/tree/a.txt; seq 1 500 > /tmp/tree/sub/b; seq 1 2000 > /tmp/tree/sub/deeper/c";
+
+/// The MD5s of a tree's three files, in order.
+fn tree_sums(s: &mut Session, root: &str) -> Vec<String> {
+    let o = s.cmd(&format!("md5sum {root}/a.txt {root}/sub/b {root}/sub/deeper/c"));
+    let v = md5s(&o);
+    assert_eq!(v.len(), 3, "{o}");
+    v
+}
+
+#[test]
+fn scp_r_and_sftp_put_get_r() {
+    let mut s = Session::boot();
+    with_key(&mut s);
+    s.cmd(TREE);
+    let want = tree_sums(&mut s, "/tmp/tree");
+    // without -r a directory is refused
+    let o = s.cmd_max("scp /tmp/tree localhost:/tmp/x; echo status $?", LONG);
+    has(&o, &["scp: /tmp/tree: not a regular file (use -r)\nstatus 1"]);
+    // out to a new name, back to a new name, then into an existing directory
+    let o = s.cmd_max("scp -r /tmp/tree localhost:/tmp/copy; echo status $?", LONG);
+    has(&o, &["/tmp/tree/sub/deeper/c -> /tmp/copy/sub/deeper/c\n", "status 0"]);
+    assert_eq!(tree_sums(&mut s, "/tmp/copy"), want);
+    let o = s.cmd_max("scp -rq localhost:/tmp/copy /tmp/back; echo status $?; cd /tmp/back/empty && echo empty-there; cd /", LONG);
+    has(&o, &["status 0\nempty-there\n"]);
+    assert_eq!(tree_sums(&mut s, "/tmp/back"), want);
+    let o = s.cmd_max("scp -rq /tmp/tree localhost:/tmp/copy; echo status $?", LONG);
+    has(&o, &["status 0"]);
+    assert_eq!(tree_sums(&mut s, "/tmp/copy/tree"), want);
+    // sftp's put -r and get -r
+    s.cmd(&write_lines("/tmp/b", &["put -r /tmp/tree t2", "get -r t2 /tmp/t2back", "bye"]));
+    let o = s.cmd_max("sftp -b /tmp/b localhost; echo status $?", LONG);
+    has(&o, &["sftp> put -r /tmp/tree t2\n", "sftp> get -r t2 /tmp/t2back\n", "status 0"]);
+    assert_eq!(tree_sums(&mut s, "/root/t2"), want);
+    assert_eq!(tree_sums(&mut s, "/tmp/t2back"), want);
+    // a tree with a part that cannot be written: the rest still goes, the status says so
+    s.cmd("mkdir /home/user/.ssh; cp /root/.ssh/id_ed25519 /root/.ssh/authorized_keys /home/user/.ssh/; chown user /home/user/.ssh /home/user/.ssh/id_ed25519 /home/user/.ssh/authorized_keys");
+    let o = s.cmd_max("su user -c 'scp -r -q /tmp/tree localhost:/root/nope'; echo status $?", LONG);
+    has(&o, &["status 1"]);
+}

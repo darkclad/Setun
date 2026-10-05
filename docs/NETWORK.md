@@ -159,6 +159,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N9 | `sftp-server` for the `sftp` subsystem (§11) ✅ | the host's sftp and scp: binary and UTF-8 round trips, renames, removals, refusals |
 | N10 | `scp` and `sftp` clients in Trinux (§12) ✅ | both against Trinux's sshd: Russian text and 2000 lines both ways with equal MD5s, several sources into a directory, missing files on either side, a file as the target of several, local-to-local; an sftp batch with mkdir, put, ls, get, rename, rm, rmdir, a `-` command that may fail, and one that may not |
 | N11 | UDP through the NAT; `clock_settime`; `ntpdate` (§13) ✅ | a host echo server reached as 10.0.2.2 and as an outside address, text both ways, DNS and test ports untouched, the NAT off; ntpdate querying, setting the clock, refused to a user, a wrong originate time, kiss-o'-death, an unknown name, usage |
+| N12 | `scp -r`, `sftp` `put -r`/`get -r` (§12) ✅ | a tree with Russian text, nested and empty directories out and back by `scp -r` and by `sftp`, into an existing directory, refused without `-r`, partly unwritable; the host's `scp -r` into Trinux and back, binary and text identical |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -442,7 +443,14 @@ $ sftp -b commands.txt host                # a failing line ends it with status 
   - a file of characters beyond 255 goes out as UTF-8;
   - UTF-8 that comes in becomes characters again;
   - so a Russian text file arrives as the same trytes it left as.
-- Like OpenSSH's current `scp`, Trinux's uses SFTP rather than the old rcp protocol. It copies files, not whole trees (no `-r`).
+- Like OpenSSH's current `scp`, Trinux's uses SFTP rather than the old rcp protocol.
+- **Whole trees** (N12): `scp -r` and `sftp`'s `put -r`/`get -r` copy directories.
+  - A target that exists as a directory receives the tree inside it; one that doesn't exist becomes the copy.
+  - Empty directories come along.
+  - Up to 27 levels deep and 243 names per directory.
+  - A part that fails is reported and the rest is still copied; the exit status says something failed.
+  - Without `-r`, a directory is refused (`not a regular file (use -r)`).
+  - The host's own `scp -r` works against Trinux's `sftp-server` too: it creates, lists and reads directories through it.
 - Tests: `crates/trinux/tests/scp_client.rs`. Both clients run against Trinux's own `sshd` over loopback, logging in with a key made by Trinux's `ssh-keygen`.
 
 ## 13. UDP out, and the time (N11)

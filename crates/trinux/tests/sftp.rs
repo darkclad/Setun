@@ -109,3 +109,30 @@ fn scp_both_ways_and_refusals() {
     assert_ne!(code, 0);
     assert!(err.contains("ermission denied"), "{err}");
 }
+
+#[test]
+fn the_hosts_scp_r_into_trinux_and_back() {
+    let mut s = Session::boot();
+    let Some(h) = setup(&mut s, "scpr") else { return };
+    let src = h.dir.join("tree");
+    std::fs::create_dir_all(src.join("sub/deeper")).unwrap();
+    std::fs::create_dir_all(src.join("empty")).unwrap();
+    std::fs::write(src.join("a.txt"), "Сетунь: троичная машина\n").unwrap();
+    std::fs::write(src.join("sub/bin.dat"), (0..=255u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write(src.join("sub/deeper/n"), (1..=2000).map(|i| format!("{i}\n")).collect::<String>()).unwrap();
+    let scp = |s: &mut Session, args: &[&str]| {
+        let mut c = Command::new("scp");
+        c.current_dir(&h.dir).args(["-r", "-P", &h.port.to_string()]).args(ssh_opts(&h)).args(args);
+        run_host(s, &mut c, None)
+    };
+    let (code, _, err) = scp(&mut s, &["tree", "root@127.0.0.1:/tmp/hosttree"]);
+    assert_eq!(code, 0, "{err}");
+    let o = s.cmd("ls /tmp/hosttree /tmp/hosttree/sub; head -n 1 /tmp/hosttree/a.txt; wc -c /tmp/hosttree/sub/bin.dat");
+    has(&o, &["a.txt\nempty\nsub\n", "Сетунь: троичная машина\n", "256 /tmp/hosttree/sub/bin.dat"]);
+    let (code, _, err) = scp(&mut s, &["root@127.0.0.1:/tmp/hosttree", "back"]);
+    assert_eq!(code, 0, "{err}");
+    for f in ["a.txt", "sub/bin.dat", "sub/deeper/n"] {
+        assert_eq!(std::fs::read(src.join(f)).unwrap(), std::fs::read(h.dir.join("back").join(f)).unwrap(), "{f}");
+    }
+    assert!(h.dir.join("back/empty").is_dir());
+}
