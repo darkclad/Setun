@@ -1,0 +1,135 @@
+// /bin/cryptotest: the crypto library against published test vectors
+// (FIPS 180-4, RFC 7748, RFC 8032, RFC 8439) and values from another
+// implementation, one line per check, with the time each took.
+
+import "../lib/tlibc.tri";
+import "../lib/c25519.tri";
+import "../lib/chacha.tri";
+
+var failures: int;
+var a: [256]tryte;
+var b: [256]tryte;
+var out: [256]tryte;
+
+fn ms() -> int {
+    var ts: timespec;
+    clock_gettime(1, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+var t0: int;
+
+fn ok(what: *char, cond: int) {
+    puts("cryptotest: ");
+    puts(what);
+    puts(cond ? " ok" : " FAILED");
+    puts(" (");
+    put_int(ms() - t0);
+    puts(" ms)\n");
+    if (!cond) { failures += 1; }
+    t0 = ms();
+}
+
+fn hexval(c: int) -> int { return c <= '9' ? c - '0' : c - 'a' + 10; }
+
+// Parse hex into p; the number of octets.
+fn unhex(s: *char, p: *tryte) -> int {
+    var n: int = 0;
+    while (s[2 * n] != 0) {
+        p[n] = (hexval(s[2 * n]) * 16 + hexval(s[2 * n + 1])) as tryte;
+        n += 1;
+    }
+    return n;
+}
+
+fn is_hex(p: *tryte, s: *char) -> int {
+    var want: [256]tryte;
+    var n: int = unhex(s, &want[0]);
+    return octets_equal(p, &want[0], n);
+}
+
+fn text(s: *char, p: *tryte) -> int {
+    var n: int = strlen(s);
+    var k: int = 0;
+    while (k < n) { p[k] = s[k] as tryte; k += 1; }
+    return n;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    t0 = ms();
+    bin32_init();
+    ok("binary tables", xor32(4042322160, 252645135) == 4294967295 && and32(4042322160, 4278255360) == 4026593280
+        && rotr32(1, 1) == 2147483648 && rotl32(2147483648, 1) == 1);
+
+    var n: int = text("abc", &a[0]);
+    sha256(&a[0], n, &out[0]);
+    ok("SHA-256 abc", is_hex(&out[0], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    sha256(&a[0], 0, &out[0]);
+    ok("SHA-256 empty", is_hex(&out[0], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    n = text("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", &a[0]);
+    sha256(&a[0], n, &out[0]);
+    ok("SHA-256 448 bits", is_hex(&out[0], "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+    var k: int = 0;
+    while (k < 200) { b[k] = k as tryte; k += 1; }
+    var c: sha256_ctx;
+    sha256_init(&c);
+    sha256_update(&c, &b[0], 63);
+    sha256_update(&c, &b[63], 137);
+    sha256_final(&c, &out[0]);
+    ok("SHA-256 200 octets in two pieces", is_hex(&out[0], "1901da1c9f699b48f6b2636e65cbf73abf99d0441ef67f5c540a42f7051dec6f"));
+
+    n = text("abc", &a[0]);
+    sha512(&a[0], n, &out[0]);
+    ok("SHA-512 abc", is_hex(&out[0], "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"));
+    sha512(&a[0], 0, &out[0]);
+    ok("SHA-512 empty", is_hex(&out[0], "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"));
+    var c5: sha512_ctx;
+    sha512_init(&c5);
+    sha512_update(&c5, &b[0], 127);
+    sha512_update(&c5, &b[127], 73);
+    sha512_final(&c5, &out[0]);
+    ok("SHA-512 200 octets in two pieces", is_hex(&out[0], "986058e9895e2c2ab8f9e8cbdf801db12a44842a56a91d5a4e87b1fc98b293722c4664142e42c3c551ff898646268cd92b84ed230b8c94bed7798d4f27cd7465"));
+
+    var key: [32]tryte;
+    k = 0;
+    while (k < 32) { key[k] = k as tryte; k += 1; }
+    var nonce: [8]tryte;
+    unhex("0000004a00000000", &nonce[0]);
+    n = text("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.", &a[0]);
+    chacha20_xor(&out[0], &a[0], n, &key[0], &nonce[0], 1);
+    ok("ChaCha20 RFC 8439 2.4.2", n == 114 && is_hex(&out[0], "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"));
+    chacha20_xor(&out[0], &out[0], n, &key[0], &nonce[0], 1);
+    ok("ChaCha20 decrypts in place", octets_equal(&out[0], &a[0], n));
+
+    unhex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b", &key[0]);
+    n = text("Cryptographic Forum Research Group", &a[0]);
+    poly1305(&out[0], &a[0], n, &key[0]);
+    ok("Poly1305 RFC 8439 2.5.2", is_hex(&out[0], "a8061dc1305136c6c22b8baf0c0127a9"));
+
+    unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", &a[0]);
+    x25519_base(&out[0], &a[0]);
+    ok("X25519 public key (RFC 7748 6.1)", is_hex(&out[0], "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"));
+    unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", &b[0]);
+    x25519(&out[0], &a[0], &b[0]);
+    ok("X25519 shared secret (RFC 7748 6.1)", is_hex(&out[0], "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"));
+
+    var sk: [64]tryte;
+    var pk: [32]tryte;
+    unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", &a[0]);
+    ed25519_keypair(&a[0], &sk[0], &pk[0]);
+    ok("Ed25519 public key (RFC 8032 test 1)", is_hex(&pk[0], "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"));
+    ed25519_sign(&out[0], &b[0], 0, &sk[0]);
+    ok("Ed25519 signature, empty message (RFC 8032 test 1)", is_hex(&out[0], "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"));
+    unhex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", &a[0]);
+    ed25519_keypair(&a[0], &sk[0], &pk[0]);
+    b[0] = 114;
+    ed25519_sign(&out[0], &b[0], 1, &sk[0]);
+    ok("Ed25519 signature (RFC 8032 test 2)", is_hex(&out[0], "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"));
+    k = 0;
+    while (k < 200) { b[k] = k as tryte; k += 1; }
+    ed25519_sign(&out[0], &b[0], 200, &sk[0]);
+    ok("Ed25519 signature, 200 octets", is_hex(&out[0], "2a0c455a60437588653c300e8834ca93e40dbe9c5e70ad29254d3c6faef8b6b34f674ae7b23094c69e756246cfb84075a4d6cc4988b53404fa4ea985e3c1ce00"));
+
+    puts(failures == 0 ? "cryptotest: all passed\n" : "cryptotest: some checks FAILED\n");
+    return failures != 0;
+}

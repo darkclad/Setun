@@ -1,0 +1,22 @@
+// base64.tri: RFC 4648 base64 of octets, as text.
+
+// Encode n octets into out (NUL-terminated); pad with '=' unless nopad.
+fn base64_encode(p: *tryte, n: int, out: *char, nopad: int) -> int {
+    var abc: *char = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var b0: int = p[k];
+        var b1: int = k + 1 < n ? p[k + 1] : 0;
+        var b2: int = k + 2 < n ? p[k + 2] : 0;
+        var v: int = (b0 * 256 + b1) * 256 + b2;
+        out[m] = abc[v / 262144];
+        out[m + 1] = abc[v / 4096 % 64];
+        m += 2;
+        if (k + 1 < n) { out[m] = abc[v / 64 % 64]; m += 1; } else if (!nopad) { out[m] = '='; m += 1; }
+        if (k + 2 < n) { out[m] = abc[v % 64]; m += 1; } else if (!nopad) { out[m] = '='; m += 1; }
+        k += 3;
+    }
+    out[m] = 0;
+    return m;
+}

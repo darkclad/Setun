@@ -10,7 +10,7 @@
 //   md5_init(); md5_put_char(c) ...; md5_final(&digest[0]);   16 bytes
 //   md5_hex(s, n, &hex[0]);                                    32 hex digits
 
-const TWO32: int = 4294967296;
+import "u32.tri";
 
 var md5_k: [64]int = {
     3614090360, 3905402710, 606105819, 3250441966, 4118548399, 1200080426, 2821735955, 4249261313,

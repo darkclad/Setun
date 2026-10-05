@@ -1,0 +1,351 @@
+// sha2.tri: SHA-256 and SHA-512 (FIPS 180-4) on octets (one per tryte).
+//
+// SHA-256 works on 32-bit values (bin32.tri). SHA-512's 64-bit values
+// do not fit a 27-trit word, so each is a pair of 32-bit halves.
+
+import "bin32.tri";
+
+var _k256: [64]int = {
+    1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+    2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+    1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+    264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+    113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+    1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+    3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+    1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+    2428436474, 2756734187, 3204031479, 3329325298
+};
+var _h256: [8]int = {
+    1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924,
+    528734635, 1541459225
+};
+var _k512hi: [80]int = {
+    1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+    2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+    1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+    264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+    113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+    1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+    3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+    1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+    2428436474, 2756734187, 3204031479, 3329325298, 3391569614, 3515267271,
+    3940187606, 4118630271, 116418474, 174292421, 289380356, 460393269,
+    685471733, 852142971, 1017036298, 1126000580, 1288033470, 1501505948,
+    1607167915, 1816402316
+};
+var _k512lo: [80]int = {
+    3609767458, 602891725, 3964484399, 2173295548, 4081628472, 3053834265,
+    2937671579, 3664609560, 2734883394, 1164996542, 1323610764, 3590304994,
+    4068182383, 991336113, 633803317, 3479774868, 2666613458, 944711139,
+    2341262773, 2007800933, 1495990901, 1856431235, 3175218132, 2198950837,
+    3999719339, 766784016, 2566594879, 3203337956, 1034457026, 2466948901,
+    3758326383, 168717936, 1188179964, 1546045734, 1522805485, 2643833823,
+    2343527390, 1014477480, 1206759142, 344077627, 1290863460, 3158454273,
+    3505952657, 106217008, 3606008344, 1432725776, 1467031594, 851169720,
+    3100823752, 1363258195, 3750685593, 3785050280, 3318307427, 3812723403,
+    2003034995, 3602036899, 1575990012, 1125592928, 2716904306, 442776044,
+    593698344, 3733110249, 2999351573, 3815920427, 3928383900, 566280711,
+    3454069534, 4000239992, 1914138554, 2731055270, 3203993006, 320620315,
+    587496836, 1086792851, 365543100, 2618297676, 3409855158, 4234509866,
+    987167468, 1246189591
+};
+var _h512hi: [8]int = {
+    1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924,
+    528734635, 1541459225
+};
+var _h512lo: [8]int = {
+    4089235720, 2227873595, 4271175723, 1595750129, 2917565137, 725511199,
+    4215389547, 327033209
+};
+
+// ---- SHA-256 ------------------------------------------------------------------------------
+
+struct sha256_ctx {
+    h: [8]int;
+    total: int;                       // octets so far
+    n: int;                           // octets in buf
+    buf: [64]tryte;
+}
+
+var _w256: [64]int;
+
+fn sha256_init(c: *sha256_ctx) {
+    bin32_init();
+    var k: int = 0;
+    while (k < 8) { c.h[k] = _h256[k]; k += 1; }
+    c.total = 0;
+    c.n = 0;
+}
+
+fn _sha256_block(c: *sha256_ctx, p: *tryte) {
+    var w: *int = &_w256[0];
+    var t: int = 0;
+    while (t < 16) { w[t] = be32(p + 4 * t); t += 1; }
+    while (t < 64) {
+        var x: int = w[t - 15];
+        var y: int = w[t - 2];
+        var s0: int = xor32(xor32(rotr32(x, 7), rotr32(x, 18)), shr32(x, 3));
+        var s1: int = xor32(xor32(rotr32(y, 17), rotr32(y, 19)), shr32(y, 10));
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) % TWO32;
+        t += 1;
+    }
+    var a: int = c.h[0];
+    var b: int = c.h[1];
+    var cc: int = c.h[2];
+    var d: int = c.h[3];
+    var e: int = c.h[4];
+    var f: int = c.h[5];
+    var g: int = c.h[6];
+    var h: int = c.h[7];
+    t = 0;
+    while (t < 64) {
+        var S1: int = xor32(xor32(rotr32(e, 6), rotr32(e, 11)), rotr32(e, 25));
+        var ch: int = and32(e, f) + and32(not32(e), g);            // disjoint bits: + is XOR
+        var t1: int = (h + S1 + ch + _k256[t] + w[t]) % TWO32;
+        var S0: int = xor32(xor32(rotr32(a, 2), rotr32(a, 13)), rotr32(a, 22));
+        var maj: int = and32(a, b) + and32(cc, xor32(a, b));        // likewise
+        var t2: int = (S0 + maj) % TWO32;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + t1) % TWO32;
+        d = cc;
+        cc = b;
+        b = a;
+        a = (t1 + t2) % TWO32;
+        t += 1;
+    }
+    c.h[0] = (c.h[0] + a) % TWO32;
+    c.h[1] = (c.h[1] + b) % TWO32;
+    c.h[2] = (c.h[2] + cc) % TWO32;
+    c.h[3] = (c.h[3] + d) % TWO32;
+    c.h[4] = (c.h[4] + e) % TWO32;
+    c.h[5] = (c.h[5] + f) % TWO32;
+    c.h[6] = (c.h[6] + g) % TWO32;
+    c.h[7] = (c.h[7] + h) % TWO32;
+}
+
+fn sha256_update(c: *sha256_ctx, p: *tryte, n: int) {
+    c.total += n;
+    var k: int = 0;
+    while (k < n) {
+        if (c.n == 0 && n - k >= 64) {
+            _sha256_block(c, p + k);
+            k += 64;
+            continue;
+        }
+        c.buf[c.n] = p[k];
+        c.n += 1;
+        k += 1;
+        if (c.n == 64) {
+            _sha256_block(c, &c.buf[0]);
+            c.n = 0;
+        }
+    }
+}
+
+fn sha256_final(c: *sha256_ctx, out: *tryte) {
+    var bits: int = c.total * 8;
+    var pad: [72]tryte;
+    var m: int = (c.n < 56 ? 56 : 120) - c.n;
+    pad[0] = 128;
+    var k: int = 1;
+    while (k < m) { pad[k] = 0; k += 1; }
+    put_be32(&pad[m], bits / TWO32);
+    put_be32(&pad[m + 4], bits % TWO32);
+    sha256_update(c, &pad[0], m + 8);
+    k = 0;
+    while (k < 8) { put_be32(out + 4 * k, c.h[k]); k += 1; }
+}
+
+fn sha256(p: *tryte, n: int, out: *tryte) {
+    var c: sha256_ctx;
+    sha256_init(&c);
+    sha256_update(&c, p, n);
+    sha256_final(&c, out);
+}
+
+// ---- SHA-512 ------------------------------------------------------------------------------
+
+struct sha512_ctx {
+    hi: [8]int;
+    lo: [8]int;
+    total: int;
+    n: int;
+    buf: [128]tryte;
+}
+
+var _whi: [80]int;
+var _wlo: [80]int;
+
+// The result of a 64-bit operation: (_rh, _rl).
+var _rh: int;
+var _rl: int;
+
+fn _rotr64(hi: int, lo: int, n: int) {
+    if (n >= 32) {
+        var t: int = hi;
+        hi = lo;
+        lo = t;
+        n -= 32;
+    }
+    if (n == 0) { _rh = hi; _rl = lo; return; }
+    var p: int = _pow2[n];
+    var q: int = _pow2[32 - n];
+    _rh = hi / p + lo % p * q;
+    _rl = lo / p + hi % p * q;
+}
+
+fn _shr64(hi: int, lo: int, n: int) {
+    var p: int = _pow2[n];
+    _rh = hi / p;
+    _rl = lo / p + hi % p * _pow2[32 - n];
+}
+
+fn sha512_init(c: *sha512_ctx) {
+    bin32_init();
+    var k: int = 0;
+    while (k < 8) { c.hi[k] = _h512hi[k]; c.lo[k] = _h512lo[k]; k += 1; }
+    c.total = 0;
+    c.n = 0;
+}
+
+fn _sha512_block(c: *sha512_ctx, p: *tryte) {
+    var t: int = 0;
+    while (t < 16) {
+        _whi[t] = be32(p + 8 * t);
+        _wlo[t] = be32(p + 8 * t + 4);
+        t += 1;
+    }
+    while (t < 80) {
+        // s0 = rotr 1 ^ rotr 8 ^ shr 7 of w[t-15]; s1 = rotr 19 ^ rotr 61 ^ shr 6 of w[t-2]
+        var xh: int = _whi[t - 15];
+        var xl: int = _wlo[t - 15];
+        _rotr64(xh, xl, 1);
+        var ah: int = _rh;
+        var al: int = _rl;
+        _rotr64(xh, xl, 8);
+        ah = xor32(ah, _rh);
+        al = xor32(al, _rl);
+        _shr64(xh, xl, 7);
+        var s0h: int = xor32(ah, _rh);
+        var s0l: int = xor32(al, _rl);
+        xh = _whi[t - 2];
+        xl = _wlo[t - 2];
+        _rotr64(xh, xl, 19);
+        ah = _rh;
+        al = _rl;
+        _rotr64(xh, xl, 61);
+        ah = xor32(ah, _rh);
+        al = xor32(al, _rl);
+        _shr64(xh, xl, 6);
+        var s1h: int = xor32(ah, _rh);
+        var s1l: int = xor32(al, _rl);
+        var lo: int = _wlo[t - 16] + s0l + _wlo[t - 7] + s1l;
+        _wlo[t] = lo % TWO32;
+        _whi[t] = (_whi[t - 16] + s0h + _whi[t - 7] + s1h + lo / TWO32) % TWO32;
+        t += 1;
+    }
+    var vh: [8]int;
+    var vl: [8]int;
+    var k: int = 0;
+    while (k < 8) { vh[k] = c.hi[k]; vl[k] = c.lo[k]; k += 1; }
+    t = 0;
+    while (t < 80) {
+        // S1 = rotr 14 ^ rotr 18 ^ rotr 41 of e
+        _rotr64(vh[4], vl[4], 14);
+        var ah: int = _rh;
+        var al: int = _rl;
+        _rotr64(vh[4], vl[4], 18);
+        ah = xor32(ah, _rh);
+        al = xor32(al, _rl);
+        _rotr64(vh[4], vl[4], 41);
+        var S1h: int = xor32(ah, _rh);
+        var S1l: int = xor32(al, _rl);
+        var chh: int = and32(vh[4], vh[5]) + and32(not32(vh[4]), vh[6]);
+        var chl: int = and32(vl[4], vl[5]) + and32(not32(vl[4]), vl[6]);
+        var t1l: int = vl[7] + S1l + chl + _k512lo[t] + _wlo[t];
+        var t1h: int = (vh[7] + S1h + chh + _k512hi[t] + _whi[t] + t1l / TWO32) % TWO32;
+        t1l = t1l % TWO32;
+        // S0 = rotr 28 ^ rotr 34 ^ rotr 39 of a
+        _rotr64(vh[0], vl[0], 28);
+        ah = _rh;
+        al = _rl;
+        _rotr64(vh[0], vl[0], 34);
+        ah = xor32(ah, _rh);
+        al = xor32(al, _rl);
+        _rotr64(vh[0], vl[0], 39);
+        var S0h: int = xor32(ah, _rh);
+        var S0l: int = xor32(al, _rl);
+        var majh: int = and32(vh[0], vh[1]) + and32(vh[2], xor32(vh[0], vh[1]));
+        var majl: int = and32(vl[0], vl[1]) + and32(vl[2], xor32(vl[0], vl[1]));
+        var t2l: int = S0l + majl;
+        var t2h: int = (S0h + majh + t2l / TWO32) % TWO32;
+        t2l = t2l % TWO32;
+        k = 7;
+        while (k > 0) { vh[k] = vh[k - 1]; vl[k] = vl[k - 1]; k -= 1; }
+        var el: int = vl[4] + t1l;                                  // vl[4] now holds the old d
+        vh[4] = (vh[4] + t1h + el / TWO32) % TWO32;
+        vl[4] = el % TWO32;
+        var nl: int = t1l + t2l;
+        vh[0] = (t1h + t2h + nl / TWO32) % TWO32;
+        vl[0] = nl % TWO32;
+        t += 1;
+    }
+    k = 0;
+    while (k < 8) {
+        var l: int = c.lo[k] + vl[k];
+        c.hi[k] = (c.hi[k] + vh[k] + l / TWO32) % TWO32;
+        c.lo[k] = l % TWO32;
+        k += 1;
+    }
+}
+
+fn sha512_update(c: *sha512_ctx, p: *tryte, n: int) {
+    c.total += n;
+    var k: int = 0;
+    while (k < n) {
+        if (c.n == 0 && n - k >= 128) {
+            _sha512_block(c, p + k);
+            k += 128;
+            continue;
+        }
+        c.buf[c.n] = p[k];
+        c.n += 1;
+        k += 1;
+        if (c.n == 128) {
+            _sha512_block(c, &c.buf[0]);
+            c.n = 0;
+        }
+    }
+}
+
+fn sha512_final(c: *sha512_ctx, out: *tryte) {
+    var bits: int = c.total * 8;
+    var pad: [144]tryte;
+    var m: int = (c.n < 112 ? 112 : 240) - c.n;
+    pad[0] = 128;
+    var k: int = 1;
+    while (k < m + 8) { pad[k] = 0; k += 1; }                       // the high 64 bits of the length
+    put_be32(&pad[m + 8], bits / TWO32);
+    put_be32(&pad[m + 12], bits % TWO32);
+    sha512_update(c, &pad[0], m + 16);
+    k = 0;
+    while (k < 8) {
+        put_be32(out + 8 * k, c.hi[k]);
+        put_be32(out + 8 * k + 4, c.lo[k]);
+        k += 1;
+    }
+}
+
+fn sha512(p: *tryte, n: int, out: *tryte) {
+    var c: sha512_ctx;
+    sha512_init(&c);
+    sha512_update(&c, p, n);
+    sha512_final(&c, out);
+}

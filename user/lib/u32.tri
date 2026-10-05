@@ -1,0 +1,3 @@
+// u32.tri: the constant every 32-bit (binary) computation needs.
+
+const TWO32: int = 4294967296;

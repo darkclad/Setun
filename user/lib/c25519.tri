@@ -1,0 +1,452 @@
+// c25519.tri: X25519 (RFC 7748) and Ed25519 signing (RFC 8032), after
+// TweetNaCl's structure (public domain, Bernstein et al.).
+//
+// A field element mod p = 2^255 - 19 is 16 limbs of 16 bits. The limbs are
+// BALANCED: carries use divr (round to nearest), so each limb ends in
+// -2^15 .. 2^15 -- the ternary way to keep numbers small. A product of two
+// sums of limbs is under 2^34; sixteen of them under 2^38; that is carried
+// before the top half is folded down with 2^256 = 38 (mod p), so nothing
+// comes near the word's ±3.8·10^12.
+
+import "sha2.tri";
+
+struct gf {
+    v: [16]int;
+}
+
+var _gf0: gf;
+var _gf1: gf;
+var _121665: gf;
+var _D: gf;
+var _D2: gf;
+var _X: gf;
+var _Y: gf;
+var _c25519_ready: int;
+
+fn _set(o: *gf, limbs: *int) {
+    var i: int = 0;
+    while (i < 16) { o.v[i] = limbs[i]; i += 1; }
+}
+
+fn c25519_init() {
+    if (_c25519_ready) { return; }
+    bin32_init();
+    var i: int = 0;
+    while (i < 16) { _gf0.v[i] = 0; _gf1.v[i] = 0; _121665.v[i] = 0; i += 1; }
+    _gf1.v[0] = 1;
+    _121665.v[0] = 56129;                          // 0xDB41
+    _121665.v[1] = 1;
+    var d: [16]int = { 30883, 4953, 19914, 30187, 55467, 16705, 2637, 112, 59544, 30585, 16505, 36039, 65139, 11119, 27886, 20995 };
+    var d2: [16]int = { 61785, 9906, 39828, 60374, 45398, 33411, 5274, 224, 53552, 61171, 33010, 6542, 64743, 22239, 55772, 9222 };
+    var x: [16]int = { 54554, 36645, 11616, 51542, 42930, 38181, 51040, 26924, 56412, 64982, 57905, 49316, 21502, 52590, 14035, 8553 };
+    var y: [16]int = { 26200, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214 };
+    _set(&_D, &d[0]);
+    _set(&_D2, &d2[0]);
+    _set(&_X, &x[0]);
+    _set(&_Y, &y[0]);
+    _c25519_ready = 1;
+}
+
+fn gf_copy(o: *gf, a: *gf) {
+    var i: int = 0;
+    while (i < 16) { o.v[i] = a.v[i]; i += 1; }
+}
+
+// Balanced carry, once round: limb i keeps -2^15..2^15, the rest moves up;
+// what leaves limb 15 comes back to limb 0 times 38.
+fn gf_carry(o: *gf) {
+    var i: int = 0;
+    while (i < 16) {
+        var c: int = divr(o.v[i], 65536);
+        o.v[i] -= c * 65536;
+        if (i < 15) { o.v[i + 1] += c; } else { o.v[0] += 38 * c; }
+        i += 1;
+    }
+}
+
+fn gf_add(o: *gf, a: *gf, b: *gf) {
+    var i: int = 0;
+    while (i < 16) { o.v[i] = a.v[i] + b.v[i]; i += 1; }
+}
+
+fn gf_sub(o: *gf, a: *gf, b: *gf) {
+    var i: int = 0;
+    while (i < 16) { o.v[i] = a.v[i] - b.v[i]; i += 1; }
+}
+
+var _t: [32]int;
+
+fn gf_mul(o: *gf, a: *gf, b: *gf) {
+    var i: int = 0;
+    while (i < 32) { _t[i] = 0; i += 1; }
+    i = 0;
+    while (i < 16) {
+        var ai: int = a.v[i];
+        var j: int = 0;
+        while (j < 16) {
+            _t[i + j] += ai * b.v[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < 31) {
+        var c: int = divr(_t[i], 65536);
+        _t[i] -= c * 65536;
+        _t[i + 1] += c;
+        i += 1;
+    }
+    i = 0;
+    while (i < 16) {
+        o.v[i] = _t[i] + 38 * _t[i + 16];
+        i += 1;
+    }
+    gf_carry(o);
+    gf_carry(o);
+}
+
+fn gf_sq(o: *gf, a: *gf) { gf_mul(o, a, a); }
+
+// a^(p-2)
+fn gf_inv(o: *gf, a: *gf) {
+    var c: gf;
+    gf_copy(&c, a);
+    var k: int = 253;
+    while (k >= 0) {
+        gf_sq(&c, &c);
+        if (k != 2 && k != 4) { gf_mul(&c, &c, a); }
+        k -= 1;
+    }
+    gf_copy(o, &c);
+}
+
+// Floor division (Trine's / truncates).
+fn _fdiv(a: int, b: int) -> int {
+    var q: int = a / b;
+    if (a % b != 0 && a < 0) { q -= 1; }
+    return q;
+}
+
+// The canonical value (0..p-1) as 32 octets, little-endian.
+fn gf_pack(out: *tryte, n: *gf) {
+    var t: gf;
+    gf_copy(&t, n);
+    gf_carry(&t);
+    gf_carry(&t);
+    // to limbs 0..65535 (floor carries), value below 2^256
+    var round: int = 0;
+    while (round < 3) {
+        var i: int = 0;
+        while (i < 16) {
+            var c: int = _fdiv(t.v[i], 65536);
+            t.v[i] -= c * 65536;
+            if (i < 15) { t.v[i + 1] += c; } else { t.v[0] += 38 * c; }
+            i += 1;
+        }
+        round += 1;
+    }
+    // subtract p while it fits (at most twice)
+    var j: int = 0;
+    while (j < 2) {
+        var m: [16]int;
+        var borrow: int = 0;
+        var i: int = 0;
+        while (i < 16) {
+            var p: int = i == 0 ? 65517 : i == 15 ? 32767 : 65535;
+            var d: int = t.v[i] - p - borrow;
+            borrow = d < 0;
+            m[i] = d + 65536 * borrow;
+            i += 1;
+        }
+        if (!borrow) {
+            i = 0;
+            while (i < 16) { t.v[i] = m[i]; i += 1; }
+        }
+        j += 1;
+    }
+    var i: int = 0;
+    while (i < 16) {
+        out[2 * i] = (t.v[i] % 256) as tryte;
+        out[2 * i + 1] = (t.v[i] / 256) as tryte;
+        i += 1;
+    }
+}
+
+fn gf_unpack(o: *gf, n: *tryte) {
+    var i: int = 0;
+    while (i < 16) {
+        o.v[i] = n[2 * i] + n[2 * i + 1] * 256;
+        i += 1;
+    }
+    o.v[15] = o.v[15] % 32768;
+}
+
+fn gf_parity(a: *gf) -> int {
+    var d: [32]tryte;
+    gf_pack(&d[0], a);
+    return d[0] % 2;
+}
+
+// Swap p and q when b is 1.
+fn gf_cswap(p: *gf, q: *gf, b: int) {
+    if (b == 0) { return; }
+    var i: int = 0;
+    while (i < 16) {
+        var t: int = p.v[i];
+        p.v[i] = q.v[i];
+        q.v[i] = t;
+        i += 1;
+    }
+}
+
+// ---- X25519 --------------------------------------------------------------------------------
+
+// q = n·p on Curve25519 (32 octets each), the Montgomery ladder.
+fn x25519(q: *tryte, n: *tryte, p: *tryte) {
+    c25519_init();
+    var z: [32]tryte;
+    var i: int = 0;
+    while (i < 32) { z[i] = n[i]; i += 1; }
+    z[31] = (z[31] % 64 + 64) as tryte;
+    z[0] = (z[0] - z[0] % 8) as tryte;
+    var x: gf;
+    gf_unpack(&x, p);
+    var a: gf;
+    var b: gf;
+    var c: gf;
+    var d: gf;
+    var e: gf;
+    var f: gf;
+    gf_copy(&b, &x);
+    gf_copy(&a, &_gf1);
+    gf_copy(&c, &_gf0);
+    gf_copy(&d, &_gf1);
+    i = 254;
+    while (i >= 0) {
+        var r: int = z[i / 8] / pow2(i % 8) % 2;
+        gf_cswap(&a, &b, r);
+        gf_cswap(&c, &d, r);
+        gf_add(&e, &a, &c);
+        gf_sub(&a, &a, &c);
+        gf_add(&c, &b, &d);
+        gf_sub(&b, &b, &d);
+        gf_sq(&d, &e);
+        gf_sq(&f, &a);
+        gf_mul(&a, &c, &a);
+        gf_mul(&c, &b, &e);
+        gf_add(&e, &a, &c);
+        gf_sub(&a, &a, &c);
+        gf_sq(&b, &a);
+        gf_sub(&c, &d, &f);
+        gf_mul(&a, &c, &_121665);
+        gf_add(&a, &a, &d);
+        gf_mul(&c, &c, &a);
+        gf_mul(&a, &d, &f);
+        gf_mul(&d, &b, &x);
+        gf_sq(&b, &e);
+        gf_cswap(&a, &b, r);
+        gf_cswap(&c, &d, r);
+        i -= 1;
+    }
+    gf_inv(&c, &c);
+    gf_mul(&a, &a, &c);
+    gf_pack(q, &a);
+}
+
+// q = n·9 (the base point).
+fn x25519_base(q: *tryte, n: *tryte) {
+    var nine: [32]tryte;
+    var i: int = 0;
+    while (i < 32) { nine[i] = 0; i += 1; }
+    nine[0] = 9;
+    x25519(q, n, &nine[0]);
+}
+
+// ---- Ed25519 ------------------------------------------------------------------------------
+
+struct ge {                                    // extended coordinates X, Y, Z, T
+    x: gf;
+    y: gf;
+    z: gf;
+    t: gf;
+}
+
+fn ge_add(p: *ge, q: *ge) {
+    var a: gf;
+    var b: gf;
+    var c: gf;
+    var d: gf;
+    var t: gf;
+    var e: gf;
+    var f: gf;
+    var g: gf;
+    var h: gf;
+    gf_sub(&a, &p.y, &p.x);
+    gf_sub(&t, &q.y, &q.x);
+    gf_mul(&a, &a, &t);
+    gf_add(&b, &p.x, &p.y);
+    gf_add(&t, &q.x, &q.y);
+    gf_mul(&b, &b, &t);
+    gf_mul(&c, &p.t, &q.t);
+    gf_mul(&c, &c, &_D2);
+    gf_mul(&d, &p.z, &q.z);
+    gf_add(&d, &d, &d);
+    gf_sub(&e, &b, &a);
+    gf_sub(&f, &d, &c);
+    gf_add(&g, &d, &c);
+    gf_add(&h, &b, &a);
+    gf_mul(&p.x, &e, &f);
+    gf_mul(&p.y, &h, &g);
+    gf_mul(&p.z, &g, &f);
+    gf_mul(&p.t, &e, &h);
+}
+
+fn ge_cswap(p: *ge, q: *ge, b: int) {
+    gf_cswap(&p.x, &q.x, b);
+    gf_cswap(&p.y, &q.y, b);
+    gf_cswap(&p.z, &q.z, b);
+    gf_cswap(&p.t, &q.t, b);
+}
+
+fn ge_pack(r: *tryte, p: *ge) {
+    var zi: gf;
+    var tx: gf;
+    var ty: gf;
+    gf_inv(&zi, &p.z);
+    gf_mul(&tx, &p.x, &zi);
+    gf_mul(&ty, &p.y, &zi);
+    gf_pack(r, &ty);
+    r[31] = (r[31] + 128 * gf_parity(&tx)) as tryte;
+}
+
+// p = s·q (s: 32 octets)
+fn ge_scalarmult(p: *ge, q: *ge, s: *tryte) {
+    gf_copy(&p.x, &_gf0);
+    gf_copy(&p.y, &_gf1);
+    gf_copy(&p.z, &_gf1);
+    gf_copy(&p.t, &_gf0);
+    var i: int = 255;
+    while (i >= 0) {
+        var b: int = s[i / 8] / pow2(i % 8) % 2;
+        ge_cswap(p, q, b);
+        ge_add(q, p);
+        ge_add(p, p);
+        ge_cswap(p, q, b);
+        i -= 1;
+    }
+}
+
+fn ge_scalarbase(p: *ge, s: *tryte) {
+    var q: ge;
+    gf_copy(&q.x, &_X);
+    gf_copy(&q.y, &_Y);
+    gf_copy(&q.z, &_gf1);
+    gf_mul(&q.t, &_X, &_Y);
+    ge_scalarmult(p, &q, s);
+}
+
+// The group order L, little-endian octets.
+var _L: [32]int = { 237, 211, 245, 92, 26, 99, 18, 88, 214, 156, 247, 162, 222, 249, 222, 20,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16 };
+
+// r = x mod L, x being 64 limbs (octets, or bigger after products).
+fn _modL(r: *tryte, x: *int) {
+    var i: int = 63;
+    while (i >= 32) {
+        var carry: int = 0;
+        var j: int = i - 32;
+        while (j < i - 12) {
+            x[j] += carry - 16 * x[i] * _L[j - (i - 32)];
+            carry = _fdiv(x[j] + 128, 256);
+            x[j] -= carry * 256;
+            j += 1;
+        }
+        x[j] += carry;
+        x[i] = 0;
+        i -= 1;
+    }
+    var carry: int = 0;
+    var j: int = 0;
+    while (j < 32) {
+        x[j] += carry - _fdiv(x[31], 16) * _L[j];
+        carry = _fdiv(x[j], 256);
+        x[j] -= carry * 256;
+        j += 1;
+    }
+    j = 0;
+    while (j < 32) { x[j] -= carry * _L[j]; j += 1; }
+    i = 0;
+    while (i < 32) {
+        var c: int = _fdiv(x[i], 256);
+        x[i + 1] += c;
+        r[i] = (x[i] - c * 256) as tryte;
+        i += 1;
+    }
+}
+
+// r (64 octets) = r mod L, in r[0..31].
+fn _reduce(r: *tryte) {
+    var x: [64]int;
+    var i: int = 0;
+    while (i < 64) { x[i] = r[i]; r[i] = 0; i += 1; }
+    _modL(r, &x[0]);
+}
+
+// The 64-octet secret key (seed || public key) and the public key, from a 32-octet seed.
+fn ed25519_keypair(seed: *tryte, sk: *tryte, pk: *tryte) {
+    c25519_init();
+    var d: [64]tryte;
+    sha512(seed, 32, &d[0]);
+    d[0] = (d[0] - d[0] % 8) as tryte;
+    d[31] = (d[31] % 64 + 64) as tryte;
+    var p: ge;
+    ge_scalarbase(&p, &d[0]);
+    ge_pack(pk, &p);
+    var i: int = 0;
+    while (i < 32) {
+        sk[i] = seed[i];
+        sk[32 + i] = pk[i];
+        i += 1;
+    }
+}
+
+// sig (64 octets) = the Ed25519 signature of m (n octets) with sk (64 octets).
+fn ed25519_sign(sig: *tryte, m: *tryte, n: int, sk: *tryte) {
+    c25519_init();
+    var d: [64]tryte;
+    sha512(sk, 32, &d[0]);
+    d[0] = (d[0] - d[0] % 8) as tryte;
+    d[31] = (d[31] % 64 + 64) as tryte;
+    var r: [64]tryte;
+    var c: sha512_ctx;
+    sha512_init(&c);
+    sha512_update(&c, &d[32], 32);
+    sha512_update(&c, m, n);
+    sha512_final(&c, &r[0]);
+    _reduce(&r[0]);
+    var p: ge;
+    ge_scalarbase(&p, &r[0]);
+    ge_pack(sig, &p);
+    var h: [64]tryte;
+    sha512_init(&c);
+    sha512_update(&c, sig, 32);
+    sha512_update(&c, sk + 32, 32);
+    sha512_update(&c, m, n);
+    sha512_final(&c, &h[0]);
+    _reduce(&h[0]);
+    var x: [64]int;
+    var i: int = 0;
+    while (i < 64) { x[i] = 0; i += 1; }
+    i = 0;
+    while (i < 32) { x[i] = r[i]; i += 1; }
+    i = 0;
+    while (i < 32) {
+        var j: int = 0;
+        while (j < 32) {
+            x[i + j] += h[i] * d[j];
+            j += 1;
+        }
+        i += 1;
+    }
+    _modL(sig + 32, &x[0]);
+}
