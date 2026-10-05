@@ -1,0 +1,543 @@
+// sftpclient.tri: the client's side of SFTP version 3 over an SSH
+// "sftp" subsystem channel, for scp and sftp. One request at a time.
+//
+// After client_connect(): sftp_start(), then the sftp_* calls. They return
+// 0 (or a handle, a count) on success and a negative SFTP status on
+// failure, with the server's message in sftp_msg.
+
+import "sshclient.tri";
+import "octets.tri";
+
+const SFTP_OPEN: int = 3;
+const SFTP_CLOSE: int = 4;
+const SFTP_READ: int = 5;
+const SFTP_WRITE: int = 6;
+const SFTP_STAT: int = 17;
+const SFTP_OPENDIR: int = 11;
+const SFTP_READDIR: int = 12;
+const SFTP_REMOVE: int = 13;
+const SFTP_MKDIR: int = 14;
+const SFTP_RMDIR: int = 15;
+const SFTP_REALPATH: int = 16;
+const SFTP_RENAME: int = 18;
+const SFTP_STATUS: int = 101;
+const SFTP_HANDLE: int = 102;
+const SFTP_DATA: int = 103;
+const SFTP_NAME: int = 104;
+const SFTP_ATTRS: int = 105;
+
+const SFX_EOF: int = 1;
+const SFX_NO_SUCH_FILE: int = 2;
+const SFX_PERMISSION_DENIED: int = 3;
+const SFX_FAILURE: int = 4;
+
+const CH_WINDOW: int = 59049;
+
+var ch: int;                              // the server's channel number
+var ch_rwin: int;
+var ch_rmax: int;
+var ch_lwin: int;
+var rq: [40100]tryte;                     // the request being built (after its length)
+var rq_len: int;
+var rs: [72000]tryte;                     // reply octets received, not yet taken
+var rs_len: int;
+var rp: [40000]tryte;                     // the reply (after its length)
+var rp_len: int;
+var rp_pos: int;
+var rp_bad: int;
+var next_id: int;
+var sftp_msg: [243]char;
+
+// ---- the channel ------------------------------------------------------------------------------
+
+fn sftp_fail(why: *char) {
+    fputs(STDERR_FILENO, ssh_prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, why);
+    fputs(STDERR_FILENO, "\n");
+    _exit(255);
+}
+
+// Wait for the reply to a channel request.
+fn _ch_reply() -> int {
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_CHANNEL_SUCCESS) { return 1; }
+        if (t == SSH_MSG_CHANNEL_FAILURE) { return 0; }
+        if (t == SSH_MSG_CHANNEL_WINDOW_ADJUST) { get_u32(); ch_rwin += get_u32(); continue; }
+        if (t == SSH_MSG_GLOBAL_REQUEST) { continue; }
+        sftp_fail("unexpected message while starting sftp");
+    }
+}
+
+// One message while waiting for data (window changes, data, the end).
+fn _ch_message(t: int) {
+    if (t == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+        get_u32();
+        ch_rwin += get_u32();
+        return;
+    }
+    if (t == SSH_MSG_CHANNEL_DATA || t == SSH_MSG_CHANNEL_EXTENDED_DATA) {
+        get_u32();
+        var ext: int = t == SSH_MSG_CHANNEL_EXTENDED_DATA;
+        if (ext) { get_u32(); }
+        var at: int = 0;
+        var n: int = get_string(&at);
+        if (bad || n > ch_lwin) { sftp_fail("bad data from the server"); }
+        ch_lwin -= n;
+        if (ext) {
+            write(STDERR_FILENO, (&pkt[at]) as *char, n);
+        } else {
+            if (rs_len + n > 72000) { sftp_fail("the server sent too much"); }
+            var k: int = 0;
+            while (k < n) { rs[rs_len + k] = pkt[at + k]; k += 1; }
+            rs_len += n;
+        }
+        if (ch_lwin < CH_WINDOW / 2) {
+            out_start(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+            put_u32(ch);
+            put_u32(CH_WINDOW - ch_lwin);
+            send_packet();
+            ch_lwin = CH_WINDOW;
+        }
+        return;
+    }
+    if (t == SSH_MSG_CHANNEL_EOF || t == SSH_MSG_CHANNEL_CLOSE) { sftp_fail("the server closed the sftp session"); }
+    if (t == SSH_MSG_CHANNEL_REQUEST) {
+        get_u32();
+        var a: int = 0;
+        get_string(&a);
+        if (get_bool()) {
+            out_start(SSH_MSG_CHANNEL_FAILURE);
+            put_u32(ch);
+            send_packet();
+        }
+        return;
+    }
+    if (t == SSH_MSG_GLOBAL_REQUEST) {
+        var a: int = 0;
+        get_string(&a);
+        if (get_bool()) { out_start(SSH_MSG_REQUEST_FAILURE); send_packet(); }
+        return;
+    }
+}
+
+// Open a session channel with the sftp subsystem; then INIT/VERSION.
+fn sftp_start() {
+    out_start(SSH_MSG_CHANNEL_OPEN);
+    put_text("session");
+    put_u32(0);
+    put_u32(CH_WINDOW);
+    put_u32(32768);
+    send_packet();
+    ch_lwin = CH_WINDOW;
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_CHANNEL_OPEN_CONFIRMATION) { break; }
+        if (t == SSH_MSG_CHANNEL_OPEN_FAILURE) { sftp_fail("the server refused a session"); }
+        if (t == SSH_MSG_GLOBAL_REQUEST) { continue; }
+        sftp_fail("unexpected message opening the session");
+    }
+    get_u32();
+    ch = get_u32();
+    ch_rwin = get_u32();
+    ch_rmax = get_u32();
+    if (bad || ch_rmax < 1) { sftp_fail("bad CHANNEL_OPEN_CONFIRMATION"); }
+    if (ch_rmax > 32768) { ch_rmax = 32768; }
+    out_start(SSH_MSG_CHANNEL_REQUEST);
+    put_u32(ch);
+    put_text("subsystem");
+    put_byte(1);
+    put_text("sftp");
+    send_packet();
+    if (!_ch_reply()) { sftp_fail("the server has no sftp subsystem"); }
+    // INIT: version 3
+    rq_len = 0;
+    _rq_byte(1);
+    _rq_u32(3);
+    _send();
+    _receive();
+    if (rp[0] != 2) { sftp_fail("not an sftp server"); }
+}
+
+// ---- requests and replies ---------------------------------------------------------------------
+
+fn _rq_byte(v: int) { rq[rq_len] = v as tryte; rq_len += 1; }
+
+fn _rq_u32(v: int) {
+    rq[rq_len] = (v / 16777216 % 256) as tryte;
+    rq[rq_len + 1] = (v / 65536 % 256) as tryte;
+    rq[rq_len + 2] = (v / 256 % 256) as tryte;
+    rq[rq_len + 3] = (v % 256) as tryte;
+    rq_len += 4;
+}
+
+fn _rq_u64(v: int) {
+    _rq_u32(v / 4294967296);
+    _rq_u32(v % 4294967296);
+}
+
+fn _rq_octets(p: *tryte, n: int) {
+    _rq_u32(n);
+    var k: int = 0;
+    while (k < n) { rq[rq_len + k] = p[k]; k += 1; }
+    rq_len += n;
+}
+
+// A path (text) as a UTF-8 string.
+fn _rq_path(s: *char) {
+    var at: int = rq_len;
+    rq_len += 4;
+    var k: int = 0;
+    while (s[k] != 0) {
+        rq_len += utf8_encode(s[k], &rq[rq_len]);
+        k += 1;
+    }
+    var n: int = rq_len - at - 4;
+    rq[at] = (n / 16777216) as tryte;
+    rq[at + 1] = (n / 65536 % 256) as tryte;
+    rq[at + 2] = (n / 256 % 256) as tryte;
+    rq[at + 3] = (n % 256) as tryte;
+}
+
+// Start a request of this type: its id is next_id.
+fn _rq(type: int) {
+    rq_len = 0;
+    _rq_byte(type);
+    next_id += 1;
+    _rq_u32(next_id);
+}
+
+// Send the request (its length first) as channel data, as the window allows.
+fn _send() {
+    var len: [4]tryte;
+    len[0] = (rq_len / 16777216) as tryte;
+    len[1] = (rq_len / 65536 % 256) as tryte;
+    len[2] = (rq_len / 256 % 256) as tryte;
+    len[3] = (rq_len % 256) as tryte;
+    var sent: int = -4;                       // the length goes first
+    while (sent < rq_len) {
+        while (ch_rwin <= 0) {
+            var t: int = read_packet();
+            _ch_message(t);
+        }
+        var n: int = rq_len - sent;
+        if (n > ch_rwin) { n = ch_rwin; }
+        if (n > ch_rmax) { n = ch_rmax; }
+        out_start(SSH_MSG_CHANNEL_DATA);
+        put_u32(ch);
+        put_u32(n);
+        var k: int = 0;
+        while (k < n) {
+            var i: int = sent + k;
+            put_byte(i < 0 ? len[i + 4] : rq[i]);
+            k += 1;
+        }
+        send_packet();
+        ch_rwin -= n;
+        sent += n;
+    }
+}
+
+// Wait for one whole reply into rp.
+fn _receive() {
+    loop {
+        if (rs_len >= 4) {
+            var n: int = ((rs[0] * 256 + rs[1]) * 256 + rs[2]) * 256 + rs[3];
+            if (n < 1 || n > 40000) { sftp_fail("a broken sftp reply"); }
+            if (rs_len >= 4 + n) {
+                var k: int = 0;
+                while (k < n) { rp[k] = rs[4 + k]; k += 1; }
+                rp_len = n;
+                k = 0;
+                while (4 + n + k < rs_len) { rs[k] = rs[4 + n + k]; k += 1; }
+                rs_len -= 4 + n;
+                rp_pos = 0;
+                rp_bad = 0;
+                return;
+            }
+        }
+        var t: int = read_packet();
+        _ch_message(t);
+    }
+}
+
+fn _rp_byte() -> int {
+    if (rp_pos >= rp_len) { rp_bad = 1; return 0; }
+    rp_pos += 1;
+    return rp[rp_pos - 1];
+}
+
+fn _rp_u32() -> int {
+    if (rp_pos + 4 > rp_len) { rp_bad = 1; return 0; }
+    rp_pos += 4;
+    return ((rp[rp_pos - 4] * 256 + rp[rp_pos - 3]) * 256 + rp[rp_pos - 2]) * 256 + rp[rp_pos - 1];
+}
+
+fn _rp_string(at: *int) -> int {
+    var n: int = _rp_u32();
+    if (rp_bad || n < 0 || rp_pos + n > rp_len) { rp_bad = 1; *at = rp_pos; return 0; }
+    *at = rp_pos;
+    rp_pos += n;
+    return n;
+}
+
+// Send the request and read its reply's type (the id is checked).
+fn _call() -> int {
+    _send();
+    _receive();
+    var type: int = _rp_byte();
+    var id: int = _rp_u32();
+    if (rp_bad || id != next_id) { sftp_fail("an sftp reply out of order"); }
+    sftp_msg[0] = 0;
+    return type;
+}
+
+// A STATUS reply: 0 for OK, else -code with the message kept.
+fn _status() -> int {
+    var code: int = _rp_u32();
+    var at: int = 0;
+    var n: int = _rp_string(&at);
+    var st: utf8_state;
+    st.need = 0;
+    if (n > 242) { n = 242; }
+    var m: int = utf8_to_text(&st, &rp[at], n, &sftp_msg[0]);
+    sftp_msg[m] = 0;
+    return code == 0 ? 0 : -code;
+}
+
+// The reply must be STATUS: its result.
+fn _expect_status(type: int) -> int {
+    if (type != SFTP_STATUS) { sftp_fail("an unexpected sftp reply"); }
+    return _status();
+}
+
+// ---- operations -------------------------------------------------------------------------------
+
+struct sftp_attrs {
+    size: int;
+    mode: int;
+    has_mode: int;
+}
+
+fn _read_attrs(a: *sftp_attrs) {
+    var flags: int = _rp_u32();
+    a.size = 0;
+    a.mode = 0;
+    a.has_mode = 0;
+    if (flags % 2 != 0) { a.size = _rp_u32() * 4294967296 + _rp_u32(); }
+    if (flags / 2 % 2 != 0) { _rp_u32(); _rp_u32(); }
+    if (flags / 4 % 2 != 0) { a.mode = _rp_u32(); a.has_mode = 1; }
+    if (flags / 8 % 2 != 0) { _rp_u32(); _rp_u32(); }
+}
+
+fn sftp_stat(path: *char, a: *sftp_attrs) -> int {
+    _rq(SFTP_STAT);
+    _rq_path(path);
+    var t: int = _call();
+    if (t == SFTP_STATUS) { var r: int = _status(); return r == 0 ? -SFX_FAILURE : r; }
+    if (t != SFTP_ATTRS) { sftp_fail("an unexpected sftp reply"); }
+    _read_attrs(a);
+    return 0;
+}
+
+fn sftp_is_dir(path: *char) -> int {
+    var a: sftp_attrs;
+    return sftp_stat(path, &a) == 0 && a.has_mode && a.mode / 4096 % 16 == 4;
+}
+
+var _handle: [256]tryte;
+var _handle_len: int;
+
+// Open: flags as SFTP's (1 read, 2 write, 8 create, 16 truncate). 0 or -status.
+fn sftp_open(path: *char, pflags: int, mode: int) -> int {
+    _rq(SFTP_OPEN);
+    _rq_path(path);
+    _rq_u32(pflags);
+    _rq_u32(4);                               // attributes: the permissions
+    _rq_u32(mode);
+    var t: int = _call();
+    if (t == SFTP_STATUS) { var r: int = _status(); return r == 0 ? -SFX_FAILURE : r; }
+    if (t != SFTP_HANDLE) { sftp_fail("an unexpected sftp reply"); }
+    var at: int = 0;
+    _handle_len = _rp_string(&at);
+    if (rp_bad || _handle_len > 256) { sftp_fail("a bad handle"); }
+    var k: int = 0;
+    while (k < _handle_len) { _handle[k] = rp[at + k]; k += 1; }
+    return 0;
+}
+
+fn sftp_close() -> int {
+    _rq(SFTP_CLOSE);
+    _rq_octets(&_handle[0], _handle_len);
+    return _expect_status(_call());
+}
+
+// Read up to n octets at off into p: the count, 0 at the end, or -status.
+fn sftp_read(off: int, p: *tryte, n: int) -> int {
+    _rq(SFTP_READ);
+    _rq_octets(&_handle[0], _handle_len);
+    _rq_u64(off);
+    _rq_u32(n);
+    var t: int = _call();
+    if (t == SFTP_STATUS) {
+        var r: int = _status();
+        return r == -SFX_EOF ? 0 : r == 0 ? -SFX_FAILURE : r;
+    }
+    if (t != SFTP_DATA) { sftp_fail("an unexpected sftp reply"); }
+    var at: int = 0;
+    var m: int = _rp_string(&at);
+    if (rp_bad || m > n) { sftp_fail("a bad DATA reply"); }
+    var k: int = 0;
+    while (k < m) { p[k] = rp[at + k]; k += 1; }
+    return m;
+}
+
+fn sftp_write(off: int, p: *tryte, n: int) -> int {
+    _rq(SFTP_WRITE);
+    _rq_octets(&_handle[0], _handle_len);
+    _rq_u64(off);
+    _rq_octets(p, n);
+    return _expect_status(_call());
+}
+
+fn _path_op(type: int, path: *char) -> int {
+    _rq(type);
+    _rq_path(path);
+    if (type == SFTP_MKDIR) { _rq_u32(0); }
+    return _expect_status(_call());
+}
+
+fn sftp_remove(path: *char) -> int { return _path_op(SFTP_REMOVE, path); }
+fn sftp_mkdir(path: *char) -> int { return _path_op(SFTP_MKDIR, path); }
+fn sftp_rmdir(path: *char) -> int { return _path_op(SFTP_RMDIR, path); }
+
+fn sftp_rename(from: *char, to: *char) -> int {
+    _rq(SFTP_RENAME);
+    _rq_path(from);
+    _rq_path(to);
+    return _expect_status(_call());
+}
+
+// The absolute form of path, into out (243).
+fn sftp_realpath(path: *char, out: *char) -> int {
+    _rq(SFTP_REALPATH);
+    _rq_path(path);
+    var t: int = _call();
+    if (t == SFTP_STATUS) { var r: int = _status(); return r == 0 ? -SFX_FAILURE : r; }
+    if (t != SFTP_NAME || _rp_u32() < 1) { sftp_fail("an unexpected sftp reply"); }
+    var at: int = 0;
+    var n: int = _rp_string(&at);
+    var st: utf8_state;
+    st.need = 0;
+    if (n > 242) { n = 242; }
+    var m: int = utf8_to_text(&st, &rp[at], n, out);
+    out[m] = 0;
+    return 0;
+}
+
+// List a directory: for each entry, call each(longname) (the server's ls -l line).
+fn sftp_list(path: *char, each: fn(*char)) -> int {
+    _rq(SFTP_OPENDIR);
+    _rq_path(path);
+    var t: int = _call();
+    if (t == SFTP_STATUS) { var r: int = _status(); return r == 0 ? -SFX_FAILURE : r; }
+    if (t != SFTP_HANDLE) { sftp_fail("an unexpected sftp reply"); }
+    var at: int = 0;
+    _handle_len = _rp_string(&at);
+    var k: int = 0;
+    while (k < _handle_len && k < 256) { _handle[k] = rp[at + k]; k += 1; }
+    loop {
+        _rq(SFTP_READDIR);
+        _rq_octets(&_handle[0], _handle_len);
+        t = _call();
+        if (t == SFTP_STATUS) { break; }
+        if (t != SFTP_NAME) { sftp_fail("an unexpected sftp reply"); }
+        var count: int = _rp_u32();
+        while (count > 0 && !rp_bad) {
+            var na: int = 0;
+            _rp_string(&na);
+            var la: int = 0;
+            var ln: int = _rp_string(&la);
+            var a: sftp_attrs;
+            _read_attrs(&a);
+            var line: [400]char;
+            var st: utf8_state;
+            st.need = 0;
+            if (ln > 399) { ln = 399; }
+            var m: int = utf8_to_text(&st, &rp[la], ln, &line[0]);
+            line[m] = 0;
+            each(&line[0]);
+            count -= 1;
+        }
+    }
+    return sftp_close();
+}
+
+// ---- whole files ---------------------------------------------------------------------------
+
+var _xfer: [16384]tryte;
+
+// Copy a local file to the remote path. 0, or -status / -1000-errno.
+fn sftp_put(local: *char, remote: *char) -> int {
+    var fd: int = open(local, O_RDONLY, 0);
+    if (fd < 0) { return -1000 - errno; }
+    var st: stat_t;
+    fstat(fd, &st);
+    var buf: *tryte;
+    var n: int = slurp(fd, &buf);
+    close(fd);
+    if (n < 0) { return -1000 - errno; }
+    var len: int = 0;
+    var data: *tryte = as_octets(buf, n, &len);
+    var r: int = sftp_open(remote, 2 + 8 + 16, st.st_mode % 4096);
+    if (r < 0) { free(data); return r; }
+    var off: int = 0;
+    while (off < len) {
+        var m: int = len - off > 16384 ? 16384 : len - off;
+        r = sftp_write(off, data + off, m);
+        if (r < 0) { free(data); sftp_close(); return r; }
+        off += m;
+    }
+    free(data);
+    return sftp_close();
+}
+
+// Copy the remote path to a local file (UTF-8 text becomes characters).
+fn sftp_get(remote: *char, local: *char) -> int {
+    var r: int = sftp_open(remote, 1, 0);
+    if (r < 0) { return r; }
+    var cap: int = 19683;
+    var buf: *tryte = malloc(cap);
+    var n: int = 0;
+    loop {
+        if (cap - n < 16384) {
+            if (cap >= MAX_FILE) { free(buf); sftp_close(); errno = EFBIG; return -1000 - EFBIG; }
+            cap *= 3;
+            buf = realloc(buf, cap);
+        }
+        var m: int = sftp_read(n, buf + n, 16384);
+        if (m < 0) { free(buf); sftp_close(); return m; }
+        if (m == 0) { break; }
+        n += m;
+    }
+    sftp_close();
+    var chars: int = utf8_in_place(buf, n);
+    if (chars >= 0) { n = chars; }
+    var fd: int = open(local, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd < 0) { free(buf); return -1000 - errno; }
+    var w: int = write(fd, buf as *char, n);
+    close(fd);
+    free(buf);
+    if (w != n) { return -1000 - errno; }
+    return 0;
+}
+
+// What went wrong, for a message: the server's words, or strerror.
+fn sftp_error(r: int) -> *char {
+    if (r <= -1000) { return strerror(-1000 - r); }
+    if (r == -SFX_NO_SUCH_FILE) { return "No such file or directory"; }
+    if (r == -SFX_PERMISSION_DENIED) { return "Permission denied"; }
+    if (sftp_msg[0] != 0) { return &sftp_msg[0]; }
+    return "Failure";
+}

@@ -157,6 +157,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N7 | outbound TCP through a NAT to host sockets, DNS at 10.0.2.3, a resolver, `host`, `wget` (§9) ✅ | Trinux reaches servers on the host (as 10.0.2.2 and as an outside address), refusals, the NAT turned off; DNS from the host's resolver and fixed names, NXDOMAIN, a server that is not there, an illegal name, FORMERR; `wget` text, 23 893 octets, 404, https, an unknown name |
 | N8 | public-key login for `sshd`; an `ssh` client and `ssh-keygen` in Trinux (§10) ✅ | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file; the client by password and by key, known_hosts learned and a changed key refused, 3 wrong passwords, a refused port, an unknown name, a pty session, `~.` |
 | N9 | `sftp-server` for the `sftp` subsystem (§11) ✅ | the host's sftp and scp: binary and UTF-8 round trips, renames, removals, refusals |
+| N10 | `scp` and `sftp` clients in Trinux (§12) ✅ | both against Trinux's sshd: Russian text and 2000 lines both ways with equal MD5s, several sources into a directory, missing files on either side, a file as the target of several, local-to-local; an sftp batch with mkdir, put, ls, get, rename, rm, rmdir, a `-` command that may fail, and one that may not |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -424,3 +425,21 @@ Errors map from errno: ENOENT/ENOTDIR → `NO_SUCH_FILE`, EACCES/EPERM → `PERM
 - `rename`, `ls -l`, `rm`, `rmdir`;
 - errors: a missing file, a `rename` onto an existing file, `rmdir` of a non-empty directory;
 - `scp` of 3000 lines both ways, a missing remote file, and a user writing to `/root` (`Permission denied`).
+
+## 12. `scp` and `sftp` in Trinux (N10)
+
+```
+$ scp notes.txt user@host:/tmp/            # several sources need a directory as the target
+$ scp -P 2222 host:/etc/motd .
+$ sftp user@host                           # ls cd pwd get put mkdir rmdir rm rename lcd lpwd lls bye
+$ sftp -b commands.txt host                # a failing line ends it with status 1, unless written "-cmd"
+```
+
+- `user/lib/sshclient.tri` is what `ssh`, `scp` and `sftp` share: `client_target("[user@]host")` and `client_connect(identity)` (connect, key exchange, known_hosts, login). `ssh_prog` names the program in messages.
+- `user/lib/sftpclient.tri` opens a session channel with the `sftp` subsystem. It speaks version 3, one request at a time, and keeps the channel windows both ways. `sftp_put` and `sftp_get` move whole files with 16 384-octet requests.
+- `user/lib/octets.tri` holds the trytes-and-octets rules (§11). `sftp-server` and the clients share them, applied in mirror image:
+  - a file of characters beyond 255 goes out as UTF-8;
+  - UTF-8 that comes in becomes characters again;
+  - so a Russian text file arrives as the same trytes it left as.
+- Like OpenSSH's current `scp`, Trinux's uses SFTP rather than the old rcp protocol. It copies files, not whole trees (no `-r`).
+- Tests: `crates/trinux/tests/scp_client.rs`. Both clients run against Trinux's own `sshd` over loopback, logging in with a key made by Trinux's `ssh-keygen`.

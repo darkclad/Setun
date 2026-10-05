@@ -1,0 +1,152 @@
+// scp [-P PORT] [-i KEY] [-q] SOURCE ... TARGET: copy files to or from
+// another machine over SSH, using SFTP the way OpenSSH's scp does now.
+//
+// One side is remote, written [user@]host:path (an empty path is the
+// remote home directory). Several sources need a directory as the target.
+// Text and octets follow lib/octets.tri. Exit status: 0, or 1 if any copy
+// failed (255 if the connection itself did).
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/string.tri";
+import "../lib/getopt.tri";
+import "../lib/sftpclient.tri";
+
+var quiet: int;
+
+// Is s "host:path" (a colon before any slash)? Its path part, or null.
+fn remote_part(s: *char) -> *char {
+    var k: int = 0;
+    while (s[k] != 0 && s[k] != '/') {
+        if (s[k] == ':') { return &s[k + 1]; }
+        k += 1;
+    }
+    return null;
+}
+
+fn base_name(p: *char) -> *char {
+    var b: *char = strrchr(p, '/');
+    return b == null ? p : &b[1];
+}
+
+fn complain(what: *char, why: *char) {
+    fputs(STDERR_FILENO, "scp: ");
+    fputs(STDERR_FILENO, what);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, why);
+    fputs(STDERR_FILENO, "\n");
+}
+
+fn local_is_dir(p: *char) -> int {
+    var st: stat_t;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var identity: [300]char;
+    identity[0] = 0;
+    ssh_prog = "scp";
+    var c: int = getopt(argc, argv, "P:i:q");
+    while (c != -1) {
+        switch (c) {
+            case 'P': { port = atoi(optarg); if (port <= 0 || port > 65535) { c = '?'; } }
+            case 'i': { strncpy(&identity[0], optarg, 290); identity[290] = 0; }
+            case 'q': quiet = 1;
+            default: {}
+        }
+        if (c == '?') {
+            fputs(STDERR_FILENO, "usage: scp [-P port] [-i key] [-q] source ... target\n");
+            return 1;
+        }
+        c = getopt(argc, argv, "P:i:q");
+    }
+    if (argc - optind < 2) {
+        fputs(STDERR_FILENO, "usage: scp [-P port] [-i key] [-q] source ... target\n");
+        return 1;
+    }
+    var target: *char = argv[argc - 1];
+    var tpath: *char = remote_part(target);
+    var upload: int = tpath != null;
+    // every source must be on the other side
+    var i: int = optind;
+    var spec: [300]char;
+    spec[0] = 0;
+    while (i < argc - 1) {
+        var r: *char = remote_part(argv[i]);
+        if (upload == (r != null)) {
+            fputs(STDERR_FILENO, "scp: copies must go between this machine and one other\n");
+            return 1;
+        }
+        if (!upload && spec[0] == 0) {
+            var n: int = 0;
+            while (argv[i][n] != ':') { n += 1; }
+            strncpy(&spec[0], argv[i], n < 290 ? n : 290);
+            spec[n < 290 ? n : 290] = 0;
+        }
+        i += 1;
+    }
+    if (upload) {
+        var n: int = 0;
+        while (target[n] != ':') { n += 1; }
+        strncpy(&spec[0], target, n < 290 ? n : 290);
+        spec[n < 290 ? n : 290] = 0;
+    }
+    client_target(&spec[0]);
+    client_connect(&identity[0]);
+    sftp_start();
+    var failed: int = 0;
+    var many: int = argc - 1 - optind > 1;
+    if (upload) {
+        var dest: [243]char;
+        strncpy(&dest[0], tpath[0] == 0 ? "." : tpath, 240);
+        dest[240] = 0;
+        var into_dir: int = sftp_is_dir(&dest[0]);
+        if (many && !into_dir) { complain(&dest[0], "Not a directory"); return 1; }
+        i = optind;
+        while (i < argc - 1) {
+            var to: [500]char;
+            strcpy(&to[0], &dest[0]);
+            if (into_dir) {
+                if (to[strlen(&to[0]) - 1] != '/') { strcat(&to[0], "/"); }
+                strncat(&to[0], base_name(argv[i]), 200);
+            }
+            var r: int = sftp_put(argv[i], &to[0]);
+            if (r < 0) {
+                complain(r <= -1000 ? argv[i] : &to[0], sftp_error(r));
+                failed = 1;
+            } else if (!quiet) {
+                puts(argv[i]);
+                puts(" -> ");
+                puts(&to[0]);
+                puts("\n");
+            }
+            i += 1;
+        }
+    } else {
+        var into_dir: int = local_is_dir(target);
+        if (many && !into_dir) { complain(target, "Not a directory"); return 1; }
+        i = optind;
+        while (i < argc - 1) {
+            var from: *char = remote_part(argv[i]);
+            if (from[0] == 0) { from = "."; }
+            var to: [500]char;
+            strcpy(&to[0], target);
+            if (into_dir) {
+                if (to[strlen(&to[0]) - 1] != '/') { strcat(&to[0], "/"); }
+                strncat(&to[0], base_name(from), 200);
+            }
+            var r: int = sftp_get(from, &to[0]);
+            if (r < 0) {
+                complain(r <= -1000 ? &to[0] : from, sftp_error(r));
+                failed = 1;
+            } else if (!quiet) {
+                puts(from);
+                puts(" -> ");
+                puts(&to[0]);
+                puts("\n");
+            }
+            i += 1;
+        }
+    }
+    return failed;
+}

@@ -1,0 +1,278 @@
+// sshclient.tri: the client's side of a connection, for ssh, scp and sftp:
+// connect, key exchange, the host key against ~/.ssh/known_hosts, and
+// login (the key ~/.ssh/id_ed25519 or -i, then a password).
+//
+// The caller fills host, port and user (and ssh_prog for messages), then
+// calls client_connect(identity); on any failure it exits with status 255.
+
+import "tlibc.tri";
+import "stdlib.tri";
+import "string.tri";
+import "pwd.tri";
+import "ssh.tri";
+import "sshkey.tri";
+
+var host: [243]char;
+var port: int = 22;
+var user: [81]char;
+var known_path: [300]char;
+var known: [6561]char;
+
+// ---- known hosts ---------------------------------------------------------------------------
+
+// The name a host is filed under: "host", or "[host]:port" off port 22.
+fn host_label(out: *char) {
+    if (port == 22) {
+        strcpy(out, &host[0]);
+        return;
+    }
+    var num: [15]char;
+    strcpy(out, "[");
+    strcat(out, &host[0]);
+    strcat(out, "]:");
+    strcat(out, itoa(port, &num[0]));
+}
+
+// ssh_host_key_ok, for the transport.
+fn check_host_key(blob: *tryte) -> int {
+    var label: [270]char;
+    host_label(&label[0]);
+    var ln: int = strlen(&label[0]);
+    var n: int = 0;
+    var fd: int = open(&known_path[0], O_RDONLY, 0);
+    if (fd >= 0) {
+        n = read(fd, &known[0], 6560);
+        close(fd);
+        if (n < 0) { n = 0; }
+    }
+    known[n] = 0;
+    var k: int = 0;
+    while (k < n) {
+        var e: int = k;
+        while (e < n && known[e] != '\n') { e += 1; }
+        // "label ssh-ed25519 BASE64"
+        if (e - k > ln && strncmp(&known[k], &label[0], ln) == 0 && known[k + ln] == ' ') {
+            var t: int = k + ln + 1;
+            if (strncmp(&known[t], "ssh-ed25519 ", 12) == 0) {
+                var b: int = t + 12;
+                var be: int = b;
+                while (be < e && known[be] != ' ' && known[be] != '\r') { be += 1; }
+                var kb: [64]tryte;
+                var m: int = base64_decode(&known[b], be - b, &kb[0], 64);
+                if (m == 51 && octets_equal(&kb[0], blob, 51)) { return 1; }
+                fputs(STDERR_FILENO, "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
+                fputs(STDERR_FILENO, "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n");
+                fputs(STDERR_FILENO, "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
+                var fp: [64]char;
+                key_fingerprint(blob, 51, &fp[0]);
+                fputs(STDERR_FILENO, "The ED25519 key sent by the remote host is\n");
+                fputs(STDERR_FILENO, &fp[0]);
+                fputs(STDERR_FILENO, ".\nThe key on record is in ");
+                fputs(STDERR_FILENO, &known_path[0]);
+                fputs(STDERR_FILENO, ".\nHost key verification failed.\n");
+                _exit(255);
+            }
+        }
+        k = e + 1;
+    }
+    // a new host: remember it
+    var line: [400]char;
+    strcpy(&line[0], &label[0]);
+    strcat(&line[0], " ssh-ed25519 ");
+    base64_encode(blob, 51, &line[strlen(&line[0])], 0);
+    strcat(&line[0], "\n");
+    fd = open(&known_path[0], O_WRONLY + O_CREAT + O_APPEND, 420);
+    if (fd >= 0) {
+        write(fd, &line[0], strlen(&line[0]));
+        close(fd);
+    }
+    fputs(STDERR_FILENO, "Warning: Permanently added '");
+    fputs(STDERR_FILENO, &label[0]);
+    fputs(STDERR_FILENO, "' (ED25519) to the list of known hosts.\n");
+    return 1;
+}
+
+// ---- authentication ------------------------------------------------------------------------
+
+var sign_buf: [600]tryte;
+
+// Try the key at path; 1 if it got us in.
+fn try_key(path: *char) -> int {
+    var sk: [64]tryte;
+    var pk: [32]tryte;
+    if (key_load(path, &sk[0], &pk[0]) < 0) { return 0; }
+    var blob: [51]tryte;
+    key_blob(&pk[0], &blob[0]);
+    out_start(SSH_MSG_USERAUTH_REQUEST);
+    put_utf8(&user[0]);
+    put_text("ssh-connection");
+    put_text("publickey");
+    put_byte(1);
+    put_text("ssh-ed25519");
+    put_string(&blob[0], 51);
+    // the signature covers the session id and this request so far
+    put_be32(&sign_buf[0], 32);
+    var k: int = 0;
+    while (k < 32) { sign_buf[4 + k] = session_id[k]; k += 1; }
+    k = 0;
+    while (k < out_len) { sign_buf[36 + k] = outp[k]; k += 1; }
+    var sig: [64]tryte;
+    ed25519_sign(&sig[0], &sign_buf[0], 36 + out_len, &sk[0]);
+    put_u32(83);
+    put_text("ssh-ed25519");
+    put_string(&sig[0], 64);
+    send_packet();
+    k = 0;
+    while (k < 64) { sk[k] = 0; k += 1; }
+    var t: int = read_auth_reply();
+    return t == SSH_MSG_USERAUTH_SUCCESS;
+}
+
+// The answer to an authentication request (banners are shown and skipped).
+fn read_auth_reply() -> int {
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_USERAUTH_BANNER) {
+            var msg: [2187]char;
+            get_utf8(&msg[0], 2187);
+            fputs(STDERR_FILENO, &msg[0]);
+            continue;
+        }
+        if (t == SSH_MSG_USERAUTH_SUCCESS || t == SSH_MSG_USERAUTH_FAILURE) { return t; }
+        disconnect(DISCONNECT_PROTOCOL_ERROR, "unexpected message during login");
+    }
+}
+
+// Ask for a password on the terminal, without echo.
+fn ask_password(buf: *char, max: int) -> int {
+    var prompt: [400]char;
+    strcpy(&prompt[0], &user[0]);
+    strcat(&prompt[0], "@");
+    strcat(&prompt[0], &host[0]);
+    strcat(&prompt[0], "'s password: ");
+    fputs(STDERR_FILENO, &prompt[0]);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n' || c[0] == '\r') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+        fputs(STDERR_FILENO, "\n");
+    }
+    return got ? n : -1;
+}
+
+fn login(identity: *char) {
+    out_start(SSH_MSG_SERVICE_REQUEST);
+    put_text("ssh-userauth");
+    send_packet();
+    if (read_packet() != SSH_MSG_SERVICE_ACCEPT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "the server will not authenticate"); }
+    if (try_key(identity)) { return; }
+    var tries: int = 0;
+    while (tries < 3) {
+        var pass: [243]char;
+        if (ask_password(&pass[0], 243) < 0) { break; }
+        out_start(SSH_MSG_USERAUTH_REQUEST);
+        put_utf8(&user[0]);
+        put_text("ssh-connection");
+        put_text("password");
+        put_byte(0);
+        put_utf8(&pass[0]);
+        send_packet();
+        var k: int = 0;
+        while (k < 243) { pass[k] = 0; k += 1; }
+        if (read_auth_reply() == SSH_MSG_USERAUTH_SUCCESS) { return; }
+        tries += 1;
+        if (tries < 3) { fputs(STDERR_FILENO, "Permission denied, please try again.\n"); }
+    }
+    fputs(STDERR_FILENO, &user[0]);
+    fputs(STDERR_FILENO, "@");
+    fputs(STDERR_FILENO, &host[0]);
+    fputs(STDERR_FILENO, ": Permission denied (publickey,password).\n");
+    _exit(255);
+}
+
+// ---- connecting ----------------------------------------------------------------------------
+
+// "[user@]host": fill user (default: the caller's own name) and host.
+fn client_target(spec: *char) {
+    var n: int = 0;
+    while (spec[n] != 0 && spec[n] != '@') { n += 1; }
+    if (spec[n] == '@') {
+        var u: int = n > 80 ? 80 : n;
+        strncpy(&user[0], spec, u);
+        user[u] = 0;
+        spec = &spec[n + 1];
+    }
+    strncpy(&host[0], spec, 242);
+    host[242] = 0;
+    if (user[0] == 0) {
+        var pw: *passwd = getpwuid(getuid());
+        strcpy(&user[0], pw == null ? "root" : pw.pw_name);
+    }
+}
+
+// Connect, exchange keys, check the host and log in (identity: "" for
+// ~/.ssh/id_ed25519; the buffer must hold 300 characters). Exits with 255
+// if any of it fails.
+fn client_connect(identity: *char) {
+    var home: *char = getenv("HOME");
+    if (home == null) { home = "/"; }
+    strncpy(&known_path[0], home, 250);
+    known_path[250] = 0;
+    strcat(&known_path[0], "/.ssh");
+    mkdir(&known_path[0], 448);
+    if (identity[0] == 0) {
+        strcpy(&identity[0], &known_path[0]);
+        strcat(&identity[0], "/id_ed25519");
+    }
+    strcat(&known_path[0], "/known_hosts");
+    var addr: int = 0;
+    if (!resolve_host(&host[0], &addr)) {
+        fputs(STDERR_FILENO, ssh_prog);
+        fputs(STDERR_FILENO, ": Could not resolve hostname ");
+        fputs(STDERR_FILENO, &host[0]);
+        fputs(STDERR_FILENO, ": Name or service not known\n");
+        _exit(255);
+    }
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    var a: sockaddr_in;
+    sockaddr_set(&a, addr, port);
+    if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
+        var num: [15]char;
+        fputs(STDERR_FILENO, ssh_prog);
+        fputs(STDERR_FILENO, ": connect to host ");
+        fputs(STDERR_FILENO, &host[0]);
+        fputs(STDERR_FILENO, " port ");
+        fputs(STDERR_FILENO, itoa(port, &num[0]));
+        fputs(STDERR_FILENO, ": ");
+        fputs(STDERR_FILENO, strerror(errno));
+        fputs(STDERR_FILENO, "\n");
+        _exit(255);
+    }
+    strcpy(&peer[0], inet_ntoa(addr));
+    ssh_server = 0;
+    ssh_host_key_ok = &check_host_key;
+    version_exchange();
+    send_kexinit();
+    if (read_packet() != SSH_MSG_KEXINIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEXINIT"); }
+    take_kexinit();
+    kex_client();
+    login(&identity[0]);
+}

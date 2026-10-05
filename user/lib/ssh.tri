@@ -59,6 +59,7 @@ const MAX_AUTH_TRIES: int = 6;
 const KEY_PATH: *char = "/etc/ssh/ssh_host_ed25519_key";
 
 var ssh_server: int;                      // 1 in sshd, 0 in the client
+var ssh_prog: *char = "ssh";             // the client's name in messages
 var sock: int;
 var peer: [16]char;
 
@@ -103,7 +104,8 @@ fn log2(a: *char, b: *char) {
         fputs(STDERR_FILENO, itoa(getpid(), &tmp[0]));
         fputs(STDERR_FILENO, "]: ");
     } else {
-        fputs(STDERR_FILENO, "ssh: ");
+        fputs(STDERR_FILENO, ssh_prog);
+        fputs(STDERR_FILENO, ": ");
     }
     fputs(STDERR_FILENO, a);
     fputs(STDERR_FILENO, b);
