@@ -46,6 +46,7 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - ISA v0.6 ✅ binary operations (`BAND` `BOR` `BXOR` `BANDN` `BSH`, `BEXT`/`BROT` with the width as an operand; ISA §3.3.1): SHA-2/ChaCha20 without tables
     - N14 ✅ TLS for more servers: AES-128/256-GCM, P-256/P-384 key exchange after a HelloRetryRequest (cookies too); public-key crypto 2.4–4× faster (product-scanning Montgomery)
     - N15 ✅ `wget` speaks HTTP/1.1: redirects, chunked bodies, `-S`, `--max-redirect`
+    - N16 ✅ `httpd`: static files over HTTP/1.1 and HTTPS (TLS 1.3 server side, ECDSA signing with RFC 6979 nonces, `certgen` self-signed certificates)
     - next ideas: IPv6; `curl`-like POST
 
 ## Next: performance

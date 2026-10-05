@@ -161,6 +161,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N11 | UDP through the NAT; `clock_settime`; `ntpdate` (§13) ✅ | a host echo server reached as 10.0.2.2 and as an outside address, text both ways, DNS and test ports untouched, the NAT off; ntpdate querying, setting the clock, refused to a user, a wrong originate time, kiss-o'-death, an unknown name, usage |
 | N12 | `scp -r`, `sftp` `put -r`/`get -r` (§12) ✅ | a tree with Russian text, nested and empty directories out and back by `scp -r` and by `sftp`, into an existing directory, refused without `-r`, partly unwritable; the host's `scp -r` into Trinux and back, binary and text identical |
 | N13 | TLS 1.3 for `wget`; X.509 chains and a trust store; `x509`; then AES-GCM, P-256/P-384 key exchange and HelloRetryRequest (§14) ✅ | RFC and FIPS vectors, signatures from Python's `cryptography` and forged ones; good chains for each key type and ten kinds of bad one, broken PEM; `wget` against OpenSSL's `s_server` with each key type, and refusals of a wrong name, an unknown CA, an expired certificate, TLS 1.2, AES-only, a required client certificate, a non-TLS server, a changed record |
+| N16 | `httpd` over HTTP/1.1 and HTTPS; ECDSA signing; `certgen` (§15) ✅ | requests by hand through a forward, traversal and encoding refusals, 405/408/414/431/505; HTTPS against OpenSSL's `s_client` (each suite, P-256, a HelloRetryRequest) and Trinux's `wget`; refusals of X448, RSA-only, CCM, TLS 1.2, plain HTTP, a silent client; certificates and keys checked both ways with OpenSSL |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They were first done in software (256×256 tables for XOR and AND).
@@ -535,3 +536,40 @@ Not there: TLS 1.2, AES-CCM, X448 and finite-field groups, resumption, early dat
 - `x509` checks chains made by Python's `cryptography` (`tests/fixtures/tls`): good ones with each key type, and expired, not yet valid, self-signed, issued by a non-CA, too deep, a changed signature, an unknown critical extension, client-only, an impostor root, the wrong names, broken PEM;
 - `wget` against OpenSSL's `s_server` with each key type, each cipher suite, and P-256/P-384 after a HelloRetryRequest (with a cookie from `-stateless`); refusals for the wrong host, an unknown CA, an expired certificate, a TLS 1.2 server, a CCM-only server, an X448-only server, a server that requires a client certificate, a server that is not TLS, and a record changed on the way under ChaCha20-Poly1305 and under AES-GCM.
 - `pktest` also checks AES-128/256 against FIPS 197, AES-GCM in six shapes against `cryptography` (with changed tags, ciphertexts, associated data and nonces refused), and ECDH on P-256/P-384 both ways, refusing points that are off the curve, short, compressed or out of range.
+
+## 15. A web server: `httpd`, HTTP and HTTPS (N16)
+
+```
+$ setun --console --net 8080:80 --net 8443:443      # on the host
+# httpd -s &                                       # in Trinux, as root: HTTPS too
+$ curl http://localhost:8080/                      # on the host
+$ curl --cacert httpd.crt https://localhost:8443/  # with /etc/ssl/httpd.crt copied out
+```
+
+**`/sbin/httpd [-s [-c CERT] [-k KEY]] [-p PORT] [-r ROOT] [-t SECS] [-1]`** serves the files under ROOT (default `/var/www`). init starts it on port 80 when eth0 is up, logging to `/var/log/httpd.log`.
+- GET and HEAD over HTTP/1.1 (and 1.0), one request per connection, each in its own process. HTTP/1.1 requests need a Host header.
+- A directory serves its `index.html`, or else a sorted listing. A directory named without its final slash is redirected (301) to it.
+- Paths are percent-decoded as strict UTF-8 into Trinux characters, and `.`/`..` are folded; a path that would climb out of ROOT is refused (403). Overlong forms, NULs and characters beyond a tryte are refused (400).
+- File contents follow the rules of `lib/octets.tri`: trytes all in 0..255 go out octet for octet, anything else as UTF-8 text. The type comes from the name (`.html`, `.css`, `.js`, `.json`, `.png`...), or is text/plain for text.
+- Errors: 400, 403, 404, 405 (with `Allow: GET, HEAD`), 408 (no complete request within 27 s, `-t`), 414, 431, 505.
+- Each request is logged in the Common Log Format.
+
+**HTTPS (`-s`, port 443)** uses the server side of `lib/tls.tri` (`tls_accept`):
+- It prefers ChaCha20-Poly1305, then AES-128-GCM, then AES-256-GCM, among the suites the client offers.
+- It takes an X25519, P-256 or P-384 key share. When the client offers a group it supports but sent no share for it, it sends a HelloRetryRequest.
+- It signs CertificateVerify with its ECDSA P-256 or P-384 key (RFC 6979 nonces).
+- A client that is too slow (the `-t` deadline covers the handshake too), offers no common suite or group, does not take ECDSA, or does not speak TLS 1.3 gets the matching alert. The reason goes to the log.
+- The key and the certificates come from `-k`/`-c` (default `/etc/ssl/httpd.key` and `/etc/ssl/httpd.crt`). If neither default file exists, `httpd -s` first makes a P-256 key and a self-signed certificate for the host's name, localhost, 127.0.0.1 and 10.0.2.15. A certificate that is not for the key is refused at start.
+
+**`certgen [-c P-256|P-384] [-d DAYS] [-k] KEY CERT NAME...`** makes a key (PEM, mode 0600) and a self-signed X.509 v3 certificate for the names: subjectAltName with DNS names and IPv4 addresses, ECDSA-SHA-256/384, basicConstraints CA, keyUsage digitalSignature and keyCertSign, extKeyUsage serverAuth. With `-k` it uses an existing key: SEC1 (`openssl ecparam -genkey`) or PKCS #8 (`openssl genpkey`). `lib/certgen.tri` has the DER writer, the key reader and writer, and `ecdsa_sign_der`.
+
+**ECDSA signing** (`lib/ecdsa.tri`) uses RFC 6979 deterministic nonces (HMAC-DRBG), so a weak random source cannot leak the key. It matches `cryptography`'s deterministic signatures exactly. A P-256 signature costs about 1.7 s of emulated time, a P-384 one about 5 s.
+
+**What an HTTPS connection costs the server**, in emulated time: an X25519 key pair and shared secret (about 3 s), one P-256 signature (1.7 s), and the record crypto.
+
+**Tests** (`crates/trinux/tests/httpd.rs`, the HTTPS ones skipped without an `openssl`; `certgen` in `tls.rs`):
+- `httpd` from the host through a port forward, with requests written by hand: pages, HEAD, listings, a Russian file name percent-encoded, the absolute form, HTTP/1.0, the log.
+- Refusals: traversal (plain and encoded), bad encodings, POST, a missing Host, HTTP/2.0, junk, a long URI, huge headers, a client that leaves, a client too slow (408), bad options.
+- HTTPS against OpenSSL's `s_client`, verifying the server's own certificate and the host name: each suite, a P-256 share, and P-384 after a HelloRetryRequest. Trinux's `wget` against Trinux's `httpd -s` over loopback.
+- HTTPS refusals: X448 only, RSA-PSS only, CCM only, TLS 1.2, plain HTTP to the HTTPS port, a client that never speaks, a key that does not match the certificate, a missing key, `-k` without `-s`.
+- `certgen`: OpenSSL parses the certificates and verifies their signatures (P-256 and P-384), and agrees each key matches its certificate. Trinux loads keys OpenSSL made, SEC1 and PKCS #8, and refuses RSA and junk keys.
