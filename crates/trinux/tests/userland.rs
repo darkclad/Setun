@@ -938,3 +938,56 @@ fn memory_runs_short_and_the_text_cache_gives_its_frames_back() {
     );
     assert_has(&out, &["k3test: hog touched every page\n"]);
 }
+
+#[test]
+fn sh_backquotes_and_prompt_expansion() {
+    let out = session(
+        &[
+            // `...` as $(...): split unquoted, kept whole in quotes, escapes
+            "echo `echo a  b` c",
+            "for w in `echo 1 2 3`; do echo w$w; done",
+            r#"echo "[`echo '1   2'`]" `echo '1   2'`"#,
+            r#"X=v; echo `echo \$X` `echo \`echo deep\``"#,
+            r#"echo "`echo \"q\"`" `echo 'it''s'`"#,
+            "echo `nosuchcmd`; echo st=$?",
+            // the prompt is expanded each time it is shown
+            r"X=one; PS1='<\w|$X|$(echo sub)|\u|\W> $ '",
+            "cd /usr/lib",
+            "X=two",
+            // $? in the prompt is the last command's, and the prompt's own
+            // command substitution leaves it alone
+            "PS1='s=$?:`true` $ '",
+            "false",
+            "echo st=$?",
+            r"PS1='\$x\nnext $ '",
+            "echo two-lines",
+            "\u{1b}[A", // Up: the redraw repeats only the prompt's last line
+            // an unfinished `...` continues on the next line
+            "echo `echo open",
+            "echo shut`",
+            // double quotes expand once, at the assignment (as in bash)
+            r#"PS1="$(pwd) $ ""#,
+            "cd /",
+            "exit",
+        ],
+        500_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "\na b c\n",
+            "\nw1\nw2\nw3\n",
+            "\n[1   2] 1 2\n",
+            "\nv deep\n",
+            "\nq its\n",
+            "nosuchcmd: not found",
+            "\n\nst=0\n",
+            "\n<~|one|sub|root|~> $ cd /usr/lib\n</usr/lib|one|sub|root|lib> $ X=two\n</usr/lib|two|sub|root|lib> $ ",
+            "\ns=0: $ false\ns=1: $ echo st=$?\nst=1\ns=0: $ ",
+            "\n#x\nnext $ echo two-lines\ntwo-lines\n#x\nnext $ ",
+            "\n#x\nnext $ \rnext $ echo two-lines\u{1b}[K\ntwo-lines\n",
+            "\n> echo shut`\nopen shut\n",
+            "\n/usr/lib $ cd /\n/usr/lib $ exit",
+        ],
+    );
+}

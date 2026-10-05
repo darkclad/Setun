@@ -192,6 +192,7 @@ fn hid(c: char) -> (i64, bool) {
         '|' => (49, true),
         '$' => (33, true),
         '?' => (56, true),
+        '\'' => (52, false),
         _ => panic!("no key for {c:?}"),
     }
 }
@@ -358,7 +359,7 @@ fn the_dead_key_types_overlined_digits() {
     const BACKQUOTE: i64 = 53;
     let mut s = Session::boot();
     s.mark = s.out.len();
-    s.type_text("echo 0z");
+    s.type_text("echo '0z"); // quoted: the shell runs `...` as a command
     s.keys(&[BACKQUOTE, 30]); // ` 1: an overlined 1 (the code point -'1')
     s.key(7, true, false); // D
     s.keys(&[BACKQUOTE, 44]); // ` Space: a plain backquote
@@ -366,7 +367,7 @@ fn the_dead_key_types_overlined_digits() {
     s.keys(&[BACKQUOTE, 55]); // ` .: the backquote, then the dot
     s.keys(&[BACKQUOTE, 80, 79]); // ` then an arrow: the backquote is dropped (Left, then Right back)
     s.keys(&[BACKQUOTE, 7]); // ` d: letters work too
-    s.type_text("\n");
+    s.type_text("'\n");
     // the serial port shows an overlined character as itself plus U+0305
     s.expect("\n0z1\u{305}D```.d\u{305}\n", 60);
     // in the Russian layout the key is ё, not a dead key

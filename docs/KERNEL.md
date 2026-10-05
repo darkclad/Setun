@@ -740,7 +740,7 @@ There is still no `printf`; the typed writers replace it (§12).
   - quoting with `'…'`, `"…"` and `\`;
   - `$name`, `${name}`, `${name:-w}`, `${name-w}`, `${name:+w}`, `${name:=w}`, `${name:?w}`, `${#name}`;
   - `$?`, `$$`, `$!`, `$#`, `$@` (`"$@"` keeps the words), `$*`, `$-`, `$0`–`$9`;
-  - `$(…)` (nested; trailing newlines removed);
+  - `$(…)` (nested; trailing newlines removed), and the older `` `…` ``: inside it a backslash is kept unless it comes before `$`, `` ` `` or `\` (or `"` within double quotes), so `` \` `` nests one;
   - `$((…))`: `+ - * / %`, comparisons, `&& || !`, parentheses, variables;
   - `~`, field splitting of unquoted results, and globbing (`* ? [...] [!...]`, sorted; a pattern that matches nothing stays literal).
 - **Variables:** `export`, `unset`, and prefix assignments (`VAR=x cmd` exports to that command only). The shell imports the environment at startup, and `PATH` defaults to `/bin:/sbin`.
@@ -753,6 +753,7 @@ There is still no `printf`; the typed writers replace it (§12).
   - `read` takes one character at a time, so it leaves the rest of its input for the next reader;
   - `exec` with only redirections makes them permanent.
 - **Input:** multi-line commands at the terminal continue with `PS2` (`> `).
+- **Prompts:** `PS1` and `PS2` are worked out each time they are shown, as in bash: first the escapes `\u` (`$USER`), `\h` (the host name up to its first dot), `\w` (the working directory, `~` for home), `\W` (its last part), `\$` (`#` for root, else `$`), `\n`, `\e`, `\a` and `\\` (`\[` and `\]` are dropped), then parameter, command and arithmetic expansion as in double quotes. So `PS1='\u:\w\$ '` or `PS1='$(pwd)> '` follow `cd`, while `PS1="$(pwd)> "` (double quotes) is expanded once, when it is assigned. The prompt's own commands leave `$?` alone, and a line-editing redraw repeats only the prompt's last line.
 - **Line editing** at a terminal: the shell reads each line itself, with the terminal in raw mode (ISIG stays on, so ^C still interrupts).
   - Left/Right, Home/End and ^A/^E move; Backspace, Delete, ^K, ^U and ^W delete; ^D on an empty line ends the input.
   - Up/Down step through the history: the last 81 lines, without repeats in a row. The `history` builtin lists them.

@@ -92,9 +92,21 @@ fn scan_squote(i: int) -> int {
     return i + 1;
 }
 
+// `...`: the index after the closing backquote (a backslash escapes the
+// next character, so \` does not close it).
+fn scan_bquote(i: int) -> int {
+    while (i < src_len && src[i] != '`') {
+        if (src[i] == '\\') { i += 1; }
+        i += 1;
+    }
+    if (i >= src_len) { return -1; }
+    return i + 1;
+}
+
 fn scan_dquote(i: int) -> int {
     while (i < src_len && src[i] != '"') {
         if (src[i] == '\\') { i += 2; continue; }
+        if (src[i] == '`') { i = scan_bquote(i + 1); if (i < 0) { return -1; } continue; }
         if (src[i] == '$' && src[i + 1] == '(') { i = scan_paren(i + 2); if (i < 0) { return -1; } continue; }
         if (src[i] == '$' && src[i + 1] == '{') { i = scan_brace(i + 2); if (i < 0) { return -1; } continue; }
         i += 1;
@@ -111,6 +123,7 @@ fn scan_paren(i: int) -> int {
         if (c == '\\') { i += 2; continue; }
         if (c == '\'') { i = scan_squote(i + 1); if (i < 0) { return -1; } continue; }
         if (c == '"') { i = scan_dquote(i + 1); if (i < 0) { return -1; } continue; }
+        if (c == '`') { i = scan_bquote(i + 1); if (i < 0) { return -1; } continue; }
         if (c == '(') { depth += 1; }
         if (c == ')') { depth -= 1; }
         i += 1;
@@ -139,6 +152,8 @@ fn scan_word(i: int) -> int {
             i = scan_squote(i + 1);
         } else if (c == '"') {
             i = scan_dquote(i + 1);
+        } else if (c == '`') {
+            i = scan_bquote(i + 1);
         } else if (c == '$' && src[i + 1] == '(') {
             i = scan_paren(i + 2);
         } else if (c == '$' && src[i + 1] == '{') {
@@ -1338,6 +1353,31 @@ fn expand_dollar(i: int, quoted: int) -> int {
     return i + 1;
 }
 
+// `...` at src[i]: command substitution like $(...). Inside, a backslash
+// stays unless it comes before $, ` or \ (and " within double quotes);
+// the command text so read goes after the end of src for the child.
+// Returns the index after the closing backquote.
+fn expand_bquote(i: int, quoted: int) -> int {
+    var e: int = scan_bquote(i + 1);
+    if (e < 0) { put('`'); fstarted = 1; return i + 1; }        // unmatched (a here-document)
+    var base: int = src_len + 1;
+    var n: int = 0;
+    var k: int = i + 1;
+    while (k < e - 1) {
+        var c: char = src[k];
+        if (c == '\\' && k + 1 < e - 1) {
+            var d: char = src[k + 1];
+            if (d == '$' || d == '`' || d == '\\' || (quoted && d == '"')) { c = d; k += 1; }
+        }
+        if (base + n >= SRC_MAX - 2) { err("command too long", null); expand_error = 1; return e; }
+        src[base + n] = c;
+        n += 1;
+        k += 1;
+    }
+    command_substitution(base, base + n, quoted);
+    return e;
+}
+
 // Expand src[a..b) into the current field (quoted: no splitting).
 fn expand_span(a: int, b: int, quoted: int) {
     var i: int = a;
@@ -1367,6 +1407,8 @@ fn expand_span(a: int, b: int, quoted: int) {
             i = e;
         } else if (c == '$') {
             i = expand_dollar(i, quoted);
+        } else if (c == '`') {
+            i = expand_bquote(i, quoted);
         } else if (c == '~' && !quoted && i == a && (i + 1 == b || src[i + 1] == '/')) {
             var h: *char = var_get("HOME");
             put_str(h == null ? "/" : h, 1);
@@ -3114,7 +3156,10 @@ fn ed_left(n: int) {
 
 fn ed_redraw() {
     ed_puts("\r");
-    ed_puts(ed_prompt);
+    var k: int = 0;
+    var line: int = 0;                // only the prompt's last line is redrawn
+    while (ed_prompt[k] != 0) { if (ed_prompt[k] == '\n') { line = k + 1; } k += 1; }
+    ed_puts(&ed_prompt[line]);
     ed_write(&ed_buf[0], ed_len);
     ed_puts("\e[K");
     ed_left(ed_len - ed_pos);
@@ -3421,9 +3466,108 @@ fn edit_line_into_src(p: *char) -> int {
     return 1;
 }
 
+var prompt_buf: [729]char;
+var prompt_n: int;                    // where the escapes' text goes, in src
+
+// One character of the decoded prompt, kept literal by the expansion.
+fn prompt_put(c: char) {
+    if (prompt_n >= SRC_MAX - 4) { return; }
+    if (c == '$' || c == '`' || c == '\\' || c == '"') { src[prompt_n] = '\\'; prompt_n += 1; }
+    src[prompt_n] = c;
+    prompt_n += 1;
+}
+
+fn prompt_puts(t: *char) {
+    var k: int = 0;
+    while (t[k] != 0) { prompt_put(t[k]); k += 1; }
+}
+
+// \w and \W: the working directory, with the home directory as ~.
+fn prompt_dir(base_only: int) {
+    var cwd: [243]char;
+    var d: *char = var_get("PWD");
+    if (d == null) { d = getcwd(&cwd[0], 243); }
+    if (d == null) { return; }
+    var h: *char = var_get("HOME");
+    var hl: int = h == null ? 0 : strlen(h);
+    var home: int = hl > 1 && strncmp(d, h, hl) == 0 && (d[hl] == 0 || d[hl] == '/');
+    if (base_only) {
+        if (home && d[hl] == 0) { prompt_put('~'); return; }
+        var k: int = 0;
+        var last: int = 0;
+        while (d[k] != 0) { if (d[k] == '/' && d[k + 1] != 0) { last = k + 1; } k += 1; }
+        prompt_puts(&d[last]);
+        return;
+    }
+    if (home) { prompt_put('~'); d = &d[hl]; }
+    prompt_puts(d);
+}
+
+// The prompt PS1 or PS2 as bash shows it, worked out each time: first its
+// backslash escapes (\u user, \h host, \w directory, \W its last part,
+// \$ # for root else $, \n, \e, \a, \\; \[ and \] go), then parameter,
+// command and arithmetic expansion as in double quotes, so
+// PS1='$(pwd)> ' follows cd. The text is worked on after the command read
+// so far, which stays as it is, and $? is kept.
 fn prompt_text(name: *char, dflt: *char) -> *char {
     var p: *char = var_get(name);
-    return p == null ? dflt : p;
+    if (p == null) { p = dflt; }
+    if (strchr(p, '\\') == null && strchr(p, '$') == null && strchr(p, '`') == null) { return p; }
+    var base: int = src_len + 1;
+    prompt_n = base;
+    var k: int = 0;
+    while (p[k] != 0) {
+        var c: char = p[k];
+        if (c != '\\' || p[k + 1] == 0) {
+            if (prompt_n < SRC_MAX - 4) { src[prompt_n] = c; prompt_n += 1; }
+            k += 1;
+            continue;
+        }
+        k += 1;
+        c = p[k];
+        k += 1;
+        if (c == 'u') {
+            var u: *char = var_get("USER");
+            var nb: [15]char;
+            prompt_puts(u != null ? u : itoa(getuid(), &nb[0]));
+        } else if (c == 'h') {
+            var un: utsname;
+            if (uname(&un) == 0) {
+                var j: int = 0;
+                while (un.nodename[j] != 0 && un.nodename[j] != '.') { prompt_put(un.nodename[j]); j += 1; }
+            }
+        } else if (c == 'w' || c == 'W') {
+            prompt_dir(c == 'W');
+        } else if (c == '$') {
+            prompt_put(geteuid() == 0 ? '#' : '$');
+        } else if (c == 'n') {
+            prompt_put('\n');
+        } else if (c == 'e') {
+            prompt_put(27 as char);
+        } else if (c == 'a') {
+            prompt_put(7 as char);
+        } else if (c == '\\') {
+            prompt_put('\\');
+        } else if (c != '[' && c != ']') {
+            prompt_put('\\');
+            prompt_put(c);
+        }
+    }
+    var save_len: int = src_len;
+    var save_status: int = last_status;
+    var save_exp: int = exp;
+    var save_error: int = expand_error;
+    src_len = prompt_n;
+    expand_error = 0;
+    var m: int = expand_quoted_into(base, prompt_n);
+    var j2: int = 0;
+    while (ex[m + j2] != 0 && j2 < 728) { prompt_buf[j2] = ex[m + j2]; j2 += 1; }
+    prompt_buf[j2] = 0;
+    exp = save_exp;
+    src_len = save_len;
+    last_status = save_status;
+    expand_error = save_error;
+    return &prompt_buf[0];
 }
 
 fn interactive_loop() -> int {
