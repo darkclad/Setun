@@ -95,6 +95,25 @@ fn http_server() -> HostServer {
                 let body: String = (1..=5000).map(|i| format!("{i}\n")).collect();
                 format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
             }
+            // redirects: to a path, relative, absolute (from the Host header), in a loop, without Location
+            "/moved" => b"HTTP/1.1 301 Moved Permanently\r\nLocation: /hello.txt\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            "/rel/a" => b"HTTP/1.1 302 Found\r\nlocation:   b?x=1\r\n\r\n".to_vec(),
+            "/rel/b?x=1" => b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nrel b\n".to_vec(),
+            "/abs" => {
+                let host = req.lines().find_map(|l| l.strip_prefix("Host: ")).unwrap_or("").to_string();
+                format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{host}/moved\r\n\r\n").into_bytes()
+            }
+            "/loop" => b"HTTP/1.1 302 Found\r\nLocation: /loop\r\n\r\n".to_vec(),
+            "/304" => b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec(),
+            // chunked: sizes in hex with an extension, a trailer; then a bad size
+            "/chunked" => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;ext=1\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nX-Trailer: yes\r\n\r\nafter the end\n".to_vec(),
+            "/badchunk" => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\nzz\r\nmore\r\n0\r\n\r\n".to_vec(),
+            "/short" => b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly this\n".to_vec(),
+            "/garbage" => b"SSH-2.0-OpenSSH_10.2\r\n\r\n".to_vec(),
+            "/longhead" => {
+                let csp: String = "x".repeat(5000);
+                format!("HTTP/1.1 200 OK\r\nContent-Security-Policy: {csp}\r\nContent-Length: 3\r\n\r\nok\nignored").into_bytes()
+            }
             _ => b"HTTP/1.0 404 Not Found\r\n\r\nnope\n".to_vec(),
         }
     })
@@ -157,13 +176,58 @@ fn wget_over_http() {
     s.net.dns_name("web.test", [203, 0, 113, 8]);
     let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/hello.txt"));
     assert_eq!(o, "привет из хоста\n");
-    assert!(srv.requests[0].starts_with("GET /hello.txt HTTP/1.0\r\nHost: web.test\r\n"), "{:?}", srv.requests);
+    assert!(srv.requests[0].starts_with(&format!("GET /hello.txt HTTP/1.1\r\nHost: web.test:{p}\r\n")), "{:?}", srv.requests);
     let o = cmd_serving(&mut s, &mut srv, &format!("cd /tmp; wget http://10.0.2.2:{p}/big; tail -n 1 big; wc -l big"));
     has(&o, &["Saved 23893 octets to 'big'", "\n5000\n", "5000 big"]);
     let o = cmd_serving(&mut s, &mut srv, &format!("wget http://web.test:{p}/missing; echo status $?"));
     has(&o, &["wget: HTTP/1.0 404 Not Found\nstatus 8"]);
     let o = s.cmd("wget ftp://web.test/; echo status $?; wget --bogus http://web.test/; echo status $?; wget http://nosuch.invalid/; echo status $?");
     has(&o, &["wget: only http:// and https:// URLs\nstatus 1\nusage: wget", "status 1\n", "wget: unable to resolve host address 'nosuch.invalid'\nstatus 4"]);
+}
+
+#[test]
+fn wget_follows_redirects_and_reads_chunks() {
+    let mut s = Session::boot();
+    let mut srv = http_server();
+    let p = srv.port();
+    s.net.alias([203, 0, 113, 8], "127.0.0.1".parse().unwrap());
+    s.net.dns_name("web.test", [203, 0, 113, 8]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -O - http://web.test:{p}/abs; echo status $?"));
+    has(&o, &[
+        &format!("Location: http://web.test:{p}/moved [following]\n"),
+        "Location: /hello.txt [following]\n",
+        "HTTP request sent, awaiting response... 200 OK\nпривет из хоста\n",
+        "status 0",
+    ]);
+    // a relative target, with a query; saved under the final name
+    let o = cmd_serving(&mut s, &mut srv, &format!("cd /tmp; wget http://web.test:{p}/rel/a; echo status $?; cat b"));
+    has(&o, &["Location: b?x=1 [following]", "Saved 6 octets to 'b'\nstatus 0\nrel b\n"]);
+    assert!(srv.requests.iter().any(|r| r.starts_with("GET /rel/b?x=1 HTTP/1.1\r\n")), "{:?}", srv.requests);
+    // a loop gives up after 20, or as many as asked; none at all with 0
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/loop; echo status $?"));
+    has(&o, &["wget: 20 redirections exceeded.\nstatus 8"]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q --max-redirect=2 http://web.test:{p}/loop; echo status $?"));
+    has(&o, &["wget: 2 redirections exceeded.\nstatus 8"]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q --max-redirect=0 http://web.test:{p}/moved; echo status $?"));
+    has(&o, &["wget: 0 redirections exceeded.\nstatus 8"]);
+    // a 3xx without a Location is an answer like any other
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/304; echo status $?"));
+    has(&o, &["wget: HTTP/1.1 304 Not Modified\nstatus 8"]);
+    // chunked: extensions and trailers handled, nothing after the last chunk
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/chunked; echo; echo status $?"));
+    has(&o, &["Wikipedia in\r\n\r\nchunks.\nstatus 0"]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/badchunk; echo status $?"));
+    has(&o, &["wget: a malformed chunk\nstatus 7"]);
+    // a body cut short; an answer that is not HTTP; a 5 KB header
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/short; echo status $?"));
+    has(&o, &["wget: the connection closed before the end of the body\nstatus 4"]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/garbage; echo status $?"));
+    has(&o, &["wget: not an HTTP answer\nstatus 7"]);
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/longhead; echo status $?"));
+    has(&o, &["ok\nstatus 0"]);
+    // -S: the headers as they came
+    let o = cmd_serving(&mut s, &mut srv, &format!("wget -S -O /tmp/x http://web.test:{p}/moved"));
+    has(&o, &["  HTTP/1.1 301 Moved Permanently\n  Location: /hello.txt\n  Content-Length: 0\n", "  HTTP/1.0 200 OK\n  Content-Type: text/plain\n"]);
 }
 
 // ---- UDP through the NAT, and NTP -----------------------------------------------------------

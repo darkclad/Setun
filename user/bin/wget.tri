@@ -1,13 +1,18 @@
-// wget [-q] [-b] [-O FILE] [--no-check-certificate] [--ca-certificate=FILE] URL:
-// fetch a file over HTTP/1.0, or HTTPS (TLS 1.3, lib/tls.tri).
+// wget [-q] [-b] [-S] [-O FILE] [--max-redirect=N] [--no-check-certificate]
+//      [--ca-certificate=FILE] URL: fetch a file over HTTP/1.1, or HTTPS
+// (TLS 1.3, lib/tls.tri).
 //
-// The body is saved to FILE (- for standard output), or to the last part
-// of the URL's path (index.html for "/"). Text arrives as UTF-8 and is
-// stored as characters; -b keeps the octets as they are. A server's
-// certificate must chain to a root in /etc/ssl/cert.pem (and to those in
-// --ca-certificate's file) and name the host, unless --no-check-certificate.
+// Redirects (301, 302, 303, 307, 308) are followed, up to 20 unless
+// --max-redirect says otherwise. Bodies may come chunked. The body is saved
+// to FILE (- for standard output), or to the last part of the final URL's
+// path (index.html for "/"). Text arrives as UTF-8 and is stored as
+// characters; -b keeps the octets as they are. -S prints the server's
+// answer headers. A server's certificate must chain to a root in
+// /etc/ssl/cert.pem (and to those in --ca-certificate's file) and name the
+// host, unless --no-check-certificate.
 // Exit status: 0 for a 2xx answer, 4 network trouble (TLS included),
-// 5 a certificate that does not verify, 8 an error answer from the server,
+// 5 a certificate that does not verify, 7 a protocol error (a malformed
+// answer), 8 an error answer from the server or too many redirects,
 // 1 anything else.
 
 import "../lib/tlibc.tri";
@@ -20,13 +25,26 @@ import "../lib/tls.tri";
 
 var quiet: int;
 var binary: int;
+var show_headers: int;
+var check: int;
 var net: [2187]tryte;
-var head: [2187]char;
 var text: [2187]char;
 var dec: utf8_state;
 var secure: int;
 var tl: tls;
 var sock: int;
+var store_ready: int;
+
+// the URL being fetched, in parts
+var url_buf: [2187]char;
+var host: [243]char;
+var port: int;
+var path: [2187]char;
+// what the answer said
+var status_line: [729]char;
+var location: [2187]char;
+var chunked: int;
+var clen: int;                       // Content-Length, -1 if none
 
 fn say(a: *char, b: *char) {
     if (quiet) { return; }
@@ -35,7 +53,7 @@ fn say(a: *char, b: *char) {
 }
 
 fn usage() -> int {
-    fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] [--no-check-certificate] [--ca-certificate=file] http[s]://host[:port]/path\n");
+    fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-S] [-O file] [--max-redirect=n] [--no-check-certificate] [--ca-certificate=file] http[s]://host[:port]/path\n");
     return 1;
 }
 
@@ -47,7 +65,7 @@ fn conn_read(p: *tryte, n: int) -> int {
 
 fn conn_write(p: *char, n: int) -> int {
     if (secure) {
-        var o: [729]tryte;
+        var o: [2187]tryte;
         var k: int = 0;
         while (k < n) { o[k] = p[k] as tryte; k += 1; }
         return tls_write(&tl, &o[0], n);
@@ -62,79 +80,200 @@ fn tls_trouble() -> int {
     return 4;
 }
 
-fn main(argc: int, argv: **char) -> int {
-    var outname: *char = null;
-    var check: int = 1;
-    var cafile: *char = null;
-    // the long options first (getopt knows only short ones)
-    var args: [81]*char;
-    var na: int = 0;
-    var i: int = 0;
-    while (i < argc && na < 80) {
-        var a: *char = argv[i];
-        if (streq(a, "--no-check-certificate")) { check = 0; }
-        else if (strncmp(a, "--ca-certificate=", 17) == 0) { cafile = a + 17; }
-        else if (i > 0 && strncmp(a, "--", 2) == 0) { return usage(); }
-        else { args[na] = a; na += 1; }
-        i += 1;
-    }
-    args[na] = null;
-    argc = na;
-    argv = &args[0];
-    var c: int = getopt(argc, argv, "qbO:");
-    while (c != -1) {
-        switch (c) {
-            case 'q': quiet = 1;
-            case 'b': binary = 1;
-            case 'O': outname = optarg;
-            default: return usage();
-        }
-        c = getopt(argc, argv, "qbO:");
-    }
-    if (optind != argc - 1) { return usage(); }
-    var url: *char = argv[optind];
+// Split url_buf into secure, host, port and path; 0, or 1 (said why).
+fn parse_url() -> int {
+    var url: *char = &url_buf[0];
     var k: int = 0;
-    var port: int = 80;
     if (strncmp(url, "https://", 8) == 0) {
         secure = 1;
         port = 443;
         k = 8;
     } else if (strncmp(url, "http://", 7) == 0) {
+        secure = 0;
+        port = 80;
         k = 7;
     } else {
         fputs(STDERR_FILENO, "wget: only http:// and https:// URLs\n");
         return 1;
     }
-    // host[:port] and path
-    var host: [243]char;
     var h: int = 0;
-    while (url[k] != 0 && url[k] != '/' && url[k] != ':' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
+    while (url[k] != 0 && url[k] != '/' && url[k] != ':' && url[k] != '?' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
     host[h] = 0;
     if (url[k] == ':') {
         k += 1;
         port = 0;
-        while (url[k] >= '0' && url[k] <= '9') { port = port * 10 + url[k] - '0'; k += 1; }
+        while (url[k] >= '0' && url[k] <= '9' && port <= 65535) { port = port * 10 + url[k] - '0'; k += 1; }
         if (port <= 0 || port > 65535) { fputs(STDERR_FILENO, "wget: bad port\n"); return 1; }
     }
-    var path: *char = url[k] == 0 ? "/" : &url[k];
     if (h == 0) { fputs(STDERR_FILENO, "wget: no host in the URL\n"); return 1; }
-    if (secure && check) {
-        if (x509_load_store("/etc/ssl/cert.pem") < 0 && cafile == null) {
+    var q: int = 0;
+    if (url[k] != '/') { path[0] = '/'; q = 1; }
+    while (url[k] != 0 && q < 2186) { path[q] = url[k]; q += 1; k += 1; }
+    path[q] = 0;
+    return 0;
+}
+
+// The redirect target in location, made absolute against url_buf (which it replaces).
+fn follow_location() {
+    var t: [2187]char;
+    var loc: *char = &location[0];
+    if (strncmp(loc, "http://", 7) == 0 || strncmp(loc, "https://", 8) == 0) {
+        strncpy(&t[0], loc, 2186);
+    } else if (loc[0] == '/' && loc[1] == '/') {
+        strcpy(&t[0], secure ? "https:" : "http:");
+        strncat(&t[0], loc, 2170);
+    } else {
+        strcpy(&t[0], secure ? "https://" : "http://");
+        strncat(&t[0], &host[0], 242);
+        var num: [15]char;
+        if ((secure && port != 443) || (!secure && port != 80)) {
+            strcat(&t[0], ":");
+            strcat(&t[0], itoa(port, &num[0]));
+        }
+        if (loc[0] == '/') {
+            strncat(&t[0], loc, 1900);
+        } else {
+            // relative to the current path's directory
+            var dir: [2187]char;
+            strncpy(&dir[0], &path[0], 2186);
+            var qm: *char = strchr(&dir[0], '?');
+            if (qm != null) { qm[0] = 0; }
+            var slash: *char = strrchr(&dir[0], '/');
+            if (slash != null) { slash[1] = 0; }
+            strncat(&t[0], &dir[0], 1000);
+            strncat(&t[0], loc, 1000);
+        }
+    }
+    t[2186] = 0;
+    strcpy(&url_buf[0], &t[0]);
+}
+
+fn lower_eq(a: *char, b: *char, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        if (tolower(a[k]) != b[k]) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+// One header line (no CR LF): note what matters.
+fn header(line: *char, n: int, first: int) {
+    if (show_headers) {
+        fputs(STDERR_FILENO, "  ");
+        fputs(STDERR_FILENO, line);
+        fputs(STDERR_FILENO, "\n");
+    }
+    if (first) {
+        strncpy(&status_line[0], line, 728);
+        status_line[728] = 0;
+        return;
+    }
+    var nl: int = 0;
+    while (nl < n && line[nl] != ':') { nl += 1; }
+    if (nl == n) { return; }
+    var v: *char = line + nl + 1;
+    while (v[0] == ' ' || v[0] == '\t') { v = v + 1; }
+    if (nl == 8 && lower_eq(line, "location", 8)) {
+        strncpy(&location[0], v, 2186);
+        location[2186] = 0;
+    } else if (nl == 17 && lower_eq(line, "transfer-encoding", 17)) {
+        chunked = lower_eq(v, "chunked", 7);
+    } else if (nl == 14 && lower_eq(line, "content-length", 14)) {
+        clen = atoi(v);
+    }
+}
+
+// ---- the body ------------------------------------------------------------------------------
+
+var out_fd: int;
+var total: int;
+// chunked decoding: 0 size line, 1 data, 2 CR LF after data, 3 trailers, 4 done
+var cstate: int;
+var cleft: int;
+var cline: [81]char;
+var cn: int;
+var bad_chunk: int;
+
+fn put_body(p: *tryte, m: int) {
+    if (m <= 0) { return; }
+    if (clen >= 0 && total + m > clen) { m = clen - total; }
+    total += m;
+    if (binary) {
+        write(out_fd, p as *char, m);
+    } else {
+        var t: int = utf8_to_text(&dec, p, m, &text[0]);
+        write(out_fd, &text[0], t);
+    }
+}
+
+fn hexdigit(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+// Feed received octets through the chunked decoder.
+fn chunk_data(p: *tryte, m: int) {
+    var k: int = 0;
+    while (k < m && cstate != 4 && !bad_chunk) {
+        if (cstate == 1) {
+            var take: int = m - k < cleft ? m - k : cleft;
+            put_body(p + k, take);
+            k += take;
+            cleft -= take;
+            if (cleft == 0) { cstate = 2; cn = 0; }
+            continue;
+        }
+        var ch: int = p[k];
+        k += 1;
+        if (ch != '\n') {
+            if (ch != '\r') {
+                if (cn < 80) { cline[cn] = ch as char; cn += 1; } else { bad_chunk = 1; }
+            }
+            continue;
+        }
+        cline[cn] = 0;
+        if (cstate == 2) {
+            if (cn != 0) { bad_chunk = 1; }
+            cstate = 0;
+        } else if (cstate == 0) {
+            // a size in hex, perhaps ";extensions"
+            var size: int = 0;
+            var j: int = 0;
+            while (j < cn && hexdigit(cline[j]) >= 0) {
+                size = size * 16 + hexdigit(cline[j]);
+                j += 1;
+                if (size > 1594323) { bad_chunk = 1; }
+            }
+            if (j == 0 || (j < cn && cline[j] != ';' && cline[j] != ' ')) { bad_chunk = 1; }
+            if (size == 0) { cstate = 3; } else { cleft = size; cstate = 1; }
+        } else if (cstate == 3) {
+            if (cn == 0) { cstate = 4; }                      // the end of the trailers
+        }
+        cn = 0;
+    }
+}
+
+// ---- one request -----------------------------------------------------------------------------
+
+// Fetch url_buf: the status (200...), or -(exit status) on trouble. The
+// body goes to outname unless the answer is a redirect or an error.
+fn fetch(outname: *char) -> int {
+    if (parse_url()) { return -1; }
+    if (secure && check && !store_ready) {
+        if (x509_load_store("/etc/ssl/cert.pem") < 0 && store_ready == 0) {
             fputs(STDERR_FILENO, "wget: cannot read /etc/ssl/cert.pem\n");
-            return 1;
+            return -1;
         }
-        if (cafile != null && x509_load_store(cafile) < 0) {
-            fputs(STDERR_FILENO, "wget: cannot read ");
-            fputs(STDERR_FILENO, cafile);
-            fputs(STDERR_FILENO, "\n");
-            return 1;
-        }
+        store_ready = 1;
     }
     var addr: int = 0;
     if (!resolve_host(&host[0], &addr)) {
         say("wget: unable to resolve host address '", &host[0]);
         say("'\n", "");
-        return 4;
+        return -4;
     }
     say("Connecting to ", &host[0]);
     say(" (", inet_ntoa(addr));
@@ -146,7 +285,8 @@ fn main(argc: int, argv: **char) -> int {
         var e: *char = strerror(errno);
         say("failed: ", e);
         say(".\n", "");
-        return 4;
+        if (sock >= 0) { close(sock); }
+        return -4;
     }
     say("connected.\n", "");
     if (secure) {
@@ -164,9 +304,10 @@ fn main(argc: int, argv: **char) -> int {
             fputs(STDERR_FILENO, "\nTo connect to ");
             fputs(STDERR_FILENO, &host[0]);
             fputs(STDERR_FILENO, " insecurely, use `--no-check-certificate'.\n");
-            return 5;
+            close(sock);
+            return -5;
         }
-        if (r < 0) { return tls_trouble(); }
+        if (r < 0) { close(sock); return -tls_trouble(); }
         if (!check) {
             say("WARNING: the certificate of ", &host[0]);
             say(" was not checked.\n", "");
@@ -177,100 +318,199 @@ fn main(argc: int, argv: **char) -> int {
         say("\n", "");
     }
     // the request (ASCII: the path's own characters must be octets too)
-    var req: [729]char;
+    var req: [2187]char;
     strcpy(&req[0], "GET ");
-    strncat(&req[0], path, 500);
-    strcat(&req[0], " HTTP/1.0\r\nHost: ");
-    strncat(&req[0], &host[0], 100);
-    strcat(&req[0], "\r\nUser-Agent: Trinux-wget/0.2\r\nConnection: close\r\n\r\n");
-    if (conn_write(&req[0], strlen(&req[0])) < 0) {
-        if (secure) { return tls_trouble(); }
-        perror2("wget", "write");
-        return 4;
+    strncat(&req[0], &path[0], 1800);
+    strcat(&req[0], " HTTP/1.1\r\nHost: ");
+    strncat(&req[0], &host[0], 242);
+    var num: [15]char;
+    if ((secure && port != 443) || (!secure && port != 80)) {
+        strcat(&req[0], ":");
+        strcat(&req[0], itoa(port, &num[0]));
     }
-    // the status line and headers
-    // (only the start is kept: the status line is all that is used)
-    var hn: int = 0;
+    strcat(&req[0], "\r\nUser-Agent: Trinux-wget/0.3\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    if (conn_write(&req[0], strlen(&req[0])) < 0) {
+        close(sock);
+        if (secure) { return -tls_trouble(); }
+        perror2("wget", "write");
+        return -4;
+    }
+    // the status line and headers, a line at a time
+    status_line[0] = 0;
+    location[0] = 0;
+    chunked = 0;
+    clen = -1;
+    var line: [2187]char;
+    var ln: int = 0;
+    var first: int = 1;
+    var seen: int = 0;
     var body_start: int = -1;
     var n: int = 0;
-    var last4: int = 0;                                  // the last four octets, as one number
-    var seen: int = 0;
+    say("HTTP request sent, awaiting response... ", "");
+    if (show_headers) { say("\n", ""); }
     while (body_start < 0) {
         n = conn_read(&net[0], 2187);
-        if (n < 0 && secure) { return tls_trouble(); }
-        if (n <= 0) { fputs(STDERR_FILENO, seen == 0 ? "wget: no answer\n" : "wget: the headers did not end\n"); return 4; }
+        if (n < 0 && secure) { close(sock); return -tls_trouble(); }
+        if (n <= 0) {
+            close(sock);
+            fputs(STDERR_FILENO, seen == 0 ? "wget: no answer\n" : "wget: the headers did not end\n");
+            return -4;
+        }
         var j: int = 0;
         while (j < n && body_start < 0) {
-            if (hn < 2186) { head[hn] = net[j] as char; hn += 1; }
-            last4 = last4 % 16777216 * 256 + net[j];
-            seen += 1;
-            if (seen >= 4 && last4 == 218762506) { body_start = j + 1; }   // \r\n\r\n
+            var ch: int = net[j];
             j += 1;
+            seen += 1;
+            if (ch == '\n') {
+                if (ln > 0 && line[ln - 1] == '\r') { ln -= 1; }
+                line[ln] = 0;
+                if (ln == 0) { body_start = j; }
+                else { header(&line[0], ln, first); first = 0; }
+                ln = 0;
+            } else if (ln < 2186) {
+                line[ln] = ch as char;
+                ln += 1;
+            }
         }
-        if (seen > 1594323) { fputs(STDERR_FILENO, "wget: headers too long\n"); return 1; }
+        if (seen > 1594323) { close(sock); fputs(STDERR_FILENO, "wget: headers too long\n"); return -1; }
     }
-    head[hn] = 0;
     // "HTTP/1.x NNN reason"
-    var e: int = 0;
-    while (head[e] != 0 && head[e] != '\r') { e += 1; }
     var status: int = 0;
-    var sp: *char = strchr(&head[0], ' ');
-    if (sp != null) { status = atoi(sp + 1); }
-    var line: [243]char;
-    strncpy(&line[0], &head[0], e < 242 ? e : 242);
-    line[e < 242 ? e : 242] = 0;
-    var code: *char = strchr(&line[0], ' ');            // "200 OK", from the status line only
-    say("HTTP request sent, awaiting response... ", code != null ? code + 1 : "?");
-    say("", "\n");
+    var sp: *char = strchr(&status_line[0], ' ');
+    if (strncmp(&status_line[0], "HTTP/1.", 7) != 0 || sp == null) {
+        close(sock);
+        fputs(STDERR_FILENO, "wget: not an HTTP answer\n");
+        return -7;
+    }
+    status = atoi(sp + 1);
+    if (!show_headers) { say(sp + 1, "\n"); }
+    if (status >= 300 && status <= 399 && location[0] != 0) {
+        if (secure && n >= 0) { tls_close(&tl); }
+        close(sock);
+        return status;
+    }
     if (status < 200 || status > 299) {
+        close(sock);
         fputs(STDERR_FILENO, "wget: ");
-        fputs(STDERR_FILENO, &line[0]);
+        fputs(STDERR_FILENO, &status_line[0]);
         fputs(STDERR_FILENO, "\n");
-        return 8;
+        return status;
     }
     // where to put it
     var name: [243]char;
     if (outname == null) {
-        var base: *char = strrchr(path, '/');
-        base = base == null ? path : base + 1;
-        if (base[0] == 0) { base = "index.html"; }
+        var p: *char = &path[0];
+        var base: *char = strrchr(p, '/');
+        base = base == null ? p : base + 1;
+        if (base[0] == 0 || base[0] == '?') { base = "index.html"; }
         var q: int = 0;
         while (base[q] != 0 && base[q] != '?' && q < 242) { name[q] = base[q]; q += 1; }
         name[q] = 0;
         outname = &name[0];
     }
-    var fd: int = streq(outname, "-") ? STDOUT_FILENO : open(outname, O_WRONLY + O_CREAT + O_TRUNC, 420);
-    if (fd < 0) { perror2("wget", outname); return 1; }
-    var total: int = 0;
+    out_fd = streq(outname, "-") ? STDOUT_FILENO : open(outname, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (out_fd < 0) { close(sock); perror2("wget", outname); return -1; }
+    total = 0;
+    cstate = 0;
+    cn = 0;
+    bad_chunk = 0;
     var from: int = body_start;
     loop {
         var m: int = n - from;
         if (m > 0) {
-            total += m;
-            if (binary) {
-                write(fd, &net[from] as *char, m);
-            } else {
-                var t: int = utf8_to_text(&dec, &net[from], m, &text[0]);
-                write(fd, &text[0], t);
-            }
+            if (chunked) { chunk_data(&net[from], m); } else { put_body(&net[from], m); }
         }
+        if ((chunked && (cstate == 4 || bad_chunk)) || (!chunked && clen >= 0 && total >= clen)) { break; }
         n = conn_read(&net[0], 2187);
         from = 0;
         if (n <= 0) { break; }
     }
-    var status2: int = 0;
-    if (n < 0 && secure) { status2 = tls_trouble(); }
-    if (secure && n == 0) { tls_close(&tl); }
+    var result: int = status;
+    if (n < 0 && secure) { result = -tls_trouble(); }
+    else if (bad_chunk) { fputs(STDERR_FILENO, "wget: a malformed chunk\n"); result = -7; }
+    else if ((chunked && cstate != 4) || (clen >= 0 && total < clen)) {
+        fputs(STDERR_FILENO, "wget: the connection closed before the end of the body\n");
+        result = -4;
+    }
+    if (secure && n >= 0) { tls_close(&tl); }
     close(sock);
-    if (fd != STDOUT_FILENO) { close(fd); }
-    if (status2 != 0) { return status2; }
-    if (!quiet) {
-        var num: [15]char;
+    if (out_fd != STDOUT_FILENO) { close(out_fd); }
+    if (result > 0 && !quiet) {
+        var num2: [15]char;
         fputs(STDERR_FILENO, "Saved ");
-        fputs(STDERR_FILENO, itoa(total, &num[0]));
+        fputs(STDERR_FILENO, itoa(total, &num2[0]));
         fputs(STDERR_FILENO, " octets to '");
         fputs(STDERR_FILENO, outname);
         fputs(STDERR_FILENO, "'\n");
     }
-    return 0;
+    return result;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var outname: *char = null;
+    var max_redirect: int = 20;
+    check = 1;
+    var cafile: *char = null;
+    // the long options first (getopt knows only short ones)
+    var args: [81]*char;
+    var na: int = 0;
+    var i: int = 0;
+    while (i < argc && na < 80) {
+        var a: *char = argv[i];
+        if (streq(a, "--no-check-certificate")) { check = 0; }
+        else if (strncmp(a, "--ca-certificate=", 17) == 0) { cafile = a + 17; }
+        else if (strncmp(a, "--max-redirect=", 15) == 0) { max_redirect = atoi(a + 15); }
+        else if (i > 0 && strncmp(a, "--", 2) == 0) { return usage(); }
+        else { args[na] = a; na += 1; }
+        i += 1;
+    }
+    args[na] = null;
+    argc = na;
+    argv = &args[0];
+    var c: int = getopt(argc, argv, "qbSO:");
+    while (c != -1) {
+        switch (c) {
+            case 'q': quiet = 1;
+            case 'b': binary = 1;
+            case 'S': show_headers = 1;
+            case 'O': outname = optarg;
+            default: return usage();
+        }
+        c = getopt(argc, argv, "qbSO:");
+    }
+    if (optind != argc - 1 || max_redirect < 0) { return usage(); }
+    if (strlen(argv[optind]) > 2000) { fputs(STDERR_FILENO, "wget: the URL is too long\n"); return 1; }
+    strcpy(&url_buf[0], argv[optind]);
+    if (check && cafile != null) {
+        if (x509_load_store("/etc/ssl/cert.pem") >= 0) { store_ready = 1; }
+        if (x509_load_store(cafile) < 0) {
+            fputs(STDERR_FILENO, "wget: cannot read ");
+            fputs(STDERR_FILENO, cafile);
+            fputs(STDERR_FILENO, "\n");
+            return 1;
+        }
+        store_ready = 1;
+    }
+    var redirects: int = 0;
+    loop {
+        var r: int = fetch(outname);
+        if (r < 0) { return -r; }
+        if (r >= 300 && r <= 399 && location[0] != 0) {
+            if (redirects >= max_redirect) {
+                fputs(STDERR_FILENO, "wget: ");
+                var num: [15]char;
+                fputs(STDERR_FILENO, itoa(max_redirect, &num[0]));
+                fputs(STDERR_FILENO, " redirections exceeded.\n");
+                return 8;
+            }
+            redirects += 1;
+            say("Location: ", &location[0]);
+            say(" [following]\n", "");
+            follow_location();
+            continue;
+        }
+        if (r < 200 || r > 299) { return 8; }
+        return 0;
+    }
+    return 1;
 }
