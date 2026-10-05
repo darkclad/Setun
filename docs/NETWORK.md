@@ -155,7 +155,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N5 | `nc`, `netstat`, `telnetd`; docs | log in through `setun --net` with a real host socket; many sessions at once |
 | N6 | SSH: a random-number device, the crypto library, `sshd` (§8) ✅ | RFC test vectors; the host's OpenSSH logs in, runs commands and a pty session, moves 120 KB each way; refusals of other algorithms, wrong passwords, a non-SSH-2 client, an overlong line and a tampered packet |
 | N7 | outbound TCP through a NAT to host sockets, DNS at 10.0.2.3, a resolver, `host`, `wget` (§9) ✅ | Trinux reaches servers on the host (as 10.0.2.2 and as an outside address), refusals, the NAT turned off; DNS from the host's resolver and fixed names, NXDOMAIN, a server that is not there, an illegal name, FORMERR; `wget` text, 23 893 octets, 404, https, an unknown name |
-| N8 | public-key login for `sshd`; an `ssh` client in Trinux | |
+| N8 | public-key login for `sshd` ✅; an `ssh` client in Trinux | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -265,7 +265,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 | `bin32.tri` | 32-bit binary arithmetic: add, shift and rotate are plain arithmetic on words; XOR and AND go through two 256×256 tables made at start-up on the heap | tables: about 1.3 M once |
 | `sha2.tri` | SHA-256; SHA-512 with each 64-bit value as two 32-bit halves | about 50 k per SHA-256 block, 0.2 M per SHA-512 block |
 | `chacha.tri` | ChaCha20 (64-bit counter and nonce, as SSH uses it) and Poly1305 (TweetNaCl's 17 limbs of 8 bits) | about 0.1 M per 64 octets |
-| `c25519.tri` | X25519 and Ed25519 signing, after TweetNaCl | X25519 ≈ 38 M, an Ed25519 signature ≈ 65 M |
+| `c25519.tri` | X25519, Ed25519 signing and verification, after TweetNaCl (verification refuses S ≥ L, as RFC 8032 asks) | X25519 ≈ 38 M, an Ed25519 signature ≈ 65 M, a verification ≈ 130 M |
 | `base64.tri` | RFC 4648, for public keys and fingerprints | |
 
 - The field elements of 2^255 − 19 are 16 **balanced** limbs of 16 bits. Carries use `divr` (round to nearest), so a limb ends in −2^15..2^15, and every intermediate value stays far inside a 27-trit word:
@@ -281,7 +281,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 | Key exchange | `curve25519-sha256` (also `@libssh.org`), RFC 8731; strict KEX (`kex-strict-s-v00@openssh.com`, the Terrapin fix): sequence numbers restart after NEWKEYS and nothing else may come during the first exchange; re-keying when the client asks |
 | Host key | `ssh-ed25519`, made on first start: `/etc/ssh/ssh_host_ed25519_key` (the 32-octet seed in hex, mode 0600) and `.pub` in OpenSSH's format; the boot log shows its `SHA256:` fingerprint |
 | Cipher | `chacha20-poly1305@openssh.com`. The tag is checked before anything is decrypted; a bad tag ends the connection |
-| Login | `password`, checked against `/etc/shadow` like `login(1)`. Empty passwords are never accepted; an unknown user is refused the same way as a wrong password; after 6 failures the server disconnects |
+| Login | `publickey`: `ssh-ed25519` keys listed in `~/.ssh/authorized_keys` (one `ssh-ed25519 BASE64 comment` per line; the file is ignored if group or others may write it), with the PK_OK query and the RFC 4252 §7 signature over the session id and the request. `password`, checked against `/etc/shadow` like `login(1)`; empty passwords are never accepted. An unknown user is refused the same way as a wrong password or key; after 6 failures the server disconnects |
 | Sessions | one `session` channel per connection; `pty-req`, `shell`, `exec`, `window-change`; the exit code goes back as `exit-status` (or `exit-signal`) |
 | Windows | 3^10 octets in, 3^9 per packet; output waits for the client's window |
 
@@ -293,7 +293,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
   - a version line ≤ 255 characters, with at most 20 lines before it;
   - names and commands bounded by their buffers;
   - channel data decoded in pieces of 2187 octets.
-- Not yet supported: public-key login; `env`, `subsystem` (sftp) and port forwarding requests, which get `CHANNEL_FAILURE`; and more than one channel per connection.
+- Not yet supported: `env`, `subsystem` (sftp) and port forwarding requests, which get `CHANNEL_FAILURE`; and more than one channel per connection.
 
 ### What a login costs
 

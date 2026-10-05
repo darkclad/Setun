@@ -21,6 +21,7 @@ var _D: gf;
 var _D2: gf;
 var _X: gf;
 var _Y: gf;
+var _I: gf;                           // sqrt(-1)
 var _c25519_ready: int;
 
 fn _set(o: *gf, limbs: *int) {
@@ -44,6 +45,8 @@ fn c25519_init() {
     _set(&_D2, &d2[0]);
     _set(&_X, &x[0]);
     _set(&_Y, &y[0]);
+    var sqm1: [16]int = { 41136, 18958, 6951, 50414, 58488, 44335, 6150, 12099, 55207, 15867, 153, 11085, 57099, 20417, 9344, 11139 };
+    _set(&_I, &sqm1[0]);
     _c25519_ready = 1;
 }
 
@@ -449,4 +452,99 @@ fn ed25519_sign(sig: *tryte, m: *tryte, n: int, sk: *tryte) {
         i += 1;
     }
     _modL(sig + 32, &x[0]);
+}
+
+// ---- Ed25519 verification -----------------------------------------------------------------
+
+// a^((p-5)/8), for square roots.
+fn gf_pow2523(o: *gf, a: *gf) {
+    var c: gf;
+    gf_copy(&c, a);
+    var k: int = 250;
+    while (k >= 0) {
+        gf_sq(&c, &c);
+        if (k != 1) { gf_mul(&c, &c, a); }
+        k -= 1;
+    }
+    gf_copy(o, &c);
+}
+
+fn gf_equal(a: *gf, b: *gf) -> int {
+    var x: [32]tryte;
+    var y: [32]tryte;
+    gf_pack(&x[0], a);
+    gf_pack(&y[0], b);
+    return octets_equal(&x[0], &y[0], 32);
+}
+
+// r = -(the point encoded in p); 0, or -1 if p is not a point.
+fn ge_unpack_neg(r: *ge, p: *tryte) -> int {
+    var num: gf;
+    var den: gf;
+    var den2: gf;
+    var den4: gf;
+    var den6: gf;
+    var t: gf;
+    var chk: gf;
+    gf_copy(&r.z, &_gf1);
+    gf_unpack(&r.y, p);
+    gf_sq(&num, &r.y);
+    gf_mul(&den, &num, &_D);
+    gf_sub(&num, &num, &r.z);
+    gf_add(&den, &r.z, &den);
+    gf_sq(&den2, &den);
+    gf_sq(&den4, &den2);
+    gf_mul(&den6, &den4, &den2);
+    gf_mul(&t, &den6, &num);
+    gf_mul(&t, &t, &den);
+    gf_pow2523(&t, &t);
+    gf_mul(&t, &t, &num);
+    gf_mul(&t, &t, &den);
+    gf_mul(&t, &t, &den);
+    gf_mul(&r.x, &t, &den);
+    gf_sq(&chk, &r.x);
+    gf_mul(&chk, &chk, &den);
+    if (!gf_equal(&chk, &num)) { gf_mul(&r.x, &r.x, &_I); }
+    gf_sq(&chk, &r.x);
+    gf_mul(&chk, &chk, &den);
+    if (!gf_equal(&chk, &num)) { return -1; }
+    if (gf_parity(&r.x) == p[31] / 128) { gf_sub(&r.x, &_gf0, &r.x); }
+    gf_mul(&r.t, &r.x, &r.y);
+    return 0;
+}
+
+// Is s (32 octets, little-endian) below the group order L? (RFC 8032
+// requires it: a signature with S >= L is refused.)
+fn _below_L(s: *tryte) -> int {
+    var i: int = 31;
+    while (i >= 0) {
+        if (s[i] < _L[i]) { return 1; }
+        if (s[i] > _L[i]) { return 0; }
+        i -= 1;
+    }
+    return 0;
+}
+
+// 1 if sig (64 octets) is pk's Ed25519 signature of m (n octets).
+fn ed25519_verify(sig: *tryte, m: *tryte, n: int, pk: *tryte) -> int {
+    c25519_init();
+    if (!_below_L(sig + 32)) { return 0; }
+    var q: ge;
+    if (ge_unpack_neg(&q, pk) < 0) { return 0; }
+    var h: [64]tryte;
+    var c: sha512_ctx;
+    sha512_init(&c);
+    sha512_update(&c, sig, 32);
+    sha512_update(&c, pk, 32);
+    sha512_update(&c, m, n);
+    sha512_final(&c, &h[0]);
+    _reduce(&h[0]);
+    var p: ge;
+    ge_scalarmult(&p, &q, &h[0]);              // -k·A
+    var b: ge;
+    ge_scalarbase(&b, sig + 32);               // S·B
+    ge_add(&p, &b);                            // S·B - k·A, which must be R
+    var t: [32]tryte;
+    ge_pack(&t[0], &p);
+    return octets_equal(sig, &t[0], 32);
 }

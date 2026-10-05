@@ -5,6 +5,7 @@
 import "../lib/tlibc.tri";
 import "../lib/c25519.tri";
 import "../lib/chacha.tri";
+import "../lib/base64.tri";
 
 var failures: int;
 var a: [256]tryte;
@@ -129,6 +130,33 @@ fn main(argc: int, argv: **char) -> int {
     while (k < 200) { b[k] = k as tryte; k += 1; }
     ed25519_sign(&out[0], &b[0], 200, &sk[0]);
     ok("Ed25519 signature, 200 octets", is_hex(&out[0], "2a0c455a60437588653c300e8834ca93e40dbe9c5e70ad29254d3c6faef8b6b34f674ae7b23094c69e756246cfb84075a4d6cc4988b53404fa4ea985e3c1ce00"));
+
+    ok("Ed25519 verify: the 200-octet signature", ed25519_verify(&out[0], &b[0], 200, &pk[0]));
+    b[7] = 8;
+    ok("Ed25519 verify: a changed message fails", !ed25519_verify(&out[0], &b[0], 200, &pk[0]));
+    b[7] = 7;
+    out[40] = ((out[40] + 1) % 256) as tryte;
+    ok("Ed25519 verify: a changed signature fails", !ed25519_verify(&out[0], &b[0], 200, &pk[0]));
+    out[40] = ((out[40] + 255) % 256) as tryte;
+    var s_eq_l: [64]tryte;
+    k = 0;
+    while (k < 32) { s_eq_l[k] = out[k]; k += 1; }
+    unhex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010", &s_eq_l[32]);
+    ok("Ed25519 verify: S = L is refused", !ed25519_verify(&s_eq_l[0], &b[0], 200, &pk[0]));
+    var bad_pk: [32]tryte;
+    unhex("0200000000000000000000000000000000000000000000000000000000000000", &bad_pk[0]);
+    ok("Ed25519 verify: a key that is not a point fails", !ed25519_verify(&out[0], &b[0], 200, &bad_pk[0]));
+    unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", &pk[0]);
+    unhex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b", &out[0]);
+    ok("Ed25519 verify: RFC 8032 test 1", ed25519_verify(&out[0], &b[0], 0, &pk[0]));
+
+    var blob: [64]tryte;
+    var bn: int = base64_decode("AAAAC3NzaC1lZDI1NTE5", 20, &blob[0], 64);
+    ok("base64 decode", bn == 15 && blob[3] == 11 && blob[4] == 's' && blob[14] == '9');
+    var enc: [32]char;
+    base64_encode(&blob[0], 15, &enc[0], 0);
+    ok("base64 round trip", streq(&enc[0], "AAAAC3NzaC1lZDI1NTE5"));
+    ok("base64 refuses junk and overflow", base64_decode("AA*A", 4, &blob[0], 64) == -1 && base64_decode("AAAAAAAA", 8, &blob[0], 3) == -1);
 
     puts(failures == 0 ? "cryptotest: all passed\n" : "cryptotest: some checks FAILED\n");
     return failures != 0;

@@ -214,3 +214,70 @@ fn a_tampered_packet_ends_the_connection() {
     assert_eq!(code, 255, "{err}");
     has(&s.out, &["disconnecting: message authentication failed"]);
 }
+
+/// A new key pair from the host's ssh-keygen: (private key path, public line).
+fn keygen(kind: &str, name: &str) -> Option<(String, String)> {
+    let dir = std::env::temp_dir().join(format!("setun-keys-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let key = dir.join(name);
+    let _ = std::fs::remove_file(&key);
+    let _ = std::fs::remove_file(key.with_extension("pub"));
+    let ok = Command::new("ssh-keygen")
+        .args(["-q", "-t", kind, "-N", "", "-C", name, "-f"])
+        .arg(&key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .success();
+    if !ok {
+        return None;
+    }
+    let public = std::fs::read_to_string(format!("{}.pub", key.display())).ok()?;
+    Some((key.display().to_string(), public.trim().to_string()))
+}
+
+#[test]
+fn public_key_logins() {
+    let Some((mut s, port)) = booted() else { return };
+    let Some((key, public)) = keygen("ed25519", "trusted") else {
+        eprintln!("no ssh-keygen on this host: skipped");
+        return;
+    };
+    let (other, _) = keygen("ed25519", "stranger").unwrap();
+    let (rsa, rsa_public) = keygen("rsa", "rsa").unwrap();
+    s.cmd(&format!("mkdir /root/.ssh; echo '{rsa_public}' > /root/.ssh/authorized_keys; echo '{public}' >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"));
+    let with_key = |k: &str| -> Vec<String> {
+        ["-i", k, "-o", "IdentitiesOnly=yes", "-o", "PubkeyAuthentication=yes", "-o", "PreferredAuthentications=publickey"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect()
+    };
+    let opts = with_key(&key);
+    let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
+    let (code, out, err) = run_ssh(&mut s, port, "root", "unused", &o, "echo by key; whoami");
+    assert_eq!((code, out.as_str()), (0, "by key\nroot\n"), "{err}");
+    has(&s.out, &["accepted publickey for root"]);
+    // a key that is not in the file
+    let opts = with_key(&other);
+    let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
+    let (code, _, err) = run_ssh(&mut s, port, "root", "unused", &o, "true");
+    assert_eq!(code, 255);
+    assert!(err.contains("Permission denied (publickey,password)"), "{err}");
+    has(&s.out, &["key not authorized for root"]);
+    // an RSA key, even one listed: only ssh-ed25519
+    let opts = with_key(&rsa);
+    let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
+    let (code, _, err) = run_ssh(&mut s, port, "root", "unused", &o, "true");
+    assert_eq!(code, 255, "{err}");
+    // the right key for the wrong user
+    let opts = with_key(&key);
+    let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
+    let (code, _, _) = run_ssh(&mut s, port, "user", "unused", &o, "true");
+    assert_eq!(code, 255);
+    // a file others may write is not trusted
+    s.cmd("chmod 666 /root/.ssh/authorized_keys");
+    let (code, _, _) = run_ssh(&mut s, port, "root", "unused", &o, "true");
+    assert_eq!(code, 255);
+    has(&s.out, &["ignored (group or others may write it): /root/.ssh/authorized_keys"]);
+}

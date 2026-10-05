@@ -20,3 +20,45 @@ fn base64_encode(p: *tryte, n: int, out: *char, nopad: int) -> int {
     out[m] = 0;
     return m;
 }
+
+fn _b64val(c: int) -> int {
+    if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+    if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+    if (c >= '0' && c <= '9') { return c - '0' + 52; }
+    if (c == '+') { return 62; }
+    if (c == '/') { return 63; }
+    return -1;
+}
+
+// Decode n characters of base64 (padding optional) into at most max
+// octets; the count, or -1 if the text is not base64 or does not fit.
+fn base64_decode(s: *char, n: int, out: *tryte, max: int) -> int {
+    var m: int = 0;
+    var acc: int = 0;
+    var bits: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var c: int = s[k];
+        k += 1;
+        if (c == '=') { break; }
+        var v: int = _b64val(c);
+        if (v < 0) { return -1; }
+        acc = acc * 64 + v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            var div: int = 1;
+            var j: int = 0;
+            while (j < bits) { div *= 2; j += 1; }
+            if (m >= max) { return -1; }
+            out[m] = (acc / div) as tryte;
+            m += 1;
+            acc = acc % div;
+        }
+    }
+    while (k < n) {
+        if (s[k] != '=') { return -1; }
+        k += 1;
+    }
+    return m;
+}

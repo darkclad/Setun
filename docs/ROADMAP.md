@@ -37,7 +37,7 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - N1–N5 ✅: tested against smoltcp both ways, over a lossy link, through a real host socket, and with hand-made broken packets; `nettest` checks the socket calls and their errors
     - N6 ✅ SSH: a random-number device (`TRNG`, block 11), `/dev/urandom` and `getrandom`; SHA-256/512, ChaCha20-Poly1305, X25519 and Ed25519 in Trine (binary XOR/AND by table, no ISA change); `sshd` with curve25519-sha256, ssh-ed25519, chacha20-poly1305@openssh.com, strict KEX, password login, pty and exec sessions; tested with the host's OpenSSH (NETWORK.md §8)
     - N7 ✅ out to the world: outbound TCP through a NAT to host sockets, DNS at 10.0.2.3 (host resolver), a resolver in tlibc, `host`, `wget` (NETWORK.md §9)
-    - N8: public-key login for `sshd`; an `ssh` client in Trinux
+    - N8: public-key login for `sshd` ✅ (ssh-ed25519, `~/.ssh/authorized_keys`); an `ssh` client in Trinux
 
 ## Next: performance
 
