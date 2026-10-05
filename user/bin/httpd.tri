@@ -1,0 +1,561 @@
+// /sbin/httpd [-p PORT] [-r ROOT] [-1]: serve files over HTTP/1.1.
+//
+// GET and HEAD of the files under ROOT (default /var/www): a directory
+// gives its index.html, or a listing; a directory named without its final
+// slash is redirected to it. Paths are percent-decoded (UTF-8, as Trinux
+// names are characters) and may not climb out of ROOT. A file whose trytes
+// are all 0..255 goes out octet for octet; any other is sent as UTF-8 text
+// (the rules of lib/octets.tri). One request per connection
+// (Connection: close), each in its own process; a client gets 27 seconds
+// to send its request, then a 408. Requests are logged to standard error
+// in the Common Log Format.
+//
+//   -p PORT   listen on PORT (default 80)
+//   -r ROOT   serve ROOT (default /var/www)
+//   -1        serve one connection, then exit (for tests)
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+import "../lib/time.tri";
+import "../lib/octets.tri";
+
+const MAX_HEAD: int = 6561;             // the request line and headers
+const REQUEST_SECONDS: int = 27;        // to send them, or 408 and goodbye
+
+var root: *char;
+var sock: int;
+var head: [6561]char;
+var client: [27]char;
+
+// What a request asked, and what the answer was (for the log).
+var method: [27]char;
+var target: [2187]char;
+var req_line: [2187]char;
+var status: int;
+var sent: int;
+
+fn put_all(p: *tryte, n: int) -> int {
+    var done: int = 0;
+    while (done < n) {
+        var w: int = write(sock, (p + done) as *char, n - done);
+        if (w <= 0) { return -1; }
+        done += w;
+    }
+    return 0;
+}
+
+// ASCII (or any text of code points < 128) out as octets.
+fn put_text(s: *char) {
+    var n: int = strlen(s);
+    var o: [2187]tryte;
+    var k: int = 0;
+    while (k < n) {
+        o[k] = s[k] as tryte;
+        k += 1;
+        if (k == 2187 || k == n) {
+            put_all(&o[0], k);
+            s = s + k;
+            n -= k;
+            k = 0;
+        }
+    }
+}
+
+fn reason(code: int) -> *char {
+    if (code == 200) { return "OK"; }
+    if (code == 301) { return "Moved Permanently"; }
+    if (code == 400) { return "Bad Request"; }
+    if (code == 403) { return "Forbidden"; }
+    if (code == 404) { return "Not Found"; }
+    if (code == 405) { return "Method Not Allowed"; }
+    if (code == 408) { return "Request Timeout"; }
+    if (code == 414) { return "URI Too Long"; }
+    if (code == 431) { return "Request Header Fields Too Large"; }
+    if (code == 500) { return "Internal Server Error"; }
+    if (code == 505) { return "HTTP Version Not Supported"; }
+    return "Error";
+}
+
+// The status line and the common headers; `extra` ends with CR LF or is "".
+fn put_head(code: int, ctype: *char, len: int, extra: *char) {
+    status = code;
+    var num: [15]char;
+    put_text("HTTP/1.1 ");
+    put_text(itoa(code, &num[0]));
+    put_text(" ");
+    put_text(reason(code));
+    put_text("\r\nServer: Trinux-httpd/0.1\r\nDate: ");
+    var t: tm;
+    gmtime_r(time(null), &t);
+    var date: [81]char;
+    strftime(&date[0], 81, "%a, %d %b %Y %H:%M:%S GMT", &t);
+    put_text(&date[0]);
+    put_text("\r\nContent-Type: ");
+    put_text(ctype);
+    put_text("\r\nContent-Length: ");
+    put_text(itoa(len, &num[0]));
+    put_text("\r\n");
+    put_text(extra);
+    put_text("Connection: close\r\n\r\n");
+}
+
+// A short HTML page for an error (or the body of a redirect).
+fn error_page(code: int, extra: *char, head_only: int) {
+    var body: [729]char;
+    var num: [15]char;
+    strcpy(&body[0], "<!doctype html><title>");
+    strcat(&body[0], itoa(code, &num[0]));
+    strcat(&body[0], " ");
+    strcat(&body[0], reason(code));
+    strcat(&body[0], "</title><h1>");
+    strcat(&body[0], itoa(code, &num[0]));
+    strcat(&body[0], " ");
+    strcat(&body[0], reason(code));
+    strcat(&body[0], "</h1>\n");
+    put_head(code, "text/html; charset=utf-8", strlen(&body[0]), extra);
+    if (!head_only) {
+        put_text(&body[0]);
+        sent = strlen(&body[0]);
+    }
+}
+
+fn ends_with(s: *char, tail: *char) -> int {
+    var n: int = strlen(s);
+    var m: int = strlen(tail);
+    return n >= m && strcmp(s + n - m, tail) == 0;
+}
+
+fn content_type(path: *char, text: int) -> *char {
+    if (ends_with(path, ".html") || ends_with(path, ".htm")) { return "text/html; charset=utf-8"; }
+    if (ends_with(path, ".css")) { return "text/css; charset=utf-8"; }
+    if (ends_with(path, ".js")) { return "text/javascript; charset=utf-8"; }
+    if (ends_with(path, ".json")) { return "application/json"; }
+    if (ends_with(path, ".svg")) { return "image/svg+xml"; }
+    if (ends_with(path, ".png")) { return "image/png"; }
+    if (ends_with(path, ".jpg") || ends_with(path, ".jpeg")) { return "image/jpeg"; }
+    if (ends_with(path, ".gif")) { return "image/gif"; }
+    if (ends_with(path, ".ico")) { return "image/x-icon"; }
+    if (ends_with(path, ".txt") || ends_with(path, ".tri") || ends_with(path, ".md") || ends_with(path, ".sh") || text) {
+        return "text/plain; charset=utf-8";
+    }
+    return "application/octet-stream";
+}
+
+fn hexval(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+// Percent-decode the path of target (up to ? or #) into out as characters
+// (the octets are UTF-8). 0, or -1 if it is malformed or holds a NUL.
+fn decode_path(t: *char, out: *char, max: int) -> int {
+    var oct: [2187]tryte;
+    var n: int = 0;
+    var k: int = 0;
+    while (t[k] != 0 && t[k] != '?' && t[k] != '#') {
+        var c: int = t[k];
+        if (c == '%') {
+            var h: int = hexval(t[k + 1]);
+            var l: int = h < 0 ? -1 : hexval(t[k + 2]);
+            if (l < 0) { return -1; }
+            c = h * 16 + l;
+            k += 3;
+        } else {
+            if (c < 33 || c > 126) { return -1; }        // the request line is ASCII
+            k += 1;
+        }
+        if (c == 0 || n >= 2186) { return -1; }
+        oct[n] = c as tryte;
+        n += 1;
+    }
+    // UTF-8 to characters, strictly (shortest forms, no 4-octet characters:
+    // they do not fit a tryte)
+    var m: int = 0;
+    k = 0;
+    while (k < n) {
+        var b: int = oct[k];
+        var need: int = 0;
+        var cp: int = b;
+        var least: int = 0;
+        if (b >= 128) {
+            if (b >= 194 && b < 224) { need = 1; cp = b % 32; least = 128; }
+            else if (b >= 224 && b < 240) { need = 2; cp = b % 16; least = 2048; }
+            else { return -1; }
+        }
+        if (k + need >= n && need > 0) { return -1; }
+        var j: int = 1;
+        while (j <= need) {
+            var cb: int = oct[k + j];
+            if (cb < 128 || cb >= 192) { return -1; }
+            cp = cp * 64 + cb % 64;
+            j += 1;
+        }
+        if (cp < least || cp > 9841 || m >= max - 1) { return -1; }   // overlong, or beyond a tryte
+        out[m] = cp as char;
+        m += 1;
+        k += need + 1;
+    }
+    out[m] = 0;
+    return 0;
+}
+
+// Resolve the decoded path into ROOT/... with . and .. folded: 0, or -1
+// if it would leave ROOT. *dir_slash: the path ended with a slash.
+fn resolve(p: *char, out: *char, max: int, dir_slash: *int) -> int {
+    strcpy(out, root);
+    var base: int = strlen(out);
+    if (base > 0 && out[base - 1] == '/') { base -= 1; out[base] = 0; }
+    var n: int = base;
+    var k: int = 0;
+    *dir_slash = 0;
+    while (p[k] != 0) {
+        while (p[k] == '/') { k += 1; }
+        if (p[k] == 0) { *dir_slash = 1; break; }
+        var start: int = k;
+        while (p[k] != 0 && p[k] != '/') { k += 1; }
+        var len: int = k - start;
+        if (len == 1 && p[start] == '.') { continue; }
+        if (len == 2 && p[start] == '.' && p[start + 1] == '.') {
+            if (n == base) { return -1; }               // above ROOT
+            while (n > base && out[n - 1] != '/') { n -= 1; }
+            n -= 1;
+            out[n] = 0;
+            continue;
+        }
+        if (n + 1 + len >= max) { return -1; }
+        out[n] = '/';
+        n += 1;
+        var j: int = 0;
+        while (j < len) { out[n] = p[start + j]; n += 1; j += 1; }
+        out[n] = 0;
+    }
+    if (n == base) { out[n] = '/'; out[n + 1] = 0; }
+    return 0;
+}
+
+// The text of a character string as UTF-8 octets, HTML-escaped.
+fn put_html(s: *char) {
+    var o: [27]tryte;
+    var k: int = 0;
+    while (s[k] != 0) {
+        var c: int = s[k];
+        if (c == '<') { put_text("&lt;"); }
+        else if (c == '>') { put_text("&gt;"); }
+        else if (c == '&') { put_text("&amp;"); }
+        else if (c == '"') { put_text("&quot;"); }
+        else {
+            var n: int = utf8_encode(c, &o[0]);
+            put_all(&o[0], n);
+        }
+        k += 1;
+    }
+}
+
+// A directory listing (its size is not known ahead: no Content-Length,
+// the connection's end marks the end).
+fn listing(fs: *char, url: *char, head_only: int) {
+    status = 200;
+    put_text("HTTP/1.1 200 OK\r\nServer: Trinux-httpd/0.1\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n");
+    if (head_only) { return; }
+    put_text("<!doctype html><meta charset=utf-8><title>Index of ");
+    put_html(url);
+    put_text("</title><h1>Index of ");
+    put_html(url);
+    put_text("</h1><ul>\n");
+    var names: [243]*char;
+    var nn: int = 0;
+    var d: *DIR = opendir(fs);
+    if (d != null) {
+        var e: *dirent = readdir(d);
+        while (e != null && nn < 243) {
+            if (!streq(&e.d_name[0], ".") && !streq(&e.d_name[0], "..")) {
+                names[nn] = strdup(&e.d_name[0]);
+                nn += 1;
+            }
+            e = readdir(d);
+        }
+        closedir(d);
+    }
+    // sorted, so the order does not depend on the file system
+    var i: int = 1;
+    while (i < nn) {
+        var j: int = i;
+        while (j > 0 && strcmp(names[j - 1], names[j]) > 0) {
+            var t: *char = names[j];
+            names[j] = names[j - 1];
+            names[j - 1] = t;
+            j -= 1;
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < nn) {
+        var full: [2187]char;
+        strcpy(&full[0], fs);
+        if (!ends_with(&full[0], "/")) { strcat(&full[0], "/"); }
+        strncat(&full[0], names[i], 100);
+        var st: stat_t;
+        var isdir: int = stat(&full[0], &st) == 0 && S_ISDIR(st.st_mode);
+        put_text("<li><a href=\"");
+        put_html(names[i]);
+        if (isdir) { put_text("/"); }
+        put_text("\">");
+        put_html(names[i]);
+        if (isdir) { put_text("/"); }
+        put_text("</a>\n");
+        i += 1;
+    }
+    put_text("</ul>\n");
+}
+
+fn serve_file(fs: *char, head_only: int) {
+    var fd: int = open(fs, O_RDONLY, 0);
+    if (fd < 0) {
+        error_page(errno == EACCES ? 403 : 404, "", head_only);
+        return;
+    }
+    var data: *tryte = null;
+    var n: int = slurp(fd, &data);
+    close(fd);
+    if (n < 0) { error_page(500, "", head_only); return; }
+    var text: int = needs_utf8(data, n);
+    var len: int = 0;
+    var body: *tryte = as_octets(data, n, &len);
+    put_head(200, content_type(fs, text), len, "");
+    if (!head_only) {
+        put_all(body, len);
+        sent = len;
+    }
+    free(body);
+}
+
+// The log line: host - - [date] "request" status size
+fn log_request() {
+    var t: tm;
+    gmtime_r(time(null), &t);
+    var date: [81]char;
+    strftime(&date[0], 81, "%d/%b/%Y:%H:%M:%S +0000", &t);
+    var num: [15]char;
+    fputs(STDERR_FILENO, &client[0]);
+    fputs(STDERR_FILENO, " - - [");
+    fputs(STDERR_FILENO, &date[0]);
+    fputs(STDERR_FILENO, "] \"");
+    fputs(STDERR_FILENO, &req_line[0]);
+    fputs(STDERR_FILENO, "\" ");
+    fputs(STDERR_FILENO, itoa(status, &num[0]));
+    fputs(STDERR_FILENO, " ");
+    fputs(STDERR_FILENO, sent > 0 ? itoa(sent, &num[0]) : "-");
+    fputs(STDERR_FILENO, "\n");
+}
+
+fn now_ms() -> int {
+    var ts: timespec;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Read the request line and headers into head (as characters, CR LF
+// kept): their length, or -1 (closed early) / -2 (too long) / -3 (too slow).
+fn read_head() -> int {
+    var n: int = 0;
+    var buf: [729]tryte;
+    var deadline: int = now_ms() + REQUEST_SECONDS * 1000;
+    loop {
+        var left: int = deadline - now_ms();
+        var pf: pollfd;
+        pf.fd = sock;
+        pf.events = POLLIN;
+        pf.revents = 0;
+        if (left <= 0 || poll(&pf, 1, left) == 0) { return -3; }
+        var r: int = read(sock, &buf[0] as *char, 729);
+        if (r <= 0) { return -1; }
+        var k: int = 0;
+        while (k < r) {
+            if (n >= MAX_HEAD - 1) { return -2; }
+            head[n] = buf[k] as char;
+            n += 1;
+            k += 1;
+            if (n >= 4 && head[n - 4] == '\r' && head[n - 3] == '\n' && head[n - 2] == '\r' && head[n - 1] == '\n') {
+                head[n] = 0;
+                return n;
+            }
+            if (n >= 2 && head[n - 2] == '\n' && head[n - 1] == '\n') {   // bare LF, tolerated
+                head[n] = 0;
+                return n;
+            }
+        }
+    }
+    return -1;
+}
+
+fn serve() {
+    status = 0;
+    sent = 0;
+    strcpy(&req_line[0], "-");
+    var n: int = read_head();
+    if (n == -1) { return; }
+    if (n == -2) { error_page(431, "", 0); log_request(); return; }
+    if (n == -3) { error_page(408, "", 0); log_request(); return; }
+    // the request line
+    var e: int = 0;
+    while (head[e] != '\r' && head[e] != '\n') { e += 1; }
+    strncpy(&req_line[0], &head[0], e < 2186 ? e : 2186);
+    req_line[e < 2186 ? e : 2186] = 0;
+    var sp1: *char = strchr(&req_line[0], ' ');
+    var sp2: *char = sp1 == null ? null : strchr(sp1 + 1, ' ');
+    if (sp1 == null || sp2 == null || strchr(sp2 + 1, ' ') != null) { error_page(400, "", 0); log_request(); return; }
+    var ml: int = 0;
+    while (req_line[ml] != ' ' && ml < 26) { method[ml] = req_line[ml]; ml += 1; }
+    method[ml] = 0;
+    var vers: *char = sp2 + 1;
+    var tl: int = 0;
+    var tp: *char = sp1 + 1;
+    while (tp[tl] != ' ') {
+        if (tl >= 2000) { error_page(414, "", 0); log_request(); return; }
+        target[tl] = tp[tl];
+        tl += 1;
+    }
+    target[tl] = 0;
+    var head_only: int = streq(&method[0], "HEAD");
+    if (strncmp(vers, "HTTP/1.", 7) != 0 || (vers[7] != '0' && vers[7] != '1') || vers[8] != 0) {
+        if (strncmp(vers, "HTTP/", 5) == 0) { error_page(505, "", head_only); } else { error_page(400, "", head_only); }
+        log_request();
+        return;
+    }
+    // HTTP/1.1 needs a Host header
+    if (vers[7] == '1') {
+        var has_host: int = 0;
+        var p: int = e;
+        while (head[p] != 0) {
+            while (head[p] == '\r' || head[p] == '\n') { p += 1; }
+            if (strncmp(&head[p], "Host:", 5) == 0 || strncmp(&head[p], "host:", 5) == 0 || strncmp(&head[p], "HOST:", 5) == 0) { has_host = 1; }
+            while (head[p] != 0 && head[p] != '\n') { p += 1; }
+        }
+        if (!has_host) { error_page(400, "", head_only); log_request(); return; }
+    }
+    if (!streq(&method[0], "GET") && !head_only) {
+        error_page(405, "Allow: GET, HEAD\r\n", 0);
+        log_request();
+        return;
+    }
+    // the absolute form (http://host/path) is taken as its path
+    var path_part: *char = &target[0];
+    if (strncmp(path_part, "http://", 7) == 0 || strncmp(path_part, "https://", 8) == 0) {
+        path_part = strchr(path_part + 8, '/');
+        if (path_part == null) { path_part = "/"; }
+    }
+    if (path_part[0] != '/') { error_page(400, "", head_only); log_request(); return; }
+    var decoded: [2187]char;
+    if (decode_path(path_part, &decoded[0], 2187) < 0) { error_page(400, "", head_only); log_request(); return; }
+    var fs: [2187]char;
+    var dir_slash: int = 0;
+    if (resolve(&decoded[0], &fs[0], 2187, &dir_slash) < 0) { error_page(403, "", head_only); log_request(); return; }
+    var st: stat_t;
+    if (stat(&fs[0], &st) < 0) {
+        error_page(errno == EACCES ? 403 : 404, "", head_only);
+        log_request();
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (!dir_slash && !streq(&decoded[0], "/")) {
+            // the directory's own URL ends with a slash, so relative links work
+            var loc: [2187]char;
+            strcpy(&loc[0], "Location: ");
+            var q: int = 0;
+            while (path_part[q] != 0 && path_part[q] != '?' && path_part[q] != '#') { q += 1; }
+            strncat(&loc[0], path_part, q < 2100 ? q : 2100);
+            strcat(&loc[0], "/\r\n");
+            error_page(301, &loc[0], head_only);
+            log_request();
+            return;
+        }
+        var index: [2187]char;
+        strcpy(&index[0], &fs[0]);
+        if (!ends_with(&index[0], "/")) { strcat(&index[0], "/"); }
+        strcat(&index[0], "index.html");
+        if (stat(&index[0], &st) == 0 && !S_ISDIR(st.st_mode)) {
+            serve_file(&index[0], head_only);
+        } else {
+            listing(&fs[0], &decoded[0], head_only);
+        }
+    } else {
+        serve_file(&fs[0], head_only);
+    }
+    log_request();
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var port: int = 80;
+    var once: int = 0;
+    root = "/var/www";
+    var c: int = getopt(argc, argv, "p:r:1");
+    while (c != -1) {
+        if (c == 'p') { port = atoi(optarg); }
+        else if (c == 'r') { root = optarg; }
+        else if (c == '1') { once = 1; }
+        else {
+            fputs(STDERR_FILENO, "usage: httpd [-p port] [-r root] [-1]\n");
+            return 2;
+        }
+        c = getopt(argc, argv, "p:r:1");
+    }
+    if (port <= 0 || port > 65535) { fputs(STDERR_FILENO, "httpd: bad port\n"); return 2; }
+    var rs: stat_t;
+    if (stat(root, &rs) < 0 || !S_ISDIR(rs.st_mode)) {
+        fputs(STDERR_FILENO, "httpd: ");
+        fputs(STDERR_FILENO, root);
+        fputs(STDERR_FILENO, ": not a directory\n");
+        return 1;
+    }
+    var l: int = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) { perror2("httpd", "socket"); return 1; }
+    var one: int = 1;
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    var a: sockaddr_in;
+    sockaddr_set(&a, INADDR_ANY, port);
+    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("httpd", "bind"); return 1; }
+    if (listen(l, 9) < 0) { perror2("httpd", "listen"); return 1; }
+    var num: [15]char;
+    fputs(STDERR_FILENO, "httpd: serving ");
+    fputs(STDERR_FILENO, root);
+    fputs(STDERR_FILENO, " on port ");
+    fputs(STDERR_FILENO, itoa(port, &num[0]));
+    fputs(STDERR_FILENO, "\n");
+    loop {
+        var from: sockaddr_in;
+        var flen: int = sizeof(sockaddr_in);
+        var s: int = accept(l, &from, &flen);
+        if (s < 0) {
+            if (errno == EINTR) { continue; }
+            perror2("httpd", "accept");
+            return 1;
+        }
+        var st: int = 0;
+        while (waitpid(-1, &st, WNOHANG) > 0) {}
+        strncpy(&client[0], inet_ntoa(from.sin_addr), 26);
+        client[26] = 0;
+        if (once) {
+            close(l);
+            sock = s;
+            serve();
+            shutdown(s, SHUT_RDWR);
+            close(s);
+            return 0;
+        }
+        var pid: int = fork();
+        if (pid == 0) {
+            close(l);
+            sock = s;
+            serve();
+            shutdown(s, SHUT_RDWR);
+            close(s);
+            _exit(0);
+        }
+        close(s);
+    }
+    return 0;
+}

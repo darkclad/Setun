@@ -51,9 +51,10 @@ fn main(argc: int, argv: **char) -> int {
     puts(", starting /bin/login\n");
     var pid: int = spawn("/bin/login", "login");
     if (eth0_up()) {
-        puts("init: eth0 is up, starting /sbin/telnetd and /sbin/sshd (logs in /var/log)\n");
+        puts("init: eth0 is up, starting /sbin/telnetd, /sbin/sshd and /sbin/httpd (logs in /var/log)\n");
         spawn_logged("/sbin/telnetd", "telnetd", "/var/log/telnetd.log");
         spawn_logged("/sbin/sshd", "sshd", "/var/log/sshd.log");
+        spawn_logged("/sbin/httpd", "httpd", "/var/log/httpd.log");
     }
     var quick_failures: int = 0;
     loop {
