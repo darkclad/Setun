@@ -186,11 +186,15 @@ fn k6_inconsistent_superblock_is_refused() {
 
 #[test]
 fn k6_initramfs_root_still_boots() {
-    let disk = trinux::build_disk_root(&trinux::kernel_dir(), &trinux::default_files(), &Root::Initramfs)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .trytes;
+    // The initramfs is loaded into one block of 3^k pages, and 243 sectors
+    // is the most that fits beside the kernel in 729 pages of RAM. The
+    // test programs and the network and crypto tools no longer fit in
+    // that, and are not needed to boot.
+    let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest"];
+    let files: Vec<_> = trinux::default_files().into_iter().filter(|(name, _)| !heavy.iter().any(|h| name.contains(h))).collect();
+    let disk = trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Initramfs).unwrap_or_else(|e| panic!("{e}")).trytes;
     let (out, _) = session(&disk, &["echo ramfs root", "ls /proc/1", "exit"], 100_000_000);
-    let count = format!("initramfs: {} files", trinux::default_files().len());
+    let count = format!("initramfs: {} files", files.len());
     assert_has(&out, &[&count, "VFS: Mounted root (ramfs from the initramfs)", "ramfs root\n", "cmdline\nstat\nstatus\n"]);
 }
 
