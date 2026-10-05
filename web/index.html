@@ -135,7 +135,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           <option value="0" selected>Max</option>
         </select>
       </div>
-      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian.</p>
+      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. In the browser the network card has no link, so <kbd>ssh</kbd>, <kbd>wget</kbd> and <kbd>sshd</kbd> need the native build (<kbd>setun --net</kbd>).</p>
       <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
     </aside>
   </div>
@@ -220,6 +220,13 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       document.querySelectorAll("[data-trinux]").forEach((el) => { el.hidden = !trinux; });
       document.querySelectorAll("[data-demo]").forEach((el) => { el.hidden = trinux; });
     }
+    // fresh browser entropy for the machine's random-number device, before every boot
+    function seed() {
+      const w = new Uint32Array(8);
+      crypto.getRandomValues(w);
+      w.forEach((v, i) => wasm.setun_seed_word(i, v));
+    }
+    seed();
     wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
     showKind();
     const decoder = new TextDecoder();
@@ -296,9 +303,10 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     $("btn-wm").addEventListener("click", () => { sendLine("trwm term clock colors paint &"); canvas.focus(); });
     $("btn-gfx").addEventListener("click", () => press(43));
     $("btn-text").addEventListener("click", () => press(41));
-    $("btn-reset").addEventListener("click", () => { wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
-    $("btn-fresh").addEventListener("click", () => { wasm.setun_fresh_disk(Date.now() / 1000); serialEl.textContent = ""; });
+    $("btn-reset").addEventListener("click", () => { seed(); wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
+    $("btn-fresh").addEventListener("click", () => { seed(); wasm.setun_fresh_disk(Date.now() / 1000); serialEl.textContent = ""; });
     $("machine").addEventListener("change", () => {
+      seed();
       wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
       serialEl.textContent = "";
       showKind();

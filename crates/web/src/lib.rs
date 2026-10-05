@@ -33,6 +33,23 @@ struct Emu {
 
 thread_local! {
     static EMU: RefCell<Option<Emu>> = const { RefCell::new(None) };
+    /// Entropy for the next machine's TRNG, from the page's crypto.getRandomValues.
+    static SEED: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
+}
+
+/// Set word `i` (0..8) of the seed for the next boot or power-cycle. The
+/// page passes fresh browser entropy before each; a machine made without it
+/// runs its TRNG from the fixed all-zero seed (SOURCE reads 0).
+#[no_mangle]
+pub extern "C" fn setun_seed_word(i: u32, v: u32) {
+    if i >= 8 {
+        return;
+    }
+    SEED.with(|s| {
+        let mut s = s.borrow_mut();
+        let seed = s.get_or_insert([0; 32]);
+        seed[4 * i as usize..4 * i as usize + 4].copy_from_slice(&v.to_le_bytes());
+    });
 }
 
 fn with<R>(f: impl FnOnce(&mut Emu) -> R) -> R {
@@ -68,6 +85,15 @@ pub fn trinux_disk() -> Vec<i16> {
 }
 
 fn new_machine(kind: u32, ram: i64, unix: i64, disk: Option<Box<dyn setun_core::devices::BlockStore>>) -> Machine {
+    let mut m = new_machine_unseeded(kind, ram, unix, disk);
+    // each seed is used once: the page sends a new one for every machine
+    if let Some(seed) = SEED.with(|s| s.borrow_mut().take()) {
+        m.dev.rng.seed(seed, true);
+    }
+    m
+}
+
+fn new_machine_unseeded(kind: u32, ram: i64, unix: i64, disk: Option<Box<dyn setun_core::devices::BlockStore>>) -> Machine {
     if kind == KIND_DEMO {
         return setun_demo::machine(ram, unix);
     }
@@ -251,6 +277,31 @@ mod tests {
             assert!(!page.contains(old), "{old} in index.html");
             assert!(!wasm.windows(old.len()).any(|w| w == old.as_bytes()), "{old} in setun.wasm");
         }
+    }
+
+    #[test]
+    fn each_machine_takes_the_seed_given_once() {
+        let first = |kind: u32| {
+            setun_boot(kind, 27, 0.0);
+            with(|e| (e.m.dev.rng.from_host, e.m.dev.rng.next_octet(), e.m.dev.rng.next_octet()))
+        };
+        // no seed: the fixed one, the same every time
+        let a = first(KIND_TRINUX);
+        assert!(!a.0);
+        assert_eq!(first(KIND_TRINUX), a);
+        // a seed: from the host, different output; then gone again
+        for (i, v) in [7u32, 1, 2, 3, 4, 5, 6, 9].iter().enumerate() {
+            setun_seed_word(i as u32, *v);
+        }
+        setun_seed_word(8, 1); // out of range: ignored
+        let b = first(KIND_TRINUX);
+        assert!(b.0);
+        assert_ne!((b.1, b.2), (a.1, a.2));
+        assert_eq!(first(KIND_TRINUX), a);
+        // power-cycles take a new one too
+        setun_seed_word(0, 99);
+        setun_power_cycle(0.0);
+        assert!(with(|e| e.m.dev.rng.from_host));
     }
 
     fn output() -> String {
