@@ -1,0 +1,1177 @@
+// /sbin/sshd [-p PORT] [-1]: the SSH server (RFC 4251-4254), written for
+// Trinux with the crypto of user/lib (docs/NETWORK.md §8).
+//
+//   key exchange   curve25519-sha256 (RFC 8731), strict KEX (Terrapin fix)
+//   host key       ssh-ed25519 (RFC 8709), made on first start:
+//                  /etc/ssh/ssh_host_ed25519_key (the seed, hex, 0600) and .pub
+//   cipher         chacha20-poly1305@openssh.com (AEAD; no separate MAC)
+//   login          password, checked against /etc/shadow like login(1)
+//   sessions       one per connection: a shell or a command, on a pty when
+//                  the client asks for one, otherwise on pipes
+//
+// Text crosses the network as UTF-8; Trinux's terminals carry code points.
+// Each connection is served by its own process; -1 serves one and exits.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/string.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+import "../lib/pwd.tri";
+import "../lib/crypt.tri";
+import "../lib/c25519.tri";
+import "../lib/chacha.tri";
+import "../lib/base64.tri";
+
+const SSH_MSG_DISCONNECT: int = 1;
+const SSH_MSG_IGNORE: int = 2;
+const SSH_MSG_UNIMPLEMENTED: int = 3;
+const SSH_MSG_DEBUG: int = 4;
+const SSH_MSG_SERVICE_REQUEST: int = 5;
+const SSH_MSG_SERVICE_ACCEPT: int = 6;
+const SSH_MSG_KEXINIT: int = 20;
+const SSH_MSG_NEWKEYS: int = 21;
+const SSH_MSG_KEX_ECDH_INIT: int = 30;
+const SSH_MSG_KEX_ECDH_REPLY: int = 31;
+const SSH_MSG_USERAUTH_REQUEST: int = 50;
+const SSH_MSG_USERAUTH_FAILURE: int = 51;
+const SSH_MSG_USERAUTH_SUCCESS: int = 52;
+const SSH_MSG_GLOBAL_REQUEST: int = 80;
+const SSH_MSG_REQUEST_FAILURE: int = 82;
+const SSH_MSG_CHANNEL_OPEN: int = 90;
+const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: int = 91;
+const SSH_MSG_CHANNEL_OPEN_FAILURE: int = 92;
+const SSH_MSG_CHANNEL_WINDOW_ADJUST: int = 93;
+const SSH_MSG_CHANNEL_DATA: int = 94;
+const SSH_MSG_CHANNEL_EXTENDED_DATA: int = 95;
+const SSH_MSG_CHANNEL_EOF: int = 96;
+const SSH_MSG_CHANNEL_CLOSE: int = 97;
+const SSH_MSG_CHANNEL_REQUEST: int = 98;
+const SSH_MSG_CHANNEL_SUCCESS: int = 99;
+const SSH_MSG_CHANNEL_FAILURE: int = 100;
+
+const DISCONNECT_PROTOCOL_ERROR: int = 2;
+const DISCONNECT_KEY_EXCHANGE_FAILED: int = 3;
+const DISCONNECT_MAC_ERROR: int = 5;
+const DISCONNECT_SERVICE_NOT_AVAILABLE: int = 7;
+const DISCONNECT_NO_MORE_AUTH_METHODS: int = 14;
+const DISCONNECT_BY_APPLICATION: int = 11;
+
+const VERSION: *char = "SSH-2.0-TrinuxSSH_0.1";
+const MAX_PACKET: int = 35000;            // the longest packet_length we accept
+const LOCAL_WINDOW: int = 59049;          // 3^10
+const LOCAL_MAX_PACKET: int = 19683;      // 3^9
+const MAX_AUTH_TRIES: int = 6;
+const KEY_PATH: *char = "/etc/ssh/ssh_host_ed25519_key";
+
+var sock: int;
+var peer: [16]char;
+
+// ---- transport: buffers and keys ----------------------------------------------------------
+
+var inb: [72000]tryte;                    // received, not yet taken
+var in_len: int;
+var pkt: [36000]tryte;                    // the payload of the packet just read
+var pkt_len: int;
+var pkt_pos: int;
+var bad: int;                             // a read ran past the payload
+var outp: [36000]tryte;                   // the payload being built
+var out_len: int;
+var wire: [36100]tryte;
+
+var enc_in: int;
+var enc_out: int;
+var key_in: [64]tryte;                    // K_1 (payload) then K_2 (length)
+var key_out: [64]tryte;
+var seq_in: int;
+var seq_out: int;
+var strict: int;                          // strict KEX (kex-strict-*-v00@openssh.com)
+var kexes: int;                           // key exchanges done
+
+var host_sk: [64]tryte;
+var host_pk: [32]tryte;
+var v_c: [256]tryte;
+var v_c_len: int;
+var i_c: [4096]tryte;                     // the client's KEXINIT payload
+var i_c_len: int;
+var i_s: [1024]tryte;
+var i_s_len: int;
+var session_id: [32]tryte;
+
+fn log2(a: *char, b: *char) {
+    fputs(STDERR_FILENO, "sshd[");
+    var tmp: [15]char;
+    fputs(STDERR_FILENO, itoa(getpid(), &tmp[0]));
+    fputs(STDERR_FILENO, "]: ");
+    fputs(STDERR_FILENO, a);
+    fputs(STDERR_FILENO, b);
+    fputs(STDERR_FILENO, "\n");
+}
+
+fn write_all(fd: int, p: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        var w: int = write(fd, (p + k) as *char, n - k);
+        if (w < 0) {
+            if (errno == EINTR) { continue; }
+            return -1;
+        }
+        k += w;
+    }
+    return 0;
+}
+
+fn nonce_of(seq: int, n: *tryte) {
+    n[0] = 0; n[1] = 0; n[2] = 0; n[3] = 0;
+    put_be32(n + 4, seq);
+}
+
+// ---- building a payload ------------------------------------------------------------------------
+
+fn out_start(msg: int) {
+    outp[0] = msg as tryte;
+    out_len = 1;
+}
+
+fn put_byte(v: int) {
+    outp[out_len] = v as tryte;
+    out_len += 1;
+}
+
+fn put_u32(v: int) {
+    put_be32(&outp[out_len], v);
+    out_len += 4;
+}
+
+fn put_raw(p: *tryte, n: int) {
+    var k: int = 0;
+    while (k < n) { outp[out_len + k] = p[k]; k += 1; }
+    out_len += n;
+}
+
+fn put_string(p: *tryte, n: int) {
+    put_u32(n);
+    put_raw(p, n);
+}
+
+fn put_text(s: *char) { put_string(s as *tryte, strlen(s)); }
+
+// Text with code points beyond ASCII, as a UTF-8 string.
+fn put_utf8(s: *char) {
+    var at: int = out_len;
+    out_len += 4;
+    var k: int = 0;
+    while (s[k] != 0) {
+        out_len += utf8_encode(s[k], &outp[out_len]);
+        k += 1;
+    }
+    put_be32(&outp[at], out_len - at - 4);
+}
+
+// ---- reading a payload --------------------------------------------------------------------------
+
+fn get_byte() -> int {
+    if (pkt_pos >= pkt_len) { bad = 1; return 0; }
+    pkt_pos += 1;
+    return pkt[pkt_pos - 1];
+}
+
+fn get_u32() -> int {
+    if (pkt_pos + 4 > pkt_len) { bad = 1; return 0; }
+    pkt_pos += 4;
+    return be32(&pkt[pkt_pos - 4]);
+}
+
+fn get_bool() -> int { return get_byte() != 0; }
+
+// A string: its length; *at is its offset in pkt.
+fn get_string(at: *int) -> int {
+    var n: int = get_u32();
+    if (bad || n < 0 || pkt_pos + n > pkt_len) { bad = 1; *at = pkt_pos; return 0; }
+    *at = pkt_pos;
+    pkt_pos += n;
+    return n;
+}
+
+// A string as ASCII text into buf (max-1 characters at most).
+fn get_text(buf: *char, max: int) -> int {
+    var at: int = 0;
+    var n: int = get_string(&at);
+    if (n > max - 1) { bad = 1; n = 0; }
+    var k: int = 0;
+    while (k < n) { buf[k] = pkt[at + k] as char; k += 1; }
+    buf[n] = 0;
+    return n;
+}
+
+// A UTF-8 string as text into buf.
+fn get_utf8(buf: *char, max: int) -> int {
+    var at: int = 0;
+    var n: int = get_string(&at);
+    if (n > max - 1) { bad = 1; n = 0; }
+    var st: utf8_state;
+    st.need = 0;
+    var m: int = utf8_to_text(&st, &pkt[at], n, buf);
+    buf[m] = 0;
+    return m;
+}
+
+fn is_text(at: int, n: int, s: *char) -> int {
+    if (strlen(s) != n) { return 0; }
+    var k: int = 0;
+    while (k < n) {
+        if (pkt[at + k] != s[k]) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+// Does the name-list (pkt[at..at+n)) contain name?
+fn list_has(at: int, n: int, name: *char) -> int {
+    var k: int = 0;
+    while (k <= n) {
+        var e: int = k;
+        while (e < n && pkt[at + e] != ',') { e += 1; }
+        if (is_text(at + k, e - k, name)) { return 1; }
+        k = e + 1;
+    }
+    return 0;
+}
+
+// Is name the first entry of the name-list?
+fn list_first_is(at: int, n: int, name: *char) -> int {
+    var e: int = 0;
+    while (e < n && pkt[at + e] != ',') { e += 1; }
+    return is_text(at, e, name);
+}
+
+// ---- packets -----------------------------------------------------------------------------------
+
+fn send_packet() {
+    var pad: int;
+    if (enc_out) { pad = 8 - (1 + out_len) % 8; } else { pad = 8 - (5 + out_len) % 8; }
+    if (pad < 4) { pad += 8; }
+    var len: int = 1 + out_len + pad;
+    put_be32(&wire[0], len);
+    wire[4] = pad as tryte;
+    var k: int = 0;
+    while (k < out_len) { wire[5 + k] = outp[k]; k += 1; }
+    getrandom(&wire[5 + out_len], pad, 0);
+    var total: int = 4 + len;
+    if (enc_out) {
+        var nonce: [8]tryte;
+        nonce_of(seq_out, &nonce[0]);
+        var polykey: [64]tryte;
+        chacha20_block(&polykey[0], &key_out[0], &nonce[0], 0);
+        chacha20_xor(&wire[0], &wire[0], 4, &key_out[32], &nonce[0], 0);
+        chacha20_xor(&wire[4], &wire[4], len, &key_out[0], &nonce[0], 1);
+        poly1305(&wire[total], &wire[0], total, &polykey[0]);
+        total += 16;
+    }
+    seq_out = (seq_out + 1) % TWO32;
+    if (write_all(sock, &wire[0], total) < 0) {
+        log2("write to the client failed: ", strerror(errno));
+        _exit(1);
+    }
+}
+
+// Tell the client why, and end the connection.
+fn disconnect(reason: int, why: *char) {
+    log2("disconnecting: ", why);
+    out_start(SSH_MSG_DISCONNECT);
+    put_u32(reason);
+    put_text(why);
+    put_text("");
+    send_packet();
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
+    _exit(1);
+}
+
+// Read more from the socket into inb: the count (exits on EOF).
+fn net_read(block: int) -> int {
+    if (in_len >= 72000) { disconnect(DISCONNECT_PROTOCOL_ERROR, "input overflow"); }
+    var n: int = recv(sock, &inb[in_len], 72000 - in_len, block ? 0 : MSG_DONTWAIT);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EINTR) { return 0; }
+        log2("read from the client: ", strerror(errno));
+        _exit(1);
+    }
+    if (n == 0) {
+        log2("connection closed by ", &peer[0]);
+        _exit(0);
+    }
+    in_len += n;
+    return n;
+}
+
+fn consume(n: int) {
+    var k: int = 0;
+    while (k + n < in_len) { inb[k] = inb[k + n]; k += 1; }
+    in_len -= n;
+}
+
+// Take one whole packet from inb into pkt, if one is there.
+fn packet_ready() -> int {
+    if (in_len < 4) { return 0; }
+    var len: int;
+    var nonce: [8]tryte;
+    if (enc_in) {
+        nonce_of(seq_in, &nonce[0]);
+        var l: [4]tryte;
+        chacha20_xor(&l[0], &inb[0], 4, &key_in[32], &nonce[0], 0);
+        len = be32(&l[0]);
+    } else {
+        len = be32(&inb[0]);
+    }
+    if (len < 5 || len > MAX_PACKET) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad packet length"); }
+    if (enc_in ? len % 8 != 0 : (4 + len) % 8 != 0) { disconnect(DISCONNECT_PROTOCOL_ERROR, "packet length not a multiple of the block size"); }
+    var need: int = 4 + len + (enc_in ? 16 : 0);
+    if (in_len < need) { return 0; }
+    if (enc_in) {
+        var polykey: [64]tryte;
+        chacha20_block(&polykey[0], &key_in[0], &nonce[0], 0);
+        var tag: [16]tryte;
+        poly1305(&tag[0], &inb[0], 4 + len, &polykey[0]);
+        if (!octets_equal(&tag[0], &inb[4 + len], 16)) { disconnect(DISCONNECT_MAC_ERROR, "message authentication failed"); }
+        chacha20_xor(&inb[4], &inb[4], len, &key_in[0], &nonce[0], 1);
+    }
+    var pad: int = inb[4];
+    if (pad < 4 || pad > len - 1) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad padding"); }
+    pkt_len = len - 1 - pad;
+    var k: int = 0;
+    while (k < pkt_len) { pkt[k] = inb[5 + k]; k += 1; }
+    pkt_pos = 0;
+    bad = 0;
+    consume(need);
+    seq_in = (seq_in + 1) % TWO32;
+    return 1;
+}
+
+// The next packet, waiting for it; IGNORE and DEBUG are skipped (not
+// during the first key exchange in strict mode, which allows none).
+fn read_packet() -> int {
+    loop {
+        while (!packet_ready()) { net_read(1); }
+        var t: int = get_byte();
+        if ((t == SSH_MSG_IGNORE || t == SSH_MSG_DEBUG || t == SSH_MSG_UNIMPLEMENTED) && !(strict && kexes == 0)) { continue; }
+        if (t == SSH_MSG_DISCONNECT) {
+            log2("the client disconnected: ", &peer[0]);
+            _exit(0);
+        }
+        return t;
+    }
+}
+
+// ---- key exchange ----------------------------------------------------------------------------
+
+var kbuf: [40]tryte;                      // the shared secret as an mpint string (length first)
+var kbuf_len: int;
+var hash_h: [32]tryte;
+
+fn hash_string(c: *sha256_ctx, p: *tryte, n: int) {
+    var l: [4]tryte;
+    put_be32(&l[0], n);
+    sha256_update(c, &l[0], 4);
+    sha256_update(c, p, n);
+}
+
+fn derive(letter: int, out: *tryte) {
+    var c: sha256_ctx;
+    var x: [1]tryte;
+    x[0] = letter as tryte;
+    sha256_init(&c);
+    sha256_update(&c, &kbuf[0], kbuf_len);
+    sha256_update(&c, &hash_h[0], 32);
+    sha256_update(&c, &x[0], 1);
+    sha256_update(&c, &session_id[0], 32);
+    sha256_final(&c, out);
+    sha256_init(&c);
+    sha256_update(&c, &kbuf[0], kbuf_len);
+    sha256_update(&c, &hash_h[0], 32);
+    sha256_update(&c, out, 32);
+    sha256_final(&c, out + 32);
+}
+
+fn send_kexinit() {
+    out_start(SSH_MSG_KEXINIT);
+    getrandom(&outp[1], 16, 0);
+    out_len = 17;
+    put_text(kexes == 0 ? "curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-s-v00@openssh.com"
+                        : "curve25519-sha256,curve25519-sha256@libssh.org");
+    put_text("ssh-ed25519");
+    put_text("chacha20-poly1305@openssh.com");
+    put_text("chacha20-poly1305@openssh.com");
+    put_text("hmac-sha2-256");                 // never used: the cipher is an AEAD
+    put_text("hmac-sha2-256");
+    put_text("none");
+    put_text("none");
+    put_text("");
+    put_text("");
+    put_byte(0);
+    put_u32(0);
+    var k: int = 0;
+    while (k < out_len) { i_s[k] = outp[k]; k += 1; }
+    i_s_len = out_len;
+    send_packet();
+}
+
+// The client's KEXINIT is in pkt (its type already read). Agree on the
+// algorithms; returns 1 if the client's guessed first packet must be dropped.
+fn take_kexinit() -> int {
+    if (pkt_len > 4096) { disconnect(DISCONNECT_PROTOCOL_ERROR, "KEXINIT too long"); }
+    var k: int = 0;
+    while (k < pkt_len) { i_c[k] = pkt[k]; k += 1; }
+    i_c_len = pkt_len;
+    pkt_pos = 17;                               // type + cookie
+    var at: [10]int;
+    var n: [10]int;
+    var i: int = 0;
+    while (i < 10) { n[i] = get_string(&at[i]); i += 1; }
+    var guess: int = get_bool();
+    get_u32();
+    if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad KEXINIT"); }
+    if (!list_has(at[0], n[0], "curve25519-sha256") && !list_has(at[0], n[0], "curve25519-sha256@libssh.org")) {
+        disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common key exchange (curve25519-sha256 is needed)");
+    }
+    if (!list_has(at[1], n[1], "ssh-ed25519")) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common host key type (ssh-ed25519 is needed)"); }
+    if (!list_has(at[2], n[2], "chacha20-poly1305@openssh.com") || !list_has(at[3], n[3], "chacha20-poly1305@openssh.com")) {
+        disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common cipher (chacha20-poly1305@openssh.com is needed)");
+    }
+    if (!list_has(at[6], n[6], "none") || !list_has(at[7], n[7], "none")) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common compression"); }
+    if (kexes == 0) { strict = list_has(at[0], n[0], "kex-strict-c-v00@openssh.com"); }
+    var first_ok: int = (list_first_is(at[0], n[0], "curve25519-sha256") || list_first_is(at[0], n[0], "curve25519-sha256@libssh.org"))
+        && list_first_is(at[1], n[1], "ssh-ed25519");
+    return guess && !first_ok;
+}
+
+// The rest of a key exchange after both KEXINITs.
+fn kex(drop_guess: int) {
+    var t: int = read_packet();
+    if (drop_guess) { t = read_packet(); }
+    if (t != SSH_MSG_KEX_ECDH_INIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEX_ECDH_INIT"); }
+    var qc_at: int = 0;
+    var qc_len: int = get_string(&qc_at);
+    if (bad || qc_len != 32) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "bad client public key"); }
+    var qc: [32]tryte;
+    var k: int = 0;
+    while (k < 32) { qc[k] = pkt[qc_at + k]; k += 1; }
+    var e: [32]tryte;
+    getrandom(&e[0], 32, 0);
+    var qs: [32]tryte;
+    x25519_base(&qs[0], &e[0]);
+    var sh: [32]tryte;
+    x25519(&sh[0], &e[0], &qc[0]);
+    var zero: int = 1;
+    k = 0;
+    while (k < 32) { if (sh[k] != 0) { zero = 0; } k += 1; }
+    if (zero) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a degenerate shared secret"); }
+    // K as an mpint: the 32 octets read as a big-endian number
+    var lead: int = 0;
+    while (lead < 32 && sh[lead] == 0) { lead += 1; }
+    var mlen: int = 32 - lead + (sh[lead] >= 128);
+    put_be32(&kbuf[0], mlen);
+    k = 4;
+    if (sh[lead] >= 128) { kbuf[4] = 0; k = 5; }
+    var j: int = lead;
+    while (j < 32) { kbuf[k] = sh[j]; k += 1; j += 1; }
+    kbuf_len = 4 + mlen;
+    // the host key blob
+    var blob: [51]tryte;
+    put_be32(&blob[0], 11);
+    k = 0;
+    var name: *char = "ssh-ed25519";
+    while (k < 11) { blob[4 + k] = name[k] as tryte; k += 1; }
+    put_be32(&blob[15], 32);
+    k = 0;
+    while (k < 32) { blob[19 + k] = host_pk[k]; k += 1; }
+    // H = HASH(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K)
+    var c: sha256_ctx;
+    sha256_init(&c);
+    hash_string(&c, &v_c[0], v_c_len);
+    var vs: [64]tryte;
+    var vsn: int = strlen(VERSION);
+    k = 0;
+    while (k < vsn) { vs[k] = VERSION[k] as tryte; k += 1; }
+    hash_string(&c, &vs[0], vsn);
+    hash_string(&c, &i_c[0], i_c_len);
+    hash_string(&c, &i_s[0], i_s_len);
+    hash_string(&c, &blob[0], 51);
+    hash_string(&c, &qc[0], 32);
+    hash_string(&c, &qs[0], 32);
+    sha256_update(&c, &kbuf[0], kbuf_len);
+    sha256_final(&c, &hash_h[0]);
+    if (kexes == 0) {
+        k = 0;
+        while (k < 32) { session_id[k] = hash_h[k]; k += 1; }
+    }
+    var sig: [64]tryte;
+    ed25519_sign(&sig[0], &hash_h[0], 32, &host_sk[0]);
+    out_start(SSH_MSG_KEX_ECDH_REPLY);
+    put_string(&blob[0], 51);
+    put_string(&qs[0], 32);
+    put_u32(83);                                // the signature blob
+    put_text("ssh-ed25519");
+    put_string(&sig[0], 64);
+    send_packet();
+    out_start(SSH_MSG_NEWKEYS);
+    send_packet();
+    derive('D', &key_out[0]);                   // server to client
+    enc_out = 1;
+    if (strict) { seq_out = 0; }
+    t = read_packet();
+    if (t != SSH_MSG_NEWKEYS) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected NEWKEYS"); }
+    derive('C', &key_in[0]);                    // client to server
+    enc_in = 1;
+    if (strict) { seq_in = 0; }
+    kexes += 1;
+    k = 0;
+    while (k < 32) { sh[k] = 0; e[k] = 0; k += 1; }
+}
+
+// ---- the host key -------------------------------------------------------------------------------
+
+fn hexdigit(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return -1;
+}
+
+// Load the host key, making one the first time.
+fn host_key() -> int {
+    var seed: [32]tryte;
+    var hex: [80]char;
+    var fd: int = open(KEY_PATH, O_RDONLY, 0);
+    var ok: int = 0;
+    if (fd >= 0) {
+        var n: int = read(fd, &hex[0], 80);
+        close(fd);
+        ok = n >= 64;
+        var k: int = 0;
+        while (ok && k < 32) {
+            var hi: int = hexdigit(hex[2 * k]);
+            var lo: int = hexdigit(hex[2 * k + 1]);
+            if (hi < 0 || lo < 0) { ok = 0; }
+            seed[k] = (hi * 16 + lo) as tryte;
+            k += 1;
+        }
+        if (!ok) {
+            fputs(STDERR_FILENO, "sshd: ");
+            fputs(STDERR_FILENO, KEY_PATH);
+            fputs(STDERR_FILENO, ": not a key\n");
+            return -1;
+        }
+    } else {
+        mkdir("/etc/ssh", 493);
+        if (getrandom(&seed[0], 32, 0) != 32) { perror2("sshd", "getrandom"); return -1; }
+        var d: *char = "0123456789abcdef";
+        var k: int = 0;
+        while (k < 32) {
+            hex[2 * k] = d[seed[k] / 16];
+            hex[2 * k + 1] = d[seed[k] % 16];
+            k += 1;
+        }
+        hex[64] = '\n';
+        fd = open(KEY_PATH, O_WRONLY + O_CREAT + O_TRUNC, 384);       // 0600
+        if (fd < 0 || write(fd, &hex[0], 65) != 65) { perror2("sshd", KEY_PATH); return -1; }
+        close(fd);
+    }
+    ed25519_keypair(&seed[0], &host_sk[0], &host_pk[0]);
+    // the public key, as OpenSSH writes it, and its fingerprint
+    var blob: [51]tryte;
+    put_be32(&blob[0], 11);
+    var name: *char = "ssh-ed25519";
+    var k: int = 0;
+    while (k < 11) { blob[4 + k] = name[k] as tryte; k += 1; }
+    put_be32(&blob[15], 32);
+    k = 0;
+    while (k < 32) { blob[19 + k] = host_pk[k]; k += 1; }
+    var line: [128]char;
+    strcpy(&line[0], "ssh-ed25519 ");
+    base64_encode(&blob[0], 51, &line[12], 0);
+    strcat(&line[0], " root@setun\n");
+    fd = open("/etc/ssh/ssh_host_ed25519_key.pub", O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd >= 0) { write(fd, &line[0], strlen(&line[0])); close(fd); }
+    var digest: [32]tryte;
+    sha256(&blob[0], 51, &digest[0]);
+    var fp: [64]char;
+    base64_encode(&digest[0], 32, &fp[0], 1);
+    fputs(STDERR_FILENO, "sshd: host key ED25519 SHA256:");
+    fputs(STDERR_FILENO, &fp[0]);
+    fputs(STDERR_FILENO, "\n");
+    return 0;
+}
+
+// ---- authentication ------------------------------------------------------------------------------
+
+var user: [81]char;
+
+fn password_ok(name: *char, pass: *char) -> int {
+    var pw: *passwd = getpwnam(name);
+    if (pw == null) { return 0; }
+    var stored: [243]char;
+    var sp: *spwd = getspnam(name);
+    strncpy(&stored[0], sp != null ? sp.sp_pwdp : pw.pw_passwd, 242);
+    stored[242] = 0;
+    if (stored[0] == 0) { return 0; }                  // no empty passwords over the network
+    return crypt_verify(pass, &stored[0]);
+}
+
+fn authenticate() {
+    var t: int = read_packet();
+    if (t != SSH_MSG_SERVICE_REQUEST) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected SERVICE_REQUEST"); }
+    var svc: [64]char;
+    get_text(&svc[0], 64);
+    if (bad || !streq(&svc[0], "ssh-userauth")) { disconnect(DISCONNECT_SERVICE_NOT_AVAILABLE, "only ssh-userauth"); }
+    out_start(SSH_MSG_SERVICE_ACCEPT);
+    put_text("ssh-userauth");
+    send_packet();
+    var failures: int = 0;
+    loop {
+        t = read_packet();
+        if (t == SSH_MSG_KEXINIT) { kex(take_kexinit_and_answer()); continue; }
+        if (t != SSH_MSG_USERAUTH_REQUEST) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected USERAUTH_REQUEST"); }
+        get_utf8(&user[0], 81);
+        var service: [64]char;
+        get_text(&service[0], 64);
+        var method: [64]char;
+        get_text(&method[0], 64);
+        if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad USERAUTH_REQUEST"); }
+        if (!streq(&service[0], "ssh-connection")) { disconnect(DISCONNECT_SERVICE_NOT_AVAILABLE, "only ssh-connection"); }
+        if (streq(&method[0], "password")) {
+            var change: int = get_bool();
+            var pass: [243]char;
+            get_utf8(&pass[0], 243);
+            if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad password request"); }
+            var good: int = !change && password_ok(&user[0], &pass[0]);
+            var k: int = 0;
+            while (k < 243) { pass[k] = 0; k += 1; }
+            if (good) {
+                log2("accepted password for ", &user[0]);
+                out_start(SSH_MSG_USERAUTH_SUCCESS);
+                send_packet();
+                return;
+            }
+            log2("failed password for ", &user[0]);
+            failures += 1;
+        }
+        if (failures >= MAX_AUTH_TRIES) { disconnect(DISCONNECT_NO_MORE_AUTH_METHODS, "Too many authentication failures"); }
+        out_start(SSH_MSG_USERAUTH_FAILURE);
+        put_text("password");
+        put_byte(0);
+        send_packet();
+    }
+}
+
+// A KEXINIT from the client after the first exchange: answer with ours.
+fn take_kexinit_and_answer() -> int {
+    var drop: int = take_kexinit();
+    send_kexinit();
+    return drop;
+}
+
+// ---- the session ------------------------------------------------------------------------------
+
+var ch_open: int;
+var ch_peer: int;                         // the client's channel number
+var rwin: int;                            // what the client lets us send
+var rmax: int;
+var lwin: int;                            // what we still accept
+var want_pty: int;
+var term: [64]char;
+var cols: int = 80;
+var rows: int = 24;
+var child: int;
+var master: int = -1;                     // pty mode
+var in_fd: int = -1;                      // pipe mode: the child's stdin
+var out_fd: int = -1;                     //            stdout
+var err_fd: int = -1;                     //            stderr
+var child_done: int;
+var last_cr: int;
+var dec: utf8_state;
+var chars: [729]char;
+var text: [2187]char;
+var pend: [6600]tryte;                    // output waiting for window
+var pend_len: int;
+var pend_ext: int;                        // the pending output is stderr
+
+fn send_window_adjust() {
+    if (lwin >= LOCAL_WINDOW / 2) { return; }
+    out_start(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+    put_u32(ch_peer);
+    put_u32(LOCAL_WINDOW - lwin);
+    send_packet();
+    lwin = LOCAL_WINDOW;
+}
+
+fn channel_reply(want: int, ok: int) {
+    if (!want) { return; }
+    out_start(ok ? SSH_MSG_CHANNEL_SUCCESS : SSH_MSG_CHANNEL_FAILURE);
+    put_u32(ch_peer);
+    send_packet();
+}
+
+var env_store: [1458]char;
+var env_vec: [7]*char;
+
+fn env_put(k: int, name: *char, value: *char) {
+    var e: *char = &env_store[243 * k];
+    strcpy(e, name);
+    strcat(e, "=");
+    strncat(e, value, 200);
+    env_vec[k] = e;
+}
+
+// In the child: become the user, then run their shell or a command.
+fn run_as_user(command: *char) {
+    var pw: *passwd = getpwnam(&user[0]);
+    if (pw == null) { _exit(1); }
+    var name: [81]char;
+    var home: [243]char;
+    var shell: [243]char;
+    strncpy(&name[0], pw.pw_name, 80);
+    name[80] = 0;
+    strncpy(&home[0], pw.pw_dir, 242);
+    home[242] = 0;
+    strncpy(&shell[0], pw.pw_shell[0] != 0 ? pw.pw_shell : "/bin/sh", 242);
+    shell[242] = 0;
+    var uid: int = pw.pw_uid;
+    var gid: int = pw.pw_gid;
+    if (initgroups(&name[0], gid) < 0 || setgid(gid) < 0 || setuid(uid) < 0) {
+        fputs(STDERR_FILENO, "sshd: cannot become the user\n");
+        _exit(1);
+    }
+    if (chdir(&home[0]) < 0) { strcpy(&home[0], "/"); chdir("/"); }
+    env_put(0, "HOME", &home[0]);
+    env_put(1, "USER", &name[0]);
+    env_put(2, "LOGNAME", &name[0]);
+    env_put(3, "SHELL", &shell[0]);
+    env_put(4, "PATH", uid == 0 ? "/bin:/sbin" : "/bin");
+    env_put(5, "TERM", want_pty && term[0] != 0 ? &term[0] : "dumb");
+    env_vec[6] = null;
+    if (command == null) {
+        var fd: int = open("/etc/motd", O_RDONLY, 0);
+        if (fd >= 0) {
+            var buf: [729]char;
+            loop {
+                var r: int = read(fd, &buf[0], 729);
+                if (r <= 0) { break; }
+                write(STDOUT_FILENO, &buf[0], r);
+            }
+            close(fd);
+        }
+        var arg0: [243]char;
+        var base: *char = strrchr(&shell[0], '/');
+        strcpy(&arg0[0], "-");
+        strncat(&arg0[0], base == null ? &shell[0] : &base[1], 200);
+        var args: [2]*char = { &arg0[0], null };
+        execve(&shell[0], &args[0], &env_vec[0]);
+    } else {
+        var args: [4]*char = { "sh", "-c", command, null };
+        execve(&shell[0], &args[0], &env_vec[0]);
+    }
+    perror2("sshd", &shell[0]);
+    _exit(127);
+}
+
+fn start_child(command: *char) -> int {
+    if (want_pty) {
+        master = posix_openpt(O_RDWR);
+        if (master < 0) { return -1; }
+        unlockpt(master);
+        var name: [27]char;
+        if (ptsname_r(master, &name[0], 27) < 0) { return -1; }
+        var ws: winsize;
+        ws.ws_row = rows;
+        ws.ws_col = cols;
+        ioctl(master, TIOCSWINSZ, &ws as int);
+        child = fork();
+        if (child < 0) { return -1; }
+        if (child == 0) {
+            setsid();
+            var slave: int = open(&name[0], O_RDWR, 0);
+            if (slave < 0) { _exit(127); }
+            dup2(slave, 0);
+            dup2(slave, 1);
+            dup2(slave, 2);
+            var fd: int = 3;
+            while (fd < 27) { close(fd); fd += 1; }
+            run_as_user(command);
+        }
+        return 0;
+    }
+    var pin: [2]int;
+    var pout: [2]int;
+    var perr: [2]int;
+    if (pipe(&pin[0]) < 0 || pipe(&pout[0]) < 0 || pipe(&perr[0]) < 0) { return -1; }
+    child = fork();
+    if (child < 0) { return -1; }
+    if (child == 0) {
+        setsid();
+        dup2(pin[0], 0);
+        dup2(pout[1], 1);
+        dup2(perr[1], 2);
+        var fd: int = 3;
+        while (fd < 27) { close(fd); fd += 1; }
+        run_as_user(command);
+    }
+    close(pin[0]);
+    close(pout[1]);
+    close(perr[1]);
+    in_fd = pin[1];
+    out_fd = pout[0];
+    err_fd = perr[0];
+    return 0;
+}
+
+var cmdbuf: [2187]char;
+
+fn channel_request() {
+    var rcpt: int = get_u32();
+    var type: [64]char;
+    get_text(&type[0], 64);
+    var want: int = get_bool();
+    if (bad || !ch_open || rcpt != 0) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad CHANNEL_REQUEST"); }
+    if (streq(&type[0], "pty-req")) {
+        get_text(&term[0], 64);
+        cols = get_u32();
+        rows = get_u32();
+        if (bad || child != 0) { channel_reply(want, 0); return; }
+        want_pty = 1;
+        channel_reply(want, 1);
+        return;
+    }
+    if (streq(&type[0], "shell") || streq(&type[0], "exec")) {
+        var cmd: *char = null;
+        if (streq(&type[0], "exec")) {
+            get_utf8(&cmdbuf[0], 2187);
+            cmd = &cmdbuf[0];
+        }
+        if (bad || child != 0 || start_child(cmd) < 0) { channel_reply(want, 0); return; }
+        log2(cmd == null ? "shell for " : "command for ", &user[0]);
+        channel_reply(want, 1);
+        return;
+    }
+    if (streq(&type[0], "window-change")) {
+        cols = get_u32();
+        rows = get_u32();
+        if (master >= 0) {
+            var ws: winsize;
+            ws.ws_row = rows;
+            ws.ws_col = cols;
+            ioctl(master, TIOCSWINSZ, &ws as int);
+        }
+        return;
+    }
+    channel_reply(want, 0);                              // env, subsystem, signal, x11, ...
+}
+
+// Send what is pending, as far as the client's window allows.
+fn flush_pending() {
+    var at: int = 0;
+    while (at < pend_len && rwin > 0) {
+        var n: int = pend_len - at;
+        if (n > rwin) { n = rwin; }
+        if (n > rmax) { n = rmax; }
+        out_start(pend_ext ? SSH_MSG_CHANNEL_EXTENDED_DATA : SSH_MSG_CHANNEL_DATA);
+        put_u32(ch_peer);
+        if (pend_ext) { put_u32(1); }
+        put_string(&pend[at], n);
+        send_packet();
+        rwin -= n;
+        at += n;
+    }
+    var k: int = 0;
+    while (at + k < pend_len) { pend[k] = pend[at + k]; k += 1; }
+    pend_len -= at;
+}
+
+// Output from the child: read, encode, send. 0 at its end.
+fn child_output(fd: int, ext: int) -> int {
+    var n: int = read(fd, &chars[0], 729);
+    if (n < 0 && (errno == EAGAIN || errno == EINTR)) { return 1; }
+    if (n <= 0) { return 0; }
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        if (master >= 0 && chars[k] == '\n' && !last_cr) {
+            pend[m] = 13;
+            m += 1;
+        }
+        last_cr = chars[k] == '\r';
+        m += utf8_encode(chars[k], &pend[m]);
+        k += 1;
+    }
+    pend_len = m;
+    pend_ext = ext;
+    flush_pending();
+    return 1;
+}
+
+fn finish_child() {
+    var status: int = 0;
+    waitpid(child, &status, 0);
+    if (WIFEXITED(status)) {
+        out_start(SSH_MSG_CHANNEL_REQUEST);
+        put_u32(ch_peer);
+        put_text("exit-status");
+        put_byte(0);
+        put_u32(WEXITSTATUS(status));
+        send_packet();
+    } else {
+        out_start(SSH_MSG_CHANNEL_REQUEST);
+        put_u32(ch_peer);
+        put_text("exit-signal");
+        put_byte(0);
+        put_text(WTERMSIG(status) == SIGINT ? "INT" : WTERMSIG(status) == SIGKILL ? "KILL" : WTERMSIG(status) == SIGHUP ? "HUP" : "TERM");
+        put_byte(0);
+        put_text("");
+        put_text("");
+        send_packet();
+    }
+    out_start(SSH_MSG_CHANNEL_EOF);
+    put_u32(ch_peer);
+    send_packet();
+    out_start(SSH_MSG_CHANNEL_CLOSE);
+    put_u32(ch_peer);
+    send_packet();
+    child_done = 1;
+}
+
+// One message in the connection protocol (its type is t).
+fn connection_message(t: int) {
+    switch (t) {
+        case SSH_MSG_CHANNEL_OPEN: {
+            var type: [64]char;
+            get_text(&type[0], 64);
+            var sender: int = get_u32();
+            var win: int = get_u32();
+            var max: int = get_u32();
+            if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad CHANNEL_OPEN"); }
+            if (!streq(&type[0], "session") || ch_open) {
+                out_start(SSH_MSG_CHANNEL_OPEN_FAILURE);
+                put_u32(sender);
+                put_u32(streq(&type[0], "session") ? 4 : 3);   // resource shortage / unknown type
+                put_text(streq(&type[0], "session") ? "one session per connection" : "unknown channel type");
+                put_text("");
+                send_packet();
+                return;
+            }
+            ch_open = 1;
+            ch_peer = sender;
+            rwin = win;
+            rmax = max < 1 ? 1 : max > 32768 ? 32768 : max;
+            lwin = LOCAL_WINDOW;
+            out_start(SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+            put_u32(ch_peer);
+            put_u32(0);
+            put_u32(LOCAL_WINDOW);
+            put_u32(LOCAL_MAX_PACKET);
+            send_packet();
+        }
+        case SSH_MSG_CHANNEL_REQUEST: channel_request();
+        case SSH_MSG_CHANNEL_DATA: {
+            var rcpt: int = get_u32();
+            var at: int = 0;
+            var n: int = get_string(&at);
+            if (bad || !ch_open || rcpt != 0) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad CHANNEL_DATA"); }
+            if (n > lwin) { disconnect(DISCONNECT_PROTOCOL_ERROR, "the client ignored the window"); }
+            lwin -= n;
+            var fd: int = master >= 0 ? master : in_fd;
+            var done: int = 0;
+            while (done < n) {                      // text[] holds 2187 characters
+                var part: int = n - done > 2187 ? 2187 : n - done;
+                var m: int = utf8_to_text(&dec, &pkt[at + done], part, &text[0]);
+                if (fd >= 0 && m > 0) { write_all(fd, &text[0] as *tryte, m); }
+                done += part;
+            }
+            send_window_adjust();
+        }
+        case SSH_MSG_CHANNEL_WINDOW_ADJUST: {
+            get_u32();
+            var add: int = get_u32();
+            if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad WINDOW_ADJUST"); }
+            rwin += add;
+            if (rwin >= TWO32) { rwin = TWO32 - 1; }
+            flush_pending();
+        }
+        case SSH_MSG_CHANNEL_EOF: {
+            if (in_fd >= 0) { close(in_fd); in_fd = -1; }
+        }
+        case SSH_MSG_CHANNEL_CLOSE: {
+            if (child > 0 && !child_done) { kill(-child, SIGHUP); kill(child, SIGHUP); }
+            if (!child_done) {
+                out_start(SSH_MSG_CHANNEL_CLOSE);
+                put_u32(ch_peer);
+                send_packet();
+            }
+            log2("session closed for ", &user[0]);
+            shutdown(sock, SHUT_RDWR);
+            close(sock);
+            _exit(0);
+        }
+        case SSH_MSG_GLOBAL_REQUEST: {
+            var name: [64]char;
+            get_text(&name[0], 64);
+            if (get_bool()) {
+                out_start(SSH_MSG_REQUEST_FAILURE);
+                send_packet();
+            }
+        }
+        case SSH_MSG_KEXINIT: kex(take_kexinit_and_answer());
+        case SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_FAILURE, SSH_MSG_CHANNEL_EXTENDED_DATA: {}
+        default: {
+            out_start(SSH_MSG_UNIMPLEMENTED);
+            put_u32((seq_in + TWO32 - 1) % TWO32);
+            send_packet();
+        }
+    }
+}
+
+fn session() {
+    loop {
+        // everything already buffered first
+        while (packet_ready()) {
+            var t: int = get_byte();
+            if (t == SSH_MSG_DISCONNECT) { log2("the client disconnected: ", &peer[0]); _exit(0); }
+            if (t == SSH_MSG_IGNORE || t == SSH_MSG_DEBUG || t == SSH_MSG_UNIMPLEMENTED) { continue; }
+            connection_message(t);
+        }
+        var p: [3]pollfd;
+        p[0].fd = sock;
+        p[0].events = POLLIN;
+        var waiting: int = pend_len > 0;            // no room in the window: leave the child be
+        p[1].fd = waiting || child_done ? -1 : master >= 0 ? master : out_fd;
+        p[1].events = POLLIN;
+        p[2].fd = waiting || child_done || master >= 0 ? -1 : err_fd;
+        p[2].events = POLLIN;
+        if (poll(&p[0], 3, -1) < 0) {
+            if (errno == EINTR) { continue; }
+            log2("poll: ", strerror(errno));
+            _exit(1);
+        }
+        if (p[0].revents != 0) { net_read(0); }
+        if (p[1].fd >= 0 && p[1].revents != 0) {
+            if (!child_output(p[1].fd, 0)) {
+                if (master >= 0) { close(master); master = -2; }      // -2: was a pty
+                else { close(out_fd); out_fd = -1; }
+            }
+        }
+        if (p[2].fd >= 0 && p[2].revents != 0) {
+            if (!child_output(p[2].fd, 1)) { close(err_fd); err_fd = -1; }
+        }
+        if (child > 0 && !child_done && pend_len == 0 && (master == -2 || (master == -1 && out_fd < 0 && err_fd < 0))) {
+            finish_child();
+        }
+    }
+}
+
+// ---- one connection ----------------------------------------------------------------------------
+
+fn serve() {
+    var hello: [32]char;
+    strcpy(&hello[0], VERSION);
+    strcat(&hello[0], "\r\n");
+    write_all(sock, &hello[0] as *tryte, strlen(&hello[0]));
+    // the client's version line (other lines may come before it)
+    var lines: int = 0;
+    loop {
+        var nl: int = -1;
+        var k: int = 0;
+        while (k < in_len) {
+            if (inb[k] == 10) { nl = k; k = in_len; }
+            k += 1;
+        }
+        if (nl < 0) {
+            if (in_len > 255) { log2("no version line from ", &peer[0]); _exit(1); }
+            net_read(1);
+            continue;
+        }
+        var end: int = nl;
+        if (end > 0 && inb[end - 1] == 13) { end -= 1; }
+        if (end > 253) { log2("an overlong line before the version from ", &peer[0]); _exit(1); }   // RFC 4253: 255 with CR LF
+        var is_ssh: int = end >= 4 && inb[0] == 'S' && inb[1] == 'S' && inb[2] == 'H' && inb[3] == '-';
+        if (is_ssh) {
+            var v2: int = end >= 8 && inb[4] == '2' && inb[5] == '.' && inb[6] == '0' && inb[7] == '-';
+            var v199: int = end >= 9 && inb[4] == '1' && inb[5] == '.' && inb[6] == '9' && inb[7] == '9' && inb[8] == '-';
+            if (!v2 && !v199) {
+                write_all(sock, "Protocol mismatch.\r\n" as *tryte, 20);
+                log2("not SSH 2 from ", &peer[0]);
+                _exit(1);
+            }
+            k = 0;
+            while (k < end) { v_c[k] = inb[k]; k += 1; }
+            v_c_len = end;
+            consume(nl + 1);
+            break;
+        }
+        consume(nl + 1);
+        lines += 1;
+        if (lines > 20) { log2("no version line from ", &peer[0]); _exit(1); }
+    }
+    send_kexinit();
+    var t: int = read_packet();
+    if (t != SSH_MSG_KEXINIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEXINIT"); }
+    kex(take_kexinit());
+    authenticate();
+    session();
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var port: int = 22;
+    var once: int = 0;
+    var c: int = getopt(argc, argv, "p:1");
+    while (c != -1) {
+        if (c == 'p') { port = atoi(optarg); }
+        else if (c == '1') { once = 1; }
+        else {
+            fputs(STDERR_FILENO, "usage: sshd [-p port] [-1]\n");
+            return 2;
+        }
+        c = getopt(argc, argv, "p:1");
+    }
+    if (geteuid() != 0) { fputs(STDERR_FILENO, "sshd: must be run by root\n"); return 1; }
+    crypt_init();
+    if (host_key() < 0) { return 1; }
+    var l: int = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) { perror2("sshd", "socket"); return 1; }
+    var one: int = 1;
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+    var a: sockaddr_in;
+    sockaddr_set(&a, INADDR_ANY, port);
+    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("sshd", "bind"); return 1; }
+    if (listen(l, 9) < 0) { perror2("sshd", "listen"); return 1; }
+    fputs(STDERR_FILENO, "sshd: listening on port ");
+    var tmp: [15]char;
+    fputs(STDERR_FILENO, itoa(port, &tmp[0]));
+    fputs(STDERR_FILENO, "\n");
+    loop {
+        var from: sockaddr_in;
+        var flen: int = sizeof(sockaddr_in);
+        var s: int = accept(l, &from, &flen);
+        if (s < 0) {
+            if (errno == EINTR) { continue; }
+            perror2("sshd", "accept");
+            return 1;
+        }
+        var st: int = 0;
+        while (waitpid(-1, &st, WNOHANG) > 0) {}
+        strcpy(&peer[0], inet_ntoa(from.sin_addr));
+        if (once) {
+            close(l);
+            sock = s;
+            log2("connection from ", &peer[0]);
+            serve();
+            return 0;
+        }
+        var pid: int = fork();
+        if (pid == 0) {
+            close(l);
+            sock = s;
+            log2("connection from ", &peer[0]);
+            serve();
+            _exit(0);
+        }
+        close(s);
+    }
+}

@@ -2,112 +2,8 @@
 //! and sockets, against the smoltcp gateway of `setun-net`, on loopback,
 //! and against hand-made broken packets.
 
-use setun_core::Machine;
-use setun_net::Network;
-
-/// A booted Trinux with a network, logged in as root.
-struct Session {
-    m: Machine,
-    net: Network,
-    out: String,
-    /// Where `expect` starts looking.
-    mark: usize,
-    /// Echo every UDP datagram that reaches the gateway's port 7 back to its sender.
-    udp_echo: Option<setun_net::UdpId>,
-}
-
-const SLICE: u64 = 20_000; // 2 ms of emulated time between network polls
-
-impl Session {
-    fn boot() -> Session {
-        Self::boot_with(true)
-    }
-
-    fn boot_with(link: bool) -> Session {
-        let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
-        let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
-        let net = Network::attach(&mut m);
-        if !link {
-            m.dev.nic.link = false;
-        }
-        let mut s = Session { m, net, out: String::new(), mark: 0, udp_echo: None };
-        s.wait_for("login: ", 400_000_000);
-        s.send("root\n");
-        s.wait_for("Password: ", 100_000_000);
-        s.send("root\n");
-        s.wait_prompt(200_000_000);
-        s
-    }
-
-    fn step(&mut self) {
-        self.m.run(SLICE);
-        self.net.poll(&mut self.m);
-        if let Some(u) = self.udp_echo {
-            while let Some((port, data)) = self.net.udp_recv(u) {
-                self.net.udp_send(u, port, &data);
-            }
-        }
-        let fresh = self.m.dev.serial.take_output();
-        self.out.push_str(&fresh);
-        assert!(!self.out.contains("Kernel panic"), "kernel panic:\n{}", self.out);
-    }
-
-    /// Run until `pred` holds on the output after the mark; panics after `max` steps.
-    fn until(&mut self, what: &str, max: u64, pred: impl Fn(&str) -> bool) {
-        let mut n = 0;
-        while !pred(&self.out[self.mark..]) {
-            assert!(n < max, "timed out waiting for {what:?}; output:\n{}", self.out);
-            self.step();
-            n += SLICE;
-        }
-    }
-
-    fn wait_for(&mut self, s: &str, max: u64) {
-        let s2 = s.to_string();
-        self.until(s, max, move |o| o.contains(&s2));
-        self.mark = self.out.len();
-    }
-
-    fn wait_prompt(&mut self, max: u64) {
-        self.until("$ ", max, |o| o.ends_with("$ "));
-        self.mark = self.out.len();
-    }
-
-    /// Run for `n` steps (polling the network).
-    fn idle(&mut self, n: u64) {
-        let mut k = 0;
-        while k < n {
-            self.step();
-            k += SLICE;
-        }
-    }
-
-    fn send(&mut self, s: &str) {
-        self.m.dev.serial_input(s);
-    }
-
-    /// Type a command, wait for the next prompt, return what it printed.
-    fn cmd(&mut self, line: &str) -> String {
-        self.cmd_max(line, 600_000_000)
-    }
-
-    fn cmd_max(&mut self, line: &str, max: u64) -> String {
-        let start = self.out.len();
-        self.send(&format!("{line}\n"));
-        self.until(line, max, |o| o.ends_with("$ ") && o.len() > line.len() + 1);
-        let text = self.out[start..].to_string();
-        self.mark = self.out.len();
-        // drop the echoed command line and the prompt
-        let body = text.splitn(2, '\n').nth(1).unwrap_or("");
-        body.strip_suffix("$ ").unwrap_or(body).to_string()
-    }
-}
-
-fn has(out: &str, wants: &[&str]) {
-    for w in wants {
-        assert!(out.contains(w), "missing {w:?} in:\n{out}");
-    }
-}
+mod common;
+use common::*;
 
 // ---- N2: the card, ARP, IPv4, ICMP ------------------------------------------------------
 
@@ -231,11 +127,6 @@ fn icmp_echo(seq: u8) -> Vec<u8> {
     p
 }
 
-fn stat(s: &mut Session, name: &str) -> u64 {
-    let o = s.cmd("cat /proc/net/stat");
-    let line = o.lines().find(|l| l.starts_with(&format!("{name} "))).unwrap_or_else(|| panic!("no {name} in {o}"));
-    line.split(' ').nth(1).unwrap().parse().unwrap()
-}
 
 #[test]
 fn broken_packets_are_dropped_and_counted() {
@@ -338,21 +229,6 @@ fn socket_calls_and_their_errors() {
 
 // ---- N4: TCP against another stack (smoltcp, behind the card) ---------------------------------
 
-impl Session {
-    /// Type a line without waiting for a prompt.
-    fn type_line(&mut self, line: &str) {
-        self.send(&format!("{line}\n"));
-    }
-
-    fn run_until(&mut self, what: &str, max: u64, mut done: impl FnMut(&mut Session) -> bool) {
-        let mut n = 0;
-        while !done(self) {
-            assert!(n < max, "timed out: {what}; output:\n{}", self.out);
-            self.step();
-            n += SLICE;
-        }
-    }
-}
 
 #[test]
 fn tcp_server_in_trinux_client_on_the_gateway() {
@@ -606,4 +482,37 @@ fn telnet_logins() {
     let o = s.cmd("ps");
     assert!(!o.contains("-sh") || o.matches("-sh").count() == 1, "the telnet shells are gone:\n{o}");
     has(&s.out, &["telnetd: connection from 10.0.2.2"]);
+}
+
+// ---- crypto for SSH ----------------------------------------------------------------------------
+
+#[test]
+fn crypto_test_vectors() {
+    let mut s = Session::boot();
+    let o = s.cmd_max("cryptotest", 30_000_000_000);
+    println!("{o}");
+    assert!(o.contains("cryptotest: all passed") && !o.contains("FAIL"), "{o}");
+}
+
+#[test]
+fn tcp_bulk_from_the_gateway_into_trinux() {
+    let mut s = Session::boot();
+    s.cmd("nc -l 2400 < /dev/null > /tmp/in &");
+    s.idle(10_000_000);
+    let c = s.net.connect(2400);
+    s.run_until("established", 100_000_000, |s| s.net.state(c) == setun_net::State::Established);
+    let data: String = (1..=20000).map(|i| format!("{i}\n")).collect();
+    let bytes = data.as_bytes();
+    let mut sent = 0;
+    s.run_until("all sent", 3_000_000_000, |s| {
+        if sent < bytes.len() {
+            sent += s.net.send(c, &bytes[sent..]);
+        }
+        sent == bytes.len() && s.net.unacked(c) == 0
+    });
+    s.net.close(c);
+    let o = s.cmd_max("wait; seq 1 20000 > /tmp/want; wc -c /tmp/in; cmp /tmp/want /tmp/in && echo SAME || md5sum /tmp/want /tmp/in", 3_000_000_000);
+    has(&o, &["108894 /tmp/in"]);
+    let sums: Vec<&str> = o.lines().filter(|l| l.contains("/tmp/")).map(|l| l.split(' ').next().unwrap()).collect();
+    assert!(o.contains("SAME") || (sums.len() == 3 && sums[1] == sums[2]), "the data differ:\n{o}");
 }

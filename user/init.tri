@@ -33,8 +33,9 @@ fn main(argc: int, argv: **char) -> int {
     puts(", starting /bin/login\n");
     var pid: int = spawn("/bin/login", "login");
     if (eth0_up()) {
-        puts("init: eth0 is up, starting /sbin/telnetd\n");
+        puts("init: eth0 is up, starting /sbin/telnetd and /sbin/sshd\n");
         spawn("/sbin/telnetd", "telnetd");
+        spawn("/sbin/sshd", "sshd");
     }
     var quick_failures: int = 0;
     loop {

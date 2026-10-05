@@ -136,7 +136,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest",
+        "nc", "ping", "netstat", "nettest", "cryptotest",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -149,6 +149,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     }
     v.push(("/sbin/ifconfig".into(), u.join("bin/ifconfig.tri")));
     v.push(("/sbin/telnetd".into(), u.join("bin/telnetd.tri")));
+    v.push(("/sbin/sshd".into(), u.join("bin/sshd.tri")));
     for name in ["useradd", "userdel"] {
         v.push((format!("/sbin/{name}"), u.join("bin/useradm.tri")));
     }

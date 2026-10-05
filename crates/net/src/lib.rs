@@ -137,6 +137,8 @@ impl phy::TxToken for TxToken<'_> {
 
 /// A frame filter: return true to drop the frame.
 pub type LossFilter = Box<dyn FnMut(Dir, &[u8]) -> bool + Send>;
+/// A frame editor, for tests that need a broken packet the checksums accept.
+pub type Mangler = Box<dyn FnMut(Dir, &mut Vec<u8>) + Send>;
 
 pub struct Network {
     iface: Interface,
@@ -149,6 +151,7 @@ pub struct Network {
     icmp: SocketHandle,
     next_port: u16,
     loss: Option<LossFilter>,
+    mangle: Option<Mangler>,
     pub stats: Stats,
 }
 
@@ -184,6 +187,7 @@ impl Network {
             icmp,
             next_port: 49152,
             loss: None,
+            mangle: None,
             stats: Stats::default(),
         }
     }
@@ -197,10 +201,22 @@ impl Network {
         self.loss = None;
     }
 
+    /// Edit frames in flight (see [`tcp_payload`] and [`fix_checksums`]).
+    pub fn set_mangle(&mut self, f: impl FnMut(Dir, &mut Vec<u8>) + Send + 'static) {
+        self.mangle = Some(Box::new(f));
+    }
+
+    pub fn clear_mangle(&mut self) {
+        self.mangle = None;
+    }
+
     /// Exchange frames with the card and move data on every connection.
     /// Call it often: after each slice of emulation.
     pub fn poll(&mut self, m: &mut Machine) {
-        for f in m.dev.net_take_tx() {
+        for mut f in m.dev.net_take_tx() {
+            if let Some(g) = self.mangle.as_mut() {
+                g(Dir::FromGuest, &mut f);
+            }
             if self.loss.as_mut().is_some_and(|l| l(Dir::FromGuest, &f)) {
                 self.stats.dropped_from_guest += 1;
                 continue;
@@ -213,7 +229,10 @@ impl Network {
         self.iface.poll(t, &mut self.wire, &mut self.sockets);
         self.pump();
         self.iface.poll(t, &mut self.wire, &mut self.sockets);
-        while let Some(f) = self.wire.outbound.pop_front() {
+        while let Some(mut f) = self.wire.outbound.pop_front() {
+            if let Some(g) = self.mangle.as_mut() {
+                g(Dir::ToGuest, &mut f);
+            }
             if self.loss.as_mut().is_some_and(|l| l(Dir::ToGuest, &f)) {
                 self.stats.dropped_to_guest += 1;
                 continue;
@@ -515,4 +534,42 @@ impl Network {
     pub fn open_forwards(&self) -> usize {
         self.conns.iter().filter(|c| c.host.is_some()).count()
     }
+}
+
+/// Where the TCP payload of an Ethernet/IPv4/TCP frame lies, if it is one.
+pub fn tcp_payload(f: &[u8]) -> Option<std::ops::Range<usize>> {
+    if f.len() < 54 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 6 {
+        return None;
+    }
+    let ihl = (f[14] & 15) as usize * 4;
+    let total = u16::from_be_bytes([f[16], f[17]]) as usize;
+    let t = 14 + ihl;
+    let doff = (f[t + 12] >> 4) as usize * 4;
+    let start = t + doff;
+    let end = 14 + total;
+    (start <= end && end <= f.len()).then_some(start..end)
+}
+
+/// Recompute the TCP checksum of an Ethernet/IPv4/TCP frame after an edit.
+pub fn fix_checksums(f: &mut [u8]) {
+    let ihl = (f[14] & 15) as usize * 4;
+    let total = u16::from_be_bytes([f[16], f[17]]) as usize;
+    let t = 14 + ihl;
+    let len = total - ihl;
+    f[t + 16] = 0;
+    f[t + 17] = 0;
+    let mut sum: u32 = 0;
+    for c in f[26..34].chunks(2) {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    }
+    sum += 6 + len as u32;
+    for c in f[t..t + len].chunks(2) {
+        sum += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let c = !(sum as u16);
+    f[t + 16] = (c >> 8) as u8;
+    f[t + 17] = c as u8;
 }
