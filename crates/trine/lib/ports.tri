@@ -86,6 +86,10 @@ const NIC_LINK: int = 280;
 const NIC_ERROR: int = 281;
 const NIC_DROPS: int = 282;
 
+// Random-number generator (block 11)
+const RNG_DATA: int = 297;            // read: the next random octet
+const RNG_SOURCE: int = 298;          // +1 seeded from the host's entropy, 0 a fixed seed
+
 // IRQ lines (vector = IRQ + 1)
 const IRQ_TIMER: int = 0;
 const IRQ_KEYBOARD: int = 1;

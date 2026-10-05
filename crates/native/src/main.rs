@@ -160,6 +160,7 @@ fn build_machine(args: &Args) -> Machine {
             m
         }
     };
+    m.dev.rng.seed(setun_core::devices::host_entropy(), true);
     if let Some(path) = &args.disk {
         match FileDisk::open(path) {
             Ok(d) => m.dev.disks[0].attach(Box::new(d)),

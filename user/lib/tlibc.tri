@@ -503,6 +503,9 @@ const TIOCGPGRP: int = 21519;
 const TIOCSPGRP: int = 21520;
 const TIOCGWINSZ: int = 21523;
 
+// sys/random.h
+fn getrandom(buf: *tryte, n: int, flags: int) -> int { return _ret(syscall(278, buf, n, flags)); }
+
 fn ioctl(fd: int, cmd: int, arg: int) -> int { return _ret(syscall(29, fd, cmd, arg)); }
 fn tcgetattr(fd: int, t: *termios) -> int { return ioctl(fd, TCGETS, t as int); }
 fn tcsetattr(fd: int, when: int, t: *termios) -> int { return ioctl(fd, TCSETS + when, t as int); }

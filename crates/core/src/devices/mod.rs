@@ -9,6 +9,7 @@ mod display;
 mod font;
 mod input;
 mod nic;
+mod rng;
 mod pic;
 mod timer;
 
@@ -20,6 +21,9 @@ pub use font::{glyph8x8, overlined, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
 pub use input::{Keyboard, Mouse, Serial};
 pub use nic::{Nic, DEFAULT_MAC, MAX_FRAME, MIN_FRAME, NIC_QUEUE};
 pub use nic::error as nic_error;
+pub use rng::Rng;
+#[cfg(not(target_arch = "wasm32"))]
+pub use rng::host_entropy;
 pub use pic::Pic;
 pub use timer::{Rtc, Timer};
 
@@ -40,6 +44,7 @@ pub mod block {
     pub const DISK1: i64 = 8;
     pub const DISPLAY: i64 = 9;
     pub const NIC: i64 = 10;
+    pub const RNG: i64 = 11;
 }
 
 /// IRQ line numbers (ISA §8.1).
@@ -80,6 +85,7 @@ pub struct Devices {
     pub disks: [Disk; 2],
     pub display: Display,
     pub nic: Nic,
+    pub rng: Rng,
     /// Trytes written to `SYSCTL.DEBUG`, for the host log.
     pub debug_log: Vec<i64>,
     ram_frames: i64,
@@ -101,6 +107,7 @@ impl Devices {
             disks: [Disk::default(), Disk::default()],
             display: Display::new(),
             nic: Nic::default(),
+            rng: Rng::default(),
             debug_log: Vec::new(),
             ram_frames,
             power: None,
@@ -288,6 +295,7 @@ impl Io for Devices {
             block::DISK1 => self.disks[1].read(r),
             block::DISPLAY => self.display.read(r),
             block::NIC => self.nic.read(r),
+            block::RNG => self.rng.read(r),
             _ => 0,
         };
         word(v)

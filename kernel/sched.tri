@@ -124,6 +124,7 @@ const SYS_SETSOCKOPT: int = 208;
 const SYS_GETSOCKOPT: int = 209;
 const SYS_SHUTDOWN: int = 210;
 const SYS_ACCEPT4: int = 242;
+const SYS_GETRANDOM: int = 278;
 
 const WNOHANG: int = 1;
 const WUNTRACED: int = 2;
@@ -741,6 +742,7 @@ fn do_syscall(f: *int, n: int) {
         case SYS_SETSOCKOPT: f[F_R1] = sys_setsockopt(f[0], f[1], f[2], f[3], f[4]);
         case SYS_GETSOCKOPT: f[F_R1] = sys_getsockopt(f[0], f[1], f[2], f[3], f[4]);
         case SYS_SHUTDOWN: f[F_R1] = sys_shutdown(f[0], f[1]);
+        case SYS_GETRANDOM: f[F_R1] = sys_getrandom(f[0], f[1], f[2]);
         default: f[F_R1] = -ENOSYS;
     }
 }

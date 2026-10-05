@@ -1,0 +1,36 @@
+// random: /dev/random, /dev/urandom and getrandom(2), straight from the
+// TRNG device (ISA §8.2, block 11), which is a ChaCha20 stream keyed by
+// the host. With no host seed (SOURCE = 0) the stream is the same on every
+// boot: fine for tests, useless for keys, and the boot log says so.
+
+import "../params.tri";
+import "../printk.tri";
+
+const GRND_NONBLOCK: int = 1;
+const GRND_RANDOM: int = 2;
+const GRND_INSECURE: int = 4;
+
+fn random_init() {
+    if (in(RNG_SOURCE) == 1) {
+        printk("random: TRNG seeded from the host\n");
+    } else {
+        printk("random: TRNG has a fixed seed: the same numbers every boot (not for keys)\n");
+    }
+}
+
+// n random octets into buf.
+fn random_read(buf: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        buf[k] = in(RNG_DATA) as tryte;
+        k += 1;
+    }
+    return n;
+}
+
+fn sys_getrandom(buf: int, n: int, flags: int) -> int {
+    if (flags < 0 || flags > GRND_NONBLOCK + GRND_RANDOM + GRND_INSECURE) { return -22; }      // EINVAL
+    if (flags / GRND_RANDOM % 2 != 0 && flags / GRND_INSECURE % 2 != 0) { return -22; }
+    if (n < 0 || !user_range_ok(buf, n)) { return -14; }                                    // EFAULT
+    return random_read(buf as *tryte, n);
+}

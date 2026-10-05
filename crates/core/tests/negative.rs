@@ -482,7 +482,7 @@ fn inp(m: &mut Machine, b: i64, r: i64) -> i64 {
 #[test]
 fn unknown_ports_read_zero_and_ignore_writes() {
     let mut m = machine();
-    for p in [port(11, 0), port(-1, 0), port(364, 5), 9841, -9841, port(block::SYSCTL, 13), port(block::DISPLAY, -13)] {
+    for p in [port(12, 0), port(-1, 0), port(364, 5), 9841, -9841, port(block::SYSCTL, 13), port(block::DISPLAY, -13)] {
         m.dev.port_out(p, Word::MAX);
         assert_eq!(m.dev.port_in(p).value(), 0, "port {p}");
     }

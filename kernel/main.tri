@@ -107,6 +107,7 @@ fn start_kernel(disk: int, frames: int) {
     tty_init();
     input_init();
     net_init();
+    random_init();
     printk("VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty\n");
     {
         var pid: int = spawn_init("/sbin/init");

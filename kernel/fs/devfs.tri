@@ -2,7 +2,7 @@
 //
 // Device numbers follow Linux (major * 256 + minor):
 //   null 1,3   zero 1,5   ttyS0 4,64   tty 5,0   console 5,1   ptmx 5,2
-//   pts/N 136,N   fb0 29,0   mouse 13,63   kbd 13,64
+//   pts/N 136,N   fb0 29,0   mouse 13,63   kbd 13,64   random 1,8   urandom 1,9
 // tty, console and ttyS0 are all the console terminal; each open of ptmx
 // makes a new pseudo-terminal whose slave appears as /dev/pts/N.
 
@@ -11,9 +11,12 @@ import "vfs.tri";
 import "../drivers/tty.tri";
 import "../drivers/fb.tri";
 import "../drivers/input.tri";
+import "../drivers/random.tri";
 
 const DEV_NULL: int = 259;            // 1,3
 const DEV_ZERO: int = 261;            // 1,5
+const DEV_RANDOM: int = 264;          // 1,8
+const DEV_URANDOM: int = 265;         // 1,9
 const DEV_TTYS0: int = 1088;          // 4,64
 const DEV_TTY: int = 1280;            // 5,0
 const DEV_CONSOLE: int = 1281;        // 5,1
@@ -78,6 +81,7 @@ fn dev_read(rdev: int, f: int, buf: *tryte, n: int, nonblock: int) -> int {
         memset(buf, 0, n);
         return n;
     }
+    if (rdev == DEV_RANDOM || rdev == DEV_URANDOM) { return random_read(buf, n); }
     if (rdev == DEV_PTMX) { return pty_master_read(files[f].priv, buf, n, nonblock); }
     if (rdev == DEV_FB0) {
         var r: int = fb_dev_read(files[f].pos, buf, n);
@@ -92,7 +96,7 @@ fn dev_read(rdev: int, f: int, buf: *tryte, n: int, nonblock: int) -> int {
 }
 
 fn dev_write(rdev: int, f: int, buf: *tryte, n: int, nonblock: int) -> int {
-    if (rdev == DEV_NULL || rdev == DEV_ZERO) { return n; }
+    if (rdev == DEV_NULL || rdev == DEV_ZERO || rdev == DEV_RANDOM || rdev == DEV_URANDOM) { return n; }   // writes to random add nothing
     if (rdev == DEV_PTMX) { return pty_master_write(files[f].priv, buf, n); }
     if (rdev == DEV_FB0) {
         var r: int = fb_dev_write(files[f].pos, buf, n);
@@ -131,7 +135,7 @@ fn dev_ioctl_known(rdev: int, f: int, cmd: int) -> int {
 
 // poll(2) readiness: POLLIN / POLLOUT / POLLHUP.
 fn dev_poll(rdev: int, f: int) -> int {
-    if (rdev == DEV_NULL || rdev == DEV_ZERO || rdev == DEV_FB0) { return POLLIN + POLLOUT; }
+    if (rdev == DEV_NULL || rdev == DEV_ZERO || rdev == DEV_FB0 || rdev == DEV_RANDOM || rdev == DEV_URANDOM) { return POLLIN + POLLOUT; }
     if (rdev == DEV_MOUSE) { mouse_poll(); return mq_count > 0 ? POLLIN : 0; }
     if (rdev == DEV_KBD) { tty_poll(); return kq_count > 0 ? POLLIN : 0; }
     if (rdev == DEV_PTMX) {
@@ -185,6 +189,8 @@ fn devfs_init() -> int {
     var dir: int = mounts[m].root;
     mknod(dir, "null", DEV_NULL, 438);          // 0666
     mknod(dir, "zero", DEV_ZERO, 438);
+    mknod(dir, "random", DEV_RANDOM, 438);
+    mknod(dir, "urandom", DEV_URANDOM, 438);
     mknod(dir, "tty", DEV_TTY, 438);
     mknod(dir, "console", DEV_CONSOLE, 384);    // 0600
     mknod(dir, "ttyS0", DEV_TTYS0, 432);        // 0660

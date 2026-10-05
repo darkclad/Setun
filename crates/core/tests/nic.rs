@@ -215,3 +215,29 @@ fn reset_keeps_link_mac_and_queued_frames() {
     assert_eq!(inp(&mut m, LINK), 1);
     assert_eq!(inp(&mut m, RX_COUNT), 1);
 }
+
+// ---- the random-number generator (block 11) ----------------------------------------------
+
+#[test]
+fn rng_is_chacha20_and_reproducible_by_default() {
+    let mut m = Machine::new(27, 0);
+    let rd = |m: &mut Machine, r: i64| m.dev.port_in(27 * block::RNG + r).value();
+    assert_eq!(rd(&mut m, 1), 0, "SOURCE: a fixed seed");
+    let first: Vec<i64> = (0..16).map(|_| rd(&mut m, 0)).collect();
+    // RFC 8439 A.1, test vector 1: all-zero key and nonce, block 0
+    let want = [0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86, 0xbd, 0x28];
+    assert_eq!(first, want.map(|b| b as i64).to_vec());
+    // the next block continues the stream
+    for _ in 16..64 {
+        rd(&mut m, 0);
+    }
+    let second: Vec<i64> = (0..4).map(|_| rd(&mut m, 0)).collect();
+    assert_eq!(second, vec![0x9f, 0x07, 0xe7, 0xbe]); // RFC 8439 A.1 vector 2 (block counter 1)
+    m.dev.rng.seed(setun_core::devices::host_entropy(), true);
+    assert_eq!(rd(&mut m, 1), 1);
+    let a: Vec<i64> = (0..32).map(|_| rd(&mut m, 0)).collect();
+    assert!(a.iter().all(|&v| (0..=255).contains(&v)));
+    assert_ne!(a[..16], want.map(|b| b as i64)[..], "a host seed changes the stream");
+    m.reset();
+    assert_eq!(rd(&mut m, 1), 1, "reset keeps the seed");
+}

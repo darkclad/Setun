@@ -482,6 +482,7 @@ A kernel must save `EPC`/`EMODE` before re-enabling interrupts if it wants neste
 | 8 | 216 | disk 1 (reserved) | 7 |
 | 9 | 243 | display controller | 6 |
 | 10 | 270 | network card (`TNIC`) | 8 |
+| 11 | 297 | random-number generator (`TRNG`) | – |
 
 ### 8.2 Registers (offset from the block base)
 
@@ -605,6 +606,13 @@ Control values are ternary wherever that is natural.
 | 10 | `LINK` (read-only): +1 a network is attached |
 | 11 | `ERROR`: 0 none, 1 no link, 2 bad length, 3 a tryte outside 0..255, 4 bus error during DMA, 5 nothing received, 6 bad command, 7 transmit queue (27 frames) full |
 | 12 | `DROPS` (read-only): received frames lost to a full queue |
+
+**Random-number generator (297), `TRNG`.** A ChaCha20 key stream (RFC 8439 block function) under a 256-bit seed from the front end; with none, the seed is zero and every run gives the same numbers. Details: [`NETWORK.md`](NETWORK.md) §8.
+
+| Offset | Register |
+|---|---|
+| 0 | `DATA` (read): the next random octet, 0..255 |
+| 1 | `SOURCE` (read-only): +1 seeded from the host's entropy, 0 a fixed seed |
 
 ### 8.3 Framebuffer formats
 
