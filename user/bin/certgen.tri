@@ -1,0 +1,81 @@
+// certgen [-c P-256|P-384] [-d DAYS] [-k] KEY CERT NAME...: a key and a
+// self-signed certificate for a TLS server (lib/certgen.tri).
+//
+// A new key goes to KEY (PEM, mode 0600) unless -k says to use the one in
+// KEY (SEC1 or PKCS #8 PEM, as OpenSSL writes them). The certificate, for
+// the NAMEs (host names or IPv4 addresses; the first is also the common
+// name), valid for DAYS days (default 729) from now, goes to CERT.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/time.tri";
+import "../lib/certgen.tri";
+
+var der: [6561]tryte;
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: certgen [-c P-256|P-384] [-d days] [-k] key.pem cert.pem name...\n");
+    return 2;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var cid: int = CURVE_P256;
+    var days: int = 729;
+    var keep: int = 0;
+    var c: int = getopt(argc, argv, "c:d:k");
+    while (c != -1) {
+        switch (c) {
+            case 'c': {
+                if (streq(optarg, "P-256")) { cid = CURVE_P256; }
+                else if (streq(optarg, "P-384")) { cid = CURVE_P384; }
+                else { return usage(); }
+            }
+            case 'd': days = atoi(optarg);
+            case 'k': keep = 1;
+            default: return usage();
+        }
+        c = getopt(argc, argv, "c:d:k");
+    }
+    if (argc - optind < 3 || days < 1 || days > 36500) { return usage(); }
+    var keyfile: *char = argv[optind];
+    var certfile: *char = argv[optind + 1];
+    bin32_init();
+    var priv: [48]tryte;
+    var pub: [97]tryte;
+    if (keep) {
+        if (ec_key_read(keyfile, &cid, &priv[0], &pub[0]) < 0) {
+            fputs(STDERR_FILENO, "certgen: ");
+            fputs(STDERR_FILENO, keyfile);
+            fputs(STDERR_FILENO, ": not a P-256 or P-384 private key\n");
+            return 1;
+        }
+    } else {
+        if (!ec_keygen(cid, &priv[0], &pub[0]) || ec_key_write(keyfile, cid, &priv[0], &pub[0]) < 0) {
+            perror2("certgen", keyfile);
+            return 1;
+        }
+    }
+    var now: int = time(null);
+    var n: int = x509_selfsigned(cid, &priv[0], &pub[0], argv + optind + 2, argc - optind - 2, now - 3600, days, &der[0], 6561);
+    if (n < 0) { fputs(STDERR_FILENO, "certgen: signing failed\n"); return 1; }
+    var fd: int = open(certfile, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd < 0) { perror2("certgen", certfile); return 1; }
+    pem_write(fd, "CERTIFICATE", &der[0], n);
+    close(fd);
+    puts("certgen: ");
+    puts(cid == CURVE_P256 ? "P-256" : "P-384");
+    puts(keep ? " key from " : " key in ");
+    puts(keyfile);
+    puts(", certificate for ");
+    var k: int = optind + 2;
+    while (k < argc) {
+        puts(argv[k]);
+        puts(k + 1 < argc ? " " : "");
+        k += 1;
+    }
+    puts(" in ");
+    puts(certfile);
+    puts("\n");
+    return 0;
+}

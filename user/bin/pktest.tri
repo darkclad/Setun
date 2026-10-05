@@ -147,6 +147,31 @@ fn ecdh_fresh() -> int {
     return octets_equal(&sa[0], &sb[0], 32) && !octets_equal(&pa[0], &pb[0], 32);
 }
 
+// Sign msg (hex) with the fixed key; r and s must be exactly the expected
+// ones (RFC 6979 makes them deterministic), and verify.
+fn sign_case(cid: int, hid: int, dhex: *char, pub: *char, msg: *char, r: *char, s: *char) -> int {
+    var dk: [48]tryte;
+    unhex(dhex, &dk[0]);
+    var ml: int = unhex(msg, &a[0]);
+    var hl: int = hash_len(hid);
+    hash_octets(hid, &a[0], ml, &b[0]);
+    var ob: int = cid == CURVE_P256 ? 32 : 48;
+    if (!ecdsa_sign(cid, hid, &dk[0], &b[0], hl, &c[0], &d[0])) { return 0; }
+    var pl: int = unhex(pub, &out[0]);
+    return is_hex(&c[0], r) && is_hex(&d[0], s) && ecdsa_verify(cid, &out[0], pl, &b[0], hl, &c[0], ob, &d[0], ob);
+}
+
+fn sign_refusals() -> int {
+    var dk: [32]tryte;
+    var k: int = 0;
+    while (k < 32) { dk[k] = 0; k += 1; }
+    b[0] = 1;
+    var bad: int = ecdsa_sign(CURVE_P256, HASH_SHA256, &dk[0], &b[0], 32, &c[0], &d[0]);      // d = 0
+    unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", &dk[0]);          // d = n
+    bad = bad || ecdsa_sign(CURVE_P256, HASH_SHA256, &dk[0], &b[0], 32, &c[0], &d[0]);
+    return !bad;
+}
+
 fn main(argc: int, argv: **char) -> int {
     t0 = ms();
     e65537[0] = 1; e65537[1] = 0; e65537[2] = 1;
@@ -220,6 +245,13 @@ fn main(argc: int, argv: **char) -> int {
     ok("ECDH P-384: shared secret both ways", ecdh_both(CURVE_P384, XP384_A, XP384_B, XP384_APUB, XP384_BPUB, XP384_SHARED));
     ok("ECDH refuses a point off the curve, a short key, a compressed one, x >= p", ecdh_refusals());
     ok("ECDH P-256: two new key pairs agree", ecdh_fresh());
+
+    ok("ECDSA P-256 sign, RFC 6979 \"sample\"", sign_case(CURVE_P256, HASH_SHA256, SP256_D, SP256_PUB, SP256_M0, SP256_R0, SP256_S0));
+    ok("ECDSA P-256 sign, \"test\"", sign_case(CURVE_P256, HASH_SHA256, SP256_D, SP256_PUB, SP256_M1, SP256_R1, SP256_S1));
+    ok("ECDSA P-256 sign, 300 octets", sign_case(CURVE_P256, HASH_SHA256, SP256_D, SP256_PUB, SP256_M2, SP256_R2, SP256_S2));
+    ok("ECDSA P-384 sign, RFC 6979 \"sample\"", sign_case(CURVE_P384, HASH_SHA384, SP384_D, SP384_PUB, SP384_M0, SP384_R0, SP384_S0));
+    ok("ECDSA P-384 sign, 300 octets", sign_case(CURVE_P384, HASH_SHA384, SP384_D, SP384_PUB, SP384_M2, SP384_R2, SP384_S2));
+    ok("ECDSA sign refuses a key of 0 or n", sign_refusals());
 
     ok("ECDSA P-256 SHA-256", ecdsa_case(CURVE_P256, V_P256_PUB, V_P256_H, V_P256_R, V_P256_S));
     ok("ECDSA P-384 SHA-384", ecdsa_case(CURVE_P384, V_P384_PUB, V_P384_H, V_P384_R, V_P384_S));

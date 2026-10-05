@@ -32,4 +32,18 @@ for tag, curve, nb in [("P256", ec.SECP256R1(), 32), ("P384", ec.SECP384R1(), 48
     out.append(f'const X{tag}_APUB: *char = "{h(pub(ka))}";')
     out.append(f'const X{tag}_BPUB: *char = "{h(pub(kb))}";')
     out.append(f'const X{tag}_SHARED: *char = "{h(ka.exchange(ec.ECDH(), kb.public_key()))}";')
+# deterministic ECDSA (RFC 6979): fixed keys, a few messages
+from cryptography.hazmat.primitives.asymmetric import utils
+from cryptography.hazmat.primitives import hashes
+for tag, curve, nb, hsh in [("P256", ec.SECP256R1(), 32, hashes.SHA256()), ("P384", ec.SECP384R1(), 48, hashes.SHA384())]:
+    d = int("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721", 16) if tag == "P256" else \
+        int("6B9D3DAD2E1B8C1C05B19875B6659F4DE23C3B667BF297BA9AA47740787137D896D5724E4C70A825F872C9EA60D2EDF5", 16)
+    k = ec.derive_private_key(d, curve)
+    out.append(f'const S{tag}_D: *char = "{d.to_bytes(nb, "big").hex()}";')
+    out.append(f'const S{tag}_PUB: *char = "{h(pub(k))}";')
+    for i, msg in enumerate([b"sample", b"test", b"Setun-11 signs " * 20]):
+        r, s = utils.decode_dss_signature(k.sign(msg, ec.ECDSA(hsh, deterministic_signing=True)))
+        out.append(f'const S{tag}_M{i}: *char = "{h(msg)}";')
+        out.append(f'const S{tag}_R{i}: *char = "{r.to_bytes(nb, "big").hex()}";')
+        out.append(f'const S{tag}_S{i}: *char = "{s.to_bytes(nb, "big").hex()}";')
 print("\n".join(out))

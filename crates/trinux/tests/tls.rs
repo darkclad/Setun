@@ -376,3 +376,88 @@ fn wget_real_https_sites() {
         println!("---- {site}\n{o}");
     }
 }
+
+// ---- certgen: keys and certificates that OpenSSL must accept --------------------------------
+
+fn openssl(dir: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let o = Command::new("openssl").current_dir(dir).args(args).stdin(Stdio::null()).output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr))
+}
+
+/// A file's text from Trinux (the console's copy, CR LF made LF).
+fn take_file(s: &mut Session, path: &str) -> String {
+    let o = s.cmd_max(&format!("cat {path}"), 100_000_000);
+    o.replace("\r\n", "\n")
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("setun-certgen-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn certgen_makes_what_openssl_accepts() {
+    if !have_openssl() {
+        return;
+    }
+    let mut s = Session::boot();
+    let dir = scratch("made");
+    for (curve, sig, bits) in [("P-256", "ecdsa-with-SHA256", "256 bit"), ("P-384", "ecdsa-with-SHA384", "384 bit")] {
+        let o = s.cmd_max(&format!("certgen -c {curve} /tmp/k.pem /tmp/c.pem web.test www.web.test 203.0.113.8; echo status $?"), SLOW);
+        has(&o, &[&format!("certgen: {curve} key in /tmp/k.pem, certificate for web.test www.web.test 203.0.113.8 in /tmp/c.pem\nstatus 0")]);
+        // our own verifier takes it as its own root, for each of its names
+        for name in ["web.test", "www.web.test", "203.0.113.8"] {
+            has(&s.cmd_max(&format!("x509 -C /tmp/c.pem -n {name} /tmp/c.pem"), SLOW), &["verify: ok"]);
+        }
+        has(&s.cmd_max("x509 -C /tmp/c.pem -n other.test /tmp/c.pem", SLOW), &["verify: certificate does not match the host name"]);
+        has(&s.cmd("ls -l /tmp/k.pem"), &["-rw-------"]);
+        std::fs::write(dir.join("c.pem"), take_file(&mut s, "/tmp/c.pem")).unwrap();
+        std::fs::write(dir.join("k.pem"), take_file(&mut s, "/tmp/k.pem")).unwrap();
+        let (ok, text) = openssl(&dir, &["x509", "-in", "c.pem", "-noout", "-text"]);
+        assert!(ok, "{text}");
+        has(&text, &["Version: 3", "Subject: CN=web.test", "Issuer: CN=web.test", sig, bits, "DNS:web.test, DNS:www.web.test, IP Address:203.0.113.8", "TLS Web Server Authentication", "CA:TRUE"]);
+        let (ok, text) = openssl(&dir, &["verify", "-CAfile", "c.pem", "c.pem"]);
+        assert!(ok && text.contains("c.pem: OK"), "{text}");
+        let (ok, from_key) = openssl(&dir, &["pkey", "-in", "k.pem", "-pubout"]);
+        assert!(ok, "{from_key}");
+        let (_, from_cert) = openssl(&dir, &["x509", "-in", "c.pem", "-pubkey", "-noout"]);
+        assert_eq!(from_key, from_cert, "the key and the certificate disagree");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn certgen_takes_keys_openssl_made_and_refuses_others() {
+    if !have_openssl() {
+        return;
+    }
+    let mut s = Session::boot();
+    let dir = scratch("keys");
+    // SEC1 (ecparam) and PKCS #8 (genpkey) keys, P-256 and P-384; and an RSA key
+    assert!(openssl(&dir, &["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "sec1.pem"]).0);
+    assert!(openssl(&dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384", "-out", "pkcs8.pem"]).0);
+    assert!(openssl(&dir, &["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:1024", "-out", "rsa.pem"]).0);
+    for (name, curve) in [("sec1", "P-256"), ("pkcs8", "P-384")] {
+        let key = std::fs::read_to_string(dir.join(format!("{name}.pem"))).unwrap();
+        s.put_file(&format!("/tmp/{name}.pem"), &key);
+        let o = s.cmd_max(&format!("certgen -k /tmp/{name}.pem /tmp/{name}.crt host.test; echo status $?"), SLOW);
+        has(&o, &[&format!("certgen: {curve} key from /tmp/{name}.pem, certificate for host.test in /tmp/{name}.crt\nstatus 0")]);
+        std::fs::write(dir.join(format!("{name}.crt")), take_file(&mut s, &format!("/tmp/{name}.crt"))).unwrap();
+        let (_, from_key) = openssl(&dir, &["pkey", "-in", &format!("{name}.pem"), "-pubout"]);
+        let (ok, from_cert) = openssl(&dir, &["x509", "-in", &format!("{name}.crt"), "-pubkey", "-noout"]);
+        assert!(ok);
+        assert_eq!(from_key, from_cert, "{name}: the certificate is not for the key");
+        let (ok, text) = openssl(&dir, &["verify", "-CAfile", &format!("{name}.crt"), &format!("{name}.crt")]);
+        assert!(ok, "{text}");
+    }
+    s.put_file("/tmp/rsa.pem", &std::fs::read_to_string(dir.join("rsa.pem")).unwrap());
+    s.put_file("/tmp/junk.pem", "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n");
+    for f in ["rsa", "junk", "nosuch"] {
+        has(&s.cmd(&format!("certgen -k /tmp/{f}.pem /tmp/x.crt a.test; echo status $?")), &[&format!("certgen: /tmp/{f}.pem: not a P-256 or P-384 private key\nstatus 1")]);
+    }
+    let o = s.cmd("certgen -c P-521 /tmp/a /tmp/b x; echo status $?; certgen /tmp/a /tmp/b; echo status $?; certgen -d 0 /tmp/a /tmp/b x; echo status $?");
+    has(&o, &["usage: certgen", "status 2\nusage: certgen", "status 2\nusage: certgen"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

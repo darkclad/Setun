@@ -1,8 +1,10 @@
-// ecdsa.tri: ECDSA signature verification on NIST P-256 and P-384
-// (FIPS 186-4), for TLS and X.509. Points are in Jacobian coordinates with
-// coordinates in Montgomery form (bignum.tri); a = -3 on both curves.
+// ecdsa.tri: ECDSA on NIST P-256 and P-384 (FIPS 186-4) for TLS and
+// X.509: verification, signing with RFC 6979 nonces, and ECDH. Points are
+// in Jacobian coordinates with coordinates in Montgomery form (bignum.tri);
+// a = -3 on both curves.
 
 import "bignum.tri";
+import "hmac.tri";
 
 const CURVE_P256: int = 1;
 const CURVE_P384: int = 2;
@@ -394,4 +396,121 @@ fn ecdh(id: int, priv: *tryte, peer: *tryte, plen: int, out: *tryte) -> int {
     bn_from_octets(&d[0], n, priv, ob);
     var y: [48]tryte;
     return _ec_mult(c, &d[0], &qx[0], &qy[0], out, &y[0]);
+}
+
+// ---- signing (RFC 6979) ----------------------------------------------------------------------
+
+// bits2int: the leftmost octets of h (hl octets) as a number of the curve's
+// size (the order's length is a whole number of octets on both curves).
+fn _bits2int(c: *curve, h: *tryte, hl: int, out: *int) {
+    var ob: int = c.octets;
+    var t: [48]tryte;
+    var k: int = 0;
+    while (k < ob) { t[k] = 0; k += 1; }
+    if (hl >= ob) {
+        k = 0;
+        while (k < ob) { t[k] = h[k]; k += 1; }
+    } else {
+        k = 0;
+        while (k < hl) { t[ob - hl + k] = h[k]; k += 1; }
+    }
+    bn_from_octets(out, c.limbs, &t[0], ob);
+}
+
+// HMAC-DRBG state for the nonces
+var _dk: [64]tryte;
+var _dv: [64]tryte;
+var _dmsg: [256]tryte;
+
+// K = HMAC_K(V || b || x || h1); V = HMAC_K(V)
+fn _drbg(id: int, b: int, x: *tryte, h1: *tryte, ob: int) {
+    var hl: int = hash_len(id);
+    var n: int = 0;
+    var k: int = 0;
+    while (k < hl) { _dmsg[n] = _dv[k]; n += 1; k += 1; }
+    _dmsg[n] = b as tryte;
+    n += 1;
+    k = 0;
+    while (k < ob) { _dmsg[n] = x[k]; n += 1; k += 1; }
+    k = 0;
+    while (k < ob) { _dmsg[n] = h1[k]; n += 1; k += 1; }
+    hmac(id, &_dk[0], hl, &_dmsg[0], n, &_dk[0]);
+    hmac(id, &_dk[0], hl, &_dv[0], hl, &_dv[0]);
+}
+
+// Sign the hash h (hl octets, made by hash id) with priv (octets bytes):
+// r and s (octets bytes each, big-endian). 1, or 0 for a bad key.
+fn ecdsa_sign(cid: int, id: int, priv: *tryte, h: *tryte, hl: int, r: *tryte, s: *tryte) -> int {
+    var c: *curve = curve_of(cid);
+    _ec = c;
+    var n: int = c.limbs;
+    var ob: int = c.octets;
+    var hlen: int = hash_len(id);
+    var d: [24]int;
+    bn_from_octets(&d[0], n, priv, ob);
+    if (bn_is_zero(&d[0], n) || bn_cmp(&d[0], &c.fq.m[0], n) >= 0) { return 0; }
+    // e = bits2int(h) mod q, and its octets for the DRBG
+    var e: [24]int;
+    _bits2int(c, h, hl, &e[0]);
+    if (bn_cmp(&e[0], &c.fq.m[0], n) >= 0) { bn_sub(&e[0], &c.fq.m[0], n); }
+    var h1: [48]tryte;
+    bn_to_octets(&h1[0], ob, &e[0], n);
+    var k: int = 0;
+    while (k < hlen) { _dv[k] = 1; _dk[k] = 0; k += 1; }
+    _drbg(id, 0, priv, &h1[0], ob);
+    _drbg(id, 1, priv, &h1[0], ob);
+    var tries: int = 0;
+    while (tries < 27) {
+        // T = V || V' ... until it has the order's length
+        var t: [96]tryte;
+        var tl: int = 0;
+        while (tl < ob) {
+            hmac(id, &_dk[0], hlen, &_dv[0], hlen, &_dv[0]);
+            k = 0;
+            while (k < hlen && tl < 96) { t[tl] = _dv[k]; tl += 1; k += 1; }
+        }
+        var kk: [24]int;
+        _bits2int(c, &t[0], ob, &kk[0]);
+        if (!bn_is_zero(&kk[0], n) && bn_cmp(&kk[0], &c.fq.m[0], n) < 0) {
+            // r = x(kG) mod q
+            var x: [48]tryte;
+            var y: [48]tryte;
+            if (_ec_mult(c, &kk[0], &c.gx[0], &c.gy[0], &x[0], &y[0])) {
+                var rr: [24]int;
+                bn_from_octets(&rr[0], n, &x[0], ob);
+                if (bn_cmp(&rr[0], &c.fq.m[0], n) >= 0) { bn_sub(&rr[0], &c.fq.m[0], n); }
+                if (!bn_is_zero(&rr[0], n)) {
+                    // s = k^-1 (e + r d) mod q, in Montgomery form
+                    var km: [24]int;
+                    var ki: [24]int;
+                    var rm: [24]int;
+                    var dm: [24]int;
+                    var em: [24]int;
+                    var t2: [24]int;
+                    mont_to(&c.fq, &km[0], &kk[0]);
+                    mont_inv(&c.fq, &ki[0], &km[0]);
+                    mont_to(&c.fq, &rm[0], &rr[0]);
+                    mont_to(&c.fq, &dm[0], &d[0]);
+                    mont_to(&c.fq, &em[0], &e[0]);
+                    mont_mul(&c.fq, &t2[0], &rm[0], &dm[0]);
+                    mod_add(&c.fq, &t2[0], &em[0], &t2[0]);
+                    mont_mul(&c.fq, &t2[0], &ki[0], &t2[0]);
+                    mont_from(&c.fq, &t2[0], &t2[0]);
+                    if (!bn_is_zero(&t2[0], n)) {
+                        bn_to_octets(r, ob, &rr[0], n);
+                        bn_to_octets(s, ob, &t2[0], n);
+                        return 1;
+                    }
+                }
+            }
+        }
+        // K = HMAC_K(V || 0x00), V = HMAC_K(V), and again
+        k = 0;
+        while (k < hlen) { _dmsg[k] = _dv[k]; k += 1; }
+        _dmsg[hlen] = 0;
+        hmac(id, &_dk[0], hlen, &_dmsg[0], hlen + 1, &_dk[0]);
+        hmac(id, &_dk[0], hlen, &_dv[0], hlen, &_dv[0]);
+        tries += 1;
+    }
+    return 0;
 }

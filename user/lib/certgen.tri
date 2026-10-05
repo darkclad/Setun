@@ -1,0 +1,433 @@
+// certgen.tri: EC keys and self-signed certificates for TLS servers.
+//
+// Keys are P-256 or P-384, kept in PEM: written as SEC1 ("EC PRIVATE KEY",
+// what `openssl ecparam -genkey` makes), read as that or as PKCS #8
+// ("PRIVATE KEY", what `openssl genpkey` makes). Certificates are X.509 v3,
+// signed with ECDSA (SHA-256 for P-256, SHA-384 for P-384), naming their
+// hosts in subjectAltName (DNS names, and IPv4 addresses as iPAddress).
+
+import "x509.tri";
+import "socket.tri";                // utf8_encode
+import "string.tri";                // strstr
+
+// ---- writing DER -----------------------------------------------------------------------------
+
+var _dw: *tryte;
+var _dwn: int;
+
+fn _dw8(v: int) { _dw[_dwn] = v as tryte; _dwn += 1; }
+fn _dwn_bytes(p: *tryte, n: int) { var k: int = 0; while (k < n) { _dw8(p[k]); k += 1; } }
+
+// Open an element with this tag: its start (room for the longest header).
+fn _dbegin(tag: int) -> int {
+    var at: int = _dwn;
+    _dw8(tag);
+    _dw8(0);
+    _dw8(0);
+    _dw8(0);
+    return at;
+}
+
+// Close it: the length in its shortest form, the contents moved up to it.
+fn _dend(at: int) {
+    var len: int = _dwn - at - 4;
+    var hdr: int = len < 128 ? 2 : len < 256 ? 3 : 4;
+    if (hdr == 2) { _dw[at + 1] = len as tryte; }
+    else if (hdr == 3) { _dw[at + 1] = 129; _dw[at + 2] = len as tryte; }
+    else { _dw[at + 1] = 130; _dw[at + 2] = (len / 256) as tryte; _dw[at + 3] = (len % 256) as tryte; }
+    if (hdr < 4) {
+        var k: int = 0;
+        while (k < len) { _dw[at + hdr + k] = _dw[at + 4 + k]; k += 1; }
+        _dwn -= 4 - hdr;
+    }
+}
+
+fn _dhex(tag: int, h: *char) {
+    var at: int = _dbegin(tag);
+    var k: int = 0;
+    while (h[2 * k] != 0) { _dw8(_hx(h[2 * k]) * 16 + _hx(h[2 * k + 1])); k += 1; }
+    _dend(at);
+}
+
+// An unsigned big-endian number as an INTEGER (no extra leading zeros, a
+// zero added when the top bit is set).
+fn _dint(p: *tryte, n: int) {
+    while (n > 1 && p[0] == 0) { p = p + 1; n -= 1; }
+    var at: int = _dbegin(2);
+    if (p[0] >= 128) { _dw8(0); }
+    _dwn_bytes(p, n);
+    _dend(at);
+}
+
+fn _dtext(tag: int, s: *char) {
+    var at: int = _dbegin(tag);
+    var o: [8]tryte;
+    var k: int = 0;
+    while (s[k] != 0) {
+        var m: int = utf8_encode(s[k], &o[0]);
+        _dwn_bytes(&o[0], m);
+        k += 1;
+    }
+    _dend(at);
+}
+
+// A time as UTCTime (YYMMDDHHMMSSZ) before 2050, GeneralizedTime after.
+fn _dtime(t: int) {
+    var days: int = t / 86400;
+    var secs: int = t % 86400;
+    // civil from days (Howard Hinnant's algorithm)
+    var z: int = days + 719468;
+    var era: int = z / 146097;
+    var doe: int = z - era * 146097;
+    var yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: int = yoe + era * 400;
+    var doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    var mp: int = (5 * doy + 2) / 153;
+    var d: int = doy - (153 * mp + 2) / 5 + 1;
+    var m: int = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) { y += 1; }
+    var v: [6]int;
+    v[0] = y;
+    v[1] = m;
+    v[2] = d;
+    v[3] = secs / 3600;
+    v[4] = secs / 60 % 60;
+    v[5] = secs % 60;
+    var at: int = _dbegin(y < 2050 ? 23 : 24);
+    if (y >= 2050) { _dw8('0' + y / 1000); _dw8('0' + y / 100 % 10); }
+    _dw8('0' + y / 10 % 10);
+    _dw8('0' + y % 10);
+    var k: int = 1;
+    while (k < 6) { _dw8('0' + v[k] / 10); _dw8('0' + v[k] % 10); k += 1; }
+    _dw8('Z');
+    _dend(at);
+}
+
+fn _dname(cn: *char) {
+    var at: int = _dbegin(48);
+    var set: int = _dbegin(49);
+    var seq: int = _dbegin(48);
+    _dhex(6, "550403");
+    _dtext(12, cn);
+    _dend(seq);
+    _dend(set);
+    _dend(at);
+}
+
+// ---- keys ------------------------------------------------------------------------------------
+
+fn _curve_oid(cid: int) -> *char { return cid == CURVE_P256 ? "2a8648ce3d030107" : "2b81040022"; }
+fn curve_octets(cid: int) -> int { return cid == CURVE_P256 ? 32 : 48; }
+
+// SEC1 ECPrivateKey: SEQUENCE { 1, OCTET STRING d, [0] curve, [1] BIT STRING Q }
+fn _sec1(cid: int, priv: *tryte, pub: *tryte) {
+    var ob: int = curve_octets(cid);
+    var at: int = _dbegin(48);
+    _dhex(2, "01");
+    var o: int = _dbegin(4);
+    _dwn_bytes(priv, ob);
+    _dend(o);
+    var c0: int = _dbegin(160);
+    _dhex(6, _curve_oid(cid));
+    _dend(c0);
+    var c1: int = _dbegin(161);
+    var bs: int = _dbegin(3);
+    _dw8(0);
+    _dwn_bytes(pub, 1 + 2 * ob);
+    _dend(bs);
+    _dend(c1);
+    _dend(at);
+}
+
+// DER (n octets) as PEM with this label, into fd.
+fn pem_write(fd: int, label: *char, p: *tryte, n: int) {
+    var b64: [6561]char;
+    var m: int = base64_encode(p, n, &b64[0], 0);
+    fputs(fd, "-----BEGIN ");
+    fputs(fd, label);
+    fputs(fd, "-----\n");
+    var k: int = 0;
+    while (k < m) {
+        var line: [65]char;
+        var j: int = 0;
+        while (j < 64 && k + j < m) { line[j] = b64[k + j]; j += 1; }
+        line[j] = 0;
+        fputs(fd, &line[0]);
+        fputs(fd, "\n");
+        k += 64;
+    }
+    fputs(fd, "-----END ");
+    fputs(fd, label);
+    fputs(fd, "-----\n");
+}
+
+// Write a private key (mode 0600). 0, or -1 if the file cannot be made.
+fn ec_key_write(path: *char, cid: int, priv: *tryte, pub: *tryte) -> int {
+    var buf: [729]tryte;
+    _dw = &buf[0];
+    _dwn = 0;
+    _sec1(cid, priv, pub);
+    var fd: int = open(path, O_WRONLY + O_CREAT + O_TRUNC, 384);
+    if (fd < 0) { return -1; }
+    pem_write(fd, "EC PRIVATE KEY", &buf[0], _dwn);
+    close(fd);
+    return 0;
+}
+
+var _pem_txt: [19683]char;
+
+// The first PEM block labelled label (or label2) in path, decoded into out
+// (max octets): its length, -1 if the file cannot be read, -2 if there is
+// no such block, -3 if it is not base64. *which: 1 for label, 2 for label2.
+fn pem_read(path: *char, label: *char, label2: *char, out: *tryte, max: int, which: *int) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    var n: int = 0;
+    loop {
+        var r: int = read(fd, &_pem_txt[n], 19682 - n);
+        if (r <= 0) { break; }
+        n += r;
+        if (n >= 19682) { break; }
+    }
+    close(fd);
+    _pem_txt[n] = 0;
+    var begin: [81]char;
+    var k: int = 0;
+    while (k < 2) {
+        strcpy(&begin[0], "-----BEGIN ");
+        strcat(&begin[0], k == 0 ? label : label2);
+        strcat(&begin[0], "-----");
+        var p: *char = strstr(&_pem_txt[0], &begin[0]);
+        if (p != null) {
+            p = p + strlen(&begin[0]);
+            var e: *char = strstr(p, "-----END ");
+            if (e == null) { return -3; }
+            // the base64 between, without line ends
+            var b64: [8000]char;
+            var m: int = 0;
+            while (p != e && m < 7999) {
+                if (p[0] != '\n' && p[0] != '\r' && p[0] != ' ') { b64[m] = p[0]; m += 1; }
+                p = p + 1;
+            }
+            var got: int = base64_decode(&b64[0], m, out, max);
+            if (got < 0) { return -3; }
+            *which = k + 1;
+            return got;
+        }
+        k += 1;
+    }
+    return -2;
+}
+
+// Read an EC private key (SEC1 or PKCS #8): its curve into *cid, the
+// private value into priv and the public point into pub. 0, or -1.
+fn ec_key_read(path: *char, cid: *int, priv: *tryte, pub: *tryte) -> int {
+    var der: [2187]tryte;
+    var which: int = 0;
+    var n: int = pem_read(path, "EC PRIVATE KEY", "PRIVATE KEY", &der[0], 2187, &which);
+    if (n <= 0) { return -1; }
+    var p: *tryte = &der[0];
+    var end: int = n;
+    var off: int = 0;
+    var curve_from_alg: int = 0;
+    if (which == 2) {
+        // PrivateKeyInfo ::= SEQUENCE { 0, AlgorithmIdentifier, OCTET STRING ECPrivateKey }
+        if (der_expect(p, 0, n, 48) != n) { return -1; }
+        var q: int = der_expect(p, _dc, n, 2);
+        if (q < 0 || _dl != 1 || p[_dc] != 0) { return -1; }
+        var a: int = der_expect(p, q, n, 48);
+        if (a < 0) { return -1; }
+        var aend: int = _dc + _dl;
+        var o: int = der_expect(p, _dc, aend, 6);
+        if (o < 0 || !der_is(p + _dc, _dl, "2a8648ce3d0201")) { return -1; }
+        if (der_expect(p, o, aend, 6) != aend) { return -1; }
+        if (der_is(p + _dc, _dl, "2a8648ce3d030107")) { curve_from_alg = CURVE_P256; }
+        else if (der_is(p + _dc, _dl, "2b81040022")) { curve_from_alg = CURVE_P384; }
+        else { return -1; }
+        if (der_expect(p, a, n, 4) != n) { return -1; }
+        off = _dc;
+        end = _dc + _dl;
+    }
+    // ECPrivateKey ::= SEQUENCE { 1, OCTET STRING, [0] curve OPTIONAL, [1] key OPTIONAL }
+    if (der_expect(p, off, end, 48) != end) { return -1; }
+    var send: int = _dc + _dl;
+    var q2: int = der_expect(p, _dc, send, 2);
+    if (q2 < 0 || _dl != 1 || p[_dc] != 1) { return -1; }
+    var q3: int = der_expect(p, q2, send, 4);
+    if (q3 < 0) { return -1; }
+    var dp: int = _dc;
+    var dl: int = _dl;
+    var c: int = curve_from_alg;
+    while (q3 < send) {
+        q3 = der_next(p, q3, send);
+        if (q3 < 0) { return -1; }
+        if (_dt == 160) {
+            var cend: int = _dc + _dl;
+            if (der_expect(p, _dc, cend, 6) != cend) { return -1; }
+            var cc: int = 0;
+            if (der_is(p + _dc, _dl, "2a8648ce3d030107")) { cc = CURVE_P256; }
+            else if (der_is(p + _dc, _dl, "2b81040022")) { cc = CURVE_P384; }
+            if (cc == 0 || (c != 0 && c != cc)) { return -1; }
+            c = cc;
+        }
+    }
+    if (c == 0) { return -1; }
+    var ob: int = curve_octets(c);
+    if (dl > ob) { return -1; }
+    var k: int = 0;
+    while (k < ob) { priv[k] = 0; k += 1; }
+    k = 0;
+    while (k < dl) { priv[ob - dl + k] = p[dp + k]; k += 1; }
+    if (!ec_pubkey(c, priv, pub)) { return -1; }
+    *cid = c;
+    return 0;
+}
+
+// ---- certificates ----------------------------------------------------------------------------
+
+fn _is_ipv4_name(s: *char, out: *tryte) -> int {
+    var k: int = 0;
+    var part: int = 0;
+    while (part < 4) {
+        var v: int = 0;
+        var nd: int = 0;
+        while (s[k] >= '0' && s[k] <= '9' && nd < 4) { v = v * 10 + s[k] - '0'; k += 1; nd += 1; }
+        if (nd == 0 || v > 255) { return 0; }
+        out[part] = v as tryte;
+        part += 1;
+        if (part < 4) {
+            if (s[k] != '.') { return 0; }
+            k += 1;
+        }
+    }
+    return s[k] == 0;
+}
+
+// A self-signed certificate for names[0..nn) (the first is also the common
+// name), valid from `from` for `days` days, into out (max octets): its
+// length, or -1 if signing fails.
+fn x509_selfsigned(cid: int, priv: *tryte, pub: *tryte, names: **char, nn: int, from: int, days: int, out: *tryte, max: int) -> int {
+    var ob: int = curve_octets(cid);
+    var hid: int = cid == CURVE_P256 ? HASH_SHA256 : HASH_SHA384;
+    var sigalg: *char = cid == CURVE_P256 ? "2a8648ce3d040302" : "2a8648ce3d040303";
+    _dw = out;
+    _dwn = 0;
+    var cert: int = _dbegin(48);
+    var tbs: int = _dbegin(48);
+    var v: int = _dbegin(160);
+    _dhex(2, "02");
+    _dend(v);
+    var serial: [16]tryte;
+    getrandom(&serial[0], 16, 0);
+    serial[0] = (serial[0] % 64 + 1) as tryte;            // positive, not zero
+    _dint(&serial[0], 16);
+    var a1: int = _dbegin(48);
+    _dhex(6, sigalg);
+    _dend(a1);
+    _dname(names[0]);
+    var val: int = _dbegin(48);
+    _dtime(from);
+    _dtime(from + days * 86400);
+    _dend(val);
+    _dname(names[0]);
+    var spki: int = _dbegin(48);
+    var alg: int = _dbegin(48);
+    _dhex(6, "2a8648ce3d0201");
+    _dhex(6, _curve_oid(cid));
+    _dend(alg);
+    var bs: int = _dbegin(3);
+    _dw8(0);
+    _dwn_bytes(pub, 1 + 2 * ob);
+    _dend(bs);
+    _dend(spki);
+    var x3: int = _dbegin(163);
+    var exts: int = _dbegin(48);
+    // basicConstraints (critical): a CA, so it can be its own trust anchor
+    var e1: int = _dbegin(48);
+    _dhex(6, "551d13");
+    _dhex(1, "ff");
+    var o1: int = _dbegin(4);
+    _dhex(48, "0101ff");
+    _dend(o1);
+    _dend(e1);
+    // keyUsage (critical): digitalSignature, keyCertSign
+    var e2: int = _dbegin(48);
+    _dhex(6, "551d0f");
+    _dhex(1, "ff");
+    var o2: int = _dbegin(4);
+    _dhex(3, "0284");
+    _dend(o2);
+    _dend(e2);
+    // extKeyUsage: serverAuth
+    var e3: int = _dbegin(48);
+    _dhex(6, "551d25");
+    var o3: int = _dbegin(4);
+    var s3: int = _dbegin(48);
+    _dhex(6, "2b06010505070301");
+    _dend(s3);
+    _dend(o3);
+    _dend(e3);
+    // subjectAltName
+    var e4: int = _dbegin(48);
+    _dhex(6, "551d11");
+    var o4: int = _dbegin(4);
+    var gn: int = _dbegin(48);
+    var k: int = 0;
+    while (k < nn) {
+        var ip: [4]tryte;
+        if (_is_ipv4_name(names[k], &ip[0])) {
+            var g: int = _dbegin(135);
+            _dwn_bytes(&ip[0], 4);
+            _dend(g);
+        } else {
+            _dtext(130, names[k]);
+        }
+        k += 1;
+    }
+    _dend(gn);
+    _dend(o4);
+    _dend(e4);
+    _dend(exts);
+    _dend(x3);
+    _dend(tbs);
+    // the signature over the TBSCertificate
+    var tbs_start: int = tbs;
+    var tbs_len: int = _dwn - tbs;
+    var h: [48]tryte;
+    hash_octets(hid, out + tbs_start, tbs_len, &h[0]);
+    var r: [48]tryte;
+    var s: [48]tryte;
+    if (!ecdsa_sign(cid, hid, priv, &h[0], hash_len(hid), &r[0], &s[0])) { return -1; }
+    var a2: int = _dbegin(48);
+    _dhex(6, sigalg);
+    _dend(a2);
+    var sb: int = _dbegin(3);
+    _dw8(0);
+    var sq: int = _dbegin(48);
+    _dint(&r[0], ob);
+    _dint(&s[0], ob);
+    _dend(sq);
+    _dend(sb);
+    _dend(cert);
+    if (_dwn > max) { return -1; }
+    return _dwn;
+}
+
+// The ECDSA signature (DER) of message m with priv, for TLS's
+// CertificateVerify: its length in sig (at most 2·ob + 9 octets).
+fn ecdsa_sign_der(cid: int, priv: *tryte, m: *tryte, n: int, sig: *tryte) -> int {
+    var ob: int = curve_octets(cid);
+    var hid: int = cid == CURVE_P256 ? HASH_SHA256 : HASH_SHA384;
+    var h: [48]tryte;
+    hash_octets(hid, m, n, &h[0]);
+    var r: [48]tryte;
+    var s: [48]tryte;
+    if (!ecdsa_sign(cid, hid, priv, &h[0], hash_len(hid), &r[0], &s[0])) { return -1; }
+    _dw = sig;
+    _dwn = 0;
+    var sq: int = _dbegin(48);
+    _dint(&r[0], ob);
+    _dint(&s[0], ob);
+    _dend(sq);
+    return _dwn;
+}
