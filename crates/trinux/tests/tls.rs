@@ -157,7 +157,7 @@ impl Drop for TlsServer {
 }
 
 fn have_openssl() -> bool {
-    let ok = Command::new("openssl").arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+    let ok = Command::new("openssl").arg("version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
     if !ok {
         eprintln!("no openssl on this host: skipped");
     }

@@ -15,7 +15,7 @@ struct Host {
 }
 
 fn setup(s: &mut Session, name: &str) -> Option<Host> {
-    let ok = |p: &str| Command::new(p).arg("-h").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+    let ok = |p: &str| Command::new(p).arg("-h").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
     if !ok("sftp") || !ok("ssh-keygen") {
         eprintln!("no sftp or ssh-keygen on this host: skipped");
         return None;

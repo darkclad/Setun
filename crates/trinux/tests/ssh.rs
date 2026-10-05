@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 /// The host's OpenSSH client, if there is one.
 fn ssh_client() -> Option<String> {
     let cand = std::env::var("SETUN_SSH").unwrap_or_else(|_| "ssh".into());
-    Command::new(&cand).arg("-V").stderr(Stdio::null()).status().ok().filter(|s| s.success()).map(|_| cand)
+    Command::new(&cand).arg("-V").stdin(Stdio::null()).stderr(Stdio::null()).status().ok().filter(|s| s.success()).map(|_| cand)
 }
 
 /// A script that answers ssh's password prompt.
