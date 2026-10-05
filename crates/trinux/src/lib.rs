@@ -150,6 +150,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v.push(("/sbin/ifconfig".into(), u.join("bin/ifconfig.tri")));
     v.push(("/sbin/telnetd".into(), u.join("bin/telnetd.tri")));
     v.push(("/sbin/sshd".into(), u.join("bin/sshd.tri")));
+    v.push(("/usr/lib/sftp-server".into(), u.join("bin/sftp-server.tri")));
     for name in ["useradd", "userdel"] {
         v.push((format!("/sbin/{name}"), u.join("bin/useradm.tri")));
     }

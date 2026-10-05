@@ -148,3 +148,42 @@ pub fn stat(s: &mut Session, name: &str) -> u64 {
     let line = o.lines().find(|l| l.starts_with(&format!("{name} "))).unwrap_or_else(|| panic!("no {name} in {o}"));
     line.split(' ').nth(1).unwrap().parse().unwrap()
 }
+
+/// Run a host program (an ssh, sftp or scp client) while the machine runs,
+/// until it exits: (status, stdout, stderr). Its output is drained as it
+/// comes, so a full pipe never stops it.
+pub fn run_host(s: &mut Session, cmd: &mut std::process::Command, input: Option<Vec<u8>>) -> (i32, String, String) {
+    use std::process::Stdio;
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("run the host program");
+    if let Some(data) = input {
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&data);
+        });
+    }
+    let reader = |mut r: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = r.read_to_end(&mut v);
+            v
+        })
+    };
+    let out_t = reader(Box::new(child.stdout.take().unwrap()));
+    let err_t = reader(Box::new(child.stderr.take().unwrap()));
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            let out = out_t.join().unwrap();
+            let err = err_t.join().unwrap();
+            return (st.code().unwrap_or(-1), String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned());
+        }
+        if start.elapsed().as_secs() > 180 {
+            let _ = child.kill();
+            let tail: String = s.out.chars().rev().take(1500).collect::<Vec<_>>().into_iter().rev().collect();
+            panic!("the host program did not finish; the console ends:\n{tail}");
+        }
+        s.step();
+    }
+}

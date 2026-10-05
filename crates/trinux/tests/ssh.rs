@@ -222,7 +222,7 @@ fn keygen(kind: &str, name: &str) -> Option<(String, String)> {
     let key = dir.join(name);
     let _ = std::fs::remove_file(&key);
     let _ = std::fs::remove_file(key.with_extension("pub"));
-    let ok = Command::new("ssh-keygen")
+    let ok = Command::new("ssh-keygen").stdin(Stdio::null())
         .args(["-q", "-t", kind, "-N", "", "-C", name, "-f"])
         .arg(&key)
         .stdout(Stdio::null())

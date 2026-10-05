@@ -1,0 +1,771 @@
+// /usr/lib/sftp-server: the SFTP file-transfer protocol, version 3
+// (draft-ietf-secsh-filexfer-02), on standard input and output. sshd runs
+// it for the "sftp" subsystem, as the logged-in user; the host's sftp and
+// scp (which speaks SFTP since OpenSSH 9) then copy files in and out.
+//
+// Files are trytes; the protocol carries octets (docs/NETWORK.md §11):
+//   - a file whose trytes are all 0..255 travels octet for octet;
+//   - a file with characters beyond 255 (or overlined ones) is sent as
+//     UTF-8 text, and its size is reported as that text's;
+//   - a file written through SFTP that turns out to be valid UTF-8 with
+//     multi-octet characters is stored as characters when it is closed.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/string.tri";
+import "../lib/socket.tri";
+import "../lib/time.tri";
+
+const FXP_INIT: int = 1;
+const FXP_VERSION: int = 2;
+const FXP_OPEN: int = 3;
+const FXP_CLOSE: int = 4;
+const FXP_READ: int = 5;
+const FXP_WRITE: int = 6;
+const FXP_LSTAT: int = 7;
+const FXP_FSTAT: int = 8;
+const FXP_SETSTAT: int = 9;
+const FXP_FSETSTAT: int = 10;
+const FXP_OPENDIR: int = 11;
+const FXP_READDIR: int = 12;
+const FXP_REMOVE: int = 13;
+const FXP_MKDIR: int = 14;
+const FXP_RMDIR: int = 15;
+const FXP_REALPATH: int = 16;
+const FXP_STAT: int = 17;
+const FXP_RENAME: int = 18;
+const FXP_READLINK: int = 19;
+const FXP_SYMLINK: int = 20;
+const FXP_STATUS: int = 101;
+const FXP_HANDLE: int = 102;
+const FXP_DATA: int = 103;
+const FXP_NAME: int = 104;
+const FXP_ATTRS: int = 105;
+const FXP_EXTENDED: int = 200;
+
+const FX_OK: int = 0;
+const FX_EOF: int = 1;
+const FX_NO_SUCH_FILE: int = 2;
+const FX_PERMISSION_DENIED: int = 3;
+const FX_FAILURE: int = 4;
+const FX_BAD_MESSAGE: int = 5;
+const FX_OP_UNSUPPORTED: int = 8;
+
+const ATTR_SIZE: int = 1;
+const ATTR_UIDGID: int = 2;
+const ATTR_PERMISSIONS: int = 4;
+const ATTR_ACMODTIME: int = 8;
+const ATTR_EXTENDED: int = 2147483648;
+
+const PF_READ: int = 1;
+const PF_WRITE: int = 2;
+const PF_APPEND: int = 4;
+const PF_CREAT: int = 8;
+const PF_TRUNC: int = 16;
+const PF_EXCL: int = 32;
+
+const MAX_PACKET: int = 40000;
+const NHANDLES: int = 27;
+const MAX_FILE: int = 1594323;            // 3^13 trytes: what a read handle holds
+
+// ---- input and output ----------------------------------------------------------------------
+
+var inb: [81000]tryte;
+var in_len: int;
+var req: [40000]tryte;                    // the request being handled (after its length)
+var req_len: int;
+var pos: int;
+var bad: int;
+var out: [40100]tryte;
+var out_len: int;
+
+fn be32_at(p: *tryte) -> int { return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]; }
+
+fn get_byte() -> int {
+    if (pos >= req_len) { bad = 1; return 0; }
+    pos += 1;
+    return req[pos - 1];
+}
+
+fn get_u32() -> int {
+    if (pos + 4 > req_len) { bad = 1; return 0; }
+    pos += 4;
+    return be32_at(&req[pos - 4]);
+}
+
+fn get_u64() -> int {
+    var hi: int = get_u32();
+    var lo: int = get_u32();
+    return hi * 4294967296 + lo;
+}
+
+// A string: its length; *at is its offset in req.
+fn get_string(at: *int) -> int {
+    var n: int = get_u32();
+    if (bad || n < 0 || pos + n > req_len) { bad = 1; *at = pos; return 0; }
+    *at = pos;
+    pos += n;
+    return n;
+}
+
+// A path (UTF-8 on the wire) into buf, as characters.
+fn get_path(buf: *char, max: int) -> int {
+    var at: int = 0;
+    var n: int = get_string(&at);
+    if (bad || n > max - 1) { bad = 1; buf[0] = 0; return 0; }
+    var st: utf8_state;
+    st.need = 0;
+    var m: int = utf8_to_text(&st, &req[at], n, buf);
+    buf[m] = 0;
+    return m;
+}
+
+fn put_byte(v: int) { out[out_len] = v as tryte; out_len += 1; }
+
+fn put_u32(v: int) {
+    out[out_len] = (v / 16777216 % 256) as tryte;
+    out[out_len + 1] = (v / 65536 % 256) as tryte;
+    out[out_len + 2] = (v / 256 % 256) as tryte;
+    out[out_len + 3] = (v % 256) as tryte;
+    out_len += 4;
+}
+
+fn put_u64(v: int) {
+    put_u32(v / 4294967296);
+    put_u32(v % 4294967296);
+}
+
+fn put_octets(p: *tryte, n: int) {
+    put_u32(n);
+    var k: int = 0;
+    while (k < n) { out[out_len + k] = p[k]; k += 1; }
+    out_len += n;
+}
+
+// Text as a UTF-8 string.
+fn put_text(s: *char) {
+    var at: int = out_len;
+    out_len += 4;
+    var k: int = 0;
+    while (s[k] != 0) {
+        out_len += utf8_encode(s[k], &out[out_len]);
+        k += 1;
+    }
+    var n: int = out_len - at - 4;
+    out[at] = (n / 16777216) as tryte;
+    out[at + 1] = (n / 65536 % 256) as tryte;
+    out[at + 2] = (n / 256 % 256) as tryte;
+    out[at + 3] = (n % 256) as tryte;
+}
+
+fn reply_start(type: int, id: int) {
+    out_len = 4;
+    put_byte(type);
+    put_u32(id);
+}
+
+fn reply_send() {
+    var n: int = out_len - 4;
+    out[0] = (n / 16777216) as tryte;
+    out[1] = (n / 65536 % 256) as tryte;
+    out[2] = (n / 256 % 256) as tryte;
+    out[3] = (n % 256) as tryte;
+    var k: int = 0;
+    while (k < out_len) {
+        var w: int = write(STDOUT_FILENO, (&out[k]) as *char, out_len - k);
+        if (w <= 0) { _exit(1); }
+        k += w;
+    }
+}
+
+fn status(id: int, code: int, msg: *char) {
+    reply_start(FXP_STATUS, id);
+    put_u32(code);
+    put_text(msg);
+    put_text("");
+    reply_send();
+}
+
+// The status for the errno of a failed call.
+fn status_errno(id: int) {
+    if (errno == ENOENT || errno == ENOTDIR) { status(id, FX_NO_SUCH_FILE, "No such file"); return; }
+    if (errno == EACCES || errno == EPERM) { status(id, FX_PERMISSION_DENIED, "Permission denied"); return; }
+    status(id, FX_FAILURE, strerror(errno));
+}
+
+// ---- files as octets --------------------------------------------------------------------------
+
+// Read a whole file (at most MAX_FILE trytes) into a new buffer: its length,
+// or -1 (errno set; EFBIG if too large).
+fn slurp(fd: int, into: **tryte) -> int {
+    var cap: int = 19683;
+    var buf: *tryte = malloc(cap);
+    var n: int = 0;
+    loop {
+        if (n == cap) {
+            if (cap >= MAX_FILE) { free(buf); errno = EFBIG; return -1; }
+            cap = cap * 3 > MAX_FILE ? MAX_FILE : cap * 3;
+            buf = realloc(buf, cap);
+            if (buf == null) { errno = ENOMEM; return -1; }
+        }
+        var r: int = read(fd, (buf + n) as *char, cap - n);
+        if (r < 0) { free(buf); return -1; }
+        if (r == 0) { break; }
+        n += r;
+    }
+    *into = buf;
+    return n;
+}
+
+// Does the content need to travel as UTF-8 text (a tryte outside 0..255)?
+fn is_text(p: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) {
+        if (p[k] < 0 || p[k] > 255) { return 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+// The octets the content travels as: itself, or UTF-8. *len gets the size.
+fn as_octets(p: *tryte, n: int, len: *int) -> *tryte {
+    if (!is_text(p, n)) { *len = n; return p; }
+    var size: int = 0;
+    var tmp: [8]tryte;
+    var k: int = 0;
+    while (k < n) { size += utf8_encode(p[k], &tmp[0]); k += 1; }
+    var o: *tryte = malloc(size + 1);
+    var m: int = 0;
+    k = 0;
+    while (k < n) { m += utf8_encode(p[k], o + m); k += 1; }
+    free(p);
+    *len = m;
+    return o;
+}
+
+// The size a file has on the wire (for ATTRS).
+fn wire_size(path: *char, st: *stat_t) -> int {
+    if (S_ISDIR(st.st_mode)) { return st.st_size; }
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return st.st_size; }
+    var buf: *tryte;
+    var n: int = slurp(fd, &buf);
+    close(fd);
+    if (n < 0) { return st.st_size; }
+    var len: int = 0;
+    var o: *tryte = as_octets(buf, n, &len);
+    free(o);
+    return len;
+}
+
+// Strict UTF-8 with at least one multi-octet character: decode into the
+// same buffer (code points never take more trytes than octets); the new
+// length, or -1 to leave the file as it is.
+fn utf8_in_place(p: *tryte, n: int) -> int {
+    var multi: int = 0;
+    var m: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var b: int = p[k];
+        var need: int;
+        var cp: int;
+        if (b < 128) { need = 0; cp = b; }
+        else if (b >= 194 && b < 224) { need = 1; cp = b % 32; }
+        else if (b >= 224 && b < 240) { need = 2; cp = b % 16; }
+        else { return -1; }                     // 4-octet characters do not fit a tryte
+        if (need > 0 && k + need >= n) { return -1; }   // cut short
+        var j: int = 1;
+        while (j <= need) {
+            var c: int = p[k + j];
+            if (c < 128 || c >= 192) { return -1; }
+            cp = cp * 64 + c % 64;
+            j += 1;
+        }
+        if (need == 2 && cp < 2048) { return -1; }      // overlong
+        if (cp > 9841) { return -1; }
+        if (need > 0) { multi = 1; }
+        // a combining overline makes the character before it negative
+        if (cp == 773 && m > 0 && p[m - 1] > 32) {
+            p[m - 1] = (-p[m - 1]) as tryte;
+        } else {
+            p[m] = cp as tryte;
+            m += 1;
+        }
+        k += 1 + need;
+    }
+    return multi ? m : -1;
+}
+
+// ---- handles -------------------------------------------------------------------------------------
+
+const H_FREE: int = 0;
+const H_FILE: int = 1;
+const H_DIR: int = 2;
+
+struct handle {
+    kind: int;
+    fd: int;
+    data: *tryte;                         // a read handle: the content as octets
+    len: int;
+    written: int;                         // octets went in through this handle
+    dirpos: int;
+    path: [243]char;
+}
+
+var handles: [27]handle;
+
+fn new_handle(kind: int) -> int {
+    var h: int = 0;
+    while (h < NHANDLES) {
+        if (handles[h].kind == H_FREE) {
+            handles[h].kind = kind;
+            handles[h].fd = -1;
+            handles[h].data = null;
+            handles[h].len = 0;
+            handles[h].written = 0;
+            handles[h].dirpos = 0;
+            return h;
+        }
+        h += 1;
+    }
+    return -1;
+}
+
+fn send_handle(id: int, h: int) {
+    reply_start(FXP_HANDLE, id);
+    var name: [2]tryte;
+    name[0] = 'h';
+    name[1] = h as tryte;
+    put_octets(&name[0], 2);
+    reply_send();
+}
+
+// The handle named in the request, or -1.
+fn get_handle(kind: int) -> int {
+    var at: int = 0;
+    var n: int = get_string(&at);
+    if (bad || n != 2 || req[at] != 'h') { return -1; }
+    var h: int = req[at + 1];
+    if (h < 0 || h >= NHANDLES || handles[h].kind == H_FREE) { return -1; }
+    if (kind != 0 && handles[h].kind != kind) { return -1; }
+    return h;
+}
+
+// ---- attributes -------------------------------------------------------------------------------
+
+fn put_attrs(path: *char, st: *stat_t) {
+    put_u32(ATTR_SIZE + ATTR_UIDGID + ATTR_PERMISSIONS + ATTR_ACMODTIME);
+    put_u64(wire_size(path, st));
+    put_u32(st.st_uid);
+    put_u32(st.st_gid);
+    put_u32(st.st_mode);
+    put_u32(st.st_mtime);
+    put_u32(st.st_mtime);
+}
+
+// Apply the attributes in the request to path: 0, or -1 (errno set).
+fn set_attrs(path: *char) -> int {
+    var flags: int = get_u32();
+    if (flags / ATTR_SIZE % 2 != 0) { get_u64(); }                 // truncation: not offered
+    if (flags / ATTR_UIDGID % 2 != 0) {
+        var u: int = get_u32();
+        var g: int = get_u32();
+        if (!bad && chown(path, u, g) < 0) { return -1; }
+    }
+    if (flags / ATTR_PERMISSIONS % 2 != 0) {
+        var mode: int = get_u32();
+        if (!bad && chmod(path, mode % 4096) < 0) { return -1; }
+    }
+    if (flags / ATTR_ACMODTIME % 2 != 0) { get_u32(); get_u32(); }  // times: accepted, not kept
+    if (flags / ATTR_EXTENDED % 2 != 0) {
+        var count: int = get_u32();
+        while (count > 0 && !bad) {
+            var a: int = 0;
+            get_string(&a);
+            get_string(&a);
+            count -= 1;
+        }
+    }
+    return 0;
+}
+
+// "-rw-r--r--    1 root     root          123 Oct  5 07:00 name"
+fn long_name(name: *char, st: *stat_t, path: *char, buf: *char) {
+    var m: int = st.st_mode;
+    buf[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISFIFO(m) ? 'p' : '-';
+    var rwx: *char = "rwxrwxrwx";
+    var k: int = 0;
+    var bit: int = 256;
+    while (k < 9) {
+        buf[1 + k] = m / bit % 2 != 0 ? rwx[k] : '-';
+        bit = bit / 2;
+        k += 1;
+    }
+    buf[10] = 0;
+    strcat(buf, "    1 ");
+    var u: *char = user_name_of(st.st_uid);
+    strcat(buf, u);
+    var pad: int = 9 - strlen(u);
+    while (pad > 0) { strcat(buf, " "); pad -= 1; }
+    var g: *char = user_name_of(st.st_gid);
+    strcat(buf, g);
+    pad = 9 - strlen(g);
+    while (pad > 0) { strcat(buf, " "); pad -= 1; }
+    var num: [15]char;
+    var size: *char = itoa(wire_size(path, st), &num[0]);
+    pad = 8 - strlen(size);
+    while (pad > 0) { strcat(buf, " "); pad -= 1; }
+    strcat(buf, size);
+    var t: tm;
+    gmtime_r(st.st_mtime, &t);
+    var when: [32]char;
+    strftime(&when[0], 32, " %b %d %H:%M ", &t);
+    strcat(buf, &when[0]);
+    strncat(buf, name, 200);
+}
+
+fn user_name_of(id: int) -> *char {
+    if (id == 0) { return "root"; }
+    if (id == 1000) { return "user"; }
+    return "-";
+}
+
+// ---- paths ------------------------------------------------------------------------------------
+
+// An absolute path without "." and ".." (no symbolic links exist in Trinux).
+fn canonical(in: *char, outp: *char) {
+    var tmp: [486]char;
+    if (in[0] == '/') { strcpy(&tmp[0], ""); }
+    else {
+        getcwd(&tmp[0], 243);
+        if (!streq(&tmp[0], "/")) { strcat(&tmp[0], "/"); }
+    }
+    strncat(&tmp[0], in, 240);
+    // walk the parts
+    var n: int = 0;
+    outp[0] = 0;
+    var k: int = 0;
+    while (tmp[k] != 0) {
+        while (tmp[k] == '/') { k += 1; }
+        if (tmp[k] == 0) { break; }
+        var s: int = k;
+        while (tmp[k] != 0 && tmp[k] != '/') { k += 1; }
+        var len: int = k - s;
+        if (len == 1 && tmp[s] == '.') { continue; }
+        if (len == 2 && tmp[s] == '.' && tmp[s + 1] == '.') {
+            while (n > 0 && outp[n] != '/') { n -= 1; }
+            outp[n] = 0;
+            continue;
+        }
+        if (n + 1 + len >= 242) { break; }
+        outp[n] = '/';
+        var j: int = 0;
+        while (j < len) { outp[n + 1 + j] = tmp[s + j]; j += 1; }
+        n += 1 + len;
+        outp[n] = 0;
+    }
+    if (n == 0) { strcpy(outp, "/"); }
+}
+
+// ---- requests ---------------------------------------------------------------------------------
+
+var p1: [243]char;
+var p2: [243]char;
+
+fn do_open(id: int) {
+    get_path(&p1[0], 243);
+    var pflags: int = get_u32();
+    if (bad) { status(id, FX_BAD_MESSAGE, "bad OPEN"); return; }
+    var wants_write: int = pflags / PF_WRITE % 2 != 0;
+    var flags: int = wants_write ? (pflags / PF_READ % 2 != 0 ? O_RDWR : O_WRONLY) : O_RDONLY;
+    if (pflags / PF_CREAT % 2 != 0) { flags += O_CREAT; }
+    if (pflags / PF_TRUNC % 2 != 0) { flags += O_TRUNC; }
+    if (pflags / PF_EXCL % 2 != 0) { flags += O_EXCL; }
+    if (pflags / PF_APPEND % 2 != 0) { flags += O_APPEND; }
+    var mode: int = 420;
+    var aflags: int = get_u32();                 // the attributes: only the permissions matter here
+    if (!bad && aflags / ATTR_SIZE % 2 != 0) { get_u64(); }
+    if (!bad && aflags / ATTR_UIDGID % 2 != 0) { get_u32(); get_u32(); }
+    if (!bad && aflags / ATTR_PERMISSIONS % 2 != 0) { mode = get_u32() % 4096; }
+    var fd: int = open(&p1[0], flags, mode);
+    if (fd < 0) { status_errno(id); return; }
+    var st: stat_t;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) { close(fd); status(id, FX_FAILURE, "Is a directory"); return; }
+    var h: int = new_handle(H_FILE);
+    if (h < 0) { close(fd); status(id, FX_FAILURE, "too many open handles"); return; }
+    handles[h].fd = fd;
+    strcpy(&handles[h].path[0], &p1[0]);
+    if (!wants_write) {
+        var buf: *tryte;
+        var n: int = slurp(fd, &buf);
+        if (n < 0) { close(fd); handles[h].kind = H_FREE; status_errno(id); return; }
+        handles[h].data = as_octets(buf, n, &handles[h].len);
+    }
+    send_handle(id, h);
+}
+
+fn do_close(id: int) {
+    var h: int = get_handle(0);
+    if (h < 0) { status(id, FX_FAILURE, "bad handle"); return; }
+    var x: *handle = &handles[h];
+    if (x.kind == H_FILE) {
+        close(x.fd);
+        if (x.data != null) { free(x.data); }
+        if (x.written) {
+            // valid multi-octet UTF-8: keep it as characters
+            var fd: int = open(&x.path[0], O_RDONLY, 0);
+            if (fd >= 0) {
+                var buf: *tryte;
+                var n: int = slurp(fd, &buf);
+                close(fd);
+                if (n > 0) {
+                    var m: int = utf8_in_place(buf, n);
+                    if (m >= 0) {
+                        fd = open(&x.path[0], O_WRONLY + O_TRUNC, 0);
+                        if (fd >= 0) { write(fd, buf as *char, m); close(fd); }
+                    }
+                    free(buf);
+                }
+            }
+        }
+    }
+    x.kind = H_FREE;
+    status(id, FX_OK, "");
+}
+
+fn do_read(id: int) {
+    var h: int = get_handle(H_FILE);
+    var off: int = get_u64();
+    var len: int = get_u32();
+    if (h < 0 || bad) { status(id, FX_FAILURE, "bad handle"); return; }
+    var x: *handle = &handles[h];
+    if (x.data == null) { status(id, FX_FAILURE, "not open for reading"); return; }
+    if (off >= x.len) { status(id, FX_EOF, "End of file"); return; }
+    if (len > 32768) { len = 32768; }
+    if (len > x.len - off) { len = x.len - off; }
+    reply_start(FXP_DATA, id);
+    put_octets(x.data + off, len);
+    reply_send();
+}
+
+fn do_write(id: int) {
+    var h: int = get_handle(H_FILE);
+    var off: int = get_u64();
+    var at: int = 0;
+    var n: int = get_string(&at);
+    if (h < 0 || bad) { status(id, FX_FAILURE, "bad handle"); return; }
+    var x: *handle = &handles[h];
+    if (x.data != null) { status(id, FX_FAILURE, "not open for writing"); return; }
+    if (lseek(x.fd, off, SEEK_SET) < 0) { status_errno(id); return; }
+    var k: int = 0;
+    while (k < n) {
+        var w: int = write(x.fd, (&req[at + k]) as *char, n - k);
+        if (w <= 0) { status_errno(id); return; }
+        k += w;
+    }
+    x.written = 1;
+    status(id, FX_OK, "");
+}
+
+fn do_stat(id: int, by_handle: int) {
+    var path: *char = &p1[0];
+    if (by_handle) {
+        var h: int = get_handle(0);
+        if (h < 0) { status(id, FX_FAILURE, "bad handle"); return; }
+        path = &handles[h].path[0];
+    } else {
+        get_path(&p1[0], 243);
+        if (bad) { status(id, FX_BAD_MESSAGE, "bad STAT"); return; }
+    }
+    var st: stat_t;
+    if (stat(path, &st) < 0) { status_errno(id); return; }
+    reply_start(FXP_ATTRS, id);
+    put_attrs(path, &st);
+    reply_send();
+}
+
+fn do_setstat(id: int, by_handle: int) {
+    var path: *char = &p1[0];
+    if (by_handle) {
+        var h: int = get_handle(0);
+        if (h < 0) { status(id, FX_FAILURE, "bad handle"); return; }
+        path = &handles[h].path[0];
+    } else {
+        get_path(&p1[0], 243);
+    }
+    if (bad) { status(id, FX_BAD_MESSAGE, "bad SETSTAT"); return; }
+    if (set_attrs(path) < 0) { status_errno(id); return; }
+    status(id, FX_OK, "");
+}
+
+fn do_opendir(id: int) {
+    get_path(&p1[0], 243);
+    if (bad) { status(id, FX_BAD_MESSAGE, "bad OPENDIR"); return; }
+    var st: stat_t;
+    if (stat(&p1[0], &st) < 0) { status_errno(id); return; }
+    if (!S_ISDIR(st.st_mode)) { status(id, FX_FAILURE, "Not a directory"); return; }
+    var d: *DIR = opendir(&p1[0]);
+    if (d == null) { status_errno(id); return; }
+    closedir(d);
+    var h: int = new_handle(H_DIR);
+    if (h < 0) { status(id, FX_FAILURE, "too many open handles"); return; }
+    strcpy(&handles[h].path[0], &p1[0]);
+    send_handle(id, h);
+}
+
+fn do_readdir(id: int) {
+    var h: int = get_handle(H_DIR);
+    if (h < 0) { status(id, FX_FAILURE, "bad handle"); return; }
+    var x: *handle = &handles[h];
+    var d: *DIR = opendir(&x.path[0]);
+    if (d == null) { status_errno(id); return; }
+    // skip what earlier READDIRs sent, then up to 27 names
+    var k: int = 0;
+    var e: *dirent = readdir(d);
+    while (e != null && k < x.dirpos) { e = readdir(d); k += 1; }
+    if (e == null) { closedir(d); status(id, FX_EOF, "End of directory"); return; }
+    reply_start(FXP_NAME, id);
+    var count_at: int = out_len;
+    put_u32(0);
+    var count: int = 0;
+    while (e != null && count < 27) {
+        var full: [500]char;
+        strcpy(&full[0], &x.path[0]);
+        if (!streq(&x.path[0], "/")) { strcat(&full[0], "/"); }
+        strncat(&full[0], &e.d_name[0], 200);
+        var st: stat_t;
+        if (stat(&full[0], &st) == 0) {
+            var ln: [400]char;
+            long_name(&e.d_name[0], &st, &full[0], &ln[0]);
+            put_text(&e.d_name[0]);
+            put_text(&ln[0]);
+            put_attrs(&full[0], &st);
+            count += 1;
+        }
+        x.dirpos += 1;
+        e = readdir(d);
+    }
+    closedir(d);
+    var save: int = out_len;
+    out_len = count_at;
+    put_u32(count);
+    out_len = save;
+    reply_send();
+}
+
+fn do_realpath(id: int) {
+    get_path(&p1[0], 243);
+    if (bad) { status(id, FX_BAD_MESSAGE, "bad REALPATH"); return; }
+    canonical(p1[0] == 0 ? "." : &p1[0], &p2[0]);
+    reply_start(FXP_NAME, id);
+    put_u32(1);
+    put_text(&p2[0]);
+    put_text(&p2[0]);
+    put_u32(0);
+    reply_send();
+}
+
+fn do_extended(id: int) {
+    var at: int = 0;
+    var n: int = get_string(&at);
+    var name: [64]char;
+    var k: int = 0;
+    while (k < n && k < 63) { name[k] = req[at + k] as char; k += 1; }
+    name[k] = 0;
+    if (streq(&name[0], "posix-rename@openssh.com")) {
+        get_path(&p1[0], 243);
+        get_path(&p2[0], 243);
+        if (bad) { status(id, FX_BAD_MESSAGE, "bad rename"); return; }
+        if (rename(&p1[0], &p2[0]) < 0) { status_errno(id); return; }
+        status(id, FX_OK, "");
+        return;
+    }
+    status(id, FX_OP_UNSUPPORTED, "Operation unsupported");
+}
+
+fn handle_request(type: int) {
+    var id: int = get_u32();
+    if (bad) { _exit(1); }
+    switch (type) {
+        case FXP_OPEN: do_open(id);
+        case FXP_CLOSE: do_close(id);
+        case FXP_READ: do_read(id);
+        case FXP_WRITE: do_write(id);
+        case FXP_LSTAT, FXP_STAT: do_stat(id, 0);
+        case FXP_FSTAT: do_stat(id, 1);
+        case FXP_SETSTAT: do_setstat(id, 0);
+        case FXP_FSETSTAT: do_setstat(id, 1);
+        case FXP_OPENDIR: do_opendir(id);
+        case FXP_READDIR: do_readdir(id);
+        case FXP_REMOVE: {
+            get_path(&p1[0], 243);
+            if (bad) { status(id, FX_BAD_MESSAGE, "bad REMOVE"); }
+            else if (unlink(&p1[0]) < 0) { status_errno(id); }
+            else { status(id, FX_OK, ""); }
+        }
+        case FXP_MKDIR: {
+            get_path(&p1[0], 243);
+            var mode: int = 493;
+            var aflags: int = get_u32();
+            if (!bad && aflags / ATTR_PERMISSIONS % 2 != 0) {
+                if (aflags / ATTR_SIZE % 2 != 0) { get_u64(); }
+                if (aflags / ATTR_UIDGID % 2 != 0) { get_u32(); get_u32(); }
+                mode = get_u32() % 4096;
+            }
+            if (mkdir(&p1[0], mode) < 0) { status_errno(id); } else { status(id, FX_OK, ""); }
+        }
+        case FXP_RMDIR: {
+            get_path(&p1[0], 243);
+            if (bad) { status(id, FX_BAD_MESSAGE, "bad RMDIR"); }
+            else if (rmdir(&p1[0]) < 0) { status_errno(id); }
+            else { status(id, FX_OK, ""); }
+        }
+        case FXP_REALPATH: do_realpath(id);
+        case FXP_RENAME: {
+            get_path(&p1[0], 243);
+            get_path(&p2[0], 243);
+            var st: stat_t;
+            if (bad) { status(id, FX_BAD_MESSAGE, "bad RENAME"); }
+            else if (stat(&p2[0], &st) == 0) { status(id, FX_FAILURE, "the target exists"); }   // version 3 does not overwrite
+            else if (rename(&p1[0], &p2[0]) < 0) { status_errno(id); }
+            else { status(id, FX_OK, ""); }
+        }
+        case FXP_EXTENDED: do_extended(id);
+        default: status(id, FX_OP_UNSUPPORTED, "Operation unsupported");    // READLINK, SYMLINK: no links here
+    }
+}
+
+fn main(argc: int, argv: **char) -> int {
+    loop {
+        // one whole packet: length, type, the rest
+        while (in_len < 4 || in_len < 4 + be32_at(&inb[0])) {
+            if (in_len >= 4) {
+                var want: int = be32_at(&inb[0]);
+                if (want < 1 || want > MAX_PACKET) { return 1; }          // nonsense: the session ends
+            }
+            var r: int = read(STDIN_FILENO, (&inb[in_len]) as *char, 81000 - in_len);
+            if (r <= 0) { return 0; }
+            in_len += r;
+        }
+        var len: int = be32_at(&inb[0]);
+        var k: int = 0;
+        while (k < len) { req[k] = inb[4 + k]; k += 1; }
+        req_len = len;
+        k = 0;
+        while (4 + len + k < in_len) { inb[k] = inb[4 + len + k]; k += 1; }
+        in_len -= 4 + len;
+        pos = 0;
+        bad = 0;
+        var type: int = get_byte();
+        if (type == FXP_INIT) {
+            out_len = 4;
+            put_byte(FXP_VERSION);
+            put_u32(3);
+            put_text("posix-rename@openssh.com");
+            put_text("1");
+            reply_send();
+            continue;
+        }
+        handle_request(type);
+    }
+}

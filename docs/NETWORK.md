@@ -156,6 +156,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N6 | SSH: a random-number device, the crypto library, `sshd` (§8) ✅ | RFC test vectors; the host's OpenSSH logs in, runs commands and a pty session, moves 120 KB each way; refusals of other algorithms, wrong passwords, a non-SSH-2 client, an overlong line and a tampered packet |
 | N7 | outbound TCP through a NAT to host sockets, DNS at 10.0.2.3, a resolver, `host`, `wget` (§9) ✅ | Trinux reaches servers on the host (as 10.0.2.2 and as an outside address), refusals, the NAT turned off; DNS from the host's resolver and fixed names, NXDOMAIN, a server that is not there, an illegal name, FORMERR; `wget` text, 23 893 octets, 404, https, an unknown name |
 | N8 | public-key login for `sshd`; an `ssh` client and `ssh-keygen` in Trinux (§10) ✅ | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file; the client by password and by key, known_hosts learned and a changed key refused, 3 wrong passwords, a refused port, an unknown name, a pty session, `~.` |
+| N9 | `sftp-server` for the `sftp` subsystem (§11) ✅ | the host's sftp and scp: binary and UTF-8 round trips, renames, removals, refusals |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -293,7 +294,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
   - a version line ≤ 255 characters, with at most 20 lines before it;
   - names and commands bounded by their buffers;
   - channel data decoded in pieces of 2187 octets.
-- Not yet supported: `env`, `subsystem` (sftp) and port forwarding requests, which get `CHANNEL_FAILURE`; and more than one channel per connection.
+- Not yet supported: `env` and port forwarding requests, which get `CHANNEL_FAILURE`; and more than one channel per connection.
 
 ### What a login costs
 
@@ -383,3 +384,43 @@ $ ssh user@somehost 'uname -a'                # or: ssh -p 2222 -i key -t host
   - a changed host key refused;
   - a refused port and an unknown name;
   - an interactive pty session left with `exit`, and one left with `~.`.
+- **Interop**: Trinux's client was also tried against a real OpenSSH server, on another machine, reached through the NAT. Key exchange, the Ed25519 host key's signature, NEWKEYS and the encrypted login exchange all worked, up to the password prompt. This was a one-off check: nothing was changed on that server, and it is not part of the automated tests.
+
+## 11. Copying files: `sftp` and `scp` (N9)
+
+```
+sftp -P 2222 root@localhost                  # from the host, with setun --net 2222:22
+scp -P 2222 notes.txt root@localhost:/tmp/
+scp -P 2222 root@localhost:/etc/motd .
+```
+
+`sshd` serves the `sftp` subsystem by running `/usr/lib/sftp-server` as the user, on pipes, with the channel data passed as octets. OpenSSH's `scp` uses the same protocol (it has done so by default since OpenSSH 9).
+
+The server speaks SFTP version 3 (draft-ietf-secsh-filexfer-02):
+
+| Requests | Notes |
+|---|---|
+| `OPEN`, `CLOSE`, `READ`, `WRITE` | up to 27 handles; replies carry at most 32 768 octets of data |
+| `STAT`, `LSTAT`, `FSTAT` | size, uid, gid, mode and mtime (Trinux has no links, so LSTAT is STAT) |
+| `SETSTAT`, `FSETSTAT` | mode and owner; times and size are accepted and ignored (there is no truncate) |
+| `OPENDIR`, `READDIR` | 27 names per reply, with an `ls -l` style long name |
+| `MKDIR`, `RMDIR`, `REMOVE`, `REALPATH` | REALPATH resolves `.` and `..` against the home directory |
+| `RENAME` | refuses to overwrite, as version 3 asks |
+| `posix-rename@openssh.com` | rename with overwrite (advertised in VERSION) |
+| `READLINK`, `SYMLINK`, others | `OP_UNSUPPORTED` |
+
+**Trytes and octets.** A Trinux file is trytes, and SFTP moves octets:
+- **Byte files:** a file whose trytes are all 0..255 is sent octet for octet. A binary file therefore comes back exactly as it went in.
+- **Text files:** a file holding characters beyond 255 (or overlined ones) is sent as UTF-8 text, and its reported size is the size of that text. `/etc/motd` arrives with its 1̅ as `1` followed by U+0305.
+- **Uploads:** a file written through SFTP that turns out to be valid UTF-8 with multi-octet characters is turned into characters when it is closed. Russian text uploaded from the host can then be read with `cat` and edited with `edit`, and it counts its characters with `wc -c`.
+- **Limitation:** Latin-1 text (all characters at or below 255) is indistinguishable from bytes. After an upload it comes back as single octets rather than UTF-8.
+
+Errors map from errno: ENOENT/ENOTDIR → `NO_SUCH_FILE`, EACCES/EPERM → `PERMISSION_DENIED`, anything else → `FAILURE` with `strerror`'s text. A nonsensical packet length ends the session.
+
+**Tests** (`crates/trinux/tests/sftp.rs`, using the host's `sftp -b` and `scp` with a key from the host's `ssh-keygen`):
+- `mkdir`, put and get of a 512-octet file holding every value twice (identical after the round trip);
+- a Russian UTF-8 text file (identical on the host; stored in Trinux as 33 characters);
+- `/etc/motd` downloaded as UTF-8;
+- `rename`, `ls -l`, `rm`, `rmdir`;
+- errors: a missing file, a `rename` onto an existing file, `rmdir` of a non-empty directory;
+- `scp` of 3000 lines both ways, a missing remote file, and a user writing to `/root` (`Permission denied`).

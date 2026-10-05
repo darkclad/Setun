@@ -353,6 +353,12 @@ fn run_as_user(command: *char) {
         strncat(&arg0[0], base == null ? &shell[0] : &base[1], 200);
         var args: [2]*char = { &arg0[0], null };
         execve(&shell[0], &args[0], &env_vec[0]);
+    } else if (binary) {
+        // a subsystem: the program itself, not through the shell
+        var sargs: [2]*char = { "sftp-server", null };
+        execve(command, &sargs[0], &env_vec[0]);
+        perror2("sshd", command);
+        _exit(127);
     } else {
         var args: [4]*char = { "sh", "-c", command, null };
         execve(&shell[0], &args[0], &env_vec[0]);
@@ -412,6 +418,8 @@ fn start_child(command: *char) -> int {
 }
 
 var cmdbuf: [2187]char;
+var binary: int;                          // a subsystem: channel data are octets, not text
+const SFTP_SERVER: *char = "/usr/lib/sftp-server";
 
 fn channel_request() {
     var rcpt: int = get_u32();
@@ -436,6 +444,18 @@ fn channel_request() {
         }
         if (bad || child != 0 || start_child(cmd) < 0) { channel_reply(want, 0); return; }
         log2(cmd == null ? "shell for " : "command for ", &user[0]);
+        channel_reply(want, 1);
+        return;
+    }
+    if (streq(&type[0], "subsystem")) {
+        var name: [64]char;
+        get_text(&name[0], 64);
+        if (bad || child != 0 || !streq(&name[0], "sftp")) { channel_reply(want, 0); return; }
+        // octets both ways, on pipes even if a pty was asked for
+        binary = 1;
+        want_pty = 0;
+        if (start_child(SFTP_SERVER) < 0) { binary = 0; channel_reply(want, 0); return; }
+        log2("sftp for ", &user[0]);
         channel_reply(want, 1);
         return;
     }
@@ -480,6 +500,12 @@ fn child_output(fd: int, ext: int) -> int {
     if (n <= 0) { return 0; }
     var m: int = 0;
     var k: int = 0;
+    if (binary) {
+        // a subsystem's output is octets already
+        while (k < n) { pend[k] = chars[k] as tryte; k += 1; }
+        m = n;
+        k = n;
+    }
     while (k < n) {
         if (master >= 0 && chars[k] == '\n' && !last_cr) {
             pend[m] = 13;
@@ -565,6 +591,11 @@ fn connection_message(t: int) {
             if (n > lwin) { disconnect(DISCONNECT_PROTOCOL_ERROR, "the client ignored the window"); }
             lwin -= n;
             var fd: int = master >= 0 ? master : in_fd;
+            if (binary) {
+                if (fd >= 0) { write_all(fd, &pkt[at], n); }
+                send_window_adjust();
+                return;
+            }
             var done: int = 0;
             while (done < n) {                      // text[] holds 2187 characters
                 var part: int = n - done > 2187 ? 2187 : n - done;
