@@ -1,4 +1,5 @@
-// /sbin/httpd [-p PORT] [-r ROOT] [-1]: serve files over HTTP/1.1.
+// /sbin/httpd [-s [-c CERT] [-k KEY]] [-p PORT] [-r ROOT] [-1]: serve files
+// over HTTP/1.1, or HTTPS (TLS 1.3, lib/tls.tri) with -s.
 //
 // GET and HEAD of the files under ROOT (default /var/www): a directory
 // gives its index.html, or a listing; a directory named without its final
@@ -7,11 +8,19 @@
 // are all 0..255 goes out octet for octet; any other is sent as UTF-8 text
 // (the rules of lib/octets.tri). One request per connection
 // (Connection: close), each in its own process; a client gets 27 seconds
-// to send its request, then a 408. Requests are logged to standard error
+// (-t) to send its request, then a 408. Requests are logged to standard error
 // in the Common Log Format.
 //
-//   -p PORT   listen on PORT (default 80)
+//   -s        HTTPS: TLS 1.3 with the ECDSA key in KEY (default
+//             /etc/ssl/httpd.key) and the certificates in CERT (default
+//             /etc/ssl/httpd.crt, the server's own first). If neither
+//             default file is there, a P-256 key and a self-signed
+//             certificate for this host's name, localhost, 127.0.0.1 and
+//             10.0.2.15 are made first (lib/certgen.tri).
+//   -p PORT   listen on PORT (default 80, or 443 with -s)
 //   -r ROOT   serve ROOT (default /var/www)
+//   -t SECS   a client's time to shake hands and send its request (default
+//             27; 0: no limit)
 //   -1        serve one connection, then exit (for tests)
 
 import "../lib/tlibc.tri";
@@ -20,12 +29,17 @@ import "../lib/getopt.tri";
 import "../lib/socket.tri";
 import "../lib/time.tri";
 import "../lib/octets.tri";
+import "../lib/tls.tri";
 
 const MAX_HEAD: int = 6561;             // the request line and headers
-const REQUEST_SECONDS: int = 27;        // to send them, or 408 and goodbye
+var request_seconds: int;                // to send them (and shake hands), or 408 and goodbye; 0: forever
 
 var root: *char;
 var sock: int;
+var secure: int;
+var tl: tls;
+var ident: tls_identity;
+var chain_der: [59049]tryte;
 var head: [6561]char;
 var client: [27]char;
 
@@ -37,6 +51,7 @@ var status: int;
 var sent: int;
 
 fn put_all(p: *tryte, n: int) -> int {
+    if (secure) { return tls_write(&tl, p, n); }
     var done: int = 0;
     while (done < n) {
         var w: int = write(sock, (p + done) as *char, n - done);
@@ -363,15 +378,23 @@ fn now_ms() -> int {
 fn read_head() -> int {
     var n: int = 0;
     var buf: [729]tryte;
-    var deadline: int = now_ms() + REQUEST_SECONDS * 1000;
+    var deadline: int = request_seconds > 0 ? now_ms() + request_seconds * 1000 : 0;
     loop {
-        var left: int = deadline - now_ms();
-        var pf: pollfd;
-        pf.fd = sock;
-        pf.events = POLLIN;
-        pf.revents = 0;
-        if (left <= 0 || poll(&pf, 1, left) == 0) { return -3; }
-        var r: int = read(sock, &buf[0] as *char, 729);
+        var left: int = deadline > 0 ? deadline - now_ms() : -1;
+        var r: int = 0;
+        if (secure) {
+            if (deadline > 0 && left <= 0) { return -3; }
+            tls_set_timeout(&tl, deadline > 0 ? left : 0);
+            r = tls_read(&tl, &buf[0], 729);
+            if (r < 0 && deadline > 0 && now_ms() >= deadline) { return -3; }
+        } else {
+            var pf: pollfd;
+            pf.fd = sock;
+            pf.events = POLLIN;
+            pf.revents = 0;
+            if (deadline > 0 && (left <= 0 || poll(&pf, 1, left) == 0)) { return -3; }
+            r = read(sock, &buf[0] as *char, 729);
+        }
         if (r <= 0) { return -1; }
         var k: int = 0;
         while (k < r) {
@@ -390,6 +413,21 @@ fn read_head() -> int {
         }
     }
     return -1;
+}
+
+// One connection: the TLS handshake first with -s.
+fn serve_conn() {
+    if (secure) {
+        if (tls_accept(&tl, sock, &ident, request_seconds * 1000) < 0) {
+            fputs(STDERR_FILENO, &client[0]);
+            fputs(STDERR_FILENO, " TLS: ");
+            fputs(STDERR_FILENO, &tl.why[0]);
+            fputs(STDERR_FILENO, "\n");
+            return;
+        }
+    }
+    serve();
+    if (secure) { tls_close(&tl); }
 }
 
 fn serve() {
@@ -488,22 +526,72 @@ fn serve() {
     log_request();
 }
 
+// Make the default key and a self-signed certificate: 0, or -1.
+fn make_identity(keyfile: *char, certfile: *char) -> int {
+    var u: utsname;
+    uname(&u);
+    var names: [4]*char;
+    names[0] = &u.nodename[0];
+    names[1] = "localhost";
+    names[2] = "127.0.0.1";
+    names[3] = "10.0.2.15";
+    var priv: [48]tryte;
+    var pub: [97]tryte;
+    if (!ec_keygen(CURVE_P256, &priv[0], &pub[0]) || ec_key_write(keyfile, CURVE_P256, &priv[0], &pub[0]) < 0) { return -1; }
+    var der: [6561]tryte;
+    var n: int = x509_selfsigned(CURVE_P256, &priv[0], &pub[0], &names[0], 4, time(null) - 3600, 729, &der[0], 6561);
+    if (n < 0) { return -1; }
+    var fd: int = open(certfile, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd < 0) { return -1; }
+    pem_write(fd, "CERTIFICATE", &der[0], n);
+    close(fd);
+    fputs(STDERR_FILENO, "httpd: made a P-256 key and a self-signed certificate for ");
+    fputs(STDERR_FILENO, names[0]);
+    fputs(STDERR_FILENO, ", localhost, 127.0.0.1 and 10.0.2.15 in ");
+    fputs(STDERR_FILENO, certfile);
+    fputs(STDERR_FILENO, "\n");
+    return 0;
+}
+
 fn main(argc: int, argv: **char) -> int {
-    var port: int = 80;
+    var port: int = 0;
     var once: int = 0;
+    var certfile: *char = null;
+    var keyfile: *char = null;
     root = "/var/www";
-    var c: int = getopt(argc, argv, "p:r:1");
+    request_seconds = 27;
+    var c: int = getopt(argc, argv, "sc:k:p:r:t:1");
     while (c != -1) {
-        if (c == 'p') { port = atoi(optarg); }
+        if (c == 'p') { port = atoi(optarg); if (port <= 0) { port = -1; } }
         else if (c == 'r') { root = optarg; }
         else if (c == '1') { once = 1; }
+        else if (c == 's') { secure = 1; }
+        else if (c == 'c') { certfile = optarg; }
+        else if (c == 'k') { keyfile = optarg; }
+        else if (c == 't') { request_seconds = atoi(optarg); if (request_seconds < 0) { request_seconds = 0; } }
         else {
-            fputs(STDERR_FILENO, "usage: httpd [-p port] [-r root] [-1]\n");
+            fputs(STDERR_FILENO, "usage: httpd [-s [-c cert] [-k key]] [-p port] [-r root] [-t secs] [-1]\n");
             return 2;
         }
-        c = getopt(argc, argv, "p:r:1");
+        c = getopt(argc, argv, "sc:k:p:r:t:1");
+    }
+    if (port == 0) { port = secure ? 443 : 80; }
+    if (!secure && (certfile != null || keyfile != null)) {
+        fputs(STDERR_FILENO, "httpd: -c and -k go with -s\n");
+        return 2;
     }
     if (port <= 0 || port > 65535) { fputs(STDERR_FILENO, "httpd: bad port\n"); return 2; }
+    if (secure) {
+        bin32_init();
+        var defaults: int = certfile == null && keyfile == null;
+        if (certfile == null) { certfile = "/etc/ssl/httpd.crt"; }
+        if (keyfile == null) { keyfile = "/etc/ssl/httpd.key"; }
+        var ks: stat_t;
+        if (defaults && stat(keyfile, &ks) < 0 && stat(certfile, &ks) < 0) {
+            if (make_identity(keyfile, certfile) < 0) { perror2("httpd", keyfile); return 1; }
+        }
+        if (tls_identity_load(&ident, keyfile, certfile, &chain_der[0], 59049) < 0) { return 1; }
+    }
     var rs: stat_t;
     if (stat(root, &rs) < 0 || !S_ISDIR(rs.st_mode)) {
         fputs(STDERR_FILENO, "httpd: ");
@@ -520,7 +608,7 @@ fn main(argc: int, argv: **char) -> int {
     if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("httpd", "bind"); return 1; }
     if (listen(l, 9) < 0) { perror2("httpd", "listen"); return 1; }
     var num: [15]char;
-    fputs(STDERR_FILENO, "httpd: serving ");
+    fputs(STDERR_FILENO, secure ? "httpd: serving HTTPS from " : "httpd: serving ");
     fputs(STDERR_FILENO, root);
     fputs(STDERR_FILENO, " on port ");
     fputs(STDERR_FILENO, itoa(port, &num[0]));
@@ -541,7 +629,7 @@ fn main(argc: int, argv: **char) -> int {
         if (once) {
             close(l);
             sock = s;
-            serve();
+            serve_conn();
             shutdown(s, SHUT_RDWR);
             close(s);
             return 0;
@@ -550,7 +638,7 @@ fn main(argc: int, argv: **char) -> int {
         if (pid == 0) {
             close(l);
             sock = s;
-            serve();
+            serve_conn();
             shutdown(s, SHUT_RDWR);
             close(s);
             _exit(0);
