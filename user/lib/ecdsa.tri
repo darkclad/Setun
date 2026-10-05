@@ -305,3 +305,93 @@ fn ecdsa_verify(id: int, pub: *tryte, publen: int, h: *tryte, hlen: int, r: *try
     mod_reduce_wide(&c.fq, &v[0], &xw[0]);
     return bn_cmp(&v[0], &rr[0], n) == 0;
 }
+
+// ---- key exchange (ECDH) ---------------------------------------------------------------------
+//
+// For TLS's secp256r1 and secp384r1 groups. The scalar multiplication is a
+// plain double-and-add, not constant-time: its timing depends on the secret
+// scalar (one-off ephemeral keys here, never long-term ones).
+
+// k·(px, py) (k: n ordinary limbs; the point in Montgomery form) into
+// x, y (ob octets each, big-endian). 0 if the result is the point at infinity.
+fn _ec_mult(c: *curve, k: *int, px: *int, py: *int, x: *tryte, y: *tryte) -> int {
+    _ec = c;
+    var n: int = c.limbs;
+    var p: jpoint;
+    bn_copy(&p.x[0], px, n);
+    bn_copy(&p.y[0], py, n);
+    bn_copy(&p.z[0], &c.fp.one[0], n);
+    var acc: jpoint;
+    bn_zero(&acc.x[0], n);
+    bn_zero(&acc.y[0], n);
+    bn_zero(&acc.z[0], n);
+    var i: int = bn_bits(k, n) - 1;
+    while (i >= 0) {
+        _pdouble(&acc);
+        if (bn_bit(k, i)) { _padd(&acc, &p); }
+        i -= 1;
+    }
+    if (_is_inf(&acc)) { return 0; }
+    // affine: x = X/Z^2, y = Y/Z^3
+    var zi: [24]int;
+    var zi2: [24]int;
+    var t: [24]int;
+    mont_inv(&c.fp, &zi[0], &acc.z[0]);
+    mont_mul(&c.fp, &zi2[0], &zi[0], &zi[0]);
+    mont_mul(&c.fp, &t[0], &acc.x[0], &zi2[0]);
+    mont_from(&c.fp, &t[0], &t[0]);
+    bn_to_octets(x, c.octets, &t[0], n);
+    mont_mul(&c.fp, &zi2[0], &zi2[0], &zi[0]);
+    mont_mul(&c.fp, &t[0], &acc.y[0], &zi2[0]);
+    mont_from(&c.fp, &t[0], &t[0]);
+    bn_to_octets(y, c.octets, &t[0], n);
+    return 1;
+}
+
+// The public key (04 || X || Y) of priv (octets bytes, 1 .. n-1).
+fn ec_pubkey(id: int, priv: *tryte, pub: *tryte) -> int {
+    var c: *curve = curve_of(id);
+    var d: [24]int;
+    bn_from_octets(&d[0], c.limbs, priv, c.octets);
+    pub[0] = 4;
+    return _ec_mult(c, &d[0], &c.gx[0], &c.gy[0], pub + 1, pub + 1 + c.octets);
+}
+
+// A new key pair: priv (octets bytes, 1 .. n-1, from getrandom) and pub
+// (04 || X || Y). 1, or 0 if no good private key came (it never should).
+fn ec_keygen(id: int, priv: *tryte, pub: *tryte) -> int {
+    var c: *curve = curve_of(id);
+    var n: int = c.limbs;
+    var d: [24]int;
+    var tries: int = 0;
+    while (tries < 27) {
+        getrandom(priv, c.octets, 0);
+        bn_from_octets(&d[0], n, priv, c.octets);
+        if (!bn_is_zero(&d[0], n) && bn_cmp(&d[0], &c.fq.m[0], n) < 0) { return ec_pubkey(id, priv, pub); }
+        tries += 1;
+    }
+    return 0;
+}
+
+// The shared secret: the x coordinate of priv·peer (octets bytes) into
+// out. 0 if the peer's key is not an uncompressed point of the curve, or
+// the result is the point at infinity.
+fn ecdh(id: int, priv: *tryte, peer: *tryte, plen: int, out: *tryte) -> int {
+    var c: *curve = curve_of(id);
+    _ec = c;
+    var n: int = c.limbs;
+    var ob: int = c.octets;
+    if (plen != 1 + 2 * ob || peer[0] != 4) { return 0; }
+    var qx: [24]int;
+    var qy: [24]int;
+    var t: [24]int;
+    if (!bn_from_octets(&t[0], n, peer + 1, ob) || bn_cmp(&t[0], &c.fp.m[0], n) >= 0) { return 0; }
+    mont_to(&c.fp, &qx[0], &t[0]);
+    if (!bn_from_octets(&t[0], n, peer + 1 + ob, ob) || bn_cmp(&t[0], &c.fp.m[0], n) >= 0) { return 0; }
+    mont_to(&c.fp, &qy[0], &t[0]);
+    if (!_on_curve(&qx[0], &qy[0])) { return 0; }
+    var d: [24]int;
+    bn_from_octets(&d[0], n, priv, ob);
+    var y: [48]tryte;
+    return _ec_mult(c, &d[0], &qx[0], &qy[0], out, &y[0]);
+}

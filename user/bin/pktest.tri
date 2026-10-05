@@ -8,7 +8,9 @@ import "../lib/ecdsa.tri";
 import "../lib/rsa.tri";
 import "../lib/hmac.tri";
 import "../lib/chacha.tri";
+import "../lib/aes.tri";
 import "pkvectors.inc.tri";
+import "aesvectors.inc.tri";
 
 var failures: int;
 var t0: int;
@@ -70,6 +72,81 @@ fn rsa_case(scheme: int, id: int, n: *char, sig: *char, h: *char) -> int {
     return rsa_verify(scheme, id, &a[0], nl, &e65537[0], 3, &b[0], sl, &c[0]);
 }
 
+var gc: gcm;
+
+// GCM case: seal must give ct; open must give msg back; a changed octet
+// of the tag, the ciphertext or the associated data must be refused.
+fn gcm_case(key: *char, nonce: *char, aad: *char, msg: *char, ct: *char) -> int {
+    var kl: int = unhex(key, &a[0]);
+    gcm_setkey(&gc, &a[0], kl);
+    var nonce12: [12]tryte;
+    unhex(nonce, &nonce12[0]);
+    var al: int = unhex(aad, &b[0]);
+    var ml: int = unhex(msg, &c[0]);
+    gcm_seal(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+    var good: int = is_hex(&c[0], ct);
+    good = good && gcm_open(&gc, &nonce12[0], &b[0], al, &c[0], ml) && is_hex(&c[0], msg);
+    gcm_seal(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+    c[ml + 15] = xor8(c[ml + 15], 1) as tryte;                       // the tag
+    good = good && !gcm_open(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+    c[ml + 15] = xor8(c[ml + 15], 1) as tryte;
+    if (ml > 0) {
+        c[ml - 1] = xor8(c[ml - 1], 128) as tryte;                   // the ciphertext
+        good = good && !gcm_open(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+        c[ml - 1] = xor8(c[ml - 1], 128) as tryte;
+    }
+    if (al > 0) {
+        b[0] = xor8(b[0], 2) as tryte;                                 // the associated data
+        good = good && !gcm_open(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+        b[0] = xor8(b[0], 2) as tryte;
+    }
+    nonce12[11] = xor8(nonce12[11], 4) as tryte;                     // another nonce
+    good = good && !gcm_open(&gc, &nonce12[0], &b[0], al, &c[0], ml);
+    return good;
+}
+
+fn ecdh_pub(id: int, priv: *char, pub: *char) -> int {
+    unhex(priv, &a[0]);
+    return ec_pubkey(id, &a[0], &out[0]) && is_hex(&out[0], pub);
+}
+
+fn ecdh_both(id: int, pa: *char, pb: *char, apub: *char, bpub: *char, shared: *char) -> int {
+    unhex(pa, &a[0]);
+    var bl: int = unhex(bpub, &b[0]);
+    var good: int = ecdh(id, &a[0], &b[0], bl, &out[0]) && is_hex(&out[0], shared);
+    unhex(pb, &a[0]);
+    var al: int = unhex(apub, &b[0]);
+    return good && ecdh(id, &a[0], &b[0], al, &out[0]) && is_hex(&out[0], shared);
+}
+
+fn ecdh_refusals() -> int {
+    unhex(XP256_A, &a[0]);
+    var bl: int = unhex(XP256_BPUB, &b[0]);
+    b[bl - 1] = xor8(b[bl - 1], 1) as tryte;                         // y changed: off the curve
+    var bad: int = ecdh(CURVE_P256, &a[0], &b[0], bl, &out[0]);
+    b[bl - 1] = xor8(b[bl - 1], 1) as tryte;
+    bad = bad || ecdh(CURVE_P256, &a[0], &b[0], bl - 1, &out[0]);   // short
+    b[0] = 2;                                                          // compressed form
+    bad = bad || ecdh(CURVE_P256, &a[0], &b[0], bl, &out[0]);
+    b[0] = 4;
+    var k: int = 1;
+    while (k <= 32) { b[k] = 255; k += 1; }                            // x = 2^256 - 1 >= p
+    bad = bad || ecdh(CURVE_P256, &a[0], &b[0], bl, &out[0]);
+    return !bad;
+}
+
+fn ecdh_fresh() -> int {
+    var pa: [32]tryte;
+    var pb: [32]tryte;
+    var qa: [65]tryte;
+    var qb: [65]tryte;
+    var sa: [32]tryte;
+    var sb: [32]tryte;
+    if (!ec_keygen(CURVE_P256, &pa[0], &qa[0]) || !ec_keygen(CURVE_P256, &pb[0], &qb[0])) { return 0; }
+    if (!ecdh(CURVE_P256, &pa[0], &qb[0], 65, &sa[0]) || !ecdh(CURVE_P256, &pb[0], &qa[0], 65, &sb[0])) { return 0; }
+    return octets_equal(&sa[0], &sb[0], 32) && !octets_equal(&pa[0], &pb[0], 32);
+}
+
 fn main(argc: int, argv: **char) -> int {
     t0 = ms();
     e65537[0] = 1; e65537[1] = 0; e65537[2] = 1;
@@ -119,6 +196,30 @@ fn main(argc: int, argv: **char) -> int {
     aead_seal(&key[0], &nonce[0], &aad[0], 12, &out[0], n);
     aad[0] = 0;
     ok("ChaCha20-Poly1305 refuses changed associated data", !aead_open(&key[0], &nonce[0], &aad[0], 12, &out[0], n));
+
+    // FIPS 197 appendix C.1 and C.3
+    var ak: aes;
+    unhex("000102030405060708090a0b0c0d0e0f", &a[0]);
+    aes_setkey(&ak, &a[0], 16);
+    unhex("00112233445566778899aabbccddeeff", &b[0]);
+    aes_encrypt(&ak, &b[0], &out[0]);
+    ok("AES-128 FIPS 197 C.1", is_hex(&out[0], "69c4e0d86a7b0430d8cdb78070b4c55a"));
+    unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", &a[0]);
+    aes_setkey(&ak, &a[0], 32);
+    aes_encrypt(&ak, &b[0], &out[0]);
+    ok("AES-256 FIPS 197 C.3", is_hex(&out[0], "8ea2b7ca516745bfeafc49904b496089"));
+    ok("AES-128-GCM, empty", gcm_case(G0_KEY, G0_NONCE, G0_AAD, G0_MSG, G0_CT));
+    ok("AES-128-GCM, 13 + 16", gcm_case(G1_KEY, G1_NONCE, G1_AAD, G1_MSG, G1_CT));
+    ok("AES-128-GCM, 20 + 60", gcm_case(G2_KEY, G2_NONCE, G2_AAD, G2_MSG, G2_CT));
+    ok("AES-256-GCM, 0 + 17", gcm_case(G3_KEY, G3_NONCE, G3_AAD, G3_MSG, G3_CT));
+    ok("AES-256-GCM, 12 + 64", gcm_case(G4_KEY, G4_NONCE, G4_AAD, G4_MSG, G4_CT));
+    ok("AES-128-GCM, 300 octets", gcm_case(G5_KEY, G5_NONCE, G5_AAD, G5_MSG, G5_CT));
+
+    ok("ECDH P-256: public key", ecdh_pub(CURVE_P256, XP256_A, XP256_APUB));
+    ok("ECDH P-256: shared secret both ways", ecdh_both(CURVE_P256, XP256_A, XP256_B, XP256_APUB, XP256_BPUB, XP256_SHARED));
+    ok("ECDH P-384: shared secret both ways", ecdh_both(CURVE_P384, XP384_A, XP384_B, XP384_APUB, XP384_BPUB, XP384_SHARED));
+    ok("ECDH refuses a point off the curve, a short key, a compressed one, x >= p", ecdh_refusals());
+    ok("ECDH P-256: two new key pairs agree", ecdh_fresh());
 
     ok("ECDSA P-256 SHA-256", ecdsa_case(CURVE_P256, V_P256_PUB, V_P256_H, V_P256_R, V_P256_S));
     ok("ECDSA P-384 SHA-384", ecdsa_case(CURVE_P384, V_P384_PUB, V_P384_H, V_P384_R, V_P384_S));
