@@ -1,0 +1,175 @@
+// wget [-q] [-b] [-O FILE] URL: fetch a file over HTTP/1.0.
+//
+// Only http:// (there is no TLS). The body is saved to FILE (- for
+// standard output), or to the last part of the URL's path (index.html for
+// "/"). Text arrives as UTF-8 and is stored as characters; -b keeps the
+// octets as they are. Exit status: 0 for a 2xx answer, 4 network trouble,
+// 8 an error answer from the server, 1 anything else.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+var quiet: int;
+var binary: int;
+var net: [2187]tryte;
+var head: [2187]char;
+var text: [2187]char;
+var dec: utf8_state;
+
+fn say(a: *char, b: *char) {
+    if (quiet) { return; }
+    fputs(STDERR_FILENO, a);
+    fputs(STDERR_FILENO, b);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var outname: *char = null;
+    var c: int = getopt(argc, argv, "qbO:");
+    while (c != -1) {
+        switch (c) {
+            case 'q': quiet = 1;
+            case 'b': binary = 1;
+            case 'O': outname = optarg;
+            default: {
+                fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] http://host[:port]/path\n");
+                return 1;
+            }
+        }
+        c = getopt(argc, argv, "qbO:");
+    }
+    if (optind != argc - 1) {
+        fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] http://host[:port]/path\n");
+        return 1;
+    }
+    var url: *char = argv[optind];
+    if (strncmp(url, "https://", 8) == 0) {
+        fputs(STDERR_FILENO, "wget: https is not supported (there is no TLS)\n");
+        return 1;
+    }
+    if (strncmp(url, "http://", 7) != 0) {
+        fputs(STDERR_FILENO, "wget: only http:// URLs\n");
+        return 1;
+    }
+    // host[:port] and path
+    var host: [243]char;
+    var k: int = 7;
+    var h: int = 0;
+    while (url[k] != 0 && url[k] != '/' && url[k] != ':' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
+    host[h] = 0;
+    var port: int = 80;
+    if (url[k] == ':') {
+        k += 1;
+        port = 0;
+        while (url[k] >= '0' && url[k] <= '9') { port = port * 10 + url[k] - '0'; k += 1; }
+        if (port <= 0 || port > 65535) { fputs(STDERR_FILENO, "wget: bad port\n"); return 1; }
+    }
+    var path: *char = url[k] == 0 ? "/" : &url[k];
+    if (h == 0) { fputs(STDERR_FILENO, "wget: no host in the URL\n"); return 1; }
+    var addr: int = 0;
+    if (!resolve_host(&host[0], &addr)) {
+        say("wget: unable to resolve host address '", &host[0]);
+        say("'\n", "");
+        return 4;
+    }
+    say("Connecting to ", &host[0]);
+    say(" (", inet_ntoa(addr));
+    say(")... ", "");
+    var s: int = socket(AF_INET, SOCK_STREAM, 0);
+    var a: sockaddr_in;
+    sockaddr_set(&a, addr, port);
+    if (s < 0 || connect(s, &a, sizeof(sockaddr_in)) < 0) {
+        var e: *char = strerror(errno);
+        say("failed: ", e);
+        say(".\n", "");
+        return 4;
+    }
+    say("connected.\n", "");
+    // the request (ASCII: the path's own characters must be octets too)
+    var req: [729]char;
+    strcpy(&req[0], "GET ");
+    strncat(&req[0], path, 500);
+    strcat(&req[0], " HTTP/1.0\r\nHost: ");
+    strncat(&req[0], &host[0], 100);
+    strcat(&req[0], "\r\nUser-Agent: Trinux-wget/0.1\r\nConnection: close\r\n\r\n");
+    if (write(s, &req[0], strlen(&req[0])) < 0) {
+        perror2("wget", "write");
+        return 4;
+    }
+    // the status line and headers
+    var hn: int = 0;
+    var body_start: int = -1;
+    var n: int = 0;
+    while (body_start < 0) {
+        n = read(s, &net[0] as *char, 2187);
+        if (n <= 0) { fputs(STDERR_FILENO, "wget: no answer\n"); return 4; }
+        var j: int = 0;
+        while (j < n && body_start < 0) {
+            if (hn < 2186) { head[hn] = net[j] as char; hn += 1; }
+            if (hn >= 4 && head[hn - 4] == '\r' && head[hn - 3] == '\n' && head[hn - 2] == '\r' && head[hn - 1] == '\n') { body_start = j + 1; }
+            j += 1;
+        }
+        if (hn >= 2186 && body_start < 0) { fputs(STDERR_FILENO, "wget: headers too long\n"); return 1; }
+    }
+    head[hn] = 0;
+    // "HTTP/1.x NNN reason"
+    var e: int = 0;
+    while (head[e] != 0 && head[e] != '\r') { e += 1; }
+    var status: int = 0;
+    var sp: *char = strchr(&head[0], ' ');
+    if (sp != null) { status = atoi(sp + 1); }
+    var line: [243]char;
+    strncpy(&line[0], &head[0], e < 242 ? e : 242);
+    line[e < 242 ? e : 242] = 0;
+    say("HTTP request sent, awaiting response... ", sp != null ? sp + 1 : "?");
+    say("", "\n");
+    if (status < 200 || status > 299) {
+        fputs(STDERR_FILENO, "wget: ");
+        fputs(STDERR_FILENO, &line[0]);
+        fputs(STDERR_FILENO, "\n");
+        return 8;
+    }
+    // where to put it
+    var name: [243]char;
+    if (outname == null) {
+        var base: *char = strrchr(path, '/');
+        base = base == null ? path : base + 1;
+        if (base[0] == 0) { base = "index.html"; }
+        var q: int = 0;
+        while (base[q] != 0 && base[q] != '?' && q < 242) { name[q] = base[q]; q += 1; }
+        name[q] = 0;
+        outname = &name[0];
+    }
+    var fd: int = streq(outname, "-") ? STDOUT_FILENO : open(outname, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd < 0) { perror2("wget", outname); return 1; }
+    var total: int = 0;
+    var from: int = body_start;
+    loop {
+        var m: int = n - from;
+        if (m > 0) {
+            total += m;
+            if (binary) {
+                write(fd, &net[from] as *char, m);
+            } else {
+                var t: int = utf8_to_text(&dec, &net[from], m, &text[0]);
+                write(fd, &text[0], t);
+            }
+        }
+        n = read(s, &net[0] as *char, 2187);
+        from = 0;
+        if (n <= 0) { break; }
+    }
+    close(s);
+    if (fd != STDOUT_FILENO) { close(fd); }
+    if (!quiet) {
+        var num: [15]char;
+        fputs(STDERR_FILENO, "Saved ");
+        fputs(STDERR_FILENO, itoa(total, &num[0]));
+        fputs(STDERR_FILENO, " octets to '");
+        fputs(STDERR_FILENO, outname);
+        fputs(STDERR_FILENO, "'\n");
+    }
+    return 0;
+}

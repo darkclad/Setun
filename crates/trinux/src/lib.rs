@@ -136,7 +136,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest", "cryptotest",
+        "nc", "ping", "netstat", "nettest", "cryptotest", "host", "wget",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -168,7 +168,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v.push(("/bin/k2_hello".into(), u.join("k2_hello.tri")));
     v.push(("/etc/motd".into(), u.join("etc/motd")));
     v.push(("/etc/pangrams".into(), u.join("etc/pangrams")));
-    for db in ["passwd", "group", "shadow", "hosts"] {
+    for db in ["passwd", "group", "shadow", "hosts", "resolv.conf"] {
         v.push((format!("/etc/{db}"), u.join(format!("etc/{db}"))));
     }
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));

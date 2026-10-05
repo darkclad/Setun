@@ -98,7 +98,6 @@ fn booted() -> Option<(Session, u16)> {
         return None;
     }
     let mut s = Session::boot();
-    s.wait_for("sshd: listening on port 22", 2_000_000_000);
     let port = s.net.forward("127.0.0.1:0".parse().unwrap(), 22).unwrap().port();
     Some((s, port))
 }

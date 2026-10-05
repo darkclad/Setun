@@ -9,9 +9,14 @@
 //!   bytes of each accepted connection both ways;
 //! - **test connections** are the same without a host socket, so tests
 //!   stay deterministic;
-//! - **listeners** on the gateway accept connections the guest makes.
+//! - **listeners** on the gateway accept connections the guest makes;
+//! - **outbound connections** from the guest reach the outside world through
+//!   host sockets (a NAT), and 10.0.2.3 answers DNS (`nat.rs`).
 //!
 //! Time is the emulator's clock. A loss filter can drop chosen frames.
+
+mod nat;
+pub use nat::DNS;
 
 use setun_core::Machine;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -21,7 +26,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
 pub use smoltcp::socket::tcp::State;
 
@@ -60,6 +65,8 @@ struct Conn {
     /// Bytes from the guest not yet written to the host socket.
     to_host: Vec<u8>,
     host_eof: bool,
+    /// The guest closed its side, so the host socket's sending side was shut.
+    host_wr_shut: bool,
     /// Bytes received from the guest (test connections).
     received: Vec<u8>,
     closed: bool,
@@ -152,6 +159,9 @@ pub struct Network {
     next_port: u16,
     loss: Option<LossFilter>,
     mangle: Option<Mangler>,
+    nat: nat::Nat,
+    dns: SocketHandle,
+    outbound: bool,
     pub stats: Stats,
 }
 
@@ -169,6 +179,7 @@ impl Network {
         let mut iface = Interface::new(config, &mut wire, now(m));
         iface.update_ip_addrs(|a| {
             a.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24)).unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv4(DNS), 24)).unwrap();
         });
         let mut sockets = SocketSet::new(Vec::new());
         let icmp = sockets.add(icmp::Socket::new(
@@ -176,6 +187,12 @@ impl Network {
             icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 27], vec![0; 27 * 1514]),
         ));
         sockets.get_mut::<icmp::Socket>(icmp).bind(icmp::Endpoint::Ident(0x5e7)).unwrap();
+        let mut d = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 27], vec![0; 27 * 1514]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 27], vec![0; 27 * 1514]),
+        );
+        d.bind(smoltcp::wire::IpListenEndpoint { addr: Some(IpAddress::Ipv4(DNS)), port: 53 }).unwrap();
+        let dns = sockets.add(d);
         Network {
             iface,
             wire,
@@ -188,8 +205,44 @@ impl Network {
             next_port: 49152,
             loss: None,
             mangle: None,
+            nat: nat::Nat::new(),
+            dns,
+            outbound: true,
             stats: Stats::default(),
         }
+    }
+
+    /// Let the guest connect out through host sockets (on by default).
+    pub fn set_outbound(&mut self, on: bool) {
+        self.outbound = on;
+    }
+
+    /// Make guest address `seen` stand for host address `host` (10.0.2.2
+    /// stands for 127.0.0.1 from the start).
+    pub fn alias(&mut self, seen: [u8; 4], host: IpAddr) {
+        self.nat.aliases.insert(Ipv4Address::from(seen), host);
+    }
+
+    /// Let DNS answer `name` with `addr` without asking the host.
+    pub fn dns_name(&mut self, name: &str, addr: [u8; 4]) {
+        self.nat.names.insert(name.to_ascii_lowercase(), Ipv4Addr::from(addr));
+    }
+
+    /// How long a host connection may take before the guest is refused.
+    pub fn set_connect_timeout(&mut self, d: std::time::Duration) {
+        self.nat.connect_timeout = d;
+    }
+
+    /// Connections made through the NAT so far.
+    pub fn outbound_flows(&self) -> usize {
+        self.nat.flows.len()
+    }
+
+    /// Host connections or DNS lookups still under way. They take real
+    /// time, so a front end that runs the guest faster than real time
+    /// should slow down while this is non-zero (or the guest gives up first).
+    pub fn waiting_on_host(&self) -> usize {
+        self.nat.flows.iter().filter(|f| matches!(f.state, nat::FlowState::Connecting(..))).count() + self.nat.pending_dns.len()
     }
 
     /// Drop the frames `f` returns true for.
@@ -222,14 +275,19 @@ impl Network {
                 continue;
             }
             self.stats.frames_from_guest += 1;
-            self.wire.inbound.push_back(f);
+            if let Some(f) = self.nat_in(f) {
+                self.wire.inbound.push_back(f);
+            }
         }
+        self.nat_connects();
         self.accept_forwards();
         let t = now(m);
         self.iface.poll(t, &mut self.wire, &mut self.sockets);
         self.pump();
+        self.dns_poll();
         self.iface.poll(t, &mut self.wire, &mut self.sockets);
         while let Some(mut f) = self.wire.outbound.pop_front() {
+            self.nat_out(&mut f);
             if let Some(g) = self.mangle.as_mut() {
                 g(Dir::ToGuest, &mut f);
             }
@@ -240,6 +298,7 @@ impl Network {
             self.stats.frames_to_guest += 1;
             m.dev.net_receive(&f);
         }
+        self.nat_prune(); // after the frames that still needed the flows (a refusal's RST)
     }
 
     /// How long (µs of emulated time) until smoltcp has a timer to run, if
@@ -265,7 +324,15 @@ impl Network {
     }
 
     fn add_conn(&mut self, handle: SocketHandle, host: Option<TcpStream>) -> ConnId {
-        self.conns.push(Conn { handle, host, to_host: Vec::new(), host_eof: false, received: Vec::new(), closed: false });
+        self.conns.push(Conn {
+            handle,
+            host,
+            to_host: Vec::new(),
+            host_eof: false,
+            host_wr_shut: false,
+            received: Vec::new(),
+            closed: false,
+        });
         ConnId(self.conns.len() - 1)
     }
 
@@ -517,13 +584,17 @@ impl Network {
                     }
                 }
             }
+            // the guest's FIN half-closes the host socket; the host's EOF closes
+            // ours (above); the connection is over when both are done
             let after_fin = matches!(s.state(), State::CloseWait | State::LastAck | State::Closing | State::TimeWait | State::Closed);
-            let guest_done = after_fin && s.recv_queue() == 0 && conn.to_host.is_empty();
-            if guest_done || s.state() == State::Closed {
+            if after_fin && s.recv_queue() == 0 && conn.to_host.is_empty() && !conn.host_wr_shut {
+                let _ = host.shutdown(std::net::Shutdown::Write);
+                conn.host_wr_shut = true;
+            }
+            let reset = s.state() == State::Closed && !(conn.host_eof && conn.host_wr_shut);
+            let finished = conn.host_eof && conn.host_wr_shut && matches!(s.state(), State::Closed | State::TimeWait);
+            if reset || finished {
                 let _ = host.shutdown(std::net::Shutdown::Both);
-                if s.state() != State::Closed && s.state() != State::TimeWait {
-                    s.close();
-                }
                 conn.closed = true;
                 conn.host = None;
             }
@@ -572,4 +643,163 @@ pub fn fix_checksums(f: &mut [u8]) {
     let c = !(sum as u16);
     f[t + 16] = (c >> 8) as u8;
     f[t + 17] = c as u8;
+}
+
+// ---- the NAT and DNS (nat.rs) ---------------------------------------------------------------
+
+impl Network {
+    /// A frame from the guest: rewritten if it belongs to an outbound
+    /// connection, held (None) while that connection is being made.
+    fn nat_in(&mut self, mut f: Vec<u8>) -> Option<Vec<u8>> {
+        let Some((_, t)) = nat::tcp_offsets(&f) else { return Some(f) };
+        let dst = nat::ip_dst(&f);
+        let sport = nat::port_at(&f, t);
+        let dport = nat::port_at(&f, t + 2);
+        let flags = f[t + 13];
+        let syn = flags & 2 != 0 && flags & 16 == 0;
+        if let Some(k) = self.nat.flows.iter().position(|x| x.gport == sport && x.dst == dst && x.dport == dport) {
+            let over = self.nat.flows[k].conn.is_none_or(|c| self.conns[c].closed);
+            match &mut self.nat.flows[k].state {
+                nat::FlowState::Connecting(_, held) => {
+                    if syn {
+                        *held = f; // the newest copy of the SYN waits
+                    }
+                    return None;
+                }
+                nat::FlowState::Open if syn && over => {
+                    self.nat.flows.remove(k); // the same ports again: a new connection
+                }
+                nat::FlowState::Open => {
+                    let standin = self.nat.flows[k].standin;
+                    Self::to_standin(&mut f, t, standin);
+                    return Some(f);
+                }
+            }
+        }
+        if !syn || !self.outbound {
+            return Some(f);
+        }
+        let outside = !(dst.octets()[0] == 10 && dst.octets()[1] == 0 && dst.octets()[2] == 2);
+        let to_host = dst == GATEWAY && dport < nat::STANDIN_FIRST && !self.listeners.iter().any(|l| l.port == dport);
+        if !outside && !to_host {
+            return Some(f);
+        }
+        let standin = self.nat.standin();
+        let rx = self.nat.start_connect(SocketAddr::new(self.nat.host_for(dst), dport));
+        self.nat.flows.push(nat::Flow { gport: sport, dst, dport, standin, state: nat::FlowState::Connecting(rx, f), conn: None });
+        None
+    }
+
+    fn to_standin(f: &mut [u8], t: usize, standin: u16) {
+        nat::set_ip(f, 30, GATEWAY);
+        nat::set_port(f, t + 2, standin);
+        nat::fix_ip_checksum(f);
+        fix_checksums(f);
+    }
+
+    /// Finish host connections that have come through (or failed).
+    fn nat_connects(&mut self) {
+        for k in 0..self.nat.flows.len() {
+            let nat::FlowState::Connecting(rx, _) = &self.nat.flows[k].state else { continue };
+            let result = match rx.try_recv() {
+                Ok(r) => r.ok(),
+                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                Err(_) => None,
+            };
+            let standin = self.nat.flows[k].standin;
+            if let Some(stream) = result {
+                let _ = stream.set_nonblocking(true);
+                let _ = stream.set_nodelay(true);
+                let mut sock = Self::tcp_socket();
+                sock.listen(smoltcp::wire::IpListenEndpoint { addr: Some(IpAddress::Ipv4(GATEWAY)), port: standin }).expect("listen");
+                let h = self.sockets.add(sock);
+                let c = self.add_conn(h, Some(stream));
+                self.nat.flows[k].conn = Some(c.0);
+            }
+            // refused or timed out: nobody listens, so smoltcp answers with RST
+            let st = std::mem::replace(&mut self.nat.flows[k].state, nat::FlowState::Open);
+            if let nat::FlowState::Connecting(_, mut held) = st {
+                if let Some((_, t)) = nat::tcp_offsets(&held) {
+                    Self::to_standin(&mut held, t, standin);
+                    self.wire.inbound.push_back(held);
+                }
+            }
+        }
+    }
+
+    /// A frame for the guest: from a stand-in port, it must come from the
+    /// address the guest connected to.
+    fn nat_out(&mut self, f: &mut [u8]) {
+        let Some((_, t)) = nat::tcp_offsets(f) else { return };
+        if nat::ip_src(f) != GATEWAY {
+            return;
+        }
+        let sport = nat::port_at(f, t);
+        let dport = nat::port_at(f, t + 2);
+        let Some(fl) = self.nat.flows.iter().find(|x| x.standin == sport && x.gport == dport) else { return };
+        nat::set_ip(f, 26, fl.dst);
+        nat::set_port(f, t, fl.dport);
+        nat::fix_ip_checksum(f);
+        fix_checksums(f);
+    }
+
+    /// Forget outbound connections that are over (and their sockets).
+    fn nat_prune(&mut self) {
+        let mut k = 0;
+        while k < self.nat.flows.len() {
+            let gone = match self.nat.flows[k].conn {
+                Some(c) => {
+                    let h = self.conns[c].handle;
+                    self.conns[c].closed && self.sockets.get::<tcp::Socket>(h).state() == State::Closed
+                }
+                None => matches!(self.nat.flows[k].state, nat::FlowState::Open),
+            };
+            if gone {
+                if let Some(c) = self.nat.flows[k].conn {
+                    self.sockets.remove(self.conns[c].handle);
+                }
+                self.nat.flows.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    /// Answer DNS queries to 10.0.2.3.
+    fn dns_poll(&mut self) {
+        let mut queries = Vec::new();
+        {
+            let s = self.sockets.get_mut::<udp::Socket>(self.dns);
+            while let Ok((data, meta)) = s.recv() {
+                queries.push((meta.endpoint, data.to_vec()));
+            }
+        }
+        let mut replies = Vec::new();
+        for (from, q) in queries {
+            match nat::parse_query(&q) {
+                None => replies.push((from, nat::format_error(&q))),
+                Some(p) if p.qtype == 1 => {
+                    let rx = self.nat.start_resolve(p.name.clone());
+                    self.nat.pending_dns.push((from.port, q, rx));
+                }
+                Some(p) => replies.push((from, nat::answer(&q, &p, &[]))),
+            }
+        }
+        let mut k = 0;
+        while k < self.nat.pending_dns.len() {
+            match self.nat.pending_dns[k].2.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => k += 1,
+                r => {
+                    let (port, q, _) = self.nat.pending_dns.remove(k);
+                    let addrs = r.unwrap_or_default();
+                    let p = nat::parse_query(&q).expect("parsed before");
+                    replies.push((IpEndpoint::new(IpAddress::Ipv4(GUEST), port), nat::answer(&q, &p, &addrs)));
+                }
+            }
+        }
+        let s = self.sockets.get_mut::<udp::Socket>(self.dns);
+        for (to, r) in replies {
+            let _ = s.send_slice(&r, to);
+        }
+    }
 }

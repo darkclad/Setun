@@ -74,7 +74,7 @@ The emulator stays deterministic: the card only exchanges frames with queues, an
 - **Test connections**: the same thing without a host socket, for deterministic tests: `connect(guest_port)`, `send`, `recv`, `state`.
 - **Loss injection** for tests: drop chosen frames in either direction.
 - Time is the emulator's clock, so a test run is reproducible.
-- Later (N7): outbound connections (NAT to host sockets) and DNS at `10.0.2.3`.
+- Outbound connections (a NAT to host sockets) and DNS at `10.0.2.3` (§9).
 
 The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`). Then `telnet localhost 2323` reaches Trinux's `telnetd`. The web build has no network yet: `LINK` reads 0.
 
@@ -154,7 +154,8 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N4 | TCP | a guest server with a smoltcp client; a guest client to a host-side listener; loopback; RST on a closed port; retransmission under loss; full buffers and flow control; every close path; malformed segments |
 | N5 | `nc`, `netstat`, `telnetd`; docs | log in through `setun --net` with a real host socket; many sessions at once |
 | N6 | SSH: a random-number device, the crypto library, `sshd` (§8) ✅ | RFC test vectors; the host's OpenSSH logs in, runs commands and a pty session, moves 120 KB each way; refusals of other algorithms, wrong passwords, a non-SSH-2 client, an overlong line and a tampered packet |
-| N7 | outbound NAT and DNS | |
+| N7 | outbound TCP through a NAT to host sockets, DNS at 10.0.2.3, a resolver, `host`, `wget` (§9) ✅ | Trinux reaches servers on the host (as 10.0.2.2 and as an outside address), refusals, the NAT turned off; DNS from the host's resolver and fixed names, NXDOMAIN, a server that is not there, an illegal name, FORMERR; `wget` text, 23 893 octets, 404, https, an unknown name |
+| N8 | public-key login for `sshd`; an `ssh` client in Trinux | |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -310,3 +311,46 @@ They drive the host's real OpenSSH client (10.2 here) through a port forward, wi
 - 7 wrong passwords (disconnected at 6), an unknown user, a missing command (127);
 - an SSH-1.5 client and an overlong line before the version;
 - a packet altered in flight with its TCP checksum fixed up, which SSH's MAC catches.
+
+## 9. Out to the world (N7)
+
+With `--net`, Trinux can connect out. QEMU's user-mode network does the same.
+
+```
+$ host example.com
+example.com has address 93.184.215.14
+$ wget -O - http://example.com/
+$ echo hi | nc 10.0.2.2 8000       # a server on the host's 127.0.0.1:8000
+```
+
+### TCP through a NAT (`crates/net/src/nat.rs`)
+
+1. A guest SYN to an address off the 10.0.2.0/24 network starts a host connection on a thread, with a 10 s timeout. A SYN to the gateway itself on a port with no test listener does the same, and 10.0.2.2 stands for the host's 127.0.0.1. The guest's SYN waits; its retransmissions replace it.
+2. **Connected:** smoltcp gets a listening socket on a stand-in port (40000..49151) on 10.0.2.2.
+   - Guest frames are rewritten on the way in: destination → 10.0.2.2:stand-in, with the IP and TCP checksums recomputed.
+   - Frames to the guest are rewritten on the way out: source → the address and port the guest asked for.
+   - The data are copied like a port forward's.
+3. **Refused or timed out:** the SYN reaches smoltcp with nobody listening, and smoltcp's RST tells the guest `Connection refused`.
+4. A host connection takes real time. A front end that runs the guest faster than real time slows down while `Network::waiting_on_host()` is non-zero, or the guest would give up first. `--console` and the window already run in real time.
+5. Half-close is passed through both ways: the guest's FIN shuts the host socket's sending side only, so a reply still comes back. Forwards behave the same way now.
+6. Finished connections are forgotten, along with their smoltcp sockets.
+
+Not covered:
+- UDP other than DNS;
+- ICMP to the outside (`ping` works only toward the gateway, as with QEMU);
+- connections from outside in, except through `--net` port forwards.
+
+### DNS at 10.0.2.3
+
+- 10.0.2.3 is a second address of the gateway.
+- A queries are answered by the host's resolver on a thread, with up to 8 records and a TTL of 60. Nothing found is NXDOMAIN.
+- AAAA and other types get an empty answer; a malformed query gets FORMERR.
+- Tests can fix names with `Network::dns_name` and make outside addresses stand for host ones with `Network::alias`. `Network::set_outbound(false)` turns the NAT off.
+
+### In Trinux
+
+- `/etc/resolv.conf` names 10.0.2.3.
+- `resolve_host()` in `socket.tri` tries, in order: a dotted quad, `/etc/hosts`, `localhost`, then DNS (`dns_lookup`: one A question, 3 tries of 2 s, compressed names, answers checked against the query's id and the server). `nc`, `ping` and `wget` all go through it.
+- `host [-s server] name` asks DNS only, the way bind's `host` does.
+- `wget [-q] [-b] [-O file] URL`: HTTP/1.0 GET over `http://` only (no TLS). Text arrives as UTF-8 and is stored as characters (`-b` keeps the octets). The exit codes follow GNU wget: 4 for network trouble, 8 for an error answer.
+- Tests: `crates/trinux/tests/outbound.rs` runs real servers on the host inside the test (an echo server and a small HTTP server).

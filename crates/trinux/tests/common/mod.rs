@@ -31,6 +31,11 @@ impl Session {
         }
         let mut s = Session { m, net, out: String::new(), mark: 0, udp_echo: None };
         s.wait_for("login: ", 400_000_000);
+        if link {
+            // let the network daemons finish starting (sshd makes its host
+            // key) so their messages do not land in the middle of a test's output
+            s.until("sshd listening", 3_000_000_000, |o| o.contains("sshd: listening on port 22"));
+        }
         s.send("root\n");
         s.wait_for("Password: ", 100_000_000);
         s.send("root\n");
@@ -39,6 +44,10 @@ impl Session {
     }
 
     pub fn step(&mut self) {
+        if self.net.waiting_on_host() > 0 {
+            // the host works in real time: keep the guest's clock near it
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         self.m.run(SLICE);
         self.net.poll(&mut self.m);
         if let Some(u) = self.udp_echo {
