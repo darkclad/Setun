@@ -302,9 +302,9 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 
 ### What a login costs
 
-- A key exchange takes about 140 M instructions: an X25519 key pair, the shared secret, and an Ed25519 signature.
-- `--console` runs a busy guest as fast as the host allows (about 200–400 MIPS with the JIT), so that is under a second.
-- At the window front end's default 10 MIPS it would be about 14 s.
+- A key exchange takes about 58 M instructions (140 M before ISA v0.6 and the unrolled field multiply): an X25519 key pair, the shared secret, and an Ed25519 signature.
+- `--console` runs a busy guest as fast as the host allows (about 200–400 MIPS with the JIT), so that is well under a second.
+- At the window front end's default 10 MIPS it would be about 6 s.
 
 ### Tests (`crates/trinux/tests/ssh.rs`; skipped without an `ssh` on the host, `SETUN_SSH` picks one)
 
@@ -515,7 +515,7 @@ Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, 
 - chains are built from the server's certificate: a trusted root that names and signed the current one ends the walk, otherwise a CA the server sent (it must be a v3 CA with keyCertSign and room in its path length). At most 9 certificates;
 - every certificate on the way must be valid at the time of the check; the leaf must name the host in its subject alternative names (one leftmost wildcard label, never `*.tld`; IPv4 addresses as iPAddress), and allow serverAuth and digitalSignature when it says what it is for. The common name is not used.
 
-**Bignums** (`user/lib/bignum.tri`): 16-bit limbs in words, Montgomery multiplication (CIOS), up to 4096 bits. On top: ECDSA verification on P-256 and P-384 (Jacobian coordinates, Shamir's trick), RSA verification (PKCS #1 v1.5 and PSS), and SHA-384, HMAC and HKDF with TLS's `HKDF-Expand-Label`.
+**Bignums** (`user/lib/bignum.tri`): 16-bit limbs in words, Montgomery multiplication by product scanning (each column of 16-bit products summed whole, a word holds 887 of them, one carry per column), written out in full for 16 and 24 limbs (P-256, P-384), up to 4096 bits. R mod m is R − m for a modulus with its top bit set; R² takes about 64 doublings and a few Montgomery squarings. On top: ECDSA verification on P-256 and P-384 (Jacobian coordinates, Shamir's trick), RSA verification (PKCS #1 v1.5 and PSS), and SHA-384, HMAC and HKDF with TLS's `HKDF-Expand-Label`.
 
 **The trust store** is `/etc/ssl/cert.pem`: 27 roots from the Mozilla bundle (ISRG, Google Trust Services, DigiCert, Amazon, Sectigo/USERTrust, GlobalSign, GoDaddy/Starfield, Microsoft, Entrust, SSL.com), made by `crates/trinux/tests/fixtures/tls/make_roots.py`. `x509 -l` lists it.
 
@@ -523,7 +523,7 @@ Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, 
 
 **Real sites.** Tried by hand (`wget_real_https_sites`, ignored by default): example.com, www.google.com, letsencrypt.org, github.com, www.cloudflare.com, en.wikipedia.org and www.amazon.com all completed the handshake and the certificate checks, with ECDSA P-256 or RSA-PSS signatures; all of them offer ChaCha20-Poly1305 and X25519.
 
-**What a fetch costs.** Emulated time per check: ECDSA P-256 7 s, P-384 21 s, RSA-2048 2 s, RSA-4096 9 s; X25519 and the record crypto are small beside them. A server with a P-256 key under an RSA-2048 intermediate takes about 16 s of emulated time to trust.
+**What a fetch costs.** Emulated time (10 M instructions a second) per check: ECDSA P-256 2.4 s, P-384 6.3 s, RSA-2048 0.6 s, RSA-4096 2.1 s; X25519 1.5 s; the record crypto is small beside them. A server with a P-256 key under an RSA-2048 intermediate takes about 5.5 s to trust (16 s before the speed-ups below).
 
 **Tests** (`crates/trinux/tests/tls.rs`; the TLS ones skipped without an `openssl` on the host):
 - `pktest` checks the primitives against RFC 4231, RFC 5869, RFC 8439 and FIPS 180-4, and against signatures made by Python's `cryptography`, including forged and mismatched ones;

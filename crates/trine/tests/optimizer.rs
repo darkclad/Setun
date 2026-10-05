@@ -721,3 +721,38 @@ fn binary_operations_the_same_way() {
     "#;
     same_both_ways_src("binary.tri", src, 50_000_000);
 }
+
+#[test]
+fn a_very_long_function_is_optimized_in_pieces() {
+    // straight-line code far past the optimizer's whole-function limit,
+    // inside a loop (so jumps cross the pieces), with values kept in
+    // locals across piece boundaries
+    let mut body = String::new();
+    for k in 0..200 {
+        body.push_str(&format!(
+            "        a = bxor(a * 3 + x[{}], b); b = b + band(a, {}) - c; c = bsh(c + a % 977, -1);\n",
+            k % 9,
+            k * 37 % 1000 + 1
+        ));
+    }
+    let src = format!(
+        r#"
+        import "console.tri";
+        fn put(v: int) {{ var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }}
+        fn main() -> int {{
+            var x: [9]int = {{ 5, -7, 11, 13, -17, 19, 23, -29, 31 }};
+            var a: int = 1; var b: int = 2; var c: int = 3;
+            var round: int = 0;
+            while (round < 3) {{
+{body}
+                put(a); put(b); put(c);
+                round += 1;
+            }}
+            return a % 1000;
+        }}
+    "#
+    );
+    let t = std::time::Instant::now();
+    same_both_ways_src("long.tri", &src, 100_000_000);
+    assert!(t.elapsed().as_secs() < 20, "compiling took {:?}", t.elapsed());
+}

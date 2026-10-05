@@ -197,8 +197,9 @@ fn classify(l: &str) -> Line {
 }
 
 /// Liveness after each line (indexes into `lines`); None if the function
-/// cannot be analysed.
-fn liveness(lines: &[String]) -> Option<Vec<u32>> {
+/// cannot be analysed. `tail`: what is live after the last line when it
+/// falls through (0 for a whole function; everything for a piece of one).
+fn liveness(lines: &[String], tail: u32) -> Option<Vec<u32>> {
     let parsed: Vec<Line> = lines.iter().map(|l| classify(l)).collect();
     let mut labels = HashMap::new();
     for (k, l) in parsed.iter().enumerate() {
@@ -241,7 +242,8 @@ fn liveness(lines: &[String]) -> Option<Vec<u32>> {
     loop {
         let mut changed = false;
         for k in (0..n).rev() {
-            let out = succ[k].iter().fold(0, |m, &s| m | live_in[s]);
+            let falls_off = k + 1 == n && !matches!(infos[k].as_ref().map(|i| &i.ctl), Some(Ctl::Exit | Ctl::Jump(_)));
+            let out = succ[k].iter().fold(if falls_off { tail } else { 0 }, |m, &s| m | live_in[s]);
             let inn = match &infos[k] {
                 Some(inf) => inf.uses | (out & !inf.defs),
                 None => out,
@@ -388,11 +390,35 @@ fn redundant(lines: &[String], live: &[u32]) -> Option<usize> {
     None
 }
 
-/// Optimize one function's lines in place.
+/// A function longer than this is optimized in pieces of `PIECE` lines.
+const WHOLE: usize = 3000;
+const PIECE: usize = 250;
+
+/// Optimize one function's lines in place. Each rewrite reruns the
+/// analysis, so a long function (generated, straight-line code) goes in
+/// pieces, each taking everything as live after its end: no rewrite then
+/// needs to know what follows, and the time grows linearly.
 pub fn run(lines: &mut Vec<String>) {
+    if lines.len() <= WHOLE {
+        run_piece(lines, 0);
+        return;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    let mut rest: &[String] = lines;
+    while !rest.is_empty() {
+        let take = rest.len().min(PIECE);
+        let mut piece = rest[..take].to_vec();
+        rest = &rest[take..];
+        run_piece(&mut piece, if rest.is_empty() { 0 } else { u32::MAX });
+        out.extend(piece);
+    }
+    *lines = out;
+}
+
+fn run_piece(lines: &mut Vec<String>, tail: u32) {
     // every change removes a line, so this ends
     loop {
-        let Some(live) = liveness(lines) else { return };
+        let Some(live) = liveness(lines, tail) else { return };
         let mut changed = false;
         let mut k = 0;
         while k < lines.len() {
@@ -494,7 +520,7 @@ mod tests {
     /// The line value numbering would delete next, if any.
     fn next_redundant(asm: &str) -> Option<String> {
         let lines: Vec<String> = asm.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
-        let live = liveness(&lines).expect("analysable");
+        let live = liveness(&lines, 0).expect("analysable");
         redundant(&lines, &live).map(|k| format!("{k}: {}", lines[k].trim()))
     }
 
