@@ -132,7 +132,7 @@ const WUNTRACED: int = 2;
 const EPERM_: int = 1;
 const TIMER_CHAN: int = 40000;        // woken on every tick
 const POLL_CHAN: int = 40001;         // tasks in poll(): woken by any wake_up
-const HEAP_MAX: int = 243 * 19683;    // brk may grow 243 pages past the bss
+const HEAP_MAX: int = 729 * 19683;    // brk may grow 729 pages past the bss
 
 struct Task {
     kernel_sp: int;                   // must stay first: switch_to saves it at [task]

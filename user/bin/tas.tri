@@ -1,0 +1,1371 @@
+// tas [-r] [-o OUT] FILE.s: the Setun-11̅ assembler, in Trine.
+//
+// The same language as the host's (crates/asm/src/text.rs): labels,
+// NAME = expr and .equ, .org .word .tryte .string .zero .fill .align, and
+// every instruction with its short and long forms, branches relaxed to the
+// long form when out of reach. Its output must match the host assembler's
+// word for word. Real literals (.real27, .real81, fli with a decimal) are
+// not supported here: the compiler writes reals as .word triples.
+//
+// The output is a Trinux executable (TEF): one segment at the user origin,
+// whose data area the symbols _trine_data_start and _trine_data_end give
+// (crt0 defines them). With -r it is the bare image instead.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+
+const TEF_MAGIC: int = 115067810201;
+const USER_BASE: int = -847288609443;
+const W_MAX: int = 3812798742493;
+
+// ---- errors ----------------------------------------------------------------------------------
+
+var cur_line: int;
+
+fn die(msg: *char, what: *char) {
+    var num: [15]char;
+    fputs(STDERR_FILENO, "tas: line ");
+    fputs(STDERR_FILENO, itoa(cur_line, &num[0]));
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, msg);
+    if (what != null) {
+        fputs(STDERR_FILENO, " `");
+        fputs(STDERR_FILENO, what);
+        fputs(STDERR_FILENO, "`");
+    }
+    fputs(STDERR_FILENO, "\n");
+    exit(1);
+}
+
+fn die_num(msg: *char, v: int) {
+    var num: [28]char;
+    die(msg, itoa(v, &num[0]));
+}
+
+fn need(p: *tryte, n: int) -> *tryte {
+    if (p == null) { cur_line = 0; die_num("out of memory for", n); }
+    return p;
+}
+
+// ---- symbols ---------------------------------------------------------------------------------
+
+const SYM_CAP: int = 59049;
+
+var sym_name: *int;                      // offset into names
+var sym_val: *int;
+var sym_def: *tryte;                     // 0 not yet, 1 label, 2 equ, 3 constant (equ known before layout)
+var sym_used: int;
+var names: *char;
+var names_used: int;
+var names_cap: int;
+
+fn hash_str(s: *char, n: int) -> int {
+    var h: int = 7;
+    var k: int = 0;
+    while (k < n) {
+        h = (h * 31 + s[k]) % 1000003;
+        k += 1;
+    }
+    return h < 0 ? -h : h;
+}
+
+// The symbol named s[0..n): its index (made if new).
+fn sym_find(s: *char, n: int) -> int {
+    var i: int = hash_str(s, n) % SYM_CAP;
+    loop {
+        if (sym_name[i] < 0) {
+            if (names_used + n + 1 > names_cap) { die("too many symbols", null); }
+            sym_name[i] = names_used;
+            var k: int = 0;
+            while (k < n) { names[names_used] = s[k]; names_used += 1; k += 1; }
+            names[names_used] = 0;
+            names_used += 1;
+            sym_used += 1;
+            if (sym_used > SYM_CAP - SYM_CAP / 9) { die("too many symbols", null); }
+            return i;
+        }
+        var nm: *char = names + sym_name[i];
+        if (strncmp(nm, s, n) == 0 && nm[n] == 0) { return i; }
+        i = (i + 1) % SYM_CAP;
+    }
+    return -1;
+}
+
+fn sym_str(i: int) -> *char { return names + sym_name[i]; }
+
+// ---- expressions -----------------------------------------------------------------------------
+
+const E_NUM: int = 1;
+const E_SYM: int = 2;
+const E_HERE: int = 3;
+const E_NEG: int = 4;
+const E_ADD: int = 5;
+const E_SUB: int = 6;
+const E_MUL: int = 7;
+const E_DIV: int = 8;
+
+// A node is an operator and a value: the number, the symbol, the child (a
+// negation) or a pair (binary operators; their children in p_a, p_b).
+var e_op: *tryte;
+var e_v: *int;
+var e_used: int;
+var e_cap: int;
+var p_a: *int;
+var p_b: *int;
+var p_used: int;
+var p_cap: int;
+
+fn node(op: int, v: int, a: int, b: int) -> int {
+    if (e_used >= e_cap) { die("too many expressions", null); }
+    if (op >= E_ADD) {
+        // two numbers: fold them (the usual [fp-7] reads 0 - 7)
+        if (e_op[a] == E_NUM && e_op[b] == E_NUM && b == e_used - 1 && a == e_used - 2) {
+            var x: int = e_v[a];
+            var y: int = e_v[b];
+            if (op != E_DIV || y != 0) {
+                e_used -= 1;
+                e_v[a] = op == E_ADD ? x + y : op == E_SUB ? x - y : op == E_MUL ? x * y : x / y;
+                return a;
+            }
+        }
+        if (p_used >= p_cap) { die("too many expressions", null); }
+        p_a[p_used] = a;
+        p_b[p_used] = b;
+        v = p_used;
+        p_used += 1;
+    } else if (op == E_NEG) {
+        if (e_op[a] == E_NUM && a == e_used - 1) {
+            e_v[a] = -e_v[a];
+            return a;
+        }
+        v = a;
+    }
+    e_op[e_used] = op as tryte;
+    e_v[e_used] = v;
+    e_used += 1;
+    return e_used - 1;
+}
+
+// evaluation: the value, or eval_err set (with the symbol at fault)
+var eval_err: int;                       // 0, 1 undefined symbol, 2 division by zero
+var eval_sym: int;
+
+fn eval(e: int, here: int, consts_only: int) -> int {
+    var op: int = e_op[e];
+    if (op == E_NUM) { return e_v[e]; }
+    if (op == E_HERE) {
+        if (consts_only) { eval_err = 1; eval_sym = -1; return 0; }
+        return here;
+    }
+    if (op == E_SYM) {
+        var s: int = e_v[e];
+        if (sym_def[s] == 0 || (consts_only && sym_def[s] != 3)) {
+            if (eval_err == 0) { eval_err = 1; eval_sym = s; }
+            return 0;
+        }
+        return sym_val[s];
+    }
+    if (op == E_NEG) { return -eval(e_v[e], here, consts_only); }
+    var x: int = eval(p_a[e_v[e]], here, consts_only);
+    var y: int = eval(p_b[e_v[e]], here, consts_only);
+    if (op == E_ADD) { return x + y; }
+    if (op == E_SUB) { return x - y; }
+    if (op == E_MUL) { return x * y; }
+    if (y == 0) {
+        if (eval_err == 0) { eval_err = 2; }
+        return 0;
+    }
+    return x / y;
+}
+
+// The value, or the line's error.
+fn value(e: int, here: int) -> int {
+    eval_err = 0;
+    var v: int = eval(e, here, 0);
+    if (eval_err == 1) {
+        if (eval_sym < 0) { die("`$` in a constant", null); }
+        die("undefined symbol", sym_str(eval_sym));
+    }
+    if (eval_err == 2) { die("division by zero", null); }
+    return v;
+}
+
+// The value if it needs only constants; ok set.
+var c_ok: int;
+
+fn constant(e: int) -> int {
+    eval_err = 0;
+    var v: int = eval(e, 0, 1);
+    c_ok = eval_err == 0;
+    return v;
+}
+
+// ---- the lexer for one operand ---------------------------------------------------------------
+
+var lx: *char;                           // the text being read
+var lxn: int;                            // its length
+var li: int;                             // the position
+var lerr: *char;                         // the first error in it
+
+fn lpeek() -> int { return li < lxn ? lx[li] : -1000000; }
+fn is_space(c: int) -> int { return c == ' ' || c == '\t' || c == '\r'; }
+fn skip_ws() { while (is_space(lpeek())) { li += 1; } }
+fn is_digit(c: int) -> int { return c >= '0' && c <= '9'; }
+fn is_alpha(c: int) -> int { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 128; }
+fn is_ident_start(c: int) -> int { return is_alpha(c) || c == '_' || c == '.'; }
+fn is_ident_char(c: int) -> int { return is_ident_start(c) || is_digit(c); }
+
+fn lfail(msg: *char) -> int {
+    if (lerr == null) { lerr = msg; }
+    li = lxn;
+    return node(E_NUM, 0, 0, 0);
+}
+
+// One possibly escaped character inside quotes q: the code point, or -1000000 on error.
+fn char_in_quotes(q: int) -> int {
+    if (li >= lxn) { lerr = "unterminated literal"; return -1000000; }
+    var c: int = lx[li];
+    li += 1;
+    if (c == q) { lerr = "empty character literal"; return -1000000; }
+    if (c != '\\') { return c; }
+    if (li >= lxn) { lerr = "unterminated escape"; return -1000000; }
+    var e: int = lx[li];
+    li += 1;
+    if (e == 'n') { return '\n'; }
+    if (e == 't') { return '\t'; }
+    if (e == 'r') { return '\r'; }
+    if (e == '0') { return 0; }
+    if (e == '\\' || e == '\'' || e == '"') { return e; }
+    lerr = "unknown escape";
+    return -1000000;
+}
+
+// A balanced digit of base 27: 0-9 A-D (an overlined one is a negative code point).
+fn zdigit(c: int) -> int {
+    var neg: int = c < 0;
+    if (neg) { c = -c; }
+    var d: int = -100;
+    if (c >= '0' && c <= '9') { d = c - '0'; }
+    else if (c >= 'A' && c <= 'D') { d = c - 'A' + 10; }
+    else if (c >= 'a' && c <= 'd') { d = c - 'a' + 10; }
+    if (d < 0) { return -100; }
+    return neg ? -d : d;
+}
+
+fn prefixed(base: int, s: int, e: int) -> int {
+    var v: int = 0;
+    var k: int = s;
+    var any: int = 0;
+    while (k < e) {
+        var c: int = lx[k];
+        k += 1;
+        if (c == '_') { continue; }
+        var d: int = 0;
+        if (base == 't') {
+            if (c == '1') { d = 1; } else if (c == '0') { d = 0; } else if (c == 'T' || c == 't' || c == -'1') { d = -1; }
+            else { return lfail("bad 0t literal"); }
+            v = v * 3 + d;
+        } else if (base == 'z') {
+            d = zdigit(c);
+            if (d == -100) { return lfail("bad 0z literal"); }
+            v = v * 27 + d;
+        } else {
+            if (c >= '0' && c <= '9') { d = c - '0'; }
+            else if (c >= 'a' && c <= 'f') { d = c - 'a' + 10; }
+            else if (c >= 'A' && c <= 'F') { d = c - 'A' + 10; }
+            else { return lfail("bad 0x literal"); }
+            v = v * 16 + d;
+        }
+        if (v > W_MAX || v < -W_MAX) { return lfail("literal does not fit"); }
+        any = 1;
+    }
+    if (!any) { return lfail("empty literal"); }
+    return node(E_NUM, v, 0, 0);
+}
+
+fn factor() -> int {
+    skip_ws();
+    var c: int = lpeek();
+    if (c == -1000000) { return lfail("expression expected"); }
+    if (c == '-') { li += 1; return node(E_NEG, 0, factor(), 0); }
+    if (c == '(') {
+        li += 1;
+        var e: int = expr();
+        skip_ws();
+        if (lpeek() != ')') { return lfail("`)` expected"); }
+        li += 1;
+        return e;
+    }
+    if (c == '$') { li += 1; return node(E_HERE, 0, 0, 0); }
+    if (c == '\'') {
+        li += 1;
+        var ch: int = char_in_quotes('\'');
+        if (ch == -1000000) { return lfail(lerr); }
+        if (lpeek() != '\'') { return lfail("`'` expected"); }
+        li += 1;
+        return node(E_NUM, ch, 0, 0);
+    }
+    if (is_digit(c)) {
+        var start: int = li;
+        if (c == '0' && li + 1 < lxn && (lx[li + 1] == 't' || lx[li + 1] == 'z' || lx[li + 1] == 'x')) {
+            var base: int = lx[li + 1];
+            li += 2;
+            var ds: int = li;
+            while (li < lxn && (is_ident_char(lx[li]) || lx[li] < 0)) { li += 1; }
+            if (base == 't' && (lpeek() == '+' || lpeek() == '-')) { return lfail("a 0t literal followed by + or -"); }
+            return prefixed(base, ds, li);
+        }
+        var v: int = 0;
+        while (is_digit(lpeek()) || lpeek() == '_') {
+            if (lx[li] != '_') {
+                v = v * 10 + lx[li] - '0';
+                if (v > W_MAX) { return lfail("bad number"); }
+            }
+            li += 1;
+        }
+        return node(E_NUM, v, 0, 0);
+    }
+    if (is_ident_start(c)) {
+        var s: int = li;
+        while (is_ident_char(lpeek())) { li += 1; }
+        return node(E_SYM, sym_find(lx + s, li - s), 0, 0);
+    }
+    return lfail("unexpected character");
+}
+
+fn term() -> int {
+    var e: int = factor();
+    loop {
+        skip_ws();
+        var c: int = lpeek();
+        if (c != '*' && c != '/') { return e; }
+        li += 1;
+        e = node(c == '*' ? E_MUL : E_DIV, 0, e, factor());
+    }
+    return e;
+}
+
+fn expr() -> int {
+    var e: int = term();
+    loop {
+        skip_ws();
+        var c: int = lpeek();
+        if (c != '+' && c != '-') { return e; }
+        li += 1;
+        e = node(c == '+' ? E_ADD : E_SUB, 0, e, term());
+    }
+    return e;
+}
+
+// Parse s[0..n) as a whole expression: its node, or -1 (lerr says why).
+fn parse_expr(s: *char, n: int) -> int {
+    lx = s;
+    lxn = n;
+    li = 0;
+    lerr = null;
+    var e: int = expr();
+    skip_ws();
+    if (lerr == null && li < lxn) { lerr = "unexpected text in expression"; }
+    return lerr == null ? e : -1;
+}
+
+// ---- registers and operands ------------------------------------------------------------------
+
+const O_REG: int = 1;
+const O_FREG: int = 2;
+const O_MEM: int = 3;
+const O_EXPR: int = 4;
+
+var o_kind: *tryte;
+var o_reg: *tryte;
+var o_e: *int;
+var o_used: int;
+var o_cap: int;
+
+fn trim(s: *char, n: *int) -> *char {
+    var k: int = 0;
+    while (k < *n && is_space(s[k])) { k += 1; }
+    var m: int = *n;
+    while (m > k && is_space(s[m - 1])) { m -= 1; }
+    *n = m - k;
+    return s + k;
+}
+
+// A small signed number: the value, or -100 if s[0..n) is not one in -13..13.
+fn small_num(s: *char, n: int) -> int {
+    var k: int = 0;
+    var neg: int = 0;
+    if (n > 0 && (s[0] == '-' || s[0] == '+')) { neg = s[0] == '-'; k = 1; }
+    if (k >= n || n - k > 2) { return -100; }
+    var v: int = 0;
+    while (k < n) {
+        if (!is_digit(s[k])) { return -100; }
+        v = v * 10 + s[k] - '0';
+        k += 1;
+    }
+    if (v > 13) { return -100; }
+    return neg ? -v : v;
+}
+
+fn eqn(s: *char, n: int, w: *char) -> int { return strlen(w) == n && strncmp(s, w, n) == 0; }
+
+// A register: r-13..r13, zero, fp, lr, sp; -100 if not.
+fn register(s: *char, n: int) -> int {
+    s = trim(s, &n);
+    if (eqn(s, n, "zero")) { return 0; }
+    if (eqn(s, n, "fp")) { return 11; }
+    if (eqn(s, n, "lr")) { return 12; }
+    if (eqn(s, n, "sp")) { return 13; }
+    if (n < 2 || s[0] != 'r') { return -100; }
+    return small_num(s + 1, n - 1);
+}
+
+fn fregister(s: *char, n: int) -> int {
+    s = trim(s, &n);
+    if (n < 2 || s[0] != 'f') { return -100; }
+    return small_num(s + 1, n - 1);
+}
+
+fn add_operand(kind: int, reg: int, e: int) {
+    if (o_used >= o_cap) { die("too many operands", null); }
+    o_kind[o_used] = kind as tryte;
+    o_reg[o_used] = reg as tryte;
+    o_e[o_used] = e;
+    o_used += 1;
+}
+
+fn parse_operand(s: *char, n: int) {
+    s = trim(s, &n);
+    if (n > 0 && s[0] == '"') { die("a string is only allowed after .string", null); }
+    if (n > 0 && s[0] == '[') {
+        if (s[n - 1] != ']') { die("`]` expected", null); }
+        var inner: *char = s + 1;
+        var m: int = n - 2;
+        inner = trim(inner, &m);
+        var r: int = register(inner, m);
+        if (r != -100) { add_operand(O_MEM, r, node(E_NUM, 0, 0, 0)); return; }
+        // [reg + expr], [reg - expr]: try each + or - as the split
+        var k: int = 1;
+        while (k < m) {
+            if (inner[k] == '+' || inner[k] == '-') {
+                r = register(inner, k);
+                if (r != -100) {
+                    // "0" followed by the sign and the rest
+                    var tmp: [729]char;
+                    if (m - k + 1 > 728) { die("operand too long", null); }
+                    tmp[0] = '0';
+                    var j: int = 0;
+                    while (j < m - k) { tmp[1 + j] = inner[k + j]; j += 1; }
+                    var e: int = parse_expr(&tmp[0], m - k + 1);
+                    if (e < 0) { die(lerr, null); }
+                    add_operand(O_MEM, r, e);
+                    return;
+                }
+            }
+            k += 1;
+        }
+        var e2: int = parse_expr(inner, m);
+        if (e2 < 0) { die(lerr, null); }
+        add_operand(O_MEM, 0, e2);
+        return;
+    }
+    var r2: int = register(s, n);
+    if (r2 != -100) { add_operand(O_REG, r2, 0); return; }
+    var f: int = fregister(s, n);
+    if (f != -100) { add_operand(O_FREG, f, 0); return; }
+    var e3: int = parse_expr(s, n);
+    if (e3 < 0) {
+        var k2: int = 0;
+        while (k2 < n) {
+            if (s[k2] == '.' || s[k2] == 'e' || s[k2] == 'E') { die("real literals are not supported by tas", null); }
+            k2 += 1;
+        }
+        die(lerr, null);
+    }
+    add_operand(O_EXPR, 0, e3);
+}
+
+// ---- mnemonics -------------------------------------------------------------------------------
+//
+// Codes: 1..22 the ALU functions (= their B), 30 cmp, 40.. unary ALU,
+// 50.. branches, 60.. memory, 70.. FPU memory, 80.. FALU binary,
+// 90.. FALU unary, 100.. the other FPU ones, 120.. SYS, 140.. the rest.
+
+const M_CMP: int = 30;
+const M_NEG: int = 40;
+const M_SGN: int = 41;
+const M_ABS: int = 42;
+const M_TLZ: int = 43;
+const M_B: int = 50;                     // 50..59: b blt beq bgt ble bge bne bov bnov bnever
+const M_LDT: int = 60;                   // ldt ldw stt stw swap
+const M_FLDS: int = 70;                  // flds fldd fsts fstd
+const M_FADD: int = 80;                  // fadd fsub fmul fdiv frem fmin fmax
+const M_FSQRT: int = 90;                 // fsqrt fneg fabs frnd ftrunc
+const M_FCMP: int = 100;                 // fcmp fmov fcvtif fcvtfi ftow ffrw fexp fscl fmfs fmts fclass fconst fli
+const M_NOP: int = 120;                  // nop hlt brk iret tlbflush fence ill
+const M_MOV: int = 140;                  // mov li la lea jal call jalr ret br3 in out push pop ext ins bext brot tlbinv sys mfc mtc
+
+var mn_name: [243]*char;
+var mn_code: [243]int;
+
+fn mn_add(name: *char, code: int) {
+    var h: int = hash_str(name, strlen(name)) % 243;
+    while (mn_name[h] != null) { h = (h + 1) % 243; }
+    mn_name[h] = name;
+    mn_code[h] = code;
+}
+
+fn mn_init() {
+    var alu: *char = "add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit band bor bxor bandn bsh ";
+    var groups: [12]*char;
+    var firsts: [12]int;
+    groups[0] = "cmp "; firsts[0] = M_CMP;
+    groups[1] = "neg sgn abs tlz "; firsts[1] = M_NEG;
+    groups[2] = "b blt beq bgt ble bge bne bov bnov bnever "; firsts[2] = M_B;
+    groups[3] = "ldt ldw stt stw swap "; firsts[3] = M_LDT;
+    groups[4] = "flds fldd fsts fstd "; firsts[4] = M_FLDS;
+    groups[5] = "fadd fsub fmul fdiv frem fmin fmax "; firsts[5] = M_FADD;
+    groups[6] = "fsqrt fneg fabs frnd ftrunc "; firsts[6] = M_FSQRT;
+    groups[7] = "fcmp fmov fcvtif fcvtfi ftow ffrw fexp fscl fmfs fmts fclass fconst fli "; firsts[7] = M_FCMP;
+    groups[8] = "nop hlt brk iret tlbflush fence ill "; firsts[8] = M_NOP;
+    groups[9] = "mov li la lea jal call jalr ret br3 in out push pop ext ins bext brot tlbinv sys mfc mtc "; firsts[9] = M_MOV;
+    groups[10] = alu; firsts[10] = 1;
+    var g: int = 0;
+    while (g < 11) {
+        var s: *char = groups[g];
+        var code: int = firsts[g];
+        var k: int = 0;
+        while (s[k] != 0) {
+            var e: int = k;
+            while (s[e] != ' ') { e += 1; }
+            mn_add(strndup(s + k, e - k), code);
+            code += 1;
+            k = e + 1;
+        }
+        g += 1;
+    }
+    mn_add("not", M_NEG);
+}
+
+// The code of s[0..n), or 0.
+fn mn_find(s: *char, n: int) -> int {
+    var h: int = hash_str(s, n) % 243;
+    while (mn_name[h] != null) {
+        if (eqn(s, n, mn_name[h])) { return mn_code[h]; }
+        h = (h + 1) % 243;
+    }
+    return 0;
+}
+
+fn mn_cond(code: int) -> int {
+    var c: [10]int = { 13, 9, 3, 1, 12, 4, 10, -10, -3, 0 };   // ALWAYS LT EQ GT LE GE NE OV NOV NEVER
+    return c[code - M_B];
+}
+
+// ---- statements ------------------------------------------------------------------------------
+
+const K_LABEL: int = 1;
+const K_ORG: int = 2;
+const K_EQU: int = 3;
+const K_WORDS: int = 4;
+const K_TRYTES: int = 5;
+const K_STR: int = 6;
+const K_ZERO: int = 7;
+const K_FILL: int = 8;
+const K_ALIGN: int = 9;
+const K_INST: int = 10;
+
+var st_kind: *tryte;
+var st_long: *tryte;
+var st_m: *int;                          // the mnemonic, or the symbol (labels, equs)
+var st_o: *int;                          // the first operand
+var st_n: *int;                          // operands (values)
+var st_line: *int;
+var st_used: int;
+var st_cap: int;
+
+fn add_stmt(kind: int, m: int, first: int, n: int) {
+    if (st_used >= st_cap) { die("too many statements", null); }
+    st_kind[st_used] = kind as tryte;
+    st_long[st_used] = 0;
+    st_m[st_used] = m;
+    st_o[st_used] = first;
+    st_n[st_used] = n;
+    st_line[st_used] = cur_line;
+    st_used += 1;
+}
+
+// Where a ; comment starts (quotes respected), or n.
+fn comment_at(s: *char, n: int) -> int {
+    var quote: int = 0;
+    var esc: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        var c: int = s[k];
+        if (esc) { esc = 0; }
+        else if (quote != 0) {
+            if (c == '\\') { esc = 1; } else if (c == quote) { quote = 0; }
+        } else if (c == '"' || c == '\'') { quote = c; }
+        else if (c == ';') { return k; }
+        k += 1;
+    }
+    return n;
+}
+
+fn is_ident(s: *char, n: int) -> int {
+    if (n == 0 || !is_ident_start(s[0])) { return 0; }
+    var k: int = 1;
+    while (k < n) { if (!is_ident_char(s[k])) { return 0; } k += 1; }
+    return 1;
+}
+
+// Split s[0..n) on top-level commas and parse each with `each` mode:
+// 0 operands, 1 expressions (values). The count.
+fn split_and_parse(s: *char, n: int, mode: int) -> int {
+    var count: int = 0;
+    var depth: int = 0;
+    var quote: int = 0;
+    var start: int = 0;
+    var k: int = 0;
+    var any: int = 0;
+    while (k <= n) {
+        if (k < n) {
+            var c: int = s[k];
+            if (quote != 0) {
+                if (c == '\\') { k += 2; continue; }
+                if (c == quote) { quote = 0; }
+                k += 1;
+                continue;
+            }
+            if (c == '"' || c == '\'') { quote = c; any = 1; k += 1; continue; }
+            if (c == '[' || c == '(') { depth += 1; }
+            if (c == ']' || c == ')') { depth -= 1; }
+            if (c != ',' || depth != 0) {
+                if (!is_space(c)) { any = 1; }
+                k += 1;
+                continue;
+            }
+        } else if (!any && count == 0) {
+            break;                               // nothing at all
+        }
+        // an operand: s[start..k)
+        if (mode == 0) {
+            parse_operand(s + start, k - start);
+        } else {
+            var m: int = k - start;
+            var t: *char = trim(s + start, &m);
+            var e: int = parse_expr(t, m);
+            if (e < 0) { die(lerr, null); }
+            add_operand(O_EXPR, 0, e);
+        }
+        count += 1;
+        start = k + 1;
+        k += 1;
+    }
+    return count;
+}
+
+fn parse_line(s: *char, n: int) {
+    n = comment_at(s, n);
+    s = trim(s, &n);
+    // leading labels
+    loop {
+        var colon: int = 0;
+        while (colon < n && s[colon] != ':') { colon += 1; }
+        if (colon == n) { break; }
+        var m: int = colon;
+        var name: *char = trim(s, &m);
+        if (!is_ident(name, m)) { break; }
+        add_stmt(K_LABEL, sym_find(name, m), 0, 0);
+        s = s + colon + 1;
+        n = n - colon - 1;
+        s = trim(s, &n);
+    }
+    if (n == 0) { return; }
+    // NAME = expr
+    var eq: int = 0;
+    while (eq < n && s[eq] != '=') { eq += 1; }
+    if (eq < n) {
+        var m2: int = eq;
+        var name2: *char = trim(s, &m2);
+        if (is_ident(name2, m2)) {
+            var e: int = parse_expr(s + eq + 1, n - eq - 1);
+            if (e < 0) { die(lerr, null); }
+            add_stmt(K_EQU, sym_find(name2, m2), o_used, 1);
+            add_operand(O_EXPR, 0, e);
+            return;
+        }
+    }
+    // the mnemonic or directive, lower-cased
+    var ml: int = 0;
+    while (ml < n && !is_space(s[ml])) { ml += 1; }
+    var mn: [27]char;
+    if (ml > 26) { die("unknown instruction", null); }
+    var k: int = 0;
+    while (k < ml) { mn[k] = (s[k] >= 'A' && s[k] <= 'Z' ? s[k] + 32 : s[k]) as char; k += 1; }
+    mn[ml] = 0;
+    var rest: *char = s + ml;
+    var rn: int = n - ml;
+    rest = trim(rest, &rn);
+    var first: int = o_used;
+    if (mn[0] == '.' && !(ml > 2 && mn[ml - 2] == '.' && mn[ml - 1] == 'l')) {
+        if (streq(&mn[0], ".org")) {
+            if (split_and_parse(rest, rn, 1) != 1) { die("exactly one value expected", null); }
+            add_stmt(K_ORG, 0, first, 1);
+        } else if (streq(&mn[0], ".equ")) {
+            var c2: int = 0;
+            while (c2 < rn && rest[c2] != ',') { c2 += 1; }
+            if (c2 == rn) { die(".equ NAME, value", null); }
+            var m3: int = c2;
+            var nm: *char = trim(rest, &m3);
+            var e2: int = parse_expr(rest + c2 + 1, rn - c2 - 1);
+            if (e2 < 0) { die(lerr, null); }
+            add_stmt(K_EQU, sym_find(nm, m3), o_used, 1);
+            add_operand(O_EXPR, 0, e2);
+        } else if (streq(&mn[0], ".word")) {
+            add_stmt(K_WORDS, 0, first, split_and_parse(rest, rn, 1));
+        } else if (streq(&mn[0], ".tryte")) {
+            var cnt: int = split_and_parse(rest, rn, 1);
+            // consecutive .tryte lines pack as one run
+            if (st_used > 0 && st_kind[st_used - 1] == K_TRYTES) { st_n[st_used - 1] += cnt; }
+            else { add_stmt(K_TRYTES, 0, first, cnt); }
+        } else if (streq(&mn[0], ".string")) {
+            if (rn == 0 || rest[0] != '"') { die("string literal expected", null); }
+            lx = rest;
+            lxn = rn;
+            li = 1;
+            lerr = null;
+            var cnt2: int = 0;
+            loop {
+                if (li >= lxn) { die("unterminated string", null); }
+                if (lx[li] == '"') { li += 1; break; }
+                var ch: int = char_in_quotes('"');
+                if (ch == -1000000) { die(lerr, null); }
+                add_operand(O_EXPR, 0, node(E_NUM, ch, 0, 0));
+                cnt2 += 1;
+            }
+            if (li != lxn) { die("text after string", null); }
+            add_stmt(K_STR, 0, first, cnt2);
+        } else if (streq(&mn[0], ".zero")) {
+            if (split_and_parse(rest, rn, 1) != 1) { die("exactly one value expected", null); }
+            add_stmt(K_ZERO, 0, first, 1);
+        } else if (streq(&mn[0], ".align")) {
+            if (split_and_parse(rest, rn, 1) != 1) { die("exactly one value expected", null); }
+            add_stmt(K_ALIGN, 0, first, 1);
+        } else if (streq(&mn[0], ".fill")) {
+            if (split_and_parse(rest, rn, 1) != 2) { die(".fill COUNT, VALUE", null); }
+            add_stmt(K_FILL, 0, first, 2);
+        } else if (streq(&mn[0], ".real27") || streq(&mn[0], ".real81")) {
+            die("real literals are not supported by tas", null);
+        } else {
+            die("unknown directive", &mn[0]);
+        }
+        return;
+    }
+    var long: int = 0;
+    if (ml > 2 && mn[ml - 2] == '.' && mn[ml - 1] == 'l') {
+        long = 1;
+        ml -= 2;
+        mn[ml] = 0;
+    }
+    var code: int = mn_find(&mn[0], ml);
+    if (code == 0) { die("unknown instruction", &mn[0]); }
+    var nops: int = split_and_parse(rest, rn, 0);
+    add_stmt(K_INST, code, first, nops);
+    st_long[st_used - 1] = long as tryte;
+}
+
+// ---- instruction sizes and encoding ----------------------------------------------------------
+
+fn is_alu_binary(m: int) -> int { return m >= 1 && m <= 22; }
+
+// The function B for an ALU code (1..22 map to 1..16, 18, 23..27).
+fn alu_b(m: int) -> int {
+    if (m <= 16) { return m; }
+    if (m == 17) { return 18; }                // trit
+    return m + 5;                              // band.. = 23..27
+}
+
+fn op_small(o: int, lim: int, long: int) -> int {
+    if (long || o_kind[o] != O_EXPR) { return 0; }
+    var v: int = constant(o_e[o]);
+    return c_ok && v <= lim && v >= -lim;
+}
+
+fn inst_size(i: int, long: int) -> int {
+    var m: int = st_m[i];
+    var o: int = st_o[i];
+    var n: int = st_n[i];
+    if (is_alu_binary(m) || m == M_CMP) {
+        if (n > 0 && o_kind[o + n - 1] == O_EXPR && !op_small(o + n - 1, 13, long)) { return 2; }
+        return 1;
+    }
+    if ((m >= M_LDT && m <= M_LDT + 4) || (m >= M_FLDS && m <= M_FLDS + 3)) {
+        var size: int = m == M_LDT || m == M_LDT + 2 ? 1 : m == M_FLDS + 1 || m == M_FLDS + 3 ? 9 : 3;
+        if (n > 1 && o_kind[o + 1] == O_MEM && !long) {
+            var v: int = constant(o_e[o + 1]);
+            if (c_ok && v % size == 0 && v / size <= 13 && v / size >= -13) { return 1; }
+        }
+        return 2;
+    }
+    if (m == M_MOV || m == M_MOV + 1) {                        // mov, li
+        if (n > 1 && o_kind[o + 1] == O_EXPR && !op_small(o + 1, 364, long)) { return 2; }
+        return 1;
+    }
+    // la lea jal call br3 ext ins bext brot fli
+    if (m == M_MOV + 2 || m == M_MOV + 3 || m == M_MOV + 4 || m == M_MOV + 5 || m == M_MOV + 8
+        || (m >= M_MOV + 13 && m <= M_MOV + 16) || m == M_FCMP + 12) { return 2; }
+    if (m == M_MOV + 9 || m == M_MOV + 10) {                   // in, out
+        return n > 1 && o_kind[o + 1] == O_MEM ? 1 : 2;
+    }
+    if (m == M_MOV + 11 || m == M_MOV + 12) { return 2; }       // push, pop
+    if (m >= M_B && m <= M_B + 9 && long) { return 2; }
+    return 1;
+}
+
+// ---- encoding --------------------------------------------------------------------------------
+
+var out: *int;                           // the words
+var out_n: int;
+var out_cap: int;
+var here: int;
+var relax: int;                          // a short branch did not reach
+
+fn emit(w: int) {
+    if (out_n >= out_cap) { die("too many words", null); }
+    out[out_n] = w;
+    out_n += 1;
+}
+
+fn head(a: int, b: int) -> int { return a * 387420489 + b * 19683; }
+fn rrr(a: int, b: int, x: int, y: int, z: int) -> int { return head(a, b) + x * 729 + y * 27 + z; }
+
+fn range(what: *char, v: int, lim: int) -> int {
+    if (v > lim || v < -lim) { die_num(what, v); }
+    return v;
+}
+
+fn wide(a: int, b: int, x: int, y: int, imm: int) {
+    emit(head(a, b) + x * 729 + y * 27);
+    emit(range("value out of range:", imm, W_MAX));
+}
+
+fn bad(m: int) { die("bad operands", null); }
+
+fn reg_of(o: int) -> int {
+    if (o_kind[o] != O_REG) { die("register expected", null); }
+    return o_reg[o];
+}
+fn freg_of(o: int) -> int {
+    if (o_kind[o] != O_FREG) { die("FPU register expected", null); }
+    return o_reg[o];
+}
+fn exp_of(o: int) -> int {
+    if (o_kind[o] != O_EXPR) { die("value expected", null); }
+    return value(o_e[o], here);
+}
+fn rel(target: int) -> int {
+    var d: int = target - here;
+    if (d % 3 != 0) { die_num("branch target is not word-aligned:", target); }
+    return d / 3;
+}
+
+// Encode statement i (size words); 0, or 1 if a short branch must be relaxed.
+fn encode(i: int, size: int) -> int {
+    var m: int = st_m[i];
+    var o: int = st_o[i];
+    var n: int = st_n[i];
+    if (is_alu_binary(m) || m == M_CMP) {
+        var f: int = m == M_CMP ? 17 : alu_b(m);
+        var rd: int = 0;
+        var ra: int = 0;
+        var b: int = 0;
+        if (m == M_CMP) {
+            if (n != 2) { bad(m); }
+            ra = reg_of(o);
+            b = o + 1;
+        } else {
+            if (n != 3) { bad(m); }
+            rd = reg_of(o);
+            ra = reg_of(o + 1);
+            b = o + 2;
+        }
+        if (o_kind[b] == O_REG) { emit(rrr(1, f, rd, ra, o_reg[b])); return 0; }
+        if (o_kind[b] != O_EXPR) { bad(m); }
+        if (size == 1) { emit(rrr(2, f, rd, ra, range("immediate out of range:", exp_of(b), 13))); return 0; }
+        wide(6561, f, rd, ra, exp_of(b));
+        return 0;
+    }
+    if (m >= M_NEG && m <= M_TLZ) {
+        if (n != 2) { bad(m); }
+        emit(rrr(1, 19 + m - M_NEG, reg_of(o), reg_of(o + 1), 0));
+        return 0;
+    }
+    if (m >= M_LDT && m <= M_LDT + 4) {
+        var mf: [5]int = { 1, 2, 3, 4, 5 };
+        var msz: [5]int = { 1, 3, 1, 3, 3 };
+        if (n != 2 || o_kind[o + 1] != O_MEM) { bad(m); }
+        var off: int = value(o_e[o + 1], here);
+        if (size == 1) { emit(rrr(3, mf[m - M_LDT], reg_of(o), o_reg[o + 1], off / msz[m - M_LDT])); }
+        else { wide(6562, mf[m - M_LDT], reg_of(o), o_reg[o + 1], off); }
+        return 0;
+    }
+    if (m >= M_FADD && m <= M_FADD + 6) {
+        if (n != 3) { bad(m); }
+        emit(rrr(-6561, 1 + m - M_FADD, freg_of(o), freg_of(o + 1), freg_of(o + 2)));
+        return 0;
+    }
+    if (m >= M_FSQRT && m <= M_FSQRT + 4) {
+        if (n != 2) { bad(m); }
+        emit(rrr(-6561, 8 + m - M_FSQRT, freg_of(o), freg_of(o + 1), 0));
+        return 0;
+    }
+    if (m >= M_FLDS && m <= M_FLDS + 3) {
+        var ff: [4]int = { 1, 2, -1, -2 };
+        var fsz: [4]int = { 3, 9, 3, 9 };
+        if (n != 2 || o_kind[o + 1] != O_MEM) { bad(m); }
+        var off2: int = value(o_e[o + 1], here);
+        if (size == 1) { emit(rrr(-6559, ff[m - M_FLDS], freg_of(o), o_reg[o + 1], off2 / fsz[m - M_FLDS])); }
+        else { wide(-4374, ff[m - M_FLDS], freg_of(o), o_reg[o + 1], off2); }
+        return 0;
+    }
+    if (m >= M_FCMP && m <= M_FCMP + 12) {
+        var k: int = m - M_FCMP;
+        if (k == 0) { if (n != 2) { bad(m); } emit(rrr(-6561, 13, 0, freg_of(o), freg_of(o + 1))); return 0; }
+        if (k == 1) { if (n != 2) { bad(m); } emit(rrr(-6560, 11, freg_of(o), freg_of(o + 1), 0)); return 0; }
+        if (k == 2) { if (n != 2) { bad(m); } emit(rrr(-6560, 1, freg_of(o), reg_of(o + 1), 0)); return 0; }
+        if (k == 3) { if (n != 2) { bad(m); } emit(rrr(-6560, 2, reg_of(o), freg_of(o + 1), 0)); return 0; }
+        if (k == 4) { if (n != 2) { bad(m); } emit(rrr(-6560, 3, reg_of(o), freg_of(o + 1), 0)); return 0; }
+        if (k == 5) { if (n != 2) { bad(m); } emit(rrr(-6560, 4, freg_of(o), reg_of(o + 1), 0)); return 0; }
+        if (k == 6) { if (n != 2) { bad(m); } emit(rrr(-6560, 5, reg_of(o), freg_of(o + 1), 0)); return 0; }
+        if (k == 7) { if (n != 3) { bad(m); } emit(rrr(-6560, 6, freg_of(o), freg_of(o + 1), reg_of(o + 2))); return 0; }
+        if (k == 8) { if (n != 1) { bad(m); } emit(rrr(-6560, 7, reg_of(o), 0, 0)); return 0; }
+        if (k == 9) { if (n != 1) { bad(m); } emit(rrr(-6560, 8, 0, reg_of(o), 0)); return 0; }
+        if (k == 10) { if (n != 2) { bad(m); } emit(rrr(-6560, 9, reg_of(o), freg_of(o + 1), 0)); return 0; }
+        if (k == 11) {
+            if (n != 2) { bad(m); }
+            var kv: int = 0;
+            var ko: int = o + 1;
+            if (o_kind[ko] == O_REG && o_reg[ko] == 0) { kv = 0; }
+            else if (o_kind[ko] == O_EXPR && e_op[o_e[ko]] == E_SYM) {
+                var nm: *char = sym_str(e_v[o_e[ko]]);
+                var cn: *char = "zero one pi e ln3 log3e log3_10 ";
+                kv = -1;
+                var idx: int = 0;
+                var p: int = 0;
+                while (cn[p] != 0) {
+                    var q: int = p;
+                    while (cn[q] != ' ') { q += 1; }
+                    if (eqn(cn + p, q - p, nm)) { kv = idx; }
+                    idx += 1;
+                    p = q + 1;
+                }
+                if (kv < 0) { die("unknown constant", nm); }
+            } else if (o_kind[ko] == O_EXPR) {
+                kv = range("constant number out of range:", exp_of(ko), 6);
+            } else { bad(m); }
+            emit(rrr(-6560, 10, freg_of(o), kv, 0));
+            return 0;
+        }
+        // fli with an integer
+        if (n != 2 || o_kind[o + 1] != O_EXPR) { die("real literals are not supported by tas", null); }
+        die("fli is not supported by tas", null);
+        return 0;
+    }
+    if (m >= M_B && m <= M_B + 9) {
+        if (n != 1) { bad(m); }
+        var off3: int = rel(exp_of(o));
+        if (size == 1) {
+            if (off3 > 364 || off3 < -364) { return 1; }
+            emit(head(7, 0) + mn_cond(m) * 729 + off3);
+            return 0;
+        }
+        emit(head(6566, 0) + mn_cond(m) * 729);
+        emit(off3);
+        return 0;
+    }
+    if (m >= M_NOP && m <= M_NOP + 6) {
+        var sb: [7]int = { 1, 2, 3, 5, 9, 10, 0 };
+        if (n != 0) { bad(m); }
+        emit(rrr(0, sb[m - M_NOP], 0, 0, 0));
+        return 0;
+    }
+    var k2: int = m - M_MOV;
+    if (k2 == 0 && n == 2 && o_kind[o + 1] == O_REG) { emit(rrr(1, 1, reg_of(o), o_reg[o + 1], 0)); return 0; }
+    if ((k2 == 0 || k2 == 1) && n == 2 && o_kind[o + 1] == O_EXPR) {
+        var v: int = exp_of(o + 1);
+        if (size == 1) { emit(head(6, 0) + reg_of(o) * 729 + v); }
+        else { wide(6563, 0, reg_of(o), 0, v); }
+        return 0;
+    }
+    if (k2 == 2 && n == 2) { wide(6563, 0, reg_of(o), 0, exp_of(o + 1)); return 0; }
+    if (k2 == 3 && n == 2) { wide(6564, 0, reg_of(o), 0, exp_of(o + 1) - here); return 0; }
+    if (k2 == 4 && n == 2) { wide(6565, 0, reg_of(o), 0, rel(exp_of(o + 1))); return 0; }
+    if (k2 == 5 && n == 1) { wide(6565, 0, 12, 0, rel(exp_of(o))); return 0; }
+    if (k2 == 6 && n == 2) { emit(rrr(5, 0, reg_of(o), reg_of(o + 1), 0)); return 0; }
+    if (k2 == 6 && n == 3) { emit(rrr(5, 0, reg_of(o), reg_of(o + 1), range("offset out of range:", exp_of(o + 2), 13))); return 0; }
+    if (k2 == 7 && n == 0) { emit(rrr(5, 0, 0, 12, 0)); return 0; }
+    if (k2 == 8 && n == 2) {
+        var on: int = range("BR3 offset out of range:", rel(exp_of(o)), 9841);
+        var op: int = range("BR3 offset out of range:", rel(exp_of(o + 1)), 9841);
+        emit(head(6567, 0));
+        emit(on * 387420489 + op * 19683);
+        return 0;
+    }
+    if ((k2 == 9 || k2 == 10) && n == 2) {
+        var b2: int = k2 == 9 ? 1 : 2;
+        if (o_kind[o + 1] == O_MEM) {
+            emit(rrr(4, b2, reg_of(o), o_reg[o + 1], range("port offset out of range:", value(o_e[o + 1], here), 13)));
+            return 0;
+        }
+        if (o_kind[o + 1] == O_EXPR) { wide(6568, b2, reg_of(o), 0, exp_of(o + 1)); return 0; }
+        bad(m);
+    }
+    if (k2 == 11 && n == 1) { emit(rrr(2, 2, 13, 13, 3)); emit(rrr(3, 4, reg_of(o), 13, 0)); return 0; }
+    if (k2 == 12 && n == 1) { emit(rrr(3, 2, reg_of(o), 13, 0)); emit(rrr(2, 1, 13, 13, 3)); return 0; }
+    if (k2 >= 13 && k2 <= 16 && n == 4) {
+        var pos: int = exp_of(o + 2);
+        var len: int = exp_of(o + 3);
+        var fb: int = k2 - 12;                                  // ext 1, ins 2, bext 3, brot 4
+        if (fb <= 2) {
+            if (pos < 1 || len < 1 || pos + len - 1 > 27) { die("trit field out of 1..27", null); }
+        } else if (len < 1 || len > 41 || (fb == 3 && (pos < 0 || pos > 80)) || (fb == 4 && (pos < 0 || pos >= len))) {
+            die("bit field out of range", null);
+        }
+        emit(head(6569, fb) + reg_of(o) * 729 + reg_of(o + 1) * 27);
+        emit(pos * 387420489 + len * 19683);
+        return 0;
+    }
+    if (k2 == 17 && n == 1) { emit(rrr(0, 8, 0, reg_of(o), 0)); return 0; }
+    if (k2 == 18 && n == 1) { emit(head(0, 4) + range("system call number out of range:", exp_of(o), 9841)); return 0; }
+    if ((k2 == 19 || k2 == 20) && n == 2) {
+        var co: int = k2 == 19 ? o + 1 : o;
+        if (o_kind[co] != O_EXPR || e_op[o_e[co]] != E_SYM) { bad(m); }
+        var cr: int = control_register(sym_str(e_v[o_e[co]]));
+        if (cr == -100) { die("unknown control register", sym_str(e_v[o_e[co]])); }
+        if (k2 == 19) { emit(rrr(0, 6, reg_of(o), cr, 0)); } else { emit(rrr(0, 7, cr, reg_of(o + 1), 0)); }
+        return 0;
+    }
+    bad(m);
+    return 0;
+}
+
+fn control_register(s: *char) -> int {
+    var low: [27]char;
+    var k: int = 0;
+    while (s[k] != 0 && k < 26) { low[k] = (s[k] >= 'A' && s[k] <= 'Z' ? s[k] + 32 : s[k]) as char; k += 1; }
+    low[k] = 0;
+    var names_cr: *char = "mode ptb faddr fcause itb epc emode ksp scratch cpuid cycle ";
+    var idx: int = 0;
+    var p: int = 0;
+    while (names_cr[p] != 0) {
+        var q: int = p;
+        while (names_cr[q] != ' ') { q += 1; }
+        if (eqn(names_cr + p, q - p, &low[0])) { return idx; }
+        idx += 1;
+        p = q + 1;
+    }
+    if (low[0] == 'c' && low[1] == 'r') {
+        var v: int = small_num(&low[2], k - 2);
+        if (v != -100) { return v; }
+    }
+    return -100;
+}
+
+// ---- assembly --------------------------------------------------------------------------------
+
+var st_addr: *int;
+var st_size: *int;
+var seg_org: [27]int;
+var seg_start: [27]int;
+var nsegs: int;
+
+fn pack(t0: int, t1: int, t2: int) -> int { return t0 * 387420489 + t1 * 19683 + t2; }
+
+fn assemble() {
+    // constants: .equ whose values need no labels, in order
+    var i: int = 0;
+    while (i < st_used) {
+        if (st_kind[i] == K_EQU && sym_def[st_m[i]] == 0) {
+            var v: int = constant(o_e[st_o[i]]);
+            if (c_ok) { sym_val[st_m[i]] = v; sym_def[st_m[i]] = 3; }
+        }
+        i += 1;
+    }
+    i = 0;
+    while (i < st_used) { if (st_kind[i] == K_INST && st_long[i] != 0) { st_long[i] = 2; } i += 1; }
+    var round: int = 0;
+    while (round < 50) {
+        // forget labels and later equs
+        var s: int = 0;
+        while (s < SYM_CAP) { if (sym_def[s] == 1 || sym_def[s] == 2) { sym_def[s] = 0; } s += 1; }
+        var at: int = 0;
+        i = 0;
+        while (i < st_used) {
+            cur_line = st_line[i];
+            var k: int = st_kind[i];
+            var size: int = 0;
+            var o: int = st_o[i];
+            if (k == K_ORG) {
+                at = constant(o_e[o]);
+                if (!c_ok) { die(".org needs a constant", null); }
+                if (at % 3 != 0) { die_num(".org is not word-aligned:", at); }
+            } else if (k == K_LABEL) {
+                if (sym_def[st_m[i]] != 0) { die("defined twice:", sym_str(st_m[i])); }
+                sym_def[st_m[i]] = 1;
+                sym_val[st_m[i]] = at;
+            } else if (k == K_WORDS) { size = st_n[i]; }
+            else if (k == K_TRYTES) { size = (st_n[i] + 2) / 3; }
+            else if (k == K_STR) { size = (st_n[i] + 3) / 3; }
+            else if (k == K_ALIGN) {
+                var a: int = constant(o_e[o]);
+                if (!c_ok) { die(".align needs a constant", null); }
+                if (a <= 0 || a % 3 != 0) { die(".align must be a positive multiple of 3", null); }
+                var r: int = at % a;
+                if (r < 0) { r += a; }
+                size = (a - r) % a / 3;
+            } else if (k == K_ZERO || k == K_FILL) {
+                size = constant(o_e[o]);
+                if (!c_ok) { die("count needs a constant", null); }
+                if (size < 0) { die("count is negative", null); }
+            } else if (k == K_INST) {
+                size = inst_size(i, st_long[i] != 0);
+            }
+            st_addr[i] = at;
+            st_size[i] = size;
+            at += 3 * size;
+            i += 1;
+        }
+        // the other .equs, in order
+        i = 0;
+        while (i < st_used) {
+            if (st_kind[i] == K_EQU && sym_def[st_m[i]] != 3) {
+                cur_line = st_line[i];
+                if (sym_def[st_m[i]] != 0) { die("defined twice:", sym_str(st_m[i])); }
+                sym_val[st_m[i]] = value(o_e[st_o[i]], 0);
+                sym_def[st_m[i]] = 2;
+            }
+            i += 1;
+        }
+        // encode
+        out_n = 0;
+        nsegs = 0;
+        relax = 0;
+        i = 0;
+        while (i < st_used) {
+            cur_line = st_line[i];
+            var k2: int = st_kind[i];
+            var o2: int = st_o[i];
+            here = st_addr[i];
+            var before: int = out_n;
+            if (k2 == K_ORG) {
+                if (nsegs >= 27) { die("too many segments", null); }
+                seg_org[nsegs] = here;
+                seg_start[nsegs] = out_n;
+                nsegs += 1;
+                i += 1;
+                continue;
+            }
+            if (nsegs == 0 && k2 != K_LABEL && k2 != K_EQU && st_size[i] > 0) {
+                seg_org[0] = 0;
+                seg_start[0] = 0;
+                nsegs = 1;
+            }
+            if (k2 == K_WORDS) {
+                var j: int = 0;
+                while (j < st_n[i]) { emit(range("word out of range:", value(o_e[o2 + j], here), W_MAX)); j += 1; }
+            } else if (k2 == K_TRYTES || k2 == K_STR) {
+                var cnt: int = st_n[i] + (k2 == K_STR ? 1 : 0);
+                var j2: int = 0;
+                while (j2 < cnt) {
+                    var t: [3]int;
+                    var q: int = 0;
+                    while (q < 3) {
+                        var idx: int = j2 + q;
+                        t[q] = 0;
+                        if (idx < st_n[i]) { t[q] = range("tryte out of range:", value(o_e[o2 + idx], here), 9841); }
+                        q += 1;
+                    }
+                    emit(pack(t[0], t[1], t[2]));
+                    j2 += 3;
+                }
+            } else if (k2 == K_ZERO || k2 == K_ALIGN) {
+                var z: int = 0;
+                while (z < st_size[i]) { emit(0); z += 1; }
+            } else if (k2 == K_FILL) {
+                var fv: int = range("word out of range:", value(o_e[o2 + 1], here), W_MAX);
+                var z2: int = 0;
+                while (z2 < st_size[i]) { emit(fv); z2 += 1; }
+            } else if (k2 == K_INST) {
+                if (encode(i, st_size[i])) {
+                    st_long[i] = 2;
+                    relax = 1;
+                    out_n = before;
+                }
+            }
+            i += 1;
+        }
+        if (!relax) { return; }
+        round += 1;
+    }
+    cur_line = 0;
+    die("branch relaxation did not converge", null);
+}
+
+// ---- reading and writing ---------------------------------------------------------------------
+
+var src: *char;
+var src_n: int;
+
+fn read_source(path: *char) {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { perror2("tas", path); exit(1); }
+    var st: stat_t;
+    fstat(fd, &st);
+    src = malloc(st.st_size + 1) as *char;
+    if (src == null) { fputs(STDERR_FILENO, "tas: out of memory\n"); exit(1); }
+    src_n = 0;
+    loop {
+        var r: int = read(fd, src + src_n, st.st_size - src_n);
+        if (r <= 0) { break; }
+        src_n += r;
+    }
+    close(fd);
+}
+
+fn put_word(buf: *tryte, at: int, w: int) {
+    buf[at] = ext(w, 1, 9) as tryte;
+    buf[at + 1] = ext(w, 10, 9) as tryte;
+    buf[at + 2] = ext(w, 19, 9) as tryte;
+}
+
+fn write_out(path: *char, raw: int) {
+    if (nsegs != 1) { cur_line = 0; die_num("one segment expected, found", nsegs); }
+    var words: int = out_n - seg_start[0];
+    var hdr: int = raw ? 0 : 18;
+    var buf: *tryte = need(malloc(hdr + 3 * words), hdr + 3 * words);
+    if (!raw) {
+        if (seg_org[0] != USER_BASE) { cur_line = 0; die_num("the program must start at the user origin, not", seg_org[0]); }
+        var ds: int = sym_find("_trine_data_start", 17);
+        var de: int = sym_find("_trine_data_end", 15);
+        if (sym_def[ds] == 0 || sym_def[de] == 0) { cur_line = 0; die("no _trine_data_start/_trine_data_end", null); }
+        var text_end: int = USER_BASE - 1 + 3 * words;
+        if (text_end >= sym_val[ds] - 1) { cur_line = 0; die("the code overlaps the globals", null); }
+        put_word(buf, 0, TEF_MAGIC);
+        put_word(buf, 3, USER_BASE);
+        put_word(buf, 6, USER_BASE - 1);
+        put_word(buf, 9, 3 * words);
+        put_word(buf, 12, sym_val[ds] - 1);
+        put_word(buf, 15, sym_val[de] - sym_val[ds]);
+    }
+    var k: int = 0;
+    while (k < words) { put_word(buf, hdr + 3 * k, out[seg_start[0] + k]); k += 1; }
+    var fd: int = open(path, O_WRONLY + O_CREAT + O_TRUNC, 493);
+    if (fd < 0) { perror2("tas", path); exit(1); }
+    var n: int = hdr + 3 * words;
+    var done: int = 0;
+    while (done < n) {
+        var w: int = write(fd, (buf + done) as *char, n - done);
+        if (w <= 0) { perror2("tas", path); exit(1); }
+        done += w;
+    }
+    close(fd);
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var outpath: *char = "a.out";
+    var raw: int = 0;
+    var c: int = getopt(argc, argv, "ro:");
+    while (c != -1) {
+        if (c == 'o') { outpath = optarg; }
+        else if (c == 'r') { raw = 1; }
+        else { fputs(STDERR_FILENO, "usage: tas [-r] [-o out] file.s\n"); return 2; }
+        c = getopt(argc, argv, "ro:");
+    }
+    if (optind != argc - 1) { fputs(STDERR_FILENO, "usage: tas [-r] [-o out] file.s\n"); return 2; }
+    read_source(argv[optind]);
+    // room for everything, from a count of lines and commas
+    // statements: lines and colons; operands: commas, lines and the
+    // characters of strings; expression nodes: at most one per character
+    var lines: int = 1;
+    var commas: int = 0;
+    var colons: int = 0;
+    var quoted: int = 0;
+    var inq: int = 0;
+    var k: int = 0;
+    while (k < src_n) {
+        var ch: int = src[k];
+        if (ch == '\n') { lines += 1; inq = 0; }
+        else if (inq) { quoted += 1; if (ch == '"') { inq = 0; } }
+        else if (ch == '"') { inq = 1; }
+        else if (ch == ',') { commas += 1; }
+        else if (ch == ':') { colons += 1; }
+        k += 1;
+    }
+    st_cap = lines + colons + 27;
+    o_cap = lines + commas + quoted + 27;
+    e_cap = o_cap + lines + 81;
+    p_cap = lines + 81;
+    out_cap = lines * 2 + 81;
+    names_cap = src_n / 3 + 4096;
+    st_kind = need(malloc(st_cap), st_cap);
+    st_long = need(malloc(st_cap), st_cap);
+    st_m = need(malloc(st_cap * 3), st_cap) as *int;
+    st_o = need(malloc(st_cap * 3), st_cap) as *int;
+    st_n = need(malloc(st_cap * 3), st_cap) as *int;
+    st_line = need(malloc(st_cap * 3), st_cap) as *int;
+    st_addr = need(malloc(st_cap * 3), st_cap) as *int;
+    st_size = need(malloc(st_cap * 3), st_cap) as *int;
+    o_kind = need(malloc(o_cap), o_cap);
+    o_reg = need(malloc(o_cap), o_cap);
+    o_e = need(malloc(o_cap * 3), o_cap) as *int;
+    e_op = need(malloc(e_cap), e_cap);
+    e_v = need(malloc(e_cap * 3), e_cap) as *int;
+    p_a = need(malloc(p_cap * 3), p_cap) as *int;
+    p_b = need(malloc(p_cap * 3), p_cap) as *int;
+    sym_name = need(malloc(SYM_CAP * 3), SYM_CAP) as *int;
+    sym_val = need(malloc(SYM_CAP * 3), SYM_CAP) as *int;
+    sym_def = need(malloc(SYM_CAP), SYM_CAP);
+    names = need(malloc(names_cap), names_cap) as *char;
+    k = 0;
+    while (k < SYM_CAP) { sym_name[k] = -1; sym_def[k] = 0; k += 1; }
+    mn_init();
+    // parse, a line at a time
+    var start: int = 0;
+    cur_line = 0;
+    k = 0;
+    while (k <= src_n) {
+        if (k == src_n || src[k] == '\n') {
+            cur_line += 1;
+            if (k > start || k < src_n) { parse_line(src + start, k - start); }
+            start = k + 1;
+        }
+        k += 1;
+    }
+    free(src as *tryte);                     // the names are copied: the text is done with
+    out = need(malloc(out_cap * 3), out_cap) as *int;
+    // the output can be larger than the line count suggests (.zero, .fill, .align)
+    var i: int = 0;
+    var extra: int = 0;
+    while (i < st_used) {
+        if (st_kind[i] == K_ZERO || st_kind[i] == K_FILL) {
+            var z: int = constant(o_e[st_o[i]]);
+            if (c_ok && z > 0) { extra += z; }
+        }
+        if (st_kind[i] == K_ALIGN) {
+            var al: int = constant(o_e[st_o[i]]);
+            if (c_ok && al > 0) { extra += al / 3; }
+        }
+        if (st_kind[i] == K_WORDS || st_kind[i] == K_TRYTES || st_kind[i] == K_STR) { extra += st_n[i]; }
+        i += 1;
+    }
+    if (extra > 0) {
+        out_cap += extra;
+        free(out as *tryte);
+        out = need(malloc(out_cap * 3), out_cap) as *int;
+    }
+    assemble();
+    write_out(outpath, raw);
+    return 0;
+}

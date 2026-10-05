@@ -22,7 +22,7 @@ var heap_hi: int;                     // one word past the last block
 
 fn heap_grow(words: int) -> int {
     var want: int = words < 177147 ? 177147 : words;   // 27 pages
-    var old: int = sbrk(3 * want + 3);
+    var old: int = sbrk(3 * want + 9);                  // room for the alignment and the header too
     if (old == -1) { return 0; }
     if (heap_lo == 0) {
         heap_lo = old / 3 * 3 + 3;                      // the first aligned word

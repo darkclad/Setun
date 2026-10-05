@@ -24,7 +24,12 @@ impl Session {
 
     pub fn boot_with(link: bool) -> Session {
         let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
-        let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
+        Self::boot_disk(&disk.trytes, link)
+    }
+
+    /// Boot from this disk image (logged in as root).
+    pub fn boot_disk(disk: &[i16], link: bool) -> Session {
+        let mut m = trinux::boot_trytes(disk, 729, 0, "");
         let net = Network::attach(&mut m);
         if !link {
             m.dev.nic.link = false;

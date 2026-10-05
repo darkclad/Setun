@@ -98,6 +98,16 @@ fn heap() {
     i = 0;
     while (i < 300) { if (z[i] != 0) { zero = 0; } i += 1; }
     ok("calloc zeroes", zero);
+    // larger than a step of the heap's growth (once always refused)
+    var big: *tryte = malloc(600000);
+    var bigok: int = big != null;
+    if (bigok) {
+        big[0] = 1;
+        big[599999] = 2;
+        bigok = big[0] == 1 && big[599999] == 2;
+        free(big);
+    }
+    ok("malloc 600000 trytes", bigok);
     var huge: *tryte = malloc(100000000);
     ok("malloc too much is ENOMEM", huge == null && errno == ENOMEM);
     ok("malloc(-1) is null", malloc(-1) == null);
