@@ -611,6 +611,7 @@ fn nanosleep(req: *timespec, rem: *timespec) -> int { return _ret(syscall(101, r
 const CLOCK_REALTIME: int = 0;
 const CLOCK_MONOTONIC: int = 1;
 fn clock_gettime(clk: int, ts: *timespec) -> int { return _ret(syscall(113, clk, ts)); }
+fn clock_settime(clk: int, ts: *timespec) -> int { return _ret(syscall(112, clk, ts)); }
 
 // sleep: returns the seconds left if a signal cut it short.
 fn sleep(seconds: int) -> int {

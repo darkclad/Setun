@@ -223,3 +223,80 @@ pub(crate) fn format_error(q: &[u8]) -> Vec<u8> {
     let (a, b) = (*q.first().unwrap_or(&0), *q.get(1).unwrap_or(&0));
     vec![a, b, 0x80, 0x81, 0, 0, 0, 0, 0, 0, 0, 0]
 }
+
+// ---- UDP -----------------------------------------------------------------------------------
+
+/// A UDP conversation the guest started: its datagrams go out of a host
+/// socket of their own, and whatever comes back to that socket is the reply.
+pub(crate) struct UdpFlow {
+    pub gport: u16,
+    pub dst: Ipv4Address,
+    pub dport: u16,
+    pub sock: std::net::UdpSocket,
+    pub guest_mac: [u8; 6],
+    pub last: std::time::Instant,
+}
+
+/// How long a quiet UDP conversation is kept.
+pub(crate) const UDP_IDLE: Duration = Duration::from_secs(60);
+pub(crate) const UDP_FLOWS: usize = 81;
+
+/// Where the parts of an Ethernet/IPv4/UDP frame are: (UDP header start,
+/// payload start, payload length). None if it is not one, or a fragment.
+pub(crate) fn udp_offsets(f: &[u8]) -> Option<(usize, usize, usize)> {
+    if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[14] >> 4 != 4 || f[23] != 17 {
+        return None;
+    }
+    let ihl = (f[14] & 15) as usize * 4;
+    let frag = u16::from_be_bytes([f[20], f[21]]);
+    if ihl < 20 || frag & 0x3fff != 0 {
+        return None;
+    }
+    let u = 14 + ihl;
+    if u + 8 > f.len() {
+        return None;
+    }
+    let ulen = u16::from_be_bytes([f[u + 4], f[u + 5]]) as usize;
+    if ulen < 8 || u + ulen > f.len() {
+        return None;
+    }
+    Some((u, u + 8, ulen - 8))
+}
+
+/// An Ethernet/IPv4/UDP frame to the guest, checksums and all.
+pub(crate) fn udp_frame(to_mac: [u8; 6], src: Ipv4Address, sport: u16, dst: Ipv4Address, dport: u16, data: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(42 + data.len());
+    f.extend_from_slice(&to_mac);
+    f.extend_from_slice(&crate::GATEWAY_MAC);
+    f.extend_from_slice(&[0x08, 0x00]);
+    let total = 20 + 8 + data.len();
+    f.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, 17, 0, 0]);
+    f.extend_from_slice(&src.octets());
+    f.extend_from_slice(&dst.octets());
+    let ulen = 8 + data.len();
+    f.extend_from_slice(&sport.to_be_bytes());
+    f.extend_from_slice(&dport.to_be_bytes());
+    f.extend_from_slice(&(ulen as u16).to_be_bytes());
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(data);
+    fix_ip_checksum(&mut f);
+    // the UDP checksum over the pseudo-header
+    let mut sum: u32 = 0;
+    for c in f[26..34].chunks(2) {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    }
+    sum += 17 + ulen as u32;
+    for c in f[34..].chunks(2) {
+        sum += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let c = match !(sum as u16) {
+        0 => 0xffff,
+        x => x,
+    };
+    f[40] = (c >> 8) as u8;
+    f[41] = c as u8;
+    f
+}

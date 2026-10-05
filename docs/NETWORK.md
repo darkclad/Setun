@@ -158,6 +158,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N8 | public-key login for `sshd`; an `ssh` client and `ssh-keygen` in Trinux (§10) ✅ | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file; the client by password and by key, known_hosts learned and a changed key refused, 3 wrong passwords, a refused port, an unknown name, a pty session, `~.` |
 | N9 | `sftp-server` for the `sftp` subsystem (§11) ✅ | the host's sftp and scp: binary and UTF-8 round trips, renames, removals, refusals |
 | N10 | `scp` and `sftp` clients in Trinux (§12) ✅ | both against Trinux's sshd: Russian text and 2000 lines both ways with equal MD5s, several sources into a directory, missing files on either side, a file as the target of several, local-to-local; an sftp batch with mkdir, put, ls, get, rename, rm, rmdir, a `-` command that may fail, and one that may not |
+| N11 | UDP through the NAT; `clock_settime`; `ntpdate` (§13) ✅ | a host echo server reached as 10.0.2.2 and as an outside address, text both ways, DNS and test ports untouched, the NAT off; ntpdate querying, setting the clock, refused to a user, a wrong originate time, kiss-o'-death, an unknown name, usage |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -338,7 +339,7 @@ $ echo hi | nc 10.0.2.2 8000       # a server on the host's 127.0.0.1:8000
 6. Finished connections are forgotten, along with their smoltcp sockets.
 
 Not covered:
-- UDP other than DNS;
+- UDP other than DNS (until N11, §13);
 - ICMP to the outside (`ping` works only toward the gateway, as with QEMU);
 - connections from outside in, except through `--net` port forwards.
 
@@ -443,3 +444,33 @@ $ sftp -b commands.txt host                # a failing line ends it with status 
   - so a Russian text file arrives as the same trytes it left as.
 - Like OpenSSH's current `scp`, Trinux's uses SFTP rather than the old rcp protocol. It copies files, not whole trees (no `-r`).
 - Tests: `crates/trinux/tests/scp_client.rs`. Both clients run against Trinux's own `sshd` over loopback, logging in with a key made by Trinux's `ssh-keygen`.
+
+## 13. UDP out, and the time (N11)
+
+```
+$ ntpdate -q pool.ntp.org                     # ask
+server 208.70.148.101, stratum 2, offset 3 s: 2026-10-05 15:04:36 UTC
+$ ntpdate pool.ntp.org                        # and set the clock (root)
+```
+
+**UDP through the NAT.**
+- A datagram from the guest to an address off 10.0.2.0/24 goes out through a host UDP socket of its own conversation, keyed by (guest port, destination, port). So does a datagram to the gateway on a port no test socket holds.
+- Whatever comes back to that socket is the reply. It reaches the guest from the address the guest wrote to, and from the port the reply came from.
+- Conversations are forgotten after 60 s of quiet; at most 81 are kept, and the quietest goes first.
+- Not carried:
+  - fragments, and replies over 1472 octets;
+  - DNS, which stays with 10.0.2.3;
+  - test sockets (`udp_bind`), which stay on the gateway.
+- Counters: `stats.udp_out`, `stats.udp_in`.
+
+**The clock.**
+- `clock_settime(CLOCK_REALTIME)` (112) lets root set the RTC, to the second, since writing `SECONDS` zeroes `MICROS`.
+- Anyone else gets `EPERM`. A bad clock or time value gets `EINVAL`.
+
+**`ntpdate [-q] [-p port] server`** is SNTP v4 (RFC 4330):
+- one request, three tries of 2 s;
+- the reply must be mode 4, version 3 or later, and echo the request's transmit time (with a random fraction as a nonce);
+- stratum 0 (kiss-o'-death) is refused;
+- it prints the server, stratum, offset and time, and without `-q` sets the clock.
+
+It was tried once by hand against the real `pool.ntp.org` and agreed with the host's clock to the second. The tests use NTP servers run inside the test.

@@ -40,7 +40,8 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - N8 ✅ public-key login for `sshd` (ssh-ed25519, `~/.ssh/authorized_keys`); an `ssh` client and `ssh-keygen` in Trinux, sharing the transport with `sshd` (NETWORK.md §10)
     - N9 ✅ copying files: an SFTP v3 server behind sshd's `sftp` subsystem, used by the host's `sftp` and `scp` (NETWORK.md §11); Trinux's `ssh` client checked against a real OpenSSH server
     - N10 ✅ `scp` and `sftp` clients in Trinux, on a shared client library (NETWORK.md §12)
-    - next ideas: IPv6; TLS for `wget`; UDP through the NAT; `scp -r`
+    - N11 ✅ UDP through the NAT, `clock_settime`, `ntpdate` (NETWORK.md §13)
+    - next ideas: IPv6; TLS for `wget`; `scp -r`
 
 ## Next: performance
 

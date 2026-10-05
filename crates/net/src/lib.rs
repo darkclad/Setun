@@ -90,6 +90,9 @@ pub struct Stats {
     pub frames_from_guest: u64,
     pub dropped_to_guest: u64,
     pub dropped_from_guest: u64,
+    /// Datagrams the guest sent out through the NAT, and replies brought back.
+    pub udp_out: u64,
+    pub udp_in: u64,
 }
 
 /// The frame queues smoltcp sees as its network device.
@@ -160,6 +163,8 @@ pub struct Network {
     loss: Option<LossFilter>,
     mangle: Option<Mangler>,
     nat: nat::Nat,
+    udp_flows: Vec<nat::UdpFlow>,
+    udp_ports: Vec<u16>,
     dns: SocketHandle,
     outbound: bool,
     pub stats: Stats,
@@ -206,6 +211,8 @@ impl Network {
             loss: None,
             mangle: None,
             nat: nat::Nat::new(),
+            udp_flows: Vec::new(),
+            udp_ports: Vec::new(),
             dns,
             outbound: true,
             stats: Stats::default(),
@@ -299,6 +306,15 @@ impl Network {
             m.dev.net_receive(&f);
         }
         self.nat_prune(); // after the frames that still needed the flows (a refusal's RST)
+        self.udp_poll();
+        while let Some(f) = self.wire.outbound.pop_front() {
+            if self.loss.as_mut().is_some_and(|l| l(Dir::ToGuest, &f)) {
+                self.stats.dropped_to_guest += 1;
+                continue;
+            }
+            self.stats.frames_to_guest += 1;
+            m.dev.net_receive(&f);
+        }
     }
 
     /// How long (µs of emulated time) until smoltcp has a timer to run, if
@@ -447,6 +463,7 @@ impl Network {
         );
         s.bind(port).expect("bind");
         self.udps.push(self.sockets.add(s));
+        self.udp_ports.push(port);
         UdpId(self.udps.len() - 1)
     }
 
@@ -651,6 +668,9 @@ impl Network {
     /// A frame from the guest: rewritten if it belongs to an outbound
     /// connection, held (None) while that connection is being made.
     fn nat_in(&mut self, mut f: Vec<u8>) -> Option<Vec<u8>> {
+        if nat::udp_offsets(&f).is_some() {
+            return self.udp_in(f);
+        }
         let Some((_, t)) = nat::tcp_offsets(&f) else { return Some(f) };
         let dst = nat::ip_dst(&f);
         let sport = nat::port_at(&f, t);
@@ -801,5 +821,68 @@ impl Network {
         for (to, r) in replies {
             let _ = s.send_slice(&r, to);
         }
+    }
+}
+
+// ---- UDP through the NAT --------------------------------------------------------------------
+
+impl Network {
+    /// A UDP datagram from the guest: out through a host socket if it is for
+    /// the world (or the host, as 10.0.2.2), to smoltcp otherwise.
+    fn udp_in(&mut self, f: Vec<u8>) -> Option<Vec<u8>> {
+        let (u, data, len) = nat::udp_offsets(&f).unwrap();
+        let dst = nat::ip_dst(&f);
+        let sport = nat::port_at(&f, u);
+        let dport = nat::port_at(&f, u + 2);
+        let outside = !(dst.octets()[0] == 10 && dst.octets()[1] == 0 && dst.octets()[2] == 2);
+        let to_host = dst == GATEWAY && !self.udp_ports.contains(&dport);
+        if !self.outbound || !(outside || to_host) {
+            return Some(f);
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&f[6..12]);
+        let k = match self.udp_flows.iter().position(|x| x.gport == sport && x.dst == dst && x.dport == dport) {
+            Some(k) => k,
+            None => {
+                if self.udp_flows.len() >= nat::UDP_FLOWS {
+                    // the quietest conversation makes room
+                    let oldest = (0..self.udp_flows.len()).min_by_key(|&i| self.udp_flows[i].last).unwrap();
+                    self.udp_flows.remove(oldest);
+                }
+                let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else { return None };
+                let _ = sock.set_nonblocking(true);
+                self.udp_flows.push(nat::UdpFlow { gport: sport, dst, dport, sock, guest_mac: mac, last: std::time::Instant::now() });
+                self.udp_flows.len() - 1
+            }
+        };
+        let to = SocketAddr::new(self.nat.host_for(dst), dport);
+        let fl = &mut self.udp_flows[k];
+        fl.last = std::time::Instant::now();
+        fl.guest_mac = mac;
+        let _ = fl.sock.send_to(&f[data..data + len], to);
+        self.stats.udp_out += 1;
+        None
+    }
+
+    /// Replies to the guest's UDP conversations; forget the quiet ones.
+    fn udp_poll(&mut self) {
+        let mut buf = [0u8; 2048];
+        for fl in &mut self.udp_flows {
+            while let Ok((n, from)) = fl.sock.recv_from(&mut buf) {
+                if n > 1472 {
+                    continue; // would need fragments
+                }
+                fl.last = std::time::Instant::now();
+                let f = nat::udp_frame(fl.guest_mac, fl.dst, from.port(), GUEST, fl.gport, &buf[..n]);
+                self.wire.outbound.push_back(f);
+                self.stats.udp_in += 1;
+            }
+        }
+        self.udp_flows.retain(|x| x.last.elapsed() < nat::UDP_IDLE);
+    }
+
+    /// UDP conversations the NAT is carrying.
+    pub fn udp_flows(&self) -> usize {
+        self.udp_flows.len()
     }
 }

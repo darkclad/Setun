@@ -46,6 +46,18 @@ fn sys_uname(buf: int) -> int {
 }
 
 // clock_gettime: REALTIME from the RTC, MONOTONIC from the timer ticks.
+// clock_settime(CLOCK_REALTIME): root sets the real-time clock (to the
+// second: writing RTC.SECONDS zeroes its microseconds).
+fn sys_clock_settime(clk: int, ts: int) -> int {
+    if (clk != CLOCK_REALTIME) { return -EINVAL; }
+    if (!user_range_ok(ts - 1, 6)) { return -EFAULT; }
+    var t: *int = ts as *int;
+    if (t[0] < 0 || t[1] < 0 || t[1] > 999999999) { return -EINVAL; }
+    if (current_task().euid != 0) { return -EPERM_; }
+    out(RTC_SECONDS, t[0]);
+    return 0;
+}
+
 fn sys_clock_gettime(clk: int, ts: int) -> int {
     if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC) { return -EINVAL; }
     if (!user_range_ok(ts - 1, 6)) { return -EFAULT; }

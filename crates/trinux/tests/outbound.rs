@@ -165,3 +165,115 @@ fn wget_over_http() {
     let o = s.cmd("wget https://web.test/; echo status $?; wget http://nosuch.invalid/; echo status $?");
     has(&o, &["wget: https is not supported (there is no TLS)\nstatus 1", "wget: unable to resolve host address 'nosuch.invalid'\nstatus 4"]);
 }
+
+// ---- UDP through the NAT, and NTP -----------------------------------------------------------
+
+/// Type a command and wait for its prompt, calling `serve` between slices.
+fn cmd_polling(s: &mut Session, line: &str, mut serve: impl FnMut()) -> String {
+    let start = s.out.len();
+    s.send(&format!("{line}\n"));
+    let mut n = 0u64;
+    loop {
+        serve();
+        let o = &s.out[start..];
+        if o.len() > line.len() + 1 && o.ends_with("$ ") {
+            break;
+        }
+        assert!(n < 2_000_000_000, "timed out on {line:?}:\n{}", s.out);
+        s.step();
+        n += SLICE;
+    }
+    let text = s.out[start..].to_string();
+    s.mark = s.out.len();
+    let body = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
+    body.strip_suffix("$ ").unwrap_or(&body).to_string()
+}
+
+fn udp_socket() -> std::net::UdpSocket {
+    let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    u.set_nonblocking(true).unwrap();
+    u
+}
+
+/// The seconds of 2030-01-01 00:00:00 UTC, in NTP's era.
+const NTP_2030: u32 = (1_893_456_000u64 + 2_208_988_800u64) as u32;
+
+/// Answer one NTP request on u: `mode` 4 and stratum 2 normally; `broken`
+/// echoes the wrong originate time; `kiss` answers with stratum 0.
+fn ntp_answer(u: &std::net::UdpSocket, broken: bool, kiss: bool) {
+    let mut b = [0u8; 100];
+    while let Ok((n, from)) = u.recv_from(&mut b) {
+        if n < 48 {
+            continue;
+        }
+        let mut r = [0u8; 48];
+        r[0] = (4 << 3) | 4;
+        r[1] = if kiss { 0 } else { 2 };
+        r[24..32].copy_from_slice(&b[40..48]);
+        if broken {
+            r[24] ^= 1;
+        }
+        r[40..44].copy_from_slice(&NTP_2030.to_be_bytes());
+        let _ = u.send_to(&r, from);
+    }
+}
+
+#[test]
+fn udp_out_through_the_nat() {
+    let mut s = Session::boot();
+    let echo = udp_socket();
+    let p = echo.local_addr().unwrap().port();
+    let mut serve = || {
+        let mut b = [0u8; 2048];
+        while let Ok((n, from)) = echo.recv_from(&mut b) {
+            let mut r = b"echo: ".to_vec();
+            r.extend_from_slice(&b[..n]);
+            let _ = echo.send_to(&r, from);
+        }
+    };
+    let o = cmd_polling(&mut s, &format!("echo 'hi over udp' | nc -u 10.0.2.2 {p}"), &mut serve);
+    has(&o, &["echo: hi over udp\n"]);
+    s.net.alias([203, 0, 113, 9], "127.0.0.1".parse().unwrap());
+    let o = cmd_polling(&mut s, &format!("echo 'Сетунь' | nc -u 203.0.113.9 {p}"), &mut serve);
+    has(&o, &["echo: Сетунь\n"]);
+    assert!(s.net.stats.udp_out >= 2 && s.net.stats.udp_in >= 2);
+    // the DNS server and test ports stay where they were
+    let o = s.cmd("host localhost");
+    has(&o, &["localhost has address 127.0.0.1"]);
+    // with the NAT off, nothing goes out
+    s.net.set_outbound(false);
+    let before = s.net.stats.udp_out;
+    let o = cmd_polling(&mut s, &format!("echo lost | nc -u 10.0.2.2 {p}; echo done"), &mut serve);
+    has(&o, &["done\n"]);
+    assert!(!o.contains("echo: lost"));
+    assert_eq!(s.net.stats.udp_out, before);
+}
+
+#[test]
+fn ntpdate_sets_the_clock() {
+    let mut s = Session::boot();
+    let good = udp_socket();
+    let pg = good.local_addr().unwrap().port();
+    let broken = udp_socket();
+    let pb = broken.local_addr().unwrap().port();
+    let kiss = udp_socket();
+    let pk = kiss.local_addr().unwrap().port();
+    let mut serve = || {
+        ntp_answer(&good, false, false);
+        ntp_answer(&broken, true, false);
+        ntp_answer(&kiss, false, true);
+    };
+    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pg} 10.0.2.2; echo status $?; date"), &mut serve);
+    has(&o, &["server 10.0.2.2, stratum 2, offset ", " s: 2030-01-01 00:00:00 UTC\nstatus 0\n"]);
+    assert!(!o.contains("2030\n") && !o.contains("Jan  1"), "-q leaves the clock alone: {o}");
+    let o = cmd_polling(&mut s, &format!("su user -c 'ntpdate -p {pg} 10.0.2.2'; echo status $?"), &mut serve);
+    has(&o, &["ntpdate: cannot set the clock: Operation not permitted\nstatus 2"]);
+    let o = cmd_polling(&mut s, &format!("ntpdate -p {pg} 10.0.2.2; echo status $?; date +%Y"), &mut serve);
+    has(&o, &["ntpdate: the clock is set\nstatus 0\n2030\n"]);
+    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pb} 10.0.2.2; echo status $?"), &mut serve);
+    has(&o, &["ntpdate: no server suitable for synchronization found\nstatus 1"]);
+    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pk} 10.0.2.2; echo status $?"), &mut serve);
+    has(&o, &["ntpdate: the server is not synchronised (kiss-o'-death)\nstatus 1"]);
+    let o = s.cmd("ntpdate -q nosuch.invalid; echo status $?; ntpdate; echo status $?");
+    has(&o, &["ntpdate: nosuch.invalid: Name or service not known\nstatus 1", "usage: ntpdate [-q] [-p port] server\nstatus 2"]);
+}
