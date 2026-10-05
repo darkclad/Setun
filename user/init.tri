@@ -16,6 +16,24 @@ fn spawn(path: *char, name: *char) -> int {
     return pid;
 }
 
+// A daemon, with its messages in a log file rather than on the console.
+fn spawn_logged(path: *char, name: *char, log: *char) -> int {
+    var pid: int = fork();
+    if (pid == 0) {
+        var fd: int = open(log, O_WRONLY + O_CREAT + O_APPEND, 384);       // 0600
+        if (fd >= 0) {
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) { close(fd); }
+        }
+        var args: [2]*char = { name, null };
+        execve(path, &args[0], environ);
+        perror2("init", path);
+        _exit(127);
+    }
+    return pid;
+}
+
 // With a network attached, logins over telnet are served too.
 fn eth0_up() -> int {
     var s: int = socket(AF_INET, SOCK_DGRAM, 0);
@@ -33,9 +51,9 @@ fn main(argc: int, argv: **char) -> int {
     puts(", starting /bin/login\n");
     var pid: int = spawn("/bin/login", "login");
     if (eth0_up()) {
-        puts("init: eth0 is up, starting /sbin/telnetd and /sbin/sshd\n");
-        spawn("/sbin/telnetd", "telnetd");
-        spawn("/sbin/sshd", "sshd");
+        puts("init: eth0 is up, starting /sbin/telnetd and /sbin/sshd (logs in /var/log)\n");
+        spawn_logged("/sbin/telnetd", "telnetd", "/var/log/telnetd.log");
+        spawn_logged("/sbin/sshd", "sshd", "/var/log/sshd.log");
     }
     var quick_failures: int = 0;
     loop {

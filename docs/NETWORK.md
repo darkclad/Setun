@@ -155,7 +155,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N5 | `nc`, `netstat`, `telnetd`; docs | log in through `setun --net` with a real host socket; many sessions at once |
 | N6 | SSH: a random-number device, the crypto library, `sshd` (§8) ✅ | RFC test vectors; the host's OpenSSH logs in, runs commands and a pty session, moves 120 KB each way; refusals of other algorithms, wrong passwords, a non-SSH-2 client, an overlong line and a tampered packet |
 | N7 | outbound TCP through a NAT to host sockets, DNS at 10.0.2.3, a resolver, `host`, `wget` (§9) ✅ | Trinux reaches servers on the host (as 10.0.2.2 and as an outside address), refusals, the NAT turned off; DNS from the host's resolver and fixed names, NXDOMAIN, a server that is not there, an illegal name, FORMERR; `wget` text, 23 893 octets, 404, https, an unknown name |
-| N8 | public-key login for `sshd` ✅; an `ssh` client in Trinux | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file |
+| N8 | public-key login for `sshd`; an `ssh` client and `ssh-keygen` in Trinux (§10) ✅ | Ed25519 verification (RFC vectors, altered message and signature, S = L, a non-point key); login with the host's key, refusals of an unlisted key, an RSA key, the wrong user, a world-writable file; the client by password and by key, known_hosts learned and a changed key refused, 3 wrong passwords, a refused port, an unknown name, a pty session, `~.` |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -279,7 +279,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 | | |
 |---|---|
 | Key exchange | `curve25519-sha256` (also `@libssh.org`), RFC 8731; strict KEX (`kex-strict-s-v00@openssh.com`, the Terrapin fix): sequence numbers restart after NEWKEYS and nothing else may come during the first exchange; re-keying when the client asks |
-| Host key | `ssh-ed25519`, made on first start: `/etc/ssh/ssh_host_ed25519_key` (the 32-octet seed in hex, mode 0600) and `.pub` in OpenSSH's format; the boot log shows its `SHA256:` fingerprint |
+| Host key | `ssh-ed25519`, made on first start: `/etc/ssh/ssh_host_ed25519_key` (the 32-octet seed in hex, mode 0600) and `.pub` in OpenSSH's format; `/var/log/sshd.log` shows its `SHA256:` fingerprint |
 | Cipher | `chacha20-poly1305@openssh.com`. The tag is checked before anything is decrypted; a bad tag ends the connection |
 | Login | `publickey`: `ssh-ed25519` keys listed in `~/.ssh/authorized_keys` (one `ssh-ed25519 BASE64 comment` per line; the file is ignored if group or others may write it), with the PK_OK query and the RFC 4252 §7 signature over the session id and the request. `password`, checked against `/etc/shadow` like `login(1)`; empty passwords are never accepted. An unknown user is refused the same way as a wrong password or key; after 6 failures the server disconnects |
 | Sessions | one `session` channel per connection; `pty-req`, `shell`, `exec`, `window-change`; the exit code goes back as `exit-status` (or `exit-signal`) |
@@ -354,3 +354,32 @@ Not covered:
 - `host [-s server] name` asks DNS only, the way bind's `host` does.
 - `wget [-q] [-b] [-O file] URL`: HTTP/1.0 GET over `http://` only (no TLS). Text arrives as UTF-8 and is stored as characters (`-b` keeps the octets). The exit codes follow GNU wget: 4 for network trouble, 8 for an error answer.
 - Tests: `crates/trinux/tests/outbound.rs` runs real servers on the host inside the test (an echo server and a small HTTP server).
+
+## 10. The `ssh` client and `ssh-keygen` (N8)
+
+```
+$ ssh-keygen                                  # ~/.ssh/id_ed25519 and .pub
+$ cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys     # on the server
+$ ssh user@somehost 'uname -a'                # or: ssh -p 2222 -i key -t host
+```
+
+- **The transport** (`user/lib/ssh.tri`) is shared with `sshd`. `ssh_server` picks the side; `kex_client()` verifies the server's Ed25519 signature over H before it trusts anything.
+- **Host keys** live in `~/.ssh/known_hosts` as `host ssh-ed25519 BASE64` (or `[host]:port` off port 22).
+  - A new host is added with a warning, like OpenSSH's `StrictHostKeyChecking=accept-new`.
+  - A different key for a known host prints OpenSSH's warning and ends the connection (status 255).
+- **Login** tries `~/.ssh/id_ed25519` (or `-i`) with a signed publickey request, then a password typed with the echo off (3 tries).
+- **Session**:
+  - with no command on a terminal, or with `-t`: a pty, with the local terminal raw (no echo, canonical mode or signals) until the session ends;
+  - with a command: no pty, stdin's end sent as `CHANNEL_EOF`;
+  - `~.` at the start of a line disconnects;
+  - the exit status is the remote one (`exit-status`), or 255.
+- **Key files**: a Trinux private key is the 32-octet seed in hex (mode 0600). The `.pub` file is OpenSSH's one-line format, so it works in any `authorized_keys`. `ssh-keygen -l -f FILE` prints the fingerprint.
+- **Daemon logs**: init now starts `telnetd` and `sshd` with their output in `/var/log/telnetd.log` and `/var/log/sshd.log`, so they no longer write on the console.
+- **Cost**: a login costs both ends a key exchange. The client's side is two X25519 operations and a verification, about 210 M instructions; key login adds a signature. On loopback the two run on the same CPU.
+- **Tests** (`crates/trinux/tests/ssh_client.rs`, client and server both in Trinux, over loopback):
+  - password login, the host key learned and then known;
+  - 3 wrong passwords;
+  - `ssh-keygen` and key login with no password asked;
+  - a changed host key refused;
+  - a refused port and an unknown name;
+  - an interactive pty session left with `exit`, and one left with `~.`.

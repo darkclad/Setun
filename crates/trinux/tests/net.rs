@@ -481,7 +481,7 @@ fn telnet_logins() {
     s.idle(50_000_000);
     let o = s.cmd("ps");
     assert!(!o.contains("-sh") || o.matches("-sh").count() == 1, "the telnet shells are gone:\n{o}");
-    has(&s.out, &["telnetd: connection from 10.0.2.2"]);
+    has(&s.log("telnetd"), &["telnetd: connection from 10.0.2.2"]);
 }
 
 // ---- crypto for SSH ----------------------------------------------------------------------------

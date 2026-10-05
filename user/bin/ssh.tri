@@ -1,0 +1,576 @@
+// ssh [-p PORT] [-l USER] [-i KEY] [-t | -T] [USER@]HOST [COMMAND ...]
+//
+// The SSH client: the same transport as sshd (lib/ssh.tri), as the other
+// side. The server's host key is checked against ~/.ssh/known_hosts: a new
+// host is added (OpenSSH's StrictHostKeyChecking=accept-new); a changed key
+// ends the connection. Login tries the key ~/.ssh/id_ed25519 (or -i) and
+// then a password, three times. Without COMMAND, on a terminal, the
+// session is a shell on a pty, with the terminal in raw mode; "~." at the
+// start of a line disconnects. The exit status is the remote command's,
+// or 255 when ssh itself fails.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/string.tri";
+import "../lib/getopt.tri";
+import "../lib/pwd.tri";
+import "../lib/ssh.tri";
+import "../lib/sshkey.tri";
+
+var host: [243]char;
+var port: int = 22;
+var user: [81]char;
+var known_path: [300]char;
+var known: [6561]char;
+
+// ---- known hosts ---------------------------------------------------------------------------
+
+// The name a host is filed under: "host", or "[host]:port" off port 22.
+fn host_label(out: *char) {
+    if (port == 22) {
+        strcpy(out, &host[0]);
+        return;
+    }
+    var num: [15]char;
+    strcpy(out, "[");
+    strcat(out, &host[0]);
+    strcat(out, "]:");
+    strcat(out, itoa(port, &num[0]));
+}
+
+// ssh_host_key_ok, for the transport.
+fn check_host_key(blob: *tryte) -> int {
+    var label: [270]char;
+    host_label(&label[0]);
+    var ln: int = strlen(&label[0]);
+    var n: int = 0;
+    var fd: int = open(&known_path[0], O_RDONLY, 0);
+    if (fd >= 0) {
+        n = read(fd, &known[0], 6560);
+        close(fd);
+        if (n < 0) { n = 0; }
+    }
+    known[n] = 0;
+    var k: int = 0;
+    while (k < n) {
+        var e: int = k;
+        while (e < n && known[e] != '\n') { e += 1; }
+        // "label ssh-ed25519 BASE64"
+        if (e - k > ln && strncmp(&known[k], &label[0], ln) == 0 && known[k + ln] == ' ') {
+            var t: int = k + ln + 1;
+            if (strncmp(&known[t], "ssh-ed25519 ", 12) == 0) {
+                var b: int = t + 12;
+                var be: int = b;
+                while (be < e && known[be] != ' ' && known[be] != '\r') { be += 1; }
+                var kb: [64]tryte;
+                var m: int = base64_decode(&known[b], be - b, &kb[0], 64);
+                if (m == 51 && octets_equal(&kb[0], blob, 51)) { return 1; }
+                fputs(STDERR_FILENO, "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
+                fputs(STDERR_FILENO, "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n");
+                fputs(STDERR_FILENO, "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
+                var fp: [64]char;
+                key_fingerprint(blob, 51, &fp[0]);
+                fputs(STDERR_FILENO, "The ED25519 key sent by the remote host is\n");
+                fputs(STDERR_FILENO, &fp[0]);
+                fputs(STDERR_FILENO, ".\nThe key on record is in ");
+                fputs(STDERR_FILENO, &known_path[0]);
+                fputs(STDERR_FILENO, ".\nHost key verification failed.\n");
+                _exit(255);
+            }
+        }
+        k = e + 1;
+    }
+    // a new host: remember it
+    var line: [400]char;
+    strcpy(&line[0], &label[0]);
+    strcat(&line[0], " ssh-ed25519 ");
+    base64_encode(blob, 51, &line[strlen(&line[0])], 0);
+    strcat(&line[0], "\n");
+    fd = open(&known_path[0], O_WRONLY + O_CREAT + O_APPEND, 420);
+    if (fd >= 0) {
+        write(fd, &line[0], strlen(&line[0]));
+        close(fd);
+    }
+    fputs(STDERR_FILENO, "Warning: Permanently added '");
+    fputs(STDERR_FILENO, &label[0]);
+    fputs(STDERR_FILENO, "' (ED25519) to the list of known hosts.\n");
+    return 1;
+}
+
+// ---- authentication ------------------------------------------------------------------------
+
+var sign_buf: [600]tryte;
+
+// Try the key at path; 1 if it got us in.
+fn try_key(path: *char) -> int {
+    var sk: [64]tryte;
+    var pk: [32]tryte;
+    if (key_load(path, &sk[0], &pk[0]) < 0) { return 0; }
+    var blob: [51]tryte;
+    key_blob(&pk[0], &blob[0]);
+    out_start(SSH_MSG_USERAUTH_REQUEST);
+    put_utf8(&user[0]);
+    put_text("ssh-connection");
+    put_text("publickey");
+    put_byte(1);
+    put_text("ssh-ed25519");
+    put_string(&blob[0], 51);
+    // the signature covers the session id and this request so far
+    put_be32(&sign_buf[0], 32);
+    var k: int = 0;
+    while (k < 32) { sign_buf[4 + k] = session_id[k]; k += 1; }
+    k = 0;
+    while (k < out_len) { sign_buf[36 + k] = outp[k]; k += 1; }
+    var sig: [64]tryte;
+    ed25519_sign(&sig[0], &sign_buf[0], 36 + out_len, &sk[0]);
+    put_u32(83);
+    put_text("ssh-ed25519");
+    put_string(&sig[0], 64);
+    send_packet();
+    k = 0;
+    while (k < 64) { sk[k] = 0; k += 1; }
+    var t: int = read_auth_reply();
+    return t == SSH_MSG_USERAUTH_SUCCESS;
+}
+
+// The answer to an authentication request (banners are shown and skipped).
+fn read_auth_reply() -> int {
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_USERAUTH_BANNER) {
+            var msg: [2187]char;
+            get_utf8(&msg[0], 2187);
+            fputs(STDERR_FILENO, &msg[0]);
+            continue;
+        }
+        if (t == SSH_MSG_USERAUTH_SUCCESS || t == SSH_MSG_USERAUTH_FAILURE) { return t; }
+        disconnect(DISCONNECT_PROTOCOL_ERROR, "unexpected message during login");
+    }
+}
+
+// Ask for a password on the terminal, without echo.
+fn ask_password(buf: *char, max: int) -> int {
+    var prompt: [400]char;
+    strcpy(&prompt[0], &user[0]);
+    strcat(&prompt[0], "@");
+    strcat(&prompt[0], &host[0]);
+    strcat(&prompt[0], "'s password: ");
+    fputs(STDERR_FILENO, &prompt[0]);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n' || c[0] == '\r') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+        fputs(STDERR_FILENO, "\n");
+    }
+    return got ? n : -1;
+}
+
+fn login(identity: *char) {
+    out_start(SSH_MSG_SERVICE_REQUEST);
+    put_text("ssh-userauth");
+    send_packet();
+    if (read_packet() != SSH_MSG_SERVICE_ACCEPT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "the server will not authenticate"); }
+    if (try_key(identity)) { return; }
+    var tries: int = 0;
+    while (tries < 3) {
+        var pass: [243]char;
+        if (ask_password(&pass[0], 243) < 0) { break; }
+        out_start(SSH_MSG_USERAUTH_REQUEST);
+        put_utf8(&user[0]);
+        put_text("ssh-connection");
+        put_text("password");
+        put_byte(0);
+        put_utf8(&pass[0]);
+        send_packet();
+        var k: int = 0;
+        while (k < 243) { pass[k] = 0; k += 1; }
+        if (read_auth_reply() == SSH_MSG_USERAUTH_SUCCESS) { return; }
+        tries += 1;
+        if (tries < 3) { fputs(STDERR_FILENO, "Permission denied, please try again.\n"); }
+    }
+    fputs(STDERR_FILENO, &user[0]);
+    fputs(STDERR_FILENO, "@");
+    fputs(STDERR_FILENO, &host[0]);
+    fputs(STDERR_FILENO, ": Permission denied (publickey,password).\n");
+    _exit(255);
+}
+
+// ---- the session --------------------------------------------------------------------------
+
+const WINDOW: int = 59049;
+var rwin: int;                            // what the server lets us send
+var rmax: int;
+var lwin: int;
+var server_ch: int;
+var exit_code: int = 255;
+var got_status: int;
+var raw_tty: int;
+var saved_tty: termios;
+var dec: utf8_state;
+var dec_err: utf8_state;
+var text: [2187]char;
+var inbuf: [729]char;
+var pend: [6600]tryte;                    // typed input waiting for window
+var pend_len: int;
+var line_start: int = 1;                  // for "~."
+var tilde: int;
+
+fn restore_tty() {
+    if (raw_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_tty);
+        raw_tty = 0;
+    }
+}
+
+fn finish(code: int) {
+    restore_tty();
+    close(sock);
+    _exit(code);
+}
+
+// Wait for the reply to a channel request.
+fn channel_reply() -> int {
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_CHANNEL_SUCCESS) { return 1; }
+        if (t == SSH_MSG_CHANNEL_FAILURE) { return 0; }
+        if (t == SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+            get_u32();
+            rwin += get_u32();
+            continue;
+        }
+        if (t == SSH_MSG_GLOBAL_REQUEST) { continue; }
+        disconnect(DISCONNECT_PROTOCOL_ERROR, "unexpected message while starting the session");
+    }
+}
+
+fn flush_pending() {
+    var at: int = 0;
+    while (at < pend_len && rwin > 0) {
+        var n: int = pend_len - at;
+        if (n > rwin) { n = rwin; }
+        if (n > rmax) { n = rmax; }
+        out_start(SSH_MSG_CHANNEL_DATA);
+        put_u32(server_ch);
+        put_string(&pend[at], n);
+        send_packet();
+        rwin -= n;
+        at += n;
+    }
+    var k: int = 0;
+    while (at + k < pend_len) { pend[k] = pend[at + k]; k += 1; }
+    pend_len -= at;
+}
+
+fn write_all_fd(fd: int, p: *char, n: int) {
+    var k: int = 0;
+    while (k < n) {
+        var w: int = write(fd, p + k, n - k);
+        if (w <= 0) { return; }
+        k += w;
+    }
+}
+
+// One message from the server during the session.
+fn session_message(t: int) {
+    switch (t) {
+        case SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EXTENDED_DATA: {
+            get_u32();
+            var ext: int = t == SSH_MSG_CHANNEL_EXTENDED_DATA;
+            if (ext) { get_u32(); }
+            var at: int = 0;
+            var n: int = get_string(&at);
+            if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad CHANNEL_DATA"); }
+            if (n > lwin) { disconnect(DISCONNECT_PROTOCOL_ERROR, "the server ignored the window"); }
+            lwin -= n;
+            var done: int = 0;
+            while (done < n) {
+                var part: int = n - done > 2187 ? 2187 : n - done;
+                var m: int = utf8_to_text(ext ? &dec_err : &dec, &pkt[at + done], part, &text[0]);
+                write_all_fd(ext ? STDERR_FILENO : STDOUT_FILENO, &text[0], m);
+                done += part;
+            }
+            if (lwin < WINDOW / 2) {
+                out_start(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+                put_u32(server_ch);
+                put_u32(WINDOW - lwin);
+                send_packet();
+                lwin = WINDOW;
+            }
+        }
+        case SSH_MSG_CHANNEL_WINDOW_ADJUST: {
+            get_u32();
+            rwin += get_u32();
+            flush_pending();
+        }
+        case SSH_MSG_CHANNEL_REQUEST: {
+            get_u32();
+            var type: [64]char;
+            get_text(&type[0], 64);
+            var want: int = get_bool();
+            if (streq(&type[0], "exit-status")) {
+                exit_code = get_u32();
+                got_status = 1;
+            } else if (streq(&type[0], "exit-signal")) {
+                exit_code = 255;
+                got_status = 1;
+            }
+            if (want) {
+                out_start(SSH_MSG_CHANNEL_FAILURE);
+                put_u32(server_ch);
+                send_packet();
+            }
+        }
+        case SSH_MSG_CHANNEL_EOF: {}
+        case SSH_MSG_CHANNEL_CLOSE: {
+            out_start(SSH_MSG_CHANNEL_CLOSE);
+            put_u32(server_ch);
+            send_packet();
+            finish(exit_code);
+        }
+        case SSH_MSG_GLOBAL_REQUEST: {
+            var name: [64]char;
+            get_text(&name[0], 64);
+            if (get_bool()) {
+                out_start(SSH_MSG_REQUEST_FAILURE);
+                send_packet();
+            }
+        }
+        case SSH_MSG_KEXINIT: {
+            take_kexinit();
+            send_kexinit();
+            kex_client();
+        }
+        default: {}
+    }
+}
+
+fn session(command: *char, want_pty: int) {
+    out_start(SSH_MSG_CHANNEL_OPEN);
+    put_text("session");
+    put_u32(0);
+    put_u32(WINDOW);
+    put_u32(19683);
+    send_packet();
+    lwin = WINDOW;
+    loop {
+        var t: int = read_packet();
+        if (t == SSH_MSG_CHANNEL_OPEN_CONFIRMATION) { break; }
+        if (t == SSH_MSG_CHANNEL_OPEN_FAILURE) {
+            fputs(STDERR_FILENO, "ssh: the server refused a session\n");
+            finish(255);
+        }
+        if (t == SSH_MSG_GLOBAL_REQUEST) { continue; }
+        disconnect(DISCONNECT_PROTOCOL_ERROR, "unexpected message opening the session");
+    }
+    get_u32();
+    server_ch = get_u32();
+    rwin = get_u32();
+    rmax = get_u32();
+    if (bad || rmax < 1) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad CHANNEL_OPEN_CONFIRMATION"); }
+    if (rmax > 32768) { rmax = 32768; }
+    if (want_pty) {
+        var ws: winsize;
+        ws.ws_row = 24;
+        ws.ws_col = 80;
+        ioctl(STDIN_FILENO, TIOCGWINSZ, &ws as int);
+        var term: *char = getenv("TERM");
+        out_start(SSH_MSG_CHANNEL_REQUEST);
+        put_u32(server_ch);
+        put_text("pty-req");
+        put_byte(1);
+        put_text(term == null ? "vt100" : term);
+        put_u32(ws.ws_col);
+        put_u32(ws.ws_row);
+        put_u32(0);
+        put_u32(0);
+        put_string(&pend[0], 0);
+        send_packet();
+        if (!channel_reply()) { fputs(STDERR_FILENO, "ssh: PTY allocation request failed\n"); want_pty = 0; }
+    }
+    out_start(SSH_MSG_CHANNEL_REQUEST);
+    put_u32(server_ch);
+    put_text(command == null ? "shell" : "exec");
+    put_byte(1);
+    if (command != null) { put_utf8(command); }
+    send_packet();
+    if (!channel_reply()) {
+        fputs(STDERR_FILENO, "ssh: the server would not start the session\n");
+        finish(255);
+    }
+    if (want_pty && tcgetattr(STDIN_FILENO, &saved_tty) == 0) {
+        var raw: termios;
+        tcgetattr(STDIN_FILENO, &raw);
+        if (raw.c_lflag / ICANON % 2 != 0) { raw.c_lflag -= ICANON; }
+        if (raw.c_lflag / ECHO % 2 != 0) { raw.c_lflag -= ECHO; }
+        if (raw.c_lflag / ISIG % 2 != 0) { raw.c_lflag -= ISIG; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        raw_tty = 1;
+    }
+    var stdin_open: int = 1;
+    loop {
+        while (packet_ready()) {
+            var t: int = get_byte();
+            if (t == SSH_MSG_DISCONNECT) { finish(255); }
+            if (t == SSH_MSG_IGNORE || t == SSH_MSG_DEBUG || t == SSH_MSG_UNIMPLEMENTED) { continue; }
+            session_message(t);
+        }
+        var p: [2]pollfd;
+        p[0].fd = sock;
+        p[0].events = POLLIN;
+        p[1].fd = stdin_open && pend_len == 0 ? STDIN_FILENO : -1;
+        p[1].events = POLLIN;
+        if (poll(&p[0], 2, -1) < 0) {
+            if (errno == EINTR) { continue; }
+            finish(255);
+        }
+        if (p[0].revents != 0) { net_read(0); }
+        if (p[1].fd >= 0 && p[1].revents != 0) {
+            var n: int = read(STDIN_FILENO, &inbuf[0], 729);
+            if (n <= 0) {
+                stdin_open = 0;
+                if (!want_pty) {
+                    out_start(SSH_MSG_CHANNEL_EOF);
+                    put_u32(server_ch);
+                    send_packet();
+                }
+                continue;
+            }
+            var m: int = 0;
+            var k: int = 0;
+            while (k < n) {
+                var ch: char = inbuf[k];
+                k += 1;
+                // "~." at the start of a line disconnects (on a pty)
+                if (raw_tty && tilde) {
+                    tilde = 0;
+                    if (ch == '.') {
+                        fputs(STDERR_FILENO, "\nConnection to ");
+                        fputs(STDERR_FILENO, &host[0]);
+                        fputs(STDERR_FILENO, " closed.\n");
+                        finish(255);
+                    }
+                    if (ch != '~') { m += utf8_encode('~', &pend[pend_len + m]); }
+                }
+                if (raw_tty && line_start && ch == '~') { tilde = 1; continue; }
+                line_start = ch == '\r' || ch == '\n';
+                m += utf8_encode(ch, &pend[pend_len + m]);
+            }
+            pend_len += m;
+            flush_pending();
+        }
+    }
+}
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: ssh [-p port] [-l user] [-i key] [-t | -T] [user@]host [command ...]\n");
+    return 255;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var identity: [300]char;
+    identity[0] = 0;
+    var force_pty: int = 0;
+    var no_pty: int = 0;
+    user[0] = 0;
+    var c: int = getopt(argc, argv, "p:l:i:tT");
+    while (c != -1) {
+        switch (c) {
+            case 'p': { port = atoi(optarg); if (port <= 0 || port > 65535) { return usage(); } }
+            case 'l': { strncpy(&user[0], optarg, 80); user[80] = 0; }
+            case 'i': { strncpy(&identity[0], optarg, 290); identity[290] = 0; }
+            case 't': force_pty = 1;
+            case 'T': no_pty = 1;
+            default: return usage();
+        }
+        c = getopt(argc, argv, "p:l:i:tT");
+    }
+    if (optind >= argc) { return usage(); }
+    var target: *char = argv[optind];
+    var n: int = 0;
+    while (target[n] != 0 && target[n] != '@') { n += 1; }
+    if (target[n] == '@') {
+        var u: int = n > 80 ? 80 : n;
+        strncpy(&user[0], target, u);
+        user[u] = 0;
+        target = &target[n + 1];
+    }
+    strncpy(&host[0], target, 242);
+    host[242] = 0;
+    if (user[0] == 0) {
+        var pw: *passwd = getpwuid(getuid());
+        strcpy(&user[0], pw == null ? "root" : pw.pw_name);
+    }
+    // the command: the remaining arguments, joined by spaces
+    var cmd: [2187]char;
+    cmd[0] = 0;
+    var i: int = optind + 1;
+    while (i < argc) {
+        if (i > optind + 1) { strcat(&cmd[0], " "); }
+        strncat(&cmd[0], argv[i], 2000 - strlen(&cmd[0]));
+        i += 1;
+    }
+    var command: *char = argc > optind + 1 ? &cmd[0] : null;
+    var want_pty: int = !no_pty && (force_pty || (command == null && isatty(STDIN_FILENO)));
+    var home: *char = getenv("HOME");
+    if (home == null) { home = "/"; }
+    strncpy(&known_path[0], home, 250);
+    known_path[250] = 0;
+    strcat(&known_path[0], "/.ssh");
+    mkdir(&known_path[0], 448);
+    if (identity[0] == 0) {
+        strcpy(&identity[0], &known_path[0]);
+        strcat(&identity[0], "/id_ed25519");
+    }
+    strcat(&known_path[0], "/known_hosts");
+    var addr: int = 0;
+    if (!resolve_host(&host[0], &addr)) {
+        fputs(STDERR_FILENO, "ssh: Could not resolve hostname ");
+        fputs(STDERR_FILENO, &host[0]);
+        fputs(STDERR_FILENO, ": Name or service not known\n");
+        return 255;
+    }
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    var a: sockaddr_in;
+    sockaddr_set(&a, addr, port);
+    if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
+        var num: [15]char;
+        fputs(STDERR_FILENO, "ssh: connect to host ");
+        fputs(STDERR_FILENO, &host[0]);
+        fputs(STDERR_FILENO, " port ");
+        fputs(STDERR_FILENO, itoa(port, &num[0]));
+        fputs(STDERR_FILENO, ": ");
+        fputs(STDERR_FILENO, strerror(errno));
+        fputs(STDERR_FILENO, "\n");
+        return 255;
+    }
+    strcpy(&peer[0], inet_ntoa(addr));
+    ssh_server = 0;
+    ssh_host_key_ok = &check_host_key;
+    version_exchange();
+    send_kexinit();
+    if (read_packet() != SSH_MSG_KEXINIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEXINIT"); }
+    take_kexinit();
+    kex_client();
+    login(&identity[0]);
+    session(command, want_pty);
+    return 255;
+}

@@ -62,7 +62,7 @@ impl Default for Root {
 }
 
 /// Directories every tfs root gets (mount points and the like).
-pub const ROOT_DIRS: [&str; 8] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/etc", "/root", "/home/user"];
+pub const ROOT_DIRS: [&str; 10] = ["/dev", "/proc", "/tmp", "/home", "/mnt", "/etc", "/root", "/home/user", "/var", "/var/log"];
 
 /// Owners and modes that differ from the defaults (root:root, 0755 for
 /// programs and directories, 0644 for text): the password hashes are root's
@@ -136,7 +136,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest", "cryptotest", "host", "wget",
+        "nc", "ping", "netstat", "nettest", "cryptotest", "host", "wget", "ssh", "ssh-keygen",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }

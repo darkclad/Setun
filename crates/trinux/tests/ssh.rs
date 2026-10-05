@@ -105,7 +105,7 @@ fn booted() -> Option<(Session, u16)> {
 #[test]
 fn openssh_logs_in_and_runs_commands() {
     let Some((mut s, port)) = booted() else { return };
-    has(&s.out, &["sshd: host key ED25519 SHA256:"]);
+    has(&s.log("sshd"), &["sshd: host key ED25519 SHA256:"]);
     let (code, out, err) = run_ssh(&mut s, port, "root", "root", &[], "echo привет from $USER; id; exit 3");
     assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}\nconsole:\n{}", s.out);
     assert_eq!(out, "привет from root\nuid=0(root) gid=0(root) groups=0(root),10(wheel)\n");
@@ -116,7 +116,7 @@ fn openssh_logs_in_and_runs_commands() {
     let (code, _, err) = run_ssh(&mut s, port, "user", "nope", &[], "true");
     assert_eq!(code, 255, "{err}");
     assert!(err.contains("Permission denied"), "{err}");
-    has(&s.out, &["accepted password for root", "failed password for user"]);
+    has(&s.log("sshd"), &["accepted password for root", "failed password for user"]);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn an_interactive_session_on_a_pty() {
     assert!(out.contains("Welcome to Trinux"), "the motd: {out}");
     assert!(out.contains("TERM="), "{out}");
     assert!(out.contains("жук\r\n"), "UTF-8 both ways, CR LF on the pty: {out:?}");
-    has(&s.out, &["shell for root"]);
+    has(&s.log("sshd"), &["shell for root"]);
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn not_ssh_2() {
     s.run_until("the server hangs up", 300_000_000, |s| s.net.guest_closed(c));
     let got = String::from_utf8(s.net.recv(c)).unwrap();
     assert_eq!(got, "SSH-2.0-TrinuxSSH_0.1\r\nProtocol mismatch.\r\n");
-    has(&s.out, &["not SSH 2 from 10.0.2.2"]);
+    has(&s.log("sshd"), &["not SSH 2 from 10.0.2.2"]);
     // a line longer than the 255 RFC 4253 allows, before any version
     let c = s.net.connect(22);
     s.run_until("connected", 100_000_000, |s| s.net.state(c) == setun_net::State::Established);
@@ -187,7 +187,7 @@ fn not_ssh_2() {
     long.extend(b"\r\nSSH-2.0-late\r\n");
     s.net.send(c, &long);
     s.run_until("the server hangs up", 300_000_000, |s| s.net.guest_closed(c));
-    has(&s.out, &["an overlong line before the version from 10.0.2.2"]);
+    has(&s.log("sshd"), &["an overlong line before the version from 10.0.2.2"]);
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn a_tampered_packet_ends_the_connection() {
     });
     let (code, _, err) = run_ssh(&mut s, port, "root", "root", &[], "true");
     assert_eq!(code, 255, "{err}");
-    has(&s.out, &["disconnecting: message authentication failed"]);
+    has(&s.log("sshd"), &["disconnecting: message authentication failed"]);
 }
 
 /// A new key pair from the host's ssh-keygen: (private key path, public line).
@@ -257,14 +257,14 @@ fn public_key_logins() {
     let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
     let (code, out, err) = run_ssh(&mut s, port, "root", "unused", &o, "echo by key; whoami");
     assert_eq!((code, out.as_str()), (0, "by key\nroot\n"), "{err}");
-    has(&s.out, &["accepted publickey for root"]);
+    has(&s.log("sshd"), &["accepted publickey for root"]);
     // a key that is not in the file
     let opts = with_key(&other);
     let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
     let (code, _, err) = run_ssh(&mut s, port, "root", "unused", &o, "true");
     assert_eq!(code, 255);
     assert!(err.contains("Permission denied (publickey,password)"), "{err}");
-    has(&s.out, &["key not authorized for root"]);
+    has(&s.log("sshd"), &["key not authorized for root"]);
     // an RSA key, even one listed: only ssh-ed25519
     let opts = with_key(&rsa);
     let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();
@@ -279,5 +279,5 @@ fn public_key_logins() {
     s.cmd("chmod 666 /root/.ssh/authorized_keys");
     let (code, _, _) = run_ssh(&mut s, port, "root", "unused", &o, "true");
     assert_eq!(code, 255);
-    has(&s.out, &["ignored (group or others may write it): /root/.ssh/authorized_keys"]);
+    has(&s.log("sshd"), &["ignored (group or others may write it): /root/.ssh/authorized_keys"]);
 }

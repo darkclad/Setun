@@ -31,16 +31,25 @@ impl Session {
         }
         let mut s = Session { m, net, out: String::new(), mark: 0, udp_echo: None };
         s.wait_for("login: ", 400_000_000);
-        if link {
-            // let the network daemons finish starting (sshd makes its host
-            // key) so their messages do not land in the middle of a test's output
-            s.until("sshd listening", 3_000_000_000, |o| o.contains("sshd: listening on port 22"));
-        }
         s.send("root\n");
         s.wait_for("Password: ", 100_000_000);
         s.send("root\n");
         s.wait_prompt(200_000_000);
+        if link {
+            // let sshd finish starting (it makes its host key) before a test begins
+            let mut tries = 0;
+            while !s.cmd("cat /var/log/sshd.log 2>/dev/null").contains("sshd: listening on port 22") {
+                tries += 1;
+                assert!(tries < 300, "sshd did not start:\n{}", s.out);
+                s.idle(10_000_000);
+            }
+        }
         s
+    }
+
+    /// What a daemon has logged so far (/var/log/NAME.log).
+    pub fn log(&mut self, name: &str) -> String {
+        self.cmd(&format!("cat /var/log/{name}.log"))
     }
 
     pub fn step(&mut self) {

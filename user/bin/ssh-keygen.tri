@@ -1,0 +1,105 @@
+// ssh-keygen [-f FILE] [-C COMMENT]     make an ssh-ed25519 key (default ~/.ssh/id_ed25519)
+// ssh-keygen -l -f FILE                 show a key's fingerprint (FILE or FILE.pub)
+//
+// Trinux keeps the private key as a hex seed (see lib/sshkey.tri); the
+// .pub file is OpenSSH's format.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/sshkey.tri";
+
+fn main(argc: int, argv: **char) -> int {
+    var file: [300]char;
+    file[0] = 0;
+    var comment: [200]char;
+    comment[0] = 0;
+    var list: int = 0;
+    var c: int = getopt(argc, argv, "f:C:l");
+    while (c != -1) {
+        switch (c) {
+            case 'f': { strncpy(&file[0], optarg, 290); file[290] = 0; }
+            case 'C': { strncpy(&comment[0], optarg, 190); comment[190] = 0; }
+            case 'l': list = 1;
+            default: {
+                fputs(STDERR_FILENO, "usage: ssh-keygen [-f file] [-C comment] | ssh-keygen -l -f file\n");
+                return 1;
+            }
+        }
+        c = getopt(argc, argv, "f:C:l");
+    }
+    var home: *char = getenv("HOME");
+    if (home == null) { home = "/"; }
+    if (file[0] == 0) {
+        strncpy(&file[0], home, 250);
+        file[250] = 0;
+        strcat(&file[0], "/.ssh");
+        mkdir(&file[0], 448);                         // 0700
+        strcat(&file[0], "/id_ed25519");
+    }
+    if (comment[0] == 0) {
+        var u: *char = getenv("USER");
+        strcpy(&comment[0], u == null ? "user" : u);
+        strcat(&comment[0], "@setun");
+    }
+    var sk: [64]tryte;
+    var pk: [32]tryte;
+    if (list) {
+        // the private key, or the .pub line
+        var r: int = key_load(&file[0], &sk[0], &pk[0]);
+        if (r < 0) {
+            var text: [400]char;
+            var fd: int = open(&file[0], O_RDONLY, 0);
+            if (fd < 0) { perror2("ssh-keygen", &file[0]); return 1; }
+            var n: int = read(fd, &text[0], 399);
+            close(fd);
+            if (n < 13 || strncmp(&text[0], "ssh-ed25519 ", 12) != 0) {
+                fputs(STDERR_FILENO, "ssh-keygen: ");
+                fputs(STDERR_FILENO, &file[0]);
+                fputs(STDERR_FILENO, " is not a key file.\n");
+                return 1;
+            }
+            var e: int = 12;
+            while (e < n && text[e] != ' ' && text[e] != '\n') { e += 1; }
+            var blob: [64]tryte;
+            if (base64_decode(&text[12], e - 12, &blob[0], 64) != 51) {
+                fputs(STDERR_FILENO, "ssh-keygen: a broken key\n");
+                return 1;
+            }
+            var k: int = 0;
+            while (k < 32) { pk[k] = blob[19 + k]; k += 1; }
+        }
+        var blob2: [51]tryte;
+        key_blob(&pk[0], &blob2[0]);
+        var fp: [64]char;
+        key_fingerprint(&blob2[0], 51, &fp[0]);
+        puts("256 ");
+        puts(&fp[0]);
+        puts(" (ED25519)\n");
+        return 0;
+    }
+    var st: stat_t;
+    if (stat(&file[0], &st) == 0) {
+        fputs(STDERR_FILENO, "ssh-keygen: ");
+        fputs(STDERR_FILENO, &file[0]);
+        fputs(STDERR_FILENO, " already exists\n");
+        return 1;
+    }
+    puts("Generating public/private ed25519 key pair.\n");
+    if (key_create(&file[0], &comment[0], &pk[0]) < 0) { perror2("ssh-keygen", &file[0]); return 1; }
+    var blob: [51]tryte;
+    key_blob(&pk[0], &blob[0]);
+    var fp: [64]char;
+    key_fingerprint(&blob[0], 51, &fp[0]);
+    puts("Your identification has been saved in ");
+    puts(&file[0]);
+    puts("\nYour public key has been saved in ");
+    puts(&file[0]);
+    puts(".pub\nThe key fingerprint is:\n");
+    puts(&fp[0]);
+    puts(" ");
+    puts(&comment[0]);
+    puts("\n");
+    return 0;
+}
