@@ -123,13 +123,13 @@ fn bn_bit(a: *int, i: int) -> int {
 
 // ---- Montgomery ------------------------------------------------------------------------------
 
-var _t: [263]int;
+var _bn_t: [263]int;
 
 // o = a·b·R^-1 mod m (o may be a or b).
 fn mont_mul(md: *mont, o: *int, a: *int, b: *int) {
     var n: int = md.n;
     var m: *int = &md.m[0];
-    var t: *int = &_t[0];
+    var t: *int = &_bn_t[0];
     var k: int = 0;
     while (k < n + 2) { t[k] = 0; k += 1; }
     var i: int = 0;

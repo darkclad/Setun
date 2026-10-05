@@ -1,0 +1,720 @@
+// x509.tri: X.509 certificates (RFC 5280) for TLS: a DER reader, the
+// certificate fields a client needs, signature checks (RSA PKCS #1 v1.5,
+// ECDSA P-256/P-384, Ed25519), host-name matching against the subject
+// alternative names (RFC 6125, one leftmost wildcard label), and chain
+// building to a trust store read from PEM (/etc/ssl/cert.pem).
+
+import "ecdsa.tri";
+import "rsa.tri";
+import "c25519.tri";
+import "base64.tri";
+
+const KEY_RSA: int = 1;
+const KEY_P256: int = 2;
+const KEY_P384: int = 3;
+const KEY_ED25519: int = 4;
+
+const SIG_RSA_PKCS1: int = 1;                // = RSA_PKCS1
+const SIG_RSA_PSS: int = 2;                  // = RSA_PSS
+const SIG_ECDSA: int = 3;
+const SIG_ED25519: int = 4;
+
+// Why a chain was refused (x509_error names them).
+const X509_E_PARSE: int = -1;
+const X509_E_ALG: int = -2;
+const X509_E_EXPIRED: int = -3;
+const X509_E_NOTYET: int = -4;
+const X509_E_ISSUER: int = -5;
+const X509_E_SIG: int = -6;
+const X509_E_HOST: int = -7;
+const X509_E_CA: int = -8;
+const X509_E_DEPTH: int = -9;
+const X509_E_CRIT: int = -10;
+const X509_E_SELF: int = -11;
+const X509_E_PURPOSE: int = -12;
+const X509_E_OPEN: int = -13;
+
+const X509_MAX_CHAIN: int = 9;               // certificates from a server
+const X509_MAX_STORE: int = 81;              // trusted roots
+
+struct x509 {
+    p: *tryte;                               // the whole certificate (DER)
+    len: int;
+    tbs: int;                                // offsets into p
+    tbslen: int;
+    version: int;                            // 1 or 3
+    issuer: int;                             // the Name, tag and all
+    issuerlen: int;
+    subject: int;
+    subjectlen: int;
+    not_before: int;                         // seconds since 1970
+    not_after: int;
+    key: int;                                // KEY_*
+    pub: int;                                // EC point / Ed25519 key / RSA modulus
+    publen: int;
+    e: int;                                  // RSA exponent
+    elen: int;
+    sigscheme: int;                          // SIG_*
+    sighash: int;                            // HASH_*
+    sig: int;
+    siglen: int;
+    san: int;                                // the GeneralNames' contents (0: none)
+    sanlen: int;
+    ca: int;                                 // basicConstraints cA
+    pathlen: int;                            // -1: no limit
+    ku: int;                                 // the first keyUsage octet, -1: absent
+    eku_server: int;                         // -1: no EKU, 0: EKU without serverAuth, 1: with
+    crit: int;                               // a critical extension this does not handle
+}
+
+// ---- DER --------------------------------------------------------------------------------------
+
+var _dt: int;                                // the last element's tag,
+var _dc: int;                                // its contents' offset
+var _dl: int;                                // and length
+
+// Read the element at off (before end): its tag, contents and length in
+// _dt, _dc, _dl; the offset after it, or -1 if it is not well formed DER.
+fn der_next(p: *tryte, off: int, end: int) -> int {
+    if (off + 2 > end) { return -1; }
+    _dt = p[off];
+    if (_dt % 32 == 31) { return -1; }       // high tag numbers: never in a certificate
+    var l: int = p[off + 1];
+    off += 2;
+    if (l >= 128) {
+        var k: int = l - 128;
+        if (k == 0 || k > 3 || off + k > end) { return -1; }
+        l = 0;
+        while (k > 0) { l = l * 256 + p[off]; off += 1; k -= 1; }
+        if (l < 128) { return -1; }          // DER: the short form when it fits
+    }
+    if (off + l > end) { return -1; }
+    _dc = off;
+    _dl = l;
+    return off + l;
+}
+
+// Expect an element with this tag; the offset after it, or -1.
+fn der_expect(p: *tryte, off: int, end: int, tag: int) -> int {
+    var nx: int = der_next(p, off, end);
+    if (nx < 0 || _dt != tag) { return -1; }
+    return nx;
+}
+
+fn _hx(c: int) -> int { return c <= '9' ? c - '0' : c - 'a' + 10; }
+
+// 1 if the n octets at p are the hex string h.
+fn der_is(p: *tryte, n: int, h: *char) -> int {
+    var k: int = 0;
+    while (k < n) {
+        if (h[2 * k] == 0 || p[k] != _hx(h[2 * k]) * 16 + _hx(h[2 * k + 1])) { return 0; }
+        k += 1;
+    }
+    return h[2 * n] == 0;
+}
+
+// ---- times ------------------------------------------------------------------------------------
+
+fn _digits(p: *tryte, n: int) -> int {
+    var v: int = 0;
+    var k: int = 0;
+    while (k < n) {
+        if (p[k] < '0' || p[k] > '9') { return -1; }
+        v = v * 10 + p[k] - '0';
+        k += 1;
+    }
+    return v;
+}
+
+// Days from 1970-01-01 to y-m-d (proleptic Gregorian, y >= 1600).
+fn days_from_civil(y: int, m: int, d: int) -> int {
+    if (m <= 2) { y -= 1; }
+    var era: int = y / 400;
+    var yoe: int = y - era * 400;
+    var mp: int = m > 2 ? m - 3 : m + 9;
+    var doy: int = (153 * mp + 2) / 5 + d - 1;
+    var doe: int = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// A UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ) at the
+// last element read: seconds since 1970, or -1.
+fn _der_time(p: *tryte) -> int {
+    var s: *tryte = p + _dc;
+    var y: int;
+    if (_dt == 23 && _dl == 13) {
+        y = _digits(s, 2);
+        if (y < 0) { return -1; }
+        y += y < 50 ? 2000 : 1900;
+        s = s + 2;
+    } else if (_dt == 24 && _dl == 15) {
+        y = _digits(s, 4);
+        s = s + 4;
+    } else {
+        return -1;
+    }
+    var mo: int = _digits(s, 2);
+    var d: int = _digits(s + 2, 2);
+    var h: int = _digits(s + 4, 2);
+    var mi: int = _digits(s + 6, 2);
+    var se: int = _digits(s + 8, 2);
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 60 || s[10] != 'Z') {
+        return -1;
+    }
+    return ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se;
+}
+
+// ---- algorithms -------------------------------------------------------------------------------
+
+// The signatureAlgorithm at the last element read (an AlgorithmIdentifier)
+// into c.sigscheme (0 for one this does not know), c.sighash; 0, or X509_E_PARSE.
+fn _sig_alg(c: *x509, p: *tryte) -> int {
+    var end: int = _dc + _dl;
+    var nx: int = der_expect(p, _dc, end, 6);
+    if (nx < 0) { return X509_E_PARSE; }
+    var o: *tryte = p + _dc;
+    var ol: int = _dl;
+    // RSA's parameters are NULL (or absent); the others have none
+    var params: int = nx < end;
+    if (params && (der_expect(p, nx, end, 5) != end || _dl != 0)) { params = 2; }
+    c.sigscheme = 0;
+    if (der_is(o, ol, "2a864886f70d01010b")) { c.sigscheme = SIG_RSA_PKCS1; c.sighash = HASH_SHA256; }
+    else if (der_is(o, ol, "2a864886f70d01010c")) { c.sigscheme = SIG_RSA_PKCS1; c.sighash = HASH_SHA384; }
+    else if (der_is(o, ol, "2a864886f70d01010d")) { c.sigscheme = SIG_RSA_PKCS1; c.sighash = HASH_SHA512; }
+    else if (der_is(o, ol, "2a8648ce3d040302")) { c.sigscheme = SIG_ECDSA; c.sighash = HASH_SHA256; }
+    else if (der_is(o, ol, "2a8648ce3d040303")) { c.sigscheme = SIG_ECDSA; c.sighash = HASH_SHA384; }
+    else if (der_is(o, ol, "2a8648ce3d040304")) { c.sigscheme = SIG_ECDSA; c.sighash = HASH_SHA512; }
+    else if (der_is(o, ol, "2b6570")) { c.sigscheme = SIG_ED25519; c.sighash = 0; }
+    if (c.sigscheme != 0 && (params == 2 || (params && c.sigscheme != SIG_RSA_PKCS1))) { return X509_E_PARSE; }
+    return 0;                                // unknown (sigscheme 0): refused only where it matters
+}
+
+// The SubjectPublicKeyInfo at the last element read into c.key, c.pub...
+fn _spki(c: *x509, p: *tryte) -> int {
+    var end: int = _dc + _dl;
+    var nx: int = der_expect(p, _dc, end, 48);           // AlgorithmIdentifier
+    if (nx < 0) { return X509_E_PARSE; }
+    var aend: int = nx;
+    var a2: int = der_expect(p, _dc, aend, 6);
+    if (a2 < 0) { return X509_E_PARSE; }
+    var o: *tryte = p + _dc;
+    var ol: int = _dl;
+    var bs: int = der_expect(p, nx, end, 3);             // the key, a BIT STRING
+    if (bs != end || _dl < 1 || p[_dc] != 0) { return X509_E_PARSE; }
+    var k: int = _dc + 1;
+    var kl: int = _dl - 1;
+    c.key = 0;
+    if (der_is(o, ol, "2a864886f70d010101")) {
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        if (der_expect(p, k, k + kl, 48) != k + kl) { return X509_E_PARSE; }
+        var send: int = _dc + _dl;
+        var n2: int = der_expect(p, _dc, send, 2);
+        if (n2 < 0) { return X509_E_PARSE; }
+        c.pub = _dc;
+        c.publen = _dl;
+        if (der_expect(p, n2, send, 2) != send) { return X509_E_PARSE; }
+        c.e = _dc;
+        c.elen = _dl;
+        c.key = KEY_RSA;
+    } else if (der_is(o, ol, "2a8648ce3d0201")) {
+        if (der_expect(p, a2, aend, 6) != aend) { return X509_E_PARSE; }
+        if (der_is(p + _dc, _dl, "2a8648ce3d030107")) { c.key = KEY_P256; }
+        else if (der_is(p + _dc, _dl, "2b81040022")) { c.key = KEY_P384; }
+        else { return X509_E_ALG; }
+        c.pub = k;
+        c.publen = kl;
+    } else if (der_is(o, ol, "2b6570")) {
+        if (a2 != aend || kl != 32) { return X509_E_PARSE; }
+        c.key = KEY_ED25519;
+        c.pub = k;
+        c.publen = kl;
+    } else {
+        return X509_E_ALG;
+    }
+    return 0;
+}
+
+// One extension (the last element read is its SEQUENCE).
+fn _extension(c: *x509, p: *tryte) -> int {
+    var end: int = _dc + _dl;
+    var nx: int = der_expect(p, _dc, end, 6);
+    if (nx < 0) { return X509_E_PARSE; }
+    var o: *tryte = p + _dc;
+    var ol: int = _dl;
+    var critical: int = 0;
+    var n2: int = der_next(p, nx, end);
+    if (n2 < 0) { return X509_E_PARSE; }
+    if (_dt == 1) {
+        if (_dl != 1) { return X509_E_PARSE; }
+        critical = p[_dc] != 0;
+        n2 = der_next(p, n2, end);
+        if (n2 < 0) { return X509_E_PARSE; }
+    }
+    if (_dt != 4 || n2 != end) { return X509_E_PARSE; }
+    var v: int = _dc;
+    var vend: int = _dc + _dl;
+    if (der_is(o, ol, "551d11")) {                       // subjectAltName
+        if (der_expect(p, v, vend, 48) != vend) { return X509_E_PARSE; }
+        c.san = _dc;
+        c.sanlen = _dl;
+    } else if (der_is(o, ol, "551d13")) {                // basicConstraints
+        if (der_expect(p, v, vend, 48) != vend) { return X509_E_PARSE; }
+        var q: int = _dc;
+        var qend: int = _dc + _dl;
+        if (q < qend) {
+            var q2: int = der_next(p, q, qend);
+            if (q2 < 0) { return X509_E_PARSE; }
+            if (_dt == 1) {
+                if (_dl != 1) { return X509_E_PARSE; }
+                c.ca = p[_dc] != 0;
+                q = q2;
+            }
+        }
+        if (q < qend) {
+            if (der_expect(p, q, qend, 2) != qend || _dl > 2) { return X509_E_PARSE; }
+            c.pathlen = _dl == 1 ? p[_dc] : p[_dc] * 256 + p[_dc + 1];
+        }
+    } else if (der_is(o, ol, "551d0f")) {                // keyUsage
+        if (der_expect(p, v, vend, 3) != vend || _dl < 2) { return X509_E_PARSE; }
+        c.ku = p[_dc + 1];
+    } else if (der_is(o, ol, "551d25")) {                // extKeyUsage
+        if (der_expect(p, v, vend, 48) != vend) { return X509_E_PARSE; }
+        c.eku_server = 0;
+        var q: int = _dc;
+        var qend: int = _dc + _dl;
+        while (q < qend) {
+            q = der_expect(p, q, qend, 6);
+            if (q < 0) { return X509_E_PARSE; }
+            if (der_is(p + _dc, _dl, "2b06010505070301") || der_is(p + _dc, _dl, "551d2500")) { c.eku_server = 1; }
+        }
+    } else if (critical) {
+        c.crit = 1;                                      // nameConstraints, policies...: not handled
+    }
+    return 0;
+}
+
+// Parse the certificate p (len octets) into c; 0, or X509_E_*.
+fn x509_parse(c: *x509, p: *tryte, len: int) -> int {
+    c.p = p;
+    c.len = len;
+    c.san = 0;
+    c.sanlen = 0;
+    c.ca = 0;
+    c.pathlen = -1;
+    c.ku = -1;
+    c.eku_server = -1;
+    c.crit = 0;
+    if (der_expect(p, 0, len, 48) != len) { return X509_E_PARSE; }
+    var end: int = len;
+    var off: int = der_expect(p, _dc, end, 48);         // tbsCertificate
+    if (off < 0) { return X509_E_PARSE; }
+    c.tbs = _dc - (_dl < 128 ? 2 : _dl < 256 ? 3 : _dl < 65536 ? 4 : 5);
+    c.tbslen = off - c.tbs;
+    var tend: int = _dc + _dl;
+    var t: int = _dc;
+    // version [0] EXPLICIT, absent for v1
+    c.version = 1;
+    var t2: int = der_next(p, t, tend);
+    if (t2 < 0) { return X509_E_PARSE; }
+    if (_dt == 160) {
+        if (der_expect(p, _dc, _dc + _dl, 2) != t2 || _dl != 1 || p[_dc] > 2) { return X509_E_PARSE; }
+        c.version = p[_dc] + 1;
+        t = t2;
+    }
+    t = der_expect(p, t, tend, 2);                       // serialNumber
+    if (t < 0) { return X509_E_PARSE; }
+    var a0: int = t;
+    t = der_expect(p, t, tend, 48);                      // signature
+    if (t < 0) { return X509_E_PARSE; }
+    var r: int = _sig_alg(c, p);
+    if (r < 0) { return r; }
+    var alen: int = t - a0;
+    c.issuer = t;
+    t = der_expect(p, t, tend, 48);
+    if (t < 0) { return X509_E_PARSE; }
+    c.issuerlen = t - c.issuer;
+    t = der_expect(p, t, tend, 48);                      // validity
+    if (t < 0) { return X509_E_PARSE; }
+    var vend: int = _dc + _dl;
+    var v2: int = der_next(p, _dc, vend);
+    if (v2 < 0) { return X509_E_PARSE; }
+    c.not_before = _der_time(p);
+    if (der_next(p, v2, vend) != vend) { return X509_E_PARSE; }
+    c.not_after = _der_time(p);
+    if (c.not_before < 0 || c.not_after < 0) { return X509_E_PARSE; }
+    c.subject = t;
+    t = der_expect(p, t, tend, 48);
+    if (t < 0) { return X509_E_PARSE; }
+    c.subjectlen = t - c.subject;
+    t = der_expect(p, t, tend, 48);                      // subjectPublicKeyInfo
+    if (t < 0) { return X509_E_PARSE; }
+    r = _spki(c, p);
+    if (r < 0) { return r; }
+    while (t < tend) {
+        t = der_next(p, t, tend);
+        if (t < 0) { return X509_E_PARSE; }
+        if (_dt == 129 || _dt == 130) { continue; }      // unique identifiers
+        if (_dt != 163 || c.version != 3) { return X509_E_PARSE; }
+        var xend: int = _dc + _dl;
+        if (der_expect(p, _dc, xend, 48) != xend) { return X509_E_PARSE; }
+        var x: int = _dc;
+        xend = _dc + _dl;
+        while (x < xend) {
+            x = der_expect(p, x, xend, 48);
+            if (x < 0) { return X509_E_PARSE; }
+            r = _extension(c, p);
+            if (r < 0) { return r; }
+        }
+    }
+    // signatureAlgorithm must repeat the inner one; then the signature
+    var a1: int = off;
+    off = der_expect(p, off, end, 48);
+    if (off < 0 || off - a1 != alen || !octets_equal(p + a1, p + a0, alen)) { return X509_E_PARSE; }
+    if (der_expect(p, off, end, 3) != end || _dl < 1 || p[_dc] != 0) { return X509_E_PARSE; }
+    c.sig = _dc + 1;
+    c.siglen = _dl - 1;
+    return 0;
+}
+
+// ---- signatures -------------------------------------------------------------------------------
+
+var _x509_ready: int;
+
+// 1 if sig (slen octets) is key's signature of m (n octets), made with
+// scheme (SIG_*) and hash id (HASH_*; none for Ed25519).
+fn pk_verify(key: *x509, scheme: int, id: int, m: *tryte, n: int, sig: *tryte, slen: int) -> int {
+    var kp: *tryte = key.p;
+    if (scheme == SIG_ED25519) {
+        if (key.key != KEY_ED25519 || slen != 64) { return 0; }
+        return ed25519_verify(sig, m, n, kp + key.pub);
+    }
+    var h: [64]tryte;
+    hash_octets(id, m, n, &h[0]);
+    if (scheme == SIG_RSA_PKCS1 || scheme == SIG_RSA_PSS) {
+        if (key.key != KEY_RSA) { return 0; }
+        return rsa_verify(scheme, id, kp + key.pub, key.publen, kp + key.e, key.elen, sig, slen, &h[0]);
+    }
+    if (scheme != SIG_ECDSA || (key.key != KEY_P256 && key.key != KEY_P384)) { return 0; }
+    // Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+    if (der_expect(sig, 0, slen, 48) != slen) { return 0; }
+    var send: int = _dc + _dl;
+    var s2: int = der_expect(sig, _dc, send, 2);
+    if (s2 < 0 || _dl < 1 || sig[_dc] >= 128) { return 0; }
+    var r: int = _dc;
+    var rl: int = _dl;
+    if (der_expect(sig, s2, send, 2) != send || _dl < 1 || sig[_dc] >= 128) { return 0; }
+    return ecdsa_verify(key.key == KEY_P256 ? CURVE_P256 : CURVE_P384, kp + key.pub, key.publen, &h[0], hash_len(id),
+        sig + r, rl, sig + _dc, _dl);
+}
+
+// 1 if issuer's key signed c.
+fn x509_signed_by(c: *x509, issuer: *x509) -> int {
+    return pk_verify(issuer, c.sigscheme, c.sighash, c.p + c.tbs, c.tbslen, c.p + c.sig, c.siglen);
+}
+
+// ---- names ------------------------------------------------------------------------------------
+
+fn _lower(c: int) -> int { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+// 1 if the DNS name pattern (n octets at p, perhaps *.x.y) covers host.
+fn _dns_match(p: *tryte, n: int, host: *char) -> int {
+    var hl: int = strlen(host);
+    if (hl > 0 && host[hl - 1] == '.') { hl -= 1; }      // an absolute name
+    var k: int = 0;
+    if (n >= 3 && p[0] == '*' && p[1] == '.') {
+        // the wildcard stands for exactly one whole leftmost label
+        var dot: int = 0;
+        while (dot < hl && host[dot] != '.') { dot += 1; }
+        if (dot == 0 || dot == hl) { return 0; }
+        if (hl - dot != n - 1) { return 0; }
+        k = 1;
+        while (k < n) {
+            if (_lower(p[k]) != _lower(host[dot + k - 1])) { return 0; }
+            k += 1;
+        }
+        // not a wildcard for a public suffix's direct children ("*.com")
+        var dots: int = 0;
+        k = 2;
+        while (k < n) { if (p[k] == '.') { dots += 1; } k += 1; }
+        return dots >= 1;
+    }
+    if (n != hl) { return 0; }
+    while (k < n) {
+        if (p[k] == '*' || _lower(p[k]) != _lower(host[k])) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+// host as a dotted IPv4 address into 4 octets; 1 if it is one.
+fn _ipv4(host: *char, out: *tryte) -> int {
+    var k: int = 0;
+    var part: int = 0;
+    while (part < 4) {
+        var v: int = 0;
+        var nd: int = 0;
+        while (host[k] >= '0' && host[k] <= '9' && nd < 4) { v = v * 10 + host[k] - '0'; k += 1; nd += 1; }
+        if (nd == 0 || v > 255) { return 0; }
+        out[part] = v as tryte;
+        part += 1;
+        if (part < 4) {
+            if (host[k] != '.') { return 0; }
+            k += 1;
+        }
+    }
+    return host[k] == 0;
+}
+
+// 1 if c's subject alternative names cover host (a name or an IPv4 address).
+fn x509_host_ok(c: *x509, host: *char) -> int {
+    if (c.san == 0) { return 0; }                        // no fallback to the common name
+    var p: *tryte = c.p;
+    var ip: [4]tryte;
+    var is_ip: int = _ipv4(host, &ip[0]);
+    var q: int = c.san;
+    var end: int = c.san + c.sanlen;
+    while (q < end) {
+        q = der_next(p, q, end);
+        if (q < 0) { return 0; }
+        if (_dt == 130 && !is_ip && _dns_match(p + _dc, _dl, host)) { return 1; }
+        if (_dt == 135 && is_ip && _dl == 4 && octets_equal(p + _dc, &ip[0], 4)) { return 1; }
+    }
+    return 0;
+}
+
+fn _same_name(a: *tryte, al: int, b: *tryte, bl: int) -> int {
+    return al == bl && octets_equal(a, b, al);
+}
+
+// ---- PEM and the trust store ------------------------------------------------------------------
+
+struct pem_set {
+    certs: *x509;                            // room for max certificates
+    max: int;
+    n: int;
+    der: *tryte;                             // their DER, room for dermax octets
+    dermax: int;
+    used: int;
+}
+
+var _pem_text: [19683]char;
+var _pem_b64: [6561]char;
+var _pem_line: [729]char;
+
+// Add the certificates of a PEM file to set: how many were added, or
+// X509_E_OPEN if the file cannot be read. strict: refuse the file (with
+// the reason) if one does not parse or fit; otherwise skip such ones.
+fn x509_read_pem(set: *pem_set, path: *char, strict: int) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return X509_E_OPEN; }
+    var added: int = 0;
+    var inside: int = 0;
+    var bn: int = 0;
+    var ln: int = 0;
+    var eof: int = 0;
+    var bad: int = 0;
+    while (!eof) {
+        var got: int = read(fd, &_pem_text[0], 19683);
+        if (got <= 0) { eof = 1; _pem_text[0] = '\n'; got = 1; }     // end the last line
+        var k: int = 0;
+        while (k < got) {
+            var ch: int = _pem_text[k];
+            k += 1;
+            if (ch != '\n') {
+                if (ch != '\r' && ln < 728) { _pem_line[ln] = ch as char; ln += 1; }
+                continue;
+            }
+            _pem_line[ln] = 0;
+            ln = 0;
+            if (!inside) {
+                if (streq(&_pem_line[0], "-----BEGIN CERTIFICATE-----")) { inside = 1; bn = 0; }
+                continue;
+            }
+            if (!streq(&_pem_line[0], "-----END CERTIFICATE-----")) {
+                var j: int = 0;
+                while (_pem_line[j] != 0) {
+                    if (bn >= 6561) { bad = X509_E_PARSE; }
+                    else { _pem_b64[bn] = _pem_line[j]; bn += 1; }
+                    j += 1;
+                }
+                continue;
+            }
+            inside = 0;
+            var r: int = X509_E_DEPTH;
+            if (set.n < set.max) {
+                var d: *tryte = set.der + set.used;
+                var n: int = base64_decode(&_pem_b64[0], bn, d, set.dermax - set.used);
+                r = X509_E_PARSE;
+                if (n > 0) { r = x509_parse(&set.certs[set.n], d, n); }
+                if (r == 0) {
+                    set.used += n;
+                    set.n += 1;
+                    added += 1;
+                }
+            }
+            if (r < 0 && bad == 0) { bad = r; }
+        }
+    }
+    close(fd);
+    if (inside && bad == 0) { bad = X509_E_PARSE; }
+    if (strict && bad < 0) { return bad; }
+    return added;
+}
+
+var _store_certs: [81]x509;
+var _store_der: [177147]tryte;                           // 3^11
+var _store: pem_set;
+
+// Add a PEM file's certificates to the trust store (those that parse).
+fn x509_load_store(path: *char) -> int {
+    if (_store.certs == null) {
+        _store.certs = &_store_certs[0];
+        _store.max = X509_MAX_STORE;
+        _store.der = &_store_der[0];
+        _store.dermax = 177147;
+    }
+    return x509_read_pem(&_store, path, 0);
+}
+
+fn x509_store_count() -> int { return _store.n; }
+fn x509_store_cert(k: int) -> *x509 { return &_store_certs[k]; }
+
+// The value of the first attribute oid (hex) of a Name (at off, len octets
+// in p) into out (max chars, non-ASCII as '?'); 1 if there is one.
+fn _name_attr(p: *tryte, off: int, len: int, oid: *char, out: *char, max: int) -> int {
+    out[0] = 0;
+    if (der_expect(p, off, off + len, 48) < 0) { return 0; }
+    var q: int = _dc;
+    var end: int = _dc + _dl;
+    while (q < end) {
+        q = der_expect(p, q, end, 49);                   // a RelativeDistinguishedName
+        if (q < 0) { return 0; }
+        var a: int = _dc;
+        var aend: int = _dc + _dl;
+        while (a < aend) {
+            a = der_expect(p, a, aend, 48);
+            if (a < 0) { return 0; }
+            var vend: int = _dc + _dl;
+            var v: int = der_expect(p, _dc, vend, 6);
+            if (v < 0) { return 0; }
+            if (der_is(p + _dc, _dl, oid) && der_next(p, v, vend) == vend) {
+                var k: int = 0;
+                while (k < _dl && k < max - 1) {
+                    var ch: int = p[_dc + k];
+                    out[k] = (ch >= 32 && ch < 127 ? ch : '?') as char;
+                    k += 1;
+                }
+                out[k] = 0;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// A short name for c's subject (issuer: its issuer): the common name, else
+// the organisation.
+fn x509_name(c: *x509, issuer: int, out: *char, max: int) {
+    var off: int = issuer ? c.issuer : c.subject;
+    var len: int = issuer ? c.issuerlen : c.subjectlen;
+    if (!_name_attr(c.p, off, len, "550403", out, max)) { _name_attr(c.p, off, len, "55040a", out, max); }
+}
+
+// ---- chains -----------------------------------------------------------------------------------
+
+fn x509_error(e: int) -> *char {
+    if (e == X509_E_PARSE) { return "malformed certificate"; }
+    if (e == X509_E_ALG) { return "unsupported certificate algorithm"; }
+    if (e == X509_E_EXPIRED) { return "certificate has expired"; }
+    if (e == X509_E_NOTYET) { return "certificate is not yet valid"; }
+    if (e == X509_E_ISSUER) { return "unable to get local issuer certificate"; }
+    if (e == X509_E_SIG) { return "certificate signature failure"; }
+    if (e == X509_E_HOST) { return "certificate does not match the host name"; }
+    if (e == X509_E_CA) { return "invalid CA certificate"; }
+    if (e == X509_E_DEPTH) { return "certificate chain too long"; }
+    if (e == X509_E_CRIT) { return "unhandled critical extension"; }
+    if (e == X509_E_SELF) { return "self-signed certificate"; }
+    if (e == X509_E_PURPOSE) { return "unsupported certificate purpose"; }
+    if (e == X509_E_OPEN) { return "cannot read the certificate file"; }
+    return "certificate verify failed";
+}
+
+fn _valid_at(c: *x509, now: int) -> int {
+    if (now < c.not_before) { return X509_E_NOTYET; }
+    if (now > c.not_after) { return X509_E_EXPIRED; }
+    return 0;
+}
+
+// May c issue certificates, with depth more CAs below it?
+fn _can_issue(c: *x509, below: int) -> int {
+    if (c.version != 3 || !c.ca) { return 0; }
+    if (c.ku >= 0 && c.ku % 8 / 4 == 0) { return 0; }  // keyCertSign (bit 5)
+    return c.pathlen < 0 || below <= c.pathlen;
+}
+
+// Verify a server's chain (chain[0] its own certificate, then what it sent
+// to help) for host at time now (seconds since 1970) against the trust
+// store; 0, or X509_E_*. host 0: no name check.
+fn x509_verify_chain(chain: *x509, n: int, host: *char, now: int) -> int {
+    if (n < 1) { return X509_E_PARSE; }
+    var leaf: *x509 = &chain[0];
+    if (host != null && !x509_host_ok(leaf, host)) { return X509_E_HOST; }
+    if (leaf.eku_server == 0) { return X509_E_PURPOSE; }
+    if (leaf.ku >= 0 && leaf.ku / 128 == 0) { return X509_E_PURPOSE; }      // TLS 1.3 needs digitalSignature
+    var cur: *x509 = leaf;
+    var used: [9]int;
+    var k: int = 0;
+    while (k < 9) { used[k] = 0; k += 1; }
+    used[0] = 1;
+    var depth: int = 0;                                  // CAs between cur and the leaf
+    var sigfail: int = 0;
+    while (depth < X509_MAX_CHAIN) {
+        if (cur.crit) { return X509_E_CRIT; }
+        if (cur.sigscheme == 0) { return X509_E_ALG; }   // SHA-1, MD5, RSA-PSS...
+        var r: int = _valid_at(cur, now);
+        if (r < 0) { return r; }
+        // a trusted root first (also when the server sent its own copy of it)
+        k = 0;
+        while (k < _store.n) {
+            var t: *x509 = &_store_certs[k];
+            if (_same_name(t.p + t.subject, t.subjectlen, cur.p + cur.issuer, cur.issuerlen)) {
+                if (x509_signed_by(cur, t)) {
+                    r = _valid_at(t, now);
+                    return r;
+                }
+                sigfail = 1;
+            }
+            k += 1;
+        }
+        // the store may hold cur itself (a trusted self-signed server, or a root sent along)
+        k = 0;
+        while (k < _store.n) {
+            var t2: *x509 = &_store_certs[k];
+            if (t2.len == cur.len && octets_equal(t2.p, cur.p, cur.len)) { return 0; }
+            k += 1;
+        }
+        if (_same_name(cur.p + cur.subject, cur.subjectlen, cur.p + cur.issuer, cur.issuerlen)) {
+            return depth == 0 ? X509_E_SELF : X509_E_ISSUER;
+        }
+        // then a CA the server sent
+        var next: *x509 = null;
+        k = 1;
+        while (k < n && next == null) {
+            var s: *x509 = &chain[k];
+            if (!used[k] && _same_name(s.p + s.subject, s.subjectlen, cur.p + cur.issuer, cur.issuerlen)) {
+                if (!_can_issue(s, depth)) { return X509_E_CA; }
+                if (x509_signed_by(cur, s)) {
+                    next = s;
+                    used[k] = 1;
+                } else {
+                    sigfail = 1;
+                }
+            }
+            k += 1;
+        }
+        if (next == null) { return sigfail ? X509_E_SIG : X509_E_ISSUER; }
+        cur = next;
+        depth += 1;
+    }
+    return X509_E_DEPTH;
+}

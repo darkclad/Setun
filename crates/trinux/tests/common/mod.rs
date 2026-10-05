@@ -118,6 +118,27 @@ impl Session {
         let body = text.splitn(2, '\n').nth(1).unwrap_or("");
         body.strip_suffix("$ ").unwrap_or(body).to_string()
     }
+
+    /// Write a text file in Trinux (through a here-document, typed a line
+    /// at a time so the terminal's input buffer never overflows).
+    pub fn put_file(&mut self, path: &str, text: &str) {
+        assert!(!text.lines().any(|l| l == "EOF"));
+        let start = self.out.len();
+        let mut line = format!("cat > {path} <<'EOF'");
+        for next in text.lines().chain(["EOF"]) {
+            self.mark = self.out.len();
+            self.send(&format!("{line}\n"));
+            self.until(&line, 100_000_000, |o| o.ends_with("> "));
+            line = next.to_string();
+        }
+        self.mark = self.out.len();
+        self.send("EOF
+");
+        self.until("EOF", 200_000_000, |o| o.ends_with("$ "));
+        let o = self.out[start..].to_string();
+        self.mark = self.out.len();
+        assert!(!o.contains("sh:") && !o.contains("cat:"), "{o}");
+    }
 }
 
 pub fn has(out: &str, wants: &[&str]) {
