@@ -154,7 +154,7 @@ unsafe extern "C" fn jit_store_tryte(cpu: *mut Cpu, mem: *mut Memory, va: i64, v
 /// The ALU functions compiled code calls directly: pure, setting no flag
 /// but S (which is the result's sign), never faulting.
 fn alu_by_helper(f: i64) -> bool {
-    matches!(f, alu::MIN | alu::MAX | alu::TMUL | alu::TSAT | alu::CONS | alu::SH | alu::TRIT | alu::TLZ)
+    matches!(f, alu::MIN | alu::MAX | alu::TMUL | alu::TSAT | alu::CONS | alu::SH | alu::TRIT | alu::TLZ | alu::BSH)
 }
 
 /// One of those (`x`, `y`: words).
@@ -169,6 +169,7 @@ extern "C" fn jit_alu(f: i64, x: i64, y: i64) -> i64 {
         alu::SH => a.shift(y.clamp(-40, 40) as i32),
         alu::TRIT if (1..=27).contains(&y) => Word::new(a.trit(y as usize) as i64).expect("a trit"),
         alu::TRIT => Word::ZERO,
+        alu::BSH => Word::new(crate::isa::bin_alu(f, x, y)).expect("wrapped"),
         _ => Word::new(a.leading_zero_trits() as i64).expect("a count"), // TLZ
     };
     r.value()
@@ -844,6 +845,38 @@ impl Jit {
                         g.leave(pc, unrun);
                         g.enter(divide);
                         let r = if d.f as i64 == alu::DIV { g.b.ins().sdiv(a, c) } else { g.b.ins().srem(a, c) };
+                        g.b.def_var(g.s_var, r);
+                        g.set(x, r);
+                    }
+                    Op::AluR | Op::AluK if matches!(d.f as i64, alu::BAND | alu::BOR | alu::BXOR | alu::BANDN) => {
+                        // an i64 in two's complement is the unlimited-width
+                        // pattern; results stay within 2^42, so one wrap does
+                        let a = g.get(y);
+                        let c = if d.op == Op::AluR { g.get(z) } else { g.b.ins().iconst(I64, d.imm) };
+                        let v = match d.f as i64 {
+                            alu::BAND => g.b.ins().band(a, c),
+                            alu::BOR => g.b.ins().bor(a, c),
+                            alu::BXOR => g.b.ins().bxor(a, c),
+                            _ => g.b.ins().band_not(a, c),
+                        };
+                        let r = g.wrap(v).0;
+                        g.b.def_var(g.s_var, r);
+                        g.set(x, r);
+                    }
+                    Op::Bfld => {
+                        let a = g.get(y);
+                        let (pos, len) = (d.imm, d.imm2 as i64);
+                        let mask = (1i64 << len) - 1;
+                        let r = if d.f as i64 == crate::isa::fld::BEXT {
+                            let s = g.b.ins().sshr_imm_s(a, pos.min(63));
+                            g.b.ins().band_imm_s(s, mask)
+                        } else {
+                            let v = g.b.ins().band_imm_s(a, mask);
+                            let l = g.b.ins().ishl_imm_s(v, pos);
+                            let h = g.b.ins().ushr_imm_s(v, len - pos);
+                            let o = g.b.ins().bor(l, h);
+                            g.b.ins().band_imm_s(o, mask)
+                        };
                         g.b.def_var(g.s_var, r);
                         g.set(x, r);
                     }

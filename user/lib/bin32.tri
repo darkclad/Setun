@@ -1,9 +1,8 @@
 // bin32.tri: binary arithmetic on 32-bit values for the crypto code.
 //
 // A 32-bit value is an int in 0 .. 2^32-1 (a word holds ±3.8·10^12, so
-// it fits with room to spare). Adding, shifting and rotating are plain
-// arithmetic. XOR and AND have no ternary instruction, so they go octet by
-// octet through two 256×256 tables built once (bin32_init) on the heap.
+// it fits with room to spare). The binary instructions (ISA §3.3.1: BAND,
+// BXOR, BEXT, BROT...) do the work; each function here is one or two of them.
 
 import "tlibc.tri";
 import "stdlib.tri";
@@ -11,65 +10,28 @@ import "u32.tri";                     // TWO32
 
 const MASK32: int = 4294967295;
 
-var _xor8: *tryte;
-var _and8: *tryte;
 var _pow2: [33]int;
 
+// Kept for the callers: the powers of two (no tables are needed any more).
 fn bin32_init() {
-    if (_xor8 != null) { return; }
-    _xor8 = malloc(65536);
-    _and8 = malloc(65536);
+    if (_pow2[0] != 0) { return; }
     var k: int = 0;
     var p: int = 1;
     while (k <= 32) { _pow2[k] = p; p *= 2; k += 1; }
-    // x op y from (x/2 op y/2) and the low bits: every entry needs only
-    // entries already made (smaller indexes)
-    var a: int = 0;
-    while (a < 256) {
-        var b: int = 0;
-        while (b < 256) {
-            var i: int = a * 256 + b;
-            var up: int = (a / 2) * 256 + b / 2;
-            var la: int = a % 2;
-            var lb: int = b % 2;
-            if (a == 0 && b == 0) {
-                _xor8[0] = 0;
-                _and8[0] = 0;
-            } else {
-                _xor8[i] = (_xor8[up] * 2 + (la != lb)) as tryte;
-                _and8[i] = (_and8[up] * 2 + la * lb) as tryte;
-            }
-            b += 1;
-        }
-        a += 1;
-    }
 }
 
-fn pow2(k: int) -> int { return _pow2[k]; }
+fn pow2(k: int) -> int { return bsh(1, k); }
 
-fn xor32(a: int, b: int) -> int {
-    var r: int = _xor8[(a / 16777216) * 256 + b / 16777216];
-    r = r * 256 + _xor8[(a / 65536 % 256) * 256 + b / 65536 % 256];
-    r = r * 256 + _xor8[(a / 256 % 256) * 256 + b / 256 % 256];
-    return r * 256 + _xor8[(a % 256) * 256 + b % 256];
-}
-
-fn and32(a: int, b: int) -> int {
-    var r: int = _and8[(a / 16777216) * 256 + b / 16777216];
-    r = r * 256 + _and8[(a / 65536 % 256) * 256 + b / 65536 % 256];
-    r = r * 256 + _and8[(a / 256 % 256) * 256 + b / 256 % 256];
-    return r * 256 + _and8[(a % 256) * 256 + b % 256];
-}
-
+fn xor32(a: int, b: int) -> int { return bxor(a, b); }
+fn and32(a: int, b: int) -> int { return band(a, b); }
 fn not32(a: int) -> int { return MASK32 - a; }
+fn xor8(a: int, b: int) -> int { return bxor(a, b); }
+fn add32(a: int, b: int) -> int { return bext(a + b, 0, 32); }
 
-fn xor8(a: int, b: int) -> int { return _xor8[a * 256 + b]; }
-
-fn add32(a: int, b: int) -> int { return (a + b) % TWO32; }
-
+// (a constant count is one BROT: brot(x, n, 32) rotates left by n)
 fn rotr32(x: int, n: int) -> int { return x / _pow2[n] + x % _pow2[n] * _pow2[32 - n]; }
 fn rotl32(x: int, n: int) -> int { return rotr32(x, 32 - n); }
-fn shr32(x: int, n: int) -> int { return x / _pow2[n]; }
+fn shr32(x: int, n: int) -> int { return bsh(x, -n); }
 
 // Big- and little-endian 32-bit loads and stores of octets.
 fn be32(p: *tryte) -> int { return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]; }

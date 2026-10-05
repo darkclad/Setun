@@ -78,7 +78,7 @@ fn cat<const N: usize>(parts: [&[Word]; N]) -> Vec<Word> {
 
 #[test]
 fn reserved_alu_functions_are_illegal() {
-    for b in [0, -1, -22, 23, 100, 9841] {
+    for b in [0, -1, -22, -23, 28, 100, 9841] {
         assert_eq!(fault(&[rrr(op::ALU, b, 1, 2, 3)]), vector::ILLEGAL, "ALU B={b}");
         assert_eq!(fault(&[rrr(op::ALUQ, b, 1, 2, 3)]), vector::ILLEGAL, "ALUQ B={b}");
         assert_eq!(fault(&isa::wide(op::ALUI, b, 1, 2, 3)), vector::ILLEGAL, "ALUI B={b}");
@@ -95,7 +95,7 @@ fn reserved_memory_io_fld_sys_functions_are_illegal() {
         assert_eq!(fault(&[rrr(op::IO, b, 1, 0, 0)]), vector::ILLEGAL, "IO B={b}");
         assert_eq!(fault(&isa::wide(op::IOI, b, 1, 0, 0)), vector::ILLEGAL, "IOI B={b}");
     }
-    for b in [0, 3, -1] {
+    for b in [0, 5, -1, -3] {
         assert_eq!(fault(&isa::fld(b, 1, 2, 1, 1)), vector::ILLEGAL, "FLD B={b}");
     }
     for b in [11, 12, -1, -4] {
@@ -112,6 +112,23 @@ fn bad_trit_fields_are_illegal() {
     // The edges are fine.
     assert_eq!(fault(&isa::fld(fld::EXT, 1, 2, 1, 27)), NO_FAULT);
     assert_eq!(fault(&isa::fld(fld::EXT, 1, 2, 27, 1)), NO_FAULT);
+}
+
+#[test]
+fn bad_bit_fields_are_illegal() {
+    for (pos, len) in [(-1, 8), (81, 8), (0, 0), (0, 42), (5, -1)] {
+        assert_eq!(fault(&isa::fld(fld::BEXT, 1, 2, pos, len)), vector::ILLEGAL, "BEXT pos {pos} len {len}");
+    }
+    for (pos, len) in [(-1, 8), (8, 8), (9, 8), (0, 0), (0, 42), (41, 41)] {
+        assert_eq!(fault(&isa::fld(fld::BROT, 1, 2, pos, len)), vector::ILLEGAL, "BROT pos {pos} len {len}");
+    }
+    // The edges are fine.
+    for (pos, len) in [(0, 1), (80, 1), (0, 41), (80, 41)] {
+        assert_eq!(fault(&isa::fld(fld::BEXT, 1, 2, pos, len)), NO_FAULT, "BEXT pos {pos} len {len}");
+    }
+    for (pos, len) in [(0, 1), (0, 41), (40, 41), (31, 32)] {
+        assert_eq!(fault(&isa::fld(fld::BROT, 1, 2, pos, len)), NO_FAULT, "BROT pos {pos} len {len}");
+    }
 }
 
 #[test]

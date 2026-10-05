@@ -180,6 +180,9 @@ These are not functions: each compiles to one instruction or a few.
 | `trit(x, i)` | trit `i` (1 = most significant … 27) | `TRIT` |
 | `ext(x, pos, len)` `ins(x, v, pos, len)` | read / write a trit field (constant `pos`, `len`) | `EXT`, `INS` |
 | `tlz(x)` | leading zero trits | `TLZ` |
+| `band(a, b)` `bor(a, b)` `bxor(a, b)` `bandn(a, b)` | binary AND / OR / XOR / a AND NOT b, on two's-complement values (ISA §3.3.1) | `BAND` … `BANDN` |
+| `bsh(x, n)` | x·2^n, or ⌊x / 2^−n⌋ for n < 0 | `BSH` |
+| `bext(x, pos, len)` `brot(x, n, len)` | bits pos..pos+len−1; the low len bits rotated left by n (constant `pos`/`n`, `len`) | `BEXT`, `BROT` |
 | `mulh(a, b)` | high word of the 54-trit product | `MULH` |
 | `bytes(p)` | first tryte of a word-addressed object | `SUB 1` |
 | `in(port)` `out(port, v)` | port I/O | `IN`, `OUT` |

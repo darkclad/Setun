@@ -582,3 +582,118 @@ fn user_program_under_paging_faults_into_kernel() {
     assert_eq!(m.cr(cr::FADDR), 9843, "FADDR = the second word");
     assert_eq!(m.cr(cr::EPC), 9840);
 }
+
+// ---- binary operations (ISA §3.3.1) ----------------------------------------
+
+const W_MAX: i64 = 3_812_798_742_493;
+const W_MOD: i64 = 7_625_597_484_987;
+
+/// One binary ALU operation on two values, run on the machine.
+fn bin(f: i64, a: i64, b: i64) -> i64 {
+    let mut m = M::new(1);
+    let mut p = Prog::at(0);
+    p.i2(li(1, a)).i2(li(2, b)).i(r(f, 3, 1, 2)).i(hlt());
+    m.run(&p);
+    m.r(3)
+}
+
+fn field(f: i64, a: i64, pos: i64, len: i64) -> i64 {
+    let mut m = M::new(1);
+    let mut p = Prog::at(0);
+    p.i2(li(1, a)).i2(isa::fld(f, 3, 1, pos, len)).i(hlt());
+    m.run(&p);
+    m.r(3)
+}
+
+#[test]
+fn binary_logic_on_32_bit_values() {
+    let vals: [u32; 6] = [0xdead_beef, 0x0f0f_1234, 0, 0xffff_ffff, 0x8000_0001, 0x1234_5678];
+    for &a in &vals {
+        for &b in &vals {
+            let (x, y) = (a as i64, b as i64);
+            assert_eq!(bin(alu::BAND, x, y), (a & b) as i64, "{a:#x} & {b:#x}");
+            assert_eq!(bin(alu::BOR, x, y), (a | b) as i64, "{a:#x} | {b:#x}");
+            assert_eq!(bin(alu::BXOR, x, y), (a ^ b) as i64, "{a:#x} ^ {b:#x}");
+            assert_eq!(bin(alu::BANDN, x, y), (a & !b) as i64, "{a:#x} & !{b:#x}");
+        }
+    }
+}
+
+#[test]
+fn binary_logic_on_negative_and_huge_values() {
+    // two's complement of unlimited width: −1 is all ones
+    assert_eq!(bin(alu::BAND, -1, 12345), 12345);
+    assert_eq!(bin(alu::BXOR, -1, 12345), -12346);
+    assert_eq!(bin(alu::BOR, -5, 3), -5);
+    assert_eq!(bin(alu::BAND, -8, -3), -8);
+    assert_eq!(bin(alu::BANDN, 0xff, -16), 0xf);
+    // results past the word range wrap modulo 3^27
+    let low = (1i64 << 42) - 1 - W_MAX; // W_MAX's missing bits below 2^42
+    assert_eq!(W_MAX | low, (1i64 << 42) - 1);
+    assert_eq!(bin(alu::BOR, W_MAX, low), (1i64 << 42) - 1 - W_MOD);
+    let wrap = |v: i64| if v > W_MAX { v - W_MOD } else if v < -W_MAX { v + W_MOD } else { v };
+    let edges = [W_MAX, -W_MAX, low, -low, 1 << 41, -(1 << 41), W_MAX - 1, -W_MAX + 1, 0x2aa_aaaa_aaaa, -0x155_5555_5555];
+    let mut wrapped = 0;
+    for &a in &edges {
+        for &b in &edges {
+            for (f, v) in [(alu::BAND, a & b), (alu::BOR, a | b), (alu::BXOR, a ^ b), (alu::BANDN, a & !b)] {
+                wrapped += (wrap(v) != v) as i32;
+                assert_eq!(bin(f, a, b), wrap(v), "f {f} on {a} {b}");
+            }
+        }
+    }
+    assert!(wrapped > 10, "the edges wrap ({wrapped})");
+}
+
+#[test]
+fn binary_shifts() {
+    assert_eq!(bin(alu::BSH, 5, 3), 40);
+    assert_eq!(bin(alu::BSH, -40, -3), -5);
+    assert_eq!(bin(alu::BSH, -1, -1), -1); // floor, as an arithmetic shift
+    assert_eq!(bin(alu::BSH, 7, -1), 3);
+    assert_eq!(bin(alu::BSH, -7, -1), -4);
+    assert_eq!(bin(alu::BSH, 1 << 41, 1), (1i64 << 42) - W_MOD); // wraps
+    assert_eq!(bin(alu::BSH, 12345, 0), 12345);
+    assert_eq!(bin(alu::BSH, W_MAX, -100), 0); // limited to −81
+    assert_eq!(bin(alu::BSH, -W_MAX, -100), -1);
+    // 3·2^81 modulo 3^27, from the definition
+    let mut v: i128 = 3;
+    for _ in 0..81 {
+        v = (v * 2).rem_euclid(W_MOD as i128);
+    }
+    let want = if v > W_MAX as i128 { v - W_MOD as i128 } else { v } as i64;
+    assert_eq!(bin(alu::BSH, 3, 9841), want);
+}
+
+#[test]
+fn bit_fields() {
+    assert_eq!(field(fld::BEXT, 0xdead_beef, 8, 8), 0xbe);
+    assert_eq!(field(fld::BEXT, 0xdead_beef, 0, 32), 0xdead_beef);
+    assert_eq!(field(fld::BEXT, 0x1_dead_beef, 0, 32), 0xdead_beef); // mod 2^32
+    assert_eq!(field(fld::BEXT, -1, 70, 41), (1i64 << 41) - 1);
+    assert_eq!(field(fld::BEXT, -2, 0, 4), 14);
+    assert_eq!(field(fld::BEXT, W_MAX, 80, 1), 0);
+    assert_eq!(field(fld::BROT, 0x8000_0001, 1, 32), 3);
+    assert_eq!(field(fld::BROT, 0x1234_5678, 8, 32), 0x3456_7812);
+    assert_eq!(field(fld::BROT, 0x1234_5678, 0, 32), 0x1234_5678);
+    assert_eq!(field(fld::BROT, -1, 5, 41), (1i64 << 41) - 1);
+    assert_eq!(field(fld::BROT, 0b1011, 1, 4), 0b0111);
+}
+
+/// The ChaCha20 quarter round in binary instructions: RFC 8439 §2.1.1.
+#[test]
+fn chacha_quarter_round() {
+    let mut m = M::new(1);
+    let mut p = Prog::at(0);
+    p.i2(li(1, 0x1111_1111)).i2(li(2, 0x0102_0304)).i2(li(3, 0x9b8d_6f43)).i2(li(4, 0x0123_4567));
+    // a += b; d ^= a; d <<<= 16 ... (each sum cut to 32 bits)
+    for (a, b, d, n) in [(1, 2, 4, 16), (3, 4, 2, 12), (1, 2, 4, 8), (3, 4, 2, 7)] {
+        p.i(r(alu::ADD, a, a, b))
+            .i2(isa::fld(fld::BEXT, a, a, 0, 32))
+            .i(r(alu::BXOR, d, d, a))
+            .i2(isa::fld(fld::BROT, d, d, n, 32));
+    }
+    p.i(hlt());
+    m.run(&p);
+    assert_eq!([m.r(1), m.r(2), m.r(3), m.r(4)], [0xea2a_92f4, 0xcb1c_f8ce, 0x4581_472e, 0x5881_c4bb]);
+}

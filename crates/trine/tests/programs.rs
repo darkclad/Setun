@@ -504,3 +504,24 @@ fn math_library() {
     assert_eq!(o, Outcome::Exit(0), "{serial}");
     assert_eq!(serial, "2.71828182846 0.69314718056 0.841470984808 -0.588002603548 1.26765060023e+30 3.76219569108 ");
 }
+
+#[test]
+fn binary_builtins() {
+    assert_eq!(exit("fn main() -> int { return bxor(0xdeadbeef, 0x0f0f1234); }"), 0xdead_beef ^ 0x0f0f_1234);
+    assert_eq!(exit("fn main() -> int { var a: int = 0xdeadbeef; return band(a, 0xff00ff00) + bor(a, 1) - bandn(a, 0xffff); }"),
+        (0xdead_beef & 0xff00_ff00) + (0xdead_beef | 1) - (0xdead_beef & !0xffff));
+    assert_eq!(exit("fn main() -> int { return bsh(5, 3) * 1000 + bsh(-7, -1); }"), 40_000 - 4);
+    assert_eq!(exit("fn main() -> int { var a: int = 0xdeadbeef; return bext(a, 8, 8); }"), 0xbe);
+    assert_eq!(exit("fn main() -> int { var a: int = 0x12345678; return brot(a, 8, 32) - 0x34567812; }"), 0);
+    assert_eq!(exit("fn main() -> int { var a: int = 0xffffffff; return bext(a + 7, 0, 32); }"), 6); // mod 2^32
+    assert_eq!(exit("fn main() -> int { return bxor(-1, 12345); }"), -12346);
+}
+
+#[test]
+fn binary_builtins_check_their_fields() {
+    assert!(compile_err("fn main() -> int { return bext(5, 0, 42); }").contains("`bext` needs a bit position in 0..80 and a length in 1..41"));
+    assert!(compile_err("fn main() -> int { return brot(5, 32, 32); }").contains("`brot` needs a bit position in 0..len-1"));
+    assert!(compile_err("fn main() -> int { var n: int = 3; return brot(5, n, 32); }").contains("constant"));
+    assert!(compile_err("fn main() -> int { return bxor(1); }").contains("argument"));
+    assert!(compile_err("fn main() -> int { var r: real = 1.0; return band(r, 1); }").contains("int"));
+}

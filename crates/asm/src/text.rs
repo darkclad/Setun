@@ -558,6 +558,11 @@ fn alu_binary(m: &str) -> Option<i64> {
         "cons" => alu::CONS,
         "sh" => alu::SH,
         "trit" => alu::TRIT,
+        "band" => alu::BAND,
+        "bor" => alu::BOR,
+        "bxor" => alu::BXOR,
+        "bandn" => alu::BANDN,
+        "bsh" => alu::BSH,
         _ => return None,
     })
 }
@@ -720,7 +725,7 @@ fn inst_size(m: &str, ops: &[Operand], long: bool, consts: &HashMap<String, i64>
             Some(Operand::Expr(e)) if !small(e, 364) => 2,
             _ => 1,
         },
-        "la" | "lea" | "jal" | "call" | "br3" | "ext" | "ins" | "fli" => 2,
+        "la" | "lea" | "jal" | "call" | "br3" | "ext" | "ins" | "bext" | "brot" | "fli" => 2,
         "in" | "out" => match ops.get(1) {
             Some(Operand::Mem(..)) => 1,
             _ => 2,
@@ -902,6 +907,14 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
             }
             two(isa::fld(b, reg(d)?, reg(a)?, pos, len))
         }
+        ("bext" | "brot", [d, a, pos, len]) => {
+            let b = if m == "bext" { fld::BEXT } else { fld::BROT };
+            let (pos, len) = (exp(pos)?, exp(len)?);
+            if isa::bin_field(b, 0, pos, len).is_none() {
+                return err(line, format!("bit field {pos}+{len} out of range for {m}"));
+            }
+            two(isa::fld(b, reg(d)?, reg(a)?, pos, len))
+        }
         ("tlbinv", [a]) => one(isa::rrr(op::SYS, sys::TLBINV, 0, reg(a)?, 0)),
         ("sys", [n]) => one(isa::s9(op::SYS, sys::SYS, env.range("system call number", exp(n)?, 9841)?)),
         ("mfc", [d, Operand::Expr(Expr::Sym(c))]) => {
@@ -915,7 +928,7 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
         _ if matches!(
             m,
             "mov" | "li" | "la" | "lea" | "jal" | "call" | "jalr" | "ret" | "br3" | "in" | "out" | "push" | "pop" | "ext" | "ins"
-                | "tlbinv" | "sys" | "mfc" | "mtc"
+                | "bext" | "brot" | "tlbinv" | "sys" | "mfc" | "mtc"
         ) =>
         {
             bad()
@@ -1249,6 +1262,9 @@ mod tests {
         assert!(e(".word 0z").msg.contains("empty 0z literal"));
         assert!(e(".word 0z1DDDDDDDDDDDDDDDDDDDDDD").msg.contains("does not fit"));
         assert!(e("ext r1, r2, 20, 9").msg.contains("outside 1..27"));
+        assert!(e("bext r1, r2, 0, 42").msg.contains("out of range for bext"));
+        assert!(e("brot r1, r2, 32, 32").msg.contains("out of range for brot"));
+        assert!(e("bext r1, r2, -1, 8").msg.contains("out of range"));
         assert!(e("mfc r1, bogus").msg.contains("unknown control register"));
         assert!(e(".tryte 9842").msg.contains("out of range"));
         assert!(e(".bogus 1").msg.contains("unknown directive"));

@@ -61,6 +61,11 @@ fn alu_name(f: i64) -> Option<&'static str> {
         alu::SGN => "sgn",
         alu::ABS => "abs",
         alu::TLZ => "tlz",
+        alu::BAND => "band",
+        alu::BOR => "bor",
+        alu::BXOR => "bxor",
+        alu::BANDN => "bandn",
+        alu::BSH => "bsh",
         _ => return None,
     })
 }
@@ -216,6 +221,8 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
             let name = match f.b {
                 fld::EXT => "ext",
                 fld::INS => "ins",
+                fld::BEXT => "bext",
+                fld::BROT => "brot",
                 _ => return None,
             };
             format!("{name} {}, {}, {}, {}", r(f.x), r(f.y), w2.field(1..=9), w2.field(10..=18))
@@ -379,6 +386,13 @@ mod tests {
             blt 30
             br3 30, 33
             ext r1, r2, 19, 9
+            bxor r1, r2, r3
+            band r4, r5, 255
+            bandn r4, r5, r6
+            bor.l r4, r5, 3000000000
+            bsh r1, r1, -8
+            bext r1, r2, 8, 32
+            brot r3, r3, 7, 32
             mfc r1, fcause
             mtc itb, r2
             sys 42
@@ -390,6 +404,8 @@ mod tests {
         for m in ["add r1, r2, r3", "sub r1, r2, -4", "mul r4, r5, 27", "add.l r1, r2, 5", "mov r6, r7",
                   "cmp r3, 5", "ldw r1, [r13+6]", "stw r1, [r2+1000]", "in r2, [r3+2]", "out r2, 486",
                   "li.l r1, 3", "ret", "call 30", "blt 30", "br3 30, 33", "ext r1, r2, 19, 9",
+                  "bxor r1, r2, r3", "band r4, r5, 255", "bandn r4, r5, r6", "bor r4, r5, 3000000000", "bsh r1, r1, -8",
+                  "bext r1, r2, 8, 32", "brot r3, r3, 7, 32",
                   "mfc r1, fcause", "mtc itb, r2", "sys 42", "hlt"] {
             assert!(listing.contains(m), "missing `{m}` in\n{listing}");
         }

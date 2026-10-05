@@ -59,7 +59,7 @@ fn text(s: *char, p: *tryte) -> int {
 fn main(argc: int, argv: **char) -> int {
     t0 = ms();
     bin32_init();
-    ok("binary tables", xor32(4042322160, 252645135) == 4294967295 && and32(4042322160, 4278255360) == 4026593280
+    ok("binary operations", xor32(4042322160, 252645135) == 4294967295 && and32(4042322160, 4278255360) == 4026593280
         && rotr32(1, 1) == 2147483648 && rotl32(2147483648, 1) == 1);
 
     var n: int = text("abc", &a[0]);

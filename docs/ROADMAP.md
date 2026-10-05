@@ -43,6 +43,7 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - N11 ✅ UDP through the NAT, `clock_settime`, `ntpdate` (NETWORK.md §13)
     - N12 ✅ `scp -r` and `sftp put -r`/`get -r` (NETWORK.md §12)
     - N13 ✅ TLS 1.3 for `wget` (ChaCha20-Poly1305, X25519; ECDSA P-256/P-384, RSA, Ed25519 certificates checked to a 27-root store), `x509`; bignums, SHA-384, HMAC/HKDF (NETWORK.md §14)
+    - ISA v0.6 ✅ binary operations (`BAND` `BOR` `BXOR` `BANDN` `BSH`, `BEXT`/`BROT` with the width as an operand; ISA §3.3.1): SHA-2/ChaCha20 without tables
     - next ideas: IPv6; AES-GCM and P-256 key exchange for the servers that want them; `curl`-like POST
 
 ## Next: performance

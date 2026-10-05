@@ -8,10 +8,10 @@ var _cx: [16]int;
 
 fn _qr(a: int, b: int, c: int, d: int) {
     var x: *int = &_cx[0];
-    x[a] = add32(x[a], x[b]); x[d] = rotl32(xor32(x[d], x[a]), 16);
-    x[c] = add32(x[c], x[d]); x[b] = rotl32(xor32(x[b], x[c]), 12);
-    x[a] = add32(x[a], x[b]); x[d] = rotl32(xor32(x[d], x[a]), 8);
-    x[c] = add32(x[c], x[d]); x[b] = rotl32(xor32(x[b], x[c]), 7);
+    x[a] = bext(x[a] + x[b], 0, 32); x[d] = brot(bxor(x[d], x[a]), 16, 32);
+    x[c] = bext(x[c] + x[d], 0, 32); x[b] = brot(bxor(x[b], x[c]), 12, 32);
+    x[a] = bext(x[a] + x[b], 0, 32); x[d] = brot(bxor(x[d], x[a]), 8, 32);
+    x[c] = bext(x[c] + x[d], 0, 32); x[b] = brot(bxor(x[b], x[c]), 7, 32);
 }
 
 // One 64-octet block of key stream: key 32 octets, nonce 8 octets.

@@ -163,9 +163,9 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N13 | TLS 1.3 for `wget`; X.509 chains and a trust store; `x509` (§14) ✅ | RFC and FIPS vectors, signatures from Python's `cryptography` and forged ones; good chains for each key type and ten kinds of bad one, broken PEM; `wget` against OpenSSL's `s_server` with each key type, and refusals of a wrong name, an unknown CA, an expired certificate, TLS 1.2, AES-only, a required client certificate, a non-TLS server, a changed record |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
-rotate. They are done in software, with no change to the ISA (§8): rotates
-and shifts are plain arithmetic, and XOR and AND go through 256×256 tables.
-Binary-integer instructions could still come later, as a speed-up.
+rotate. They were first done in software (256×256 tables for XOR and AND).
+ISA v0.6 added binary operations (ISA §3.3.1), which `bin32.tri`, SHA-2 and
+ChaCha20 now use.
 
 ## 7. As built (N1–N5)
 
@@ -267,7 +267,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 
 | File | What | Cost (instructions) |
 |---|---|---|
-| `bin32.tri` | 32-bit binary arithmetic: add, shift and rotate are plain arithmetic on words; XOR and AND go through two 256×256 tables made at start-up on the heap | tables: about 1.3 M once |
+| `bin32.tri` | 32-bit binary arithmetic on the binary instructions (ISA §3.3.1); until v0.6, XOR and AND went through 256×256 tables | (the tables cost 430 ms of emulated time at every start) |
 | `sha2.tri` | SHA-256; SHA-512 with each 64-bit value as two 32-bit halves | about 50 k per SHA-256 block, 0.2 M per SHA-512 block |
 | `chacha.tri` | ChaCha20 (64-bit counter and nonce, as SSH uses it) and Poly1305 (TweetNaCl's 17 limbs of 8 bits) | about 0.1 M per 64 octets |
 | `c25519.tri` | X25519, Ed25519 signing and verification, after TweetNaCl (verification refuses S ≥ L, as RFC 8032 asks) | X25519 ≈ 38 M, an Ed25519 signature ≈ 65 M, a verification ≈ 130 M |

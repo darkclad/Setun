@@ -123,6 +123,12 @@ pub mod alu {
     pub const SGN: i64 = 20;
     pub const ABS: i64 = 21;
     pub const TLZ: i64 = 22;
+    // binary operations on the two's-complement form of the value (§3.3.1)
+    pub const BAND: i64 = 23;
+    pub const BOR: i64 = 24;
+    pub const BXOR: i64 = 25;
+    pub const BANDN: i64 = 26;
+    pub const BSH: i64 = 27;
 }
 
 /// Memory functions (tryte B).
@@ -144,6 +150,8 @@ pub mod io {
 pub mod fld {
     pub const EXT: i64 = 1;
     pub const INS: i64 = 2;
+    pub const BEXT: i64 = 3;
+    pub const BROT: i64 = 4;
 }
 
 /// Branch conditions (3-trit `cond`, ISA §3.5), as balanced values.
@@ -258,4 +266,64 @@ pub fn fld(b: i64, rd: i64, ra: i64, pos: i64, len: i64) -> [Word; 2] {
         head(op::FLD, b).with_field(19..=21, reg(rd)).with_field(22..=24, reg(ra)),
         Word::ZERO.with_field(1..=9, pos).with_field(10..=18, len),
     ]
+}
+
+// ---- binary operations (ISA §3.3.1) -------------------------------------------------
+
+/// The largest word value, (3^27 − 1) / 2, and the number of words, 3^27.
+const BW_MAX: i64 = 3_812_798_742_493;
+const BW_MOD: i64 = 7_625_597_484_987;
+
+/// Wrap any integer into a word (balanced, modulo 3^27).
+fn bwrap(v: i128) -> i64 {
+    ((v + BW_MAX as i128).rem_euclid(BW_MOD as i128) - BW_MAX as i128) as i64
+}
+
+/// `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH` on word values: the operands are
+/// read as two's-complement integers of unlimited width (so −1 is all
+/// ones); a result outside the word range wraps modulo 3^27. `BSH` is
+/// x·2^y for y > 0 and ⌊x / 2^−y⌋ for y < 0, with y limited to ±81.
+pub fn bin_alu(f: i64, x: i64, y: i64) -> i64 {
+    match f {
+        alu::BAND => bwrap((x & y) as i128),
+        alu::BOR => bwrap((x | y) as i128),
+        alu::BXOR => bwrap((x ^ y) as i128),
+        alu::BANDN => bwrap((x & !y) as i128),
+        _ => {
+            let y = y.clamp(-81, 81);
+            if y >= 0 {
+                // x·2^y modulo 3^27, by squaring (2^81 does not fit)
+                let (mut r, mut b, mut e) = (x as i128, 2i128, y);
+                while e > 0 {
+                    if e & 1 == 1 {
+                        r = bwrap(r * b) as i128;
+                    }
+                    b = (b * b).rem_euclid(BW_MOD as i128);
+                    e >>= 1;
+                }
+                bwrap(r)
+            } else {
+                x >> (-y).min(63)
+            }
+        }
+    }
+}
+
+/// `BEXT` (bits pos..pos+len−1 of x, as a non-negative number) and `BROT`
+/// (the low len bits of x, rotated left by pos within them). None when the
+/// fields are out of range: BEXT needs 0 ≤ pos ≤ 80, BROT 0 ≤ pos < len,
+/// and both 1 ≤ len ≤ 41 (2^41 − 1 is the widest field a word holds).
+pub fn bin_field(f: i64, x: i64, pos: i64, len: i64) -> Option<i64> {
+    if !(1..=41).contains(&len) {
+        return None;
+    }
+    let mask = (1i64 << len) - 1;
+    match f {
+        fld::BEXT if (0..=80).contains(&pos) => Some((x >> pos.min(63)) & mask),
+        fld::BROT if (0..len).contains(&pos) => {
+            let v = x & mask;
+            Some(((v << pos) | (v >> (len - pos))) & mask)
+        }
+        _ => None,
+    }
 }

@@ -40,7 +40,7 @@ fn insn(r: &mut Rng) -> i64 {
         op::JAL, op::BR, op::BR3, op::IOI, op::FLD, op::FALU, op::FCVT, op::FMEM, op::FMEMD, op::FLI,
     ];
     let a = if r.range(0, 20) == 0 { r.range(-9841, 9841) } else { r.pick(&majors) };
-    let b = if r.range(0, 10) == 0 { r.range(-9841, 9841) } else { r.range(-3, 24) };
+    let b = if r.range(0, 10) == 0 { r.range(-9841, 9841) } else { r.range(-3, 30) };
     let (x, y, z) = (r.range(-13, 13), r.range(-13, 13), r.range(-13, 13));
     (a * 19_683 + b) * 19_683 + x * 729 + y * 27 + z
 }
@@ -835,4 +835,62 @@ fn compares_stores_and_tritwise_ops_compiled_agree() {
         }
         assert_eq!(reg_in(&st, 9), 0, "all twelve rounds ran");
     }
+}
+
+#[test]
+fn binary_operations_in_a_compiled_loop() {
+    // 20 rounds of ChaCha quarter rounds on r1..r4 (ADD, BEXT 0..31, BXOR,
+    // BROT), plus every other binary operation folded into r10 from
+    // values that go negative and past 2^42 (BAND, BOR, BANDN, BSH both
+    // ways): compiled, block-interpreted and reference must agree, and
+    // the quarter rounds must match a plain Rust ChaCha
+    use setun_core::isa::fld;
+    let (a0, b0, c0, d0) = (0x1111_1111u32, 0x0102_0304u32, 0x9b8d_6f43u32, 0x0123_4567u32);
+    let mut prog = Vec::new();
+    for (r, v) in [(1, a0), (2, b0), (3, c0), (4, d0)] {
+        prog.extend(isa::wide(op::LI, 0, r, 0, v as i64));
+    }
+    prog.extend(isa::wide(op::LI, 0, 11, 0, -2_000_000_000_007));
+    prog.push(isa::s6(op::LIQ, 0, 9, 20));
+    let top = prog.len() as i64;
+    for (a, b, d, n) in [(1, 2, 4, 16), (3, 4, 2, 12), (1, 2, 4, 8), (3, 4, 2, 7)] {
+        prog.push(isa::rrr(op::ALU, alu::ADD, a, a, b));
+        prog.extend(isa::fld(fld::BEXT, a, a, 0, 32));
+        prog.push(isa::rrr(op::ALU, alu::BXOR, d, d, a));
+        prog.extend(isa::fld(fld::BROT, d, d, n, 32));
+    }
+    prog.push(isa::rrr(op::ALU, alu::BAND, 5, 1, 11));
+    prog.push(isa::rrr(op::ALU, alu::BOR, 6, 11, 2));
+    prog.push(isa::rrr(op::ALU, alu::BANDN, 7, 3, 11));
+    prog.extend(isa::wide(op::ALUI, alu::BXOR, 8, 11, 3_000_000_000_001));
+    prog.push(isa::rrr(op::ALUQ, alu::BSH, 12, 11, 2));
+    prog.push(isa::rrr(op::ALUQ, alu::BSH, 13, 11, -5));
+    prog.extend(isa::fld(fld::BEXT, 6, 6, 9, 41));
+    for r in [5, 6, 7, 8, 12, 13] {
+        prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, r));
+    }
+    prog.push(isa::rrr(op::ALUQ, alu::BSH, 11, 11, 1)); // grows past 2^42 and wraps
+    prog.push(isa::rrr(op::ALU, alu::BXOR, 11, 11, 4));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let steps = 2000;
+    let (st, fast) = both_ways_jit(1, |_| {}, &prog, steps);
+    assert!(fast.cpu.jit_stats()[2] > 500, "compiled code ran: {:?}", fast.cpu.jit_stats());
+    let (st2, _) = both_ways_jit(u32::MAX, |_| {}, &prog, steps);
+    assert_eq!(st, st2);
+    // the same rounds in Rust
+    let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+    for _ in 0..20 {
+        a = a.wrapping_add(b);
+        d = (d ^ a).rotate_left(16);
+        c = c.wrapping_add(d);
+        b = (b ^ c).rotate_left(12);
+        a = a.wrapping_add(b);
+        d = (d ^ a).rotate_left(8);
+        c = c.wrapping_add(d);
+        b = (b ^ c).rotate_left(7);
+    }
+    assert_eq!([reg_in(&st, 1), reg_in(&st, 2), reg_in(&st, 3), reg_in(&st, 4)], [a, b, c, d].map(|v| v as i64));
 }

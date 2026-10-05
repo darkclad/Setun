@@ -2,7 +2,7 @@
 
 Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
-**Status: v0.5 draft (2026-10-01): v0.4 (accepted 2026-09-30) plus floating-point instructions, §14.** §13 records the decisions.
+**Status: v0.6 draft (2026-10-05): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14) and binary operations (§3.3.1).** §13 records the decisions.
 
 Setun-11̅ is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
@@ -35,6 +35,7 @@ Version history:
 - v0.3: the pure-ternary revision.
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
+- v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
 
 ---
 
@@ -245,6 +246,11 @@ word 2:                                                           [ imm27 ]
 | 20 | `SGN` | `rd := sign(ra)` |
 | 21 | `ABS` | `rd := \|ra\|` |
 | 22 | `TLZ` | number of leading zero trits of `ra` (0..27) |
+| 23 | `BAND` | binary AND (§3.3.1) |
+| 24 | `BOR` | binary OR |
+| 25 | `BXOR` | binary exclusive OR |
+| 26 | `BANDN` | `ra` AND NOT `b` |
+| 27 | `BSH` | `ra · 2^b` for b > 0, `⌊ra / 2^−b⌋` for b < 0 (b limited to ±81) |
 
 `B = 0` and negative values are reserved and raise `ILL`. `MOV rd, ra` is `ADD rd, ra, r0`.
 
@@ -254,6 +260,19 @@ word 2:                                                           [ imm27 ]
 |---|---|---|
 | 1 | `EXT` | `rd := ra[pos : pos+len−1]`, read as a balanced number |
 | 2 | `INS` | `rd[pos : pos+len−1] :=` the low `len` trits of `ra` |
+| 3 | `BEXT` | `rd :=` bits `pos .. pos+len−1` of `ra` (bit 0 the lowest), as a number 0..2^len−1; 0 ≤ pos ≤ 80 |
+| 4 | `BROT` | `rd :=` the low `len` bits of `ra`, rotated left by `pos` within them; 0 ≤ pos < len |
+
+For `BEXT` and `BROT`, 1 ≤ len ≤ 41 (2^41 − 1 is the widest field a word holds); other fields raise `ILL`.
+
+#### 3.3.1 Binary operations
+
+Data from binary systems (octets, 32-bit words of SHA-2 and ChaCha20, checksums) needs AND, XOR and rotations. The binary operations read a word's **value** as a two's-complement integer of unlimited width: 5 is …000101, −1 is all ones, −6 is …111010. There is no binary register width, so no power of 2 is built into the machine: the program names the width where one matters, in `BEXT` and `BROT`.
+
+- `BAND`, `BOR`, `BXOR` and `BANDN` compute the exact integer result. It lies within ±2^42; one that is outside the word range wraps modulo 3^27, as `ADD` does. Values below 2^41 never wrap, so 32-bit data is always exact.
+- `BSH` multiplies by a power of 2 (wrapping modulo 3^27) or divides by one, rounding toward −∞ like an arithmetic shift.
+- A 32-bit sum is `ADD` then `BEXT rd, rd, 0, 32`. A 32-bit right rotation by n is `BROT` left by 32 − n.
+- All seven set S from the result and leave C unchanged.
 
 ### 3.4 Memory functions (B, for MEM and MEMD)
 
@@ -724,6 +743,7 @@ wait:   IN    r2, [r3 + 2]     ; TX_READY
 9. **No Setun-70 compatibility mode**: a new CPU from scratch that resets straight into native mode (§9). **Default RAM is 3^18 = 9^9 trytes** (§4).
 10. A **carry trit C**, **two kinds of division**, **every trap enters ring +1**, and **text mode**. These carry over from v0.2.
 11. **Floating-point instructions** (§14): real27 and real81 with one shared 9-trit exponent, a signed balanced significand (no sign trit, no −0), 27 flat registers, ±∞/NaN/subnormals, round to nearest with ties to even, and a "not available" trap for lazy context switching.
+12. **Binary operations** (§3.3.1): values read as two's-complement integers of unlimited width, so the ISA fixes no binary width; `BEXT` and `BROT` take the width as an operand. Added in v0.6 for crypto: SHA-2 and ChaCha20 had needed 256×256 tables.
 
 ## 14. The floating-point unit
 

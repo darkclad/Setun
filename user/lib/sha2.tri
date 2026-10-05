@@ -89,9 +89,10 @@ fn _sha256_block(c: *sha256_ctx, p: *tryte) {
     while (t < 64) {
         var x: int = w[t - 15];
         var y: int = w[t - 2];
-        var s0: int = xor32(xor32(rotr32(x, 7), rotr32(x, 18)), shr32(x, 3));
-        var s1: int = xor32(xor32(rotr32(y, 17), rotr32(y, 19)), shr32(y, 10));
-        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) % TWO32;
+        // (a right rotation by n is BROT left by 32 - n)
+        var s0: int = bxor(bxor(brot(x, 25, 32), brot(x, 14, 32)), bsh(x, -3));
+        var s1: int = bxor(bxor(brot(y, 15, 32), brot(y, 13, 32)), bsh(y, -10));
+        w[t] = bext(w[t - 16] + s0 + w[t - 7] + s1, 0, 32);
         t += 1;
     }
     var a: int = c.h[0];
@@ -104,20 +105,20 @@ fn _sha256_block(c: *sha256_ctx, p: *tryte) {
     var h: int = c.h[7];
     t = 0;
     while (t < 64) {
-        var S1: int = xor32(xor32(rotr32(e, 6), rotr32(e, 11)), rotr32(e, 25));
-        var ch: int = and32(e, f) + and32(not32(e), g);            // disjoint bits: + is XOR
-        var t1: int = (h + S1 + ch + _k256[t] + w[t]) % TWO32;
-        var S0: int = xor32(xor32(rotr32(a, 2), rotr32(a, 13)), rotr32(a, 22));
-        var maj: int = and32(a, b) + and32(cc, xor32(a, b));        // likewise
-        var t2: int = (S0 + maj) % TWO32;
+        var S1: int = bxor(bxor(brot(e, 26, 32), brot(e, 21, 32)), brot(e, 7, 32));
+        var ch: int = band(e, f) + bandn(g, e);                     // disjoint bits: + is XOR
+        var t1: int = bext(h + S1 + ch + _k256[t] + w[t], 0, 32);
+        var S0: int = bxor(bxor(brot(a, 30, 32), brot(a, 19, 32)), brot(a, 10, 32));
+        var maj: int = band(a, b) + band(cc, bxor(a, b));           // likewise
+        var t2: int = bext(S0 + maj, 0, 32);
         h = g;
         g = f;
         f = e;
-        e = (d + t1) % TWO32;
+        e = bext(d + t1, 0, 32);
         d = cc;
         cc = b;
         b = a;
-        a = (t1 + t2) % TWO32;
+        a = bext(t1 + t2, 0, 32);
         t += 1;
     }
     c.h[0] = (c.h[0] + a) % TWO32;

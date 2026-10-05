@@ -436,7 +436,7 @@ fn is_register_name(s: &str) -> bool {
 const CREGS: &[&str] = &["MODE", "PTB", "FADDR", "FCAUSE", "ITB", "EPC", "EMODE", "KSP", "SCRATCH", "CPUID", "CYCLE"];
 
 const BUILTINS: &[&str] = &[
-    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "bytes", "in", "out",
+    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "band", "bor", "bxor", "bandn", "bsh", "bext", "brot", "bytes", "in", "out",
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
     // the FPU
     "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
@@ -3367,7 +3367,7 @@ impl Compiler {
                 self.emit(format!("{n} r1, r1"));
                 Ok(if n == "sgn" { Ty::Trit } else { Ty::Int })
             }
-            "divr" | "modr" | "tmul" | "tsat" | "cons" | "mulh" => {
+            "divr" | "modr" | "tmul" | "tsat" | "cons" | "mulh" | "band" | "bor" | "bxor" | "bandn" | "bsh" => {
                 want(2)?;
                 let (ta, tb) = self.two(&args[0], &args[1])?;
                 self.need_integer(&ta, args[0].pos)?;
@@ -3392,6 +3392,19 @@ impl Compiler {
                 let t = self.expr(&args[0])?;
                 self.need_integer(&t, args[0].pos)?;
                 self.emit(format!("ext r1, r1, {p}, {l}"));
+                Ok(Ty::Int)
+            }
+            "bext" | "brot" => {
+                want(3)?;
+                let (p, l) = (self.const_int(&args[1])?, self.const_int(&args[2])?);
+                let f = if n == "bext" { setun_core::isa::fld::BEXT } else { setun_core::isa::fld::BROT };
+                if setun_core::isa::bin_field(f, 0, p, l).is_none() {
+                    let want = if n == "bext" { "0..80" } else { "0..len-1" };
+                    return err(args[1].pos, format!("`{n}` needs a bit position in {want} and a length in 1..41"));
+                }
+                let t = self.expr(&args[0])?;
+                self.need_integer(&t, args[0].pos)?;
+                self.emit(format!("{n} r1, r1, {p}, {l}"));
                 Ok(Ty::Int)
             }
             "ins" => {

@@ -108,6 +108,7 @@ struct Info {
 
 const ALU3: &[&str] = &[
     "add", "sub", "adc", "sbc", "mul", "mulh", "div", "mod", "divr", "modr", "min", "max", "tmul", "tsat", "cons", "sh", "trit",
+    "band", "bor", "bxor", "bandn", "bsh",
 ];
 const ALU2: &[&str] = &["neg", "sgn", "abs", "tlz"];
 const BRANCHES: &[&str] = &["blt", "beq", "bgt", "ble", "bge", "bne", "bov", "bnov", "bnever"];
@@ -138,7 +139,7 @@ fn info(i: &Ins) -> Option<Info> {
         "stw" | "stt" if a.len() == 2 => inf(src(0), 0, false, false),
         "push" if a.len() == 1 => inf(src(0) | bit(13), bit(13) | FLAGS, false, false),
         "pop" if a.len() == 1 => inf(bit(13), reg0() | bit(13) | FLAGS, false, false),
-        "ext" if a.len() == 4 => inf(src(1), reg0() | FLAGS, true, true),
+        "ext" | "bext" | "brot" if a.len() == 4 => inf(src(1), reg0() | FLAGS, true, true),
         "ins" if a.len() == 4 => inf(src(0), reg0() | FLAGS, true, false),
         "in" if a.len() == 2 => inf(src(1), reg0(), false, false),
         "out" if a.len() == 2 => inf(src(0), 0, false, false),

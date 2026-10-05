@@ -207,6 +207,8 @@ enum Op {
     Br3,
     /// An FPU instruction: run by `exec_fpu` without ending the block.
     Fpu,
+    /// BEXT / BROT with valid fields: `imm` = pos, `imm2` = len.
+    Bfld,
     Generic,
 }
 
@@ -1224,6 +1226,13 @@ impl Cpu {
                     _ => Op::Generic,
                 };
             }
+            op::FLD if matches!(b, fld::BEXT | fld::BROT) => {
+                let w = Word::new(imm).unwrap();
+                let (pos, len) = (w.field(1..=9), w.field(10..=18));
+                if crate::isa::bin_field(b, 0, pos, len).is_some() {
+                    (d.op, d.imm, d.imm2) = (Op::Bfld, pos, len as i32);
+                }
+            }
             op::JALR => (d.op, d.imm) = (Op::Jalr, 3 * z),
             op::LIQ => (d.op, d.imm) = (Op::Li, imm6),
             op::LI => (d.op, d.imm) = (Op::Li, imm),
@@ -1361,6 +1370,12 @@ impl Cpu {
                 }))
             }
             Op::Fpu => self.exec_fpu(m, d.a as i64, d.f as i64, x, y, z, pc, Some(d.imm))?,
+            Op::Bfld => {
+                let v = crate::isa::bin_field(d.f as i64, self.reg(y).value(), d.imm, d.imm2 as i64).expect("checked when decoded");
+                let r = Word::new(v).unwrap();
+                self.set_s(r.sign());
+                self.set_reg(x, r);
+            }
             Op::Generic => {
                 let _ = z;
                 return Ok(Ctl::Generic);
@@ -1505,13 +1520,22 @@ impl Cpu {
             op::FLD => {
                 let w2 = Word::new(imm).unwrap();
                 let (pos, len) = (w2.field(1..=9), w2.field(10..=18));
-                if pos < 1 || len < 1 || pos + len - 1 > 27 {
-                    return Err(ill());
-                }
-                let (p, e) = (pos as usize, (pos + len - 1) as usize);
                 let r = match b {
-                    fld::EXT => Word::new(self.reg(y).field(p..=e)).unwrap(),
-                    fld::INS => self.reg(x).with_field(p..=e, self.reg(y).value()),
+                    fld::EXT | fld::INS => {
+                        if pos < 1 || len < 1 || pos + len - 1 > 27 {
+                            return Err(ill());
+                        }
+                        let (p, e) = (pos as usize, (pos + len - 1) as usize);
+                        if b == fld::EXT {
+                            Word::new(self.reg(y).field(p..=e)).unwrap()
+                        } else {
+                            self.reg(x).with_field(p..=e, self.reg(y).value())
+                        }
+                    }
+                    fld::BEXT | fld::BROT => match crate::isa::bin_field(b, self.reg(y).value(), pos, len) {
+                        Some(v) => Word::new(v).unwrap(),
+                        None => return Err(ill()),
+                    },
                     _ => return Err(ill()),
                 };
                 self.set_s(r.sign());
@@ -1833,6 +1857,7 @@ impl Cpu {
             alu::SGN => Word::new(a.sign() as i64).unwrap(),
             alu::ABS => ww(x.abs()),
             alu::TLZ => Word::new(a.leading_zero_trits() as i64).unwrap(),
+            alu::BAND..=alu::BSH => Word::new(crate::isa::bin_alu(f, x, y)).expect("wrapped"),
             _ => return Err(Fault::new(vector::ILLEGAL)),
         };
         self.set_s(r.sign());

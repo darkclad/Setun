@@ -690,3 +690,34 @@ fn shared_parameter_registers_the_same_way() {
     "#;
     same_both_ways_src("sharedparams.tri", src, 80_000_000);
 }
+
+#[test]
+fn binary_operations_the_same_way() {
+    // SHA-256's round functions on a running state, with the results
+    // folded and printed; constants, locals and globals as operands
+    let src = r#"
+        import "console.tri";
+        var g: int = 0x6a09e667;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn ch(e: int, f: int, h: int) -> int { return bxor(band(e, f), bandn(h, e)); }
+        fn maj(a: int, b: int, c: int) -> int { return bxor(bxor(band(a, b), band(a, c)), band(b, c)); }
+        fn s1(e: int) -> int { return bxor(bxor(brot(e, 26, 32), brot(e, 21, 32)), brot(e, 7, 32)); }
+        fn main() -> int {
+            var a: int = 0xbb67ae85;
+            var e: int = 0x510e527f;
+            var f: int = 0x9b05688c;
+            var k: int = 0;
+            while (k < 64) {
+                var t: int = bext(ch(e, f, g) + s1(e) + k * 0x428a2f98, 0, 32);
+                g = f;
+                f = e;
+                e = bext(maj(a, t, g) + bsh(t, -3) + bsh(k, 5), 0, 32);
+                a = bor(bsh(a, 1), bxor(k, -1)) % 1000000007;
+                k += 1;
+            }
+            put(a); put(e); put(f); put(g);
+            return bext(e, 3, 9);
+        }
+    "#;
+    same_both_ways_src("binary.tri", src, 50_000_000);
+}
