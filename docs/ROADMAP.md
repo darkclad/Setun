@@ -49,6 +49,12 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
     - N16 ✅ `httpd`: static files over HTTP/1.1 and HTTPS (TLS 1.3 server side, ECDSA signing with RFC 6979 nonces, `certgen` self-signed certificates)
     - next ideas: IPv6; `curl`-like POST
 
+12. **Self-hosting** ([`SELFHOST.md`](SELFHOST.md)): Trinux builds its own programs
+    - S1 ✅ `tas`, the assembler in Trine: the host assembler's executables, word for word
+    - S2 ✅ `tric`, the compiler in Trine: the host compiler's unoptimized assembly, character for character (exact real literals too), and its error messages
+    - S3 ✅ the fixed point: `tric` builds itself, and that build builds the same file again
+    - next: the optimizer in `tric`
+
 ## Next: performance
 
 In rough order of payoff for effort (estimates from the benchmarks):

@@ -1,0 +1,1279 @@
+// tric/front.tri: the Trine compiler's front end, in Trine: growable
+// vectors, interned names, the lexer and the parser (after the host's
+// crates/trine/src/lexer.rs and parser.rs, which it must match).
+
+// ---- vectors ---------------------------------------------------------------------------------
+
+struct ivec {
+    p: *int;
+    n: int;
+    cap: int;
+}
+
+struct cvec {
+    p: *char;
+    n: int;
+    cap: int;
+}
+
+fn oom() {
+    fputs(STDERR_FILENO, "tric: out of memory\n");
+    exit(1);
+}
+
+fn iv_push(v: *ivec, x: int) -> int {
+    if (v.n == v.cap) {
+        // (not realloc: it copies from the centre of the first word, which
+        // loses the first int's low tryte)
+        var cap: int = v.cap == 0 ? 729 : v.cap * 2;
+        var q: *int = malloc(cap * 3) as *int;
+        if (q == null) { oom(); }
+        var k: int = 0;
+        while (k < v.n) { q[k] = v.p[k]; k += 1; }
+        if (v.p != null) { free(v.p as *tryte); }
+        v.p = q;
+        v.cap = cap;
+    }
+    v.p[v.n] = x;
+    v.n += 1;
+    return v.n - 1;
+}
+
+fn cv_push(v: *cvec, c: int) -> int {
+    if (v.n == v.cap) {
+        var cap: int = v.cap == 0 ? 6561 : v.cap * 2;
+        var q: *char = realloc(v.p as *tryte, cap) as *char;
+        if (q == null) { oom(); }
+        v.p = q;
+        v.cap = cap;
+    }
+    v.p[v.n] = c as char;
+    v.n += 1;
+    return v.n - 1;
+}
+
+fn cv_str(v: *cvec, s: *char) {
+    var k: int = 0;
+    while (s[k] != 0) { cv_push(v, s[k]); k += 1; }
+}
+
+// ---- names -----------------------------------------------------------------------------------
+//
+// Every identifier (and file name) is interned once: a name is its index.
+
+const NAME_CAP: int = 59049;
+
+var nm_slot: *int;                       // hash slot -> name
+var nm_chars: cvec;
+var nm_count: int;
+var nm_of_slot: ivec;                    // name -> its text offset (by name index)
+var nm_lens: ivec;
+
+fn names_init() {
+    nm_slot = malloc(NAME_CAP * 3) as *int;
+    if (nm_slot == null) { oom(); }
+    var k: int = 0;
+    while (k < NAME_CAP) { nm_slot[k] = -1; k += 1; }
+}
+
+fn hash_chars(s: *char, n: int) -> int {
+    var h: int = 7;
+    var k: int = 0;
+    while (k < n) { h = (h * 31 + s[k]) % 1000003; k += 1; }
+    return h < 0 ? -h : h;
+}
+
+fn intern(s: *char, n: int) -> int {
+    var i: int = hash_chars(s, n) % NAME_CAP;
+    loop {
+        var id: int = nm_slot[i];
+        if (id < 0) {
+            if (nm_count >= NAME_CAP - NAME_CAP / 9) { fputs(STDERR_FILENO, "tric: too many names\n"); exit(1); }
+            id = nm_count;
+            nm_count += 1;
+            nm_slot[i] = id;
+            iv_push(&nm_of_slot, nm_chars.n);
+            iv_push(&nm_lens, n);
+            var k: int = 0;
+            while (k < n) { cv_push(&nm_chars, s[k]); k += 1; }
+            cv_push(&nm_chars, 0);
+            return id;
+        }
+        if (nm_lens.p[id] == n && strncmp(nm_chars.p + nm_of_slot.p[id], s, n) == 0) { return id; }
+        i = (i + 1) % NAME_CAP;
+    }
+    return -1;
+}
+
+fn name_str(id: int) -> *char { return nm_chars.p + nm_of_slot.p[id]; }
+fn name_is(id: int, s: *char) -> int { return streq(name_str(id), s); }
+fn intern_c(s: *char) -> int { return intern(s, strlen(s)); }
+
+// ---- string literals -------------------------------------------------------------------------
+
+var sl_off: ivec;                        // in sl_chars
+var sl_len: ivec;
+var sl_chars: cvec;
+
+fn new_string(s: *char, n: int) -> int {
+    iv_push(&sl_off, sl_chars.n);
+    iv_push(&sl_len, n);
+    var k: int = 0;
+    while (k < n) { cv_push(&sl_chars, s[k]); k += 1; }
+    return sl_off.n - 1;
+}
+
+fn str_at(id: int) -> *char { return sl_chars.p + sl_off.p[id]; }
+fn str_n(id: int) -> int { return sl_len.p[id]; }
+
+// ---- errors ----------------------------------------------------------------------------------
+//
+// A position is (file * 100000 + line) * 10000 + col.
+
+var file_names: ivec;                    // file -> name id
+
+fn pos_of(file: int, line: int, col: int) -> int { return (file * 100000 + line) * 10000 + col; }
+
+var fail_unlink: *char;                  // an output file to remove on failure
+
+fn fail_at(pos: int, msg: *char, what: *char) {
+    var num: [28]char;
+    if (fail_unlink != null) { unlink(fail_unlink); }
+    if (pos > 0) {
+        var file: int = pos / 1000000000;
+        var line: int = pos / 10000 % 100000;
+        fputs(STDERR_FILENO, name_str(file_names.p[file]));
+        fputs(STDERR_FILENO, ":");
+        fputs(STDERR_FILENO, itoa(line, &num[0]));
+        fputs(STDERR_FILENO, ":");
+        fputs(STDERR_FILENO, itoa(pos % 10000, &num[0]));
+        fputs(STDERR_FILENO, ": ");
+    } else {
+        fputs(STDERR_FILENO, "tric: ");
+    }
+    fputs(STDERR_FILENO, msg);
+    if (what != null) {
+        fputs(STDERR_FILENO, " `");
+        fputs(STDERR_FILENO, what);
+        fputs(STDERR_FILENO, "`");
+    }
+    fputs(STDERR_FILENO, "\n");
+    exit(1);
+}
+
+// A message built up in `mb`, then reported at a position.
+var mb: cvec;
+
+fn m0() { mb.n = 0; }
+fn ms(s: *char) { cv_str(&mb, s); }
+fn mq(s: *char) { ms("`"); ms(s); ms("`"); }
+fn mi(v: int) { cv_int(&mb, v); }
+fn fail(pos: int) {
+    cv_push(&mb, 0);
+    fail_at(pos, mb.p, null);
+}
+
+fn cv_int(v: *cvec, x: int) {
+    var buf: [30]char;
+    var k: int = 29;
+    buf[k] = 0;
+    var neg: int = x < 0;
+    if (neg) { x = -x; }
+    loop {
+        k -= 1;
+        buf[k] = ('0' + x % 10) as char;
+        x /= 10;
+        if (x == 0) { break; }
+    }
+    if (neg) { k -= 1; buf[k] = '-'; }
+    cv_str(v, &buf[k]);
+}
+
+// ---- the lexer -------------------------------------------------------------------------------
+
+const T_INT: int = 1;
+const T_REAL: int = 2;
+const T_CHAR: int = 3;
+const T_STR: int = 4;
+const T_IDENT: int = 5;
+const T_KW: int = 6;
+const T_PUNCT: int = 7;
+const T_EOF: int = 8;
+
+// keywords, in the host's order: their codes are 1..
+var kw_list: *char = "fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real ";
+// punctuation, longest first (the host's order): codes 1..
+var pu_list: *char = "<<= >>= <=> -> << >> <= >= == != && || += -= *= /= %= &= |= + - * / % < > = ! ~ & | ? : ; , . ( ) [ ] { } @ ";
+
+const KW_COUNT: int = 31;
+const PU_COUNT: int = 43;
+
+var kw_name: [32]int;                    // keyword code -> name id
+var pu_text: [44]*char;
+
+fn lex_init() {
+    var k: int = 0;
+    var code: int = 1;
+    while (kw_list[k] != 0) {
+        var e: int = k;
+        while (kw_list[e] != ' ') { e += 1; }
+        kw_name[code] = intern(kw_list + k, e - k);
+        code += 1;
+        k = e + 1;
+    }
+    k = 0;
+    code = 1;
+    while (pu_list[k] != 0) {
+        var e2: int = k;
+        while (pu_list[e2] != ' ') { e2 += 1; }
+        pu_text[code] = strndup(pu_list + k, e2 - k);
+        code += 1;
+        k = e2 + 1;
+    }
+}
+
+fn kw_code(id: int) -> int {
+    var k: int = 1;
+    while (k <= KW_COUNT) { if (kw_name[k] == id) { return k; } k += 1; }
+    return 0;
+}
+
+fn pu_code(s: *char) -> int {
+    var k: int = 1;
+    while (k <= PU_COUNT) { if (streq(pu_text[k], s)) { return k; } k += 1; }
+    return 0;
+}
+
+// tokens of the file being parsed
+var tk_kind: ivec;
+var tk_val: ivec;                        // the value, name, string id or code
+var tk_pos: ivec;
+
+fn add_tok(kind: int, val: int, pos: int) {
+    iv_push(&tk_kind, kind);
+    iv_push(&tk_val, val);
+    iv_push(&tk_pos, pos);
+}
+
+fn is_ws(c: int) -> int { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12; }
+fn is_dig(c: int) -> int { return c >= '0' && c <= '9'; }
+fn is_alnum_ascii(c: int) -> int { return is_dig(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+fn is_alpha_u(c: int) -> int { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 128; }
+
+var lx_s: *char;
+var lx_n: int;
+var lx_i: int;
+var lx_line: int;
+var lx_col: int;
+var lx_file: int;
+
+fn bump() {
+    if (lx_s[lx_i] == '\n') { lx_line += 1; lx_col = 1; } else { lx_col += 1; }
+    lx_i += 1;
+}
+
+fn lpeek(d: int) -> int { return lx_i + d < lx_n ? lx_s[lx_i + d] : -1000000; }
+
+// A balanced base-27 digit (an overlined one is a negative code point), or -100.
+fn z_digit(c: int) -> int {
+    var neg: int = c < 0;
+    if (neg) { c = -c; }
+    var d: int = -100;
+    if (c >= '0' && c <= '9') { d = c - '0'; }
+    else if (c >= 'A' && c <= 'D') { d = c - 'A' + 10; }
+    else if (c >= 'a' && c <= 'd') { d = c - 'a' + 10; }
+    if (d < 0) { return -100; }
+    return neg ? -d : d;
+}
+
+// A prefixed literal's message: "bad 0t literal: empty ternary literal",
+// or (`over`) "... ternary literal does not fit".
+fn lit_fail(pos: int, base: int, over: int) {
+    m0();
+    ms("bad 0");
+    cv_push(&mb, base);
+    ms(" literal: ");
+    if (!over) { ms("empty "); }
+    ms(base == 'x' ? "hexadecimal literal" : "ternary literal");
+    if (over) { ms(" does not fit"); }
+    fail(pos);
+}
+
+// v * b + d, or the literal does not fit (in a word, here)
+fn lit_step(pos: int, base: int, v: int, b: int, d: int) -> int {
+    var w: int = 3812798742493;
+    if (v > w / b || v < -(w / b)) { lit_fail(pos, base, 1); }
+    var r: int = v * b;
+    if ((d > 0 && r > w - d) || (d < 0 && r < -w - d)) { lit_fail(pos, base, 1); }
+    return r + d;
+}
+
+fn bad_digit(pos: int, msg: *char, d: int) {
+    m0();
+    ms(msg);
+    ms("'");
+    cv_push(&mb, d < 0 ? -d : d);
+    if (d < 0) { cv_push(&mb, 773); ms("' cannot be overlined"); fail(pos); }
+    ms("'");
+    fail(pos);
+}
+
+fn lex(src: *char, n: int, file: int) {
+    lx_s = src;
+    lx_n = n;
+    lx_i = 0;
+    lx_line = 1;
+    lx_col = 1;
+    lx_file = file;
+    tk_kind.n = 0;
+    tk_val.n = 0;
+    tk_pos.n = 0;
+    var buf: [729]char;
+    while (lx_i < lx_n) {
+        var c: int = lx_s[lx_i];
+        var pos: int = pos_of(file, lx_line, lx_col);
+        if (is_ws(c)) { bump(); continue; }
+        if (c == '/' && lpeek(1) == '/') {
+            while (lx_i < lx_n && lx_s[lx_i] != '\n') { bump(); }
+            continue;
+        }
+        if (c == '/' && lpeek(1) == '*') {
+            bump();
+            bump();
+            loop {
+                if (lx_i >= lx_n) { fail_at(pos, "unterminated /* comment", null); }
+                if (lx_s[lx_i] == '*' && lpeek(1) == '/') { bump(); bump(); break; }
+                bump();
+            }
+            continue;
+        }
+        if (is_dig(c)) {
+            var start: int = lx_i;
+            if (c == '0' && (lpeek(1) == 't' || lpeek(1) == 'z' || lpeek(1) == 'x')) {
+                var base: int = lpeek(1);
+                bump();
+                bump();
+                var ds: int = lx_i;
+                while (lx_i < lx_n && (is_alnum_ascii(lx_s[lx_i]) || lx_s[lx_i] == '_' || lx_s[lx_i] < 0)) { bump(); }
+                if (base == 't' && (lpeek(0) == '+' || lpeek(0) == '-')) {
+                    fail_at(pos, ds == lx_i ? "0t digits are 1, 0 and T (the old + and - are gone)" : "a 0t literal followed by + or -: put a space before the operator (the old + and - digits are gone)", null);
+                }
+                var v: int = 0;
+                var any: int = 0;
+                var k: int = ds;
+                while (k < lx_i) {
+                    var d: int = lx_s[k];
+                    k += 1;
+                    if (d == '_') { continue; }
+                    var dv: int = 0;
+                    if (base == 't') {
+                        if (d == '1') { dv = 1; } else if (d == '0') { dv = 0; } else if (d == 'T' || d == 't' || d == -'1') { dv = -1; }
+                        else { bad_digit(pos, "bad 0t literal: invalid ternary digit ", d); }
+                        v = lit_step(pos, base, v, 3, dv);
+                    } else if (base == 'z') {
+                        dv = z_digit(d);
+                        if (dv == -100) { bad_digit(pos, "bad 0z literal: invalid ternary digit ", d); }
+                        if (dv == 0 && d < 0) { bad_digit(pos, "bad 0z literal: ", d); }
+                        v = lit_step(pos, base, v, 27, dv);
+                    } else {
+                        if (d >= '0' && d <= '9') { dv = d - '0'; }
+                        else if (d >= 'a' && d <= 'f') { dv = d - 'a' + 10; }
+                        else if (d >= 'A' && d <= 'F') { dv = d - 'A' + 10; }
+                        else { bad_digit(pos, "bad 0x literal: invalid hexadecimal digit ", d); }
+                        v = lit_step(pos, base, v, 16, dv);
+                    }
+                    any = 1;
+                }
+                if (!any) { lit_fail(pos, base, 0); }
+                add_tok(T_INT, v, pos);
+                continue;
+            }
+            while (lx_i < lx_n && (is_dig(lx_s[lx_i]) || lx_s[lx_i] == '_')) { bump(); }
+            var is_r: int = 0;
+            if (lpeek(0) == '.' && is_dig(lpeek(1))) {
+                is_r = 1;
+                bump();
+                while (lx_i < lx_n && (is_dig(lx_s[lx_i]) || lx_s[lx_i] == '_')) { bump(); }
+            }
+            if (lpeek(0) == 'e' || lpeek(0) == 'E') {
+                var dd: int = lpeek(1) == '+' || lpeek(1) == '-' ? 2 : 1;
+                if (is_dig(lpeek(dd))) {
+                    is_r = 1;
+                    var q: int = 0;
+                    while (q < dd) { bump(); q += 1; }
+                    while (lx_i < lx_n && is_dig(lx_s[lx_i])) { bump(); }
+                }
+            }
+            while (lx_i < lx_n && (is_alnum_ascii(lx_s[lx_i]) || lx_s[lx_i] == '_')) { bump(); }
+            // the text without `_`
+            var tl: int = 0;
+            var k2: int = start;
+            while (k2 < lx_i && tl < 728) {
+                if (lx_s[k2] != '_') { buf[tl] = lx_s[k2]; tl += 1; }
+                k2 += 1;
+            }
+            buf[tl] = 0;
+            if (is_r) {
+                if (!real_from_decimal(&buf[0], tl)) { fail_at(pos, "bad number", &buf[0]); }
+                add_tok(T_REAL, new_string(&buf[0], tl), pos);
+            } else {
+                var v2: int = 0;
+                var j: int = 0;
+                while (j < tl) {
+                    if (!is_dig(buf[j])) { fail_at(pos, "bad number", &buf[0]); }
+                    // (a number past the word is refused here: the host reads
+                    // it, then finds it does not fit)
+                    if (v2 > (3812798742493 - (buf[j] - '0')) / 10) { fail_at(pos, "bad number", &buf[0]); }
+                    v2 = v2 * 10 + buf[j] - '0';
+                    j += 1;
+                }
+                add_tok(T_INT, v2, pos);
+            }
+            continue;
+        }
+        if (is_alpha_u(c) || c == '_') {
+            var s2: int = lx_i;
+            while (lx_i < lx_n && (is_alpha_u(lx_s[lx_i]) || is_dig(lx_s[lx_i]) || lx_s[lx_i] == '_')) { bump(); }
+            var id: int = intern(lx_s + s2, lx_i - s2);
+            var kc: int = kw_code(id);
+            if (kc != 0) { add_tok(T_KW, kc, pos); } else { add_tok(T_IDENT, id, pos); }
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            var qt: int = c;
+            bump();
+            var sb: cvec;
+            sb.p = null;
+            sb.n = 0;
+            sb.cap = 0;
+            loop {
+                if (lx_i >= lx_n || lx_s[lx_i] == '\n') { fail_at(pos, "unterminated literal", null); }
+                var ch: int = lx_s[lx_i];
+                bump();
+                if (ch == qt) { break; }
+                if (ch == '\\') {
+                    if (lx_i >= lx_n) { fail_at(pos, "unterminated escape", null); }
+                    var e: int = lx_s[lx_i];
+                    bump();
+                    if (e == 'n') { ch = '\n'; }
+                    else if (e == 't') { ch = '\t'; }
+                    else if (e == 'r') { ch = '\r'; }
+                    else if (e == 'e') { ch = 27; }
+                    else if (e == '0') { ch = 0; }
+                    else if (e == '\\' || e == '\'' || e == '"') { ch = e; }
+                    else { m0(); ms("unknown escape `\\"); cv_push(&mb, e); ms("`"); fail(pos); }
+                }
+                cv_push(&sb, ch);
+            }
+            if (qt == '\'') {
+                if (sb.n != 1) { fail_at(pos, "a character literal holds exactly one character", null); }
+                add_tok(T_CHAR, sb.p[0], pos);
+            } else {
+                add_tok(T_STR, new_string(sb.p, sb.n), pos);
+            }
+            free(sb.p as *tryte);
+            continue;
+        }
+        // punctuation: the longest that matches
+        var best: int = 0;
+        var k3: int = 1;
+        while (k3 <= PU_COUNT && best == 0) {
+            var p: *char = pu_text[k3];
+            var pl: int = strlen(p);
+            var m: int = 0;
+            while (m < pl && lpeek(m) == p[m]) { m += 1; }
+            if (m == pl) { best = k3; }
+            k3 += 1;
+        }
+        if (best == 0) {
+            buf[0] = c as char;
+            buf[1] = 0;
+            fail_at(pos, "unexpected character", &buf[0]);
+        }
+        var pl2: int = strlen(pu_text[best]);
+        var b: int = 0;
+        while (b < pl2) { bump(); b += 1; }
+        add_tok(T_PUNCT, best, pos);
+    }
+    add_tok(T_EOF, 0, pos_of(file, lx_line, lx_col));
+}
+
+// ---- the syntax tree -------------------------------------------------------------------------
+//
+// Expressions, statements, type expressions and items live in parallel
+// vectors; lists (arguments, statements, fields) are runs in `lists`.
+
+const E_INT: int = 1;
+const E_REAL: int = 2;
+const E_CHAR: int = 3;
+const E_STR: int = 4;
+const E_NULL: int = 5;
+const E_NAME: int = 6;
+const E_UNARY: int = 7;
+const E_BINARY: int = 8;
+const E_ASSIGN: int = 9;
+const E_CALL: int = 10;
+const E_INDEX: int = 11;
+const E_FIELD: int = 12;
+const E_CAST: int = 13;
+const E_SIZEOF: int = 14;
+const E_COND: int = 15;
+const E_LIST: int = 16;
+
+// binary operators (the host's order)
+const B_ADD: int = 1;
+const B_SUB: int = 2;
+const B_MUL: int = 3;
+const B_DIV: int = 4;
+const B_MOD: int = 5;
+const B_SHL: int = 6;
+const B_SHR: int = 7;
+const B_MIN: int = 8;
+const B_MAX: int = 9;
+const B_CMP3: int = 10;
+const B_LT: int = 11;
+const B_LE: int = 12;
+const B_GT: int = 13;
+const B_GE: int = 14;
+const B_EQ: int = 15;
+const B_NE: int = 16;
+const B_AND: int = 17;
+const B_OR: int = 18;
+
+const U_NEG: int = 1;
+const U_NOT: int = 2;
+const U_DEREF: int = 3;
+const U_ADDR: int = 4;
+
+var ex_kind: ivec;
+var ex_op: ivec;                         // operator, or 0 (assign: 0 plain)
+var ex_a: ivec;
+var ex_b: ivec;
+var ex_c: ivec;
+var ex_v: ivec;                          // value, name, string id, type expr, list start
+var ex_n: ivec;                          // list length
+var ex_pos: ivec;
+var ex_pk: ivec;                         // its type, once peek_type has found it (-1)
+
+fn new_expr(kind: int, op: int, a: int, b: int, c: int, v: int, n: int, pos: int) -> int {
+    iv_push(&ex_kind, kind);
+    iv_push(&ex_op, op);
+    iv_push(&ex_a, a);
+    iv_push(&ex_b, b);
+    iv_push(&ex_c, c);
+    iv_push(&ex_v, v);
+    iv_push(&ex_n, n);
+    iv_push(&ex_pk, -1);
+    return iv_push(&ex_pos, pos);
+}
+
+var lists: ivec;
+
+// type expressions
+const TE_INT: int = 1;
+const TE_REAL: int = 2;
+const TE_TRYTE: int = 3;
+const TE_TRIT: int = 4;
+const TE_VOID: int = 5;
+const TE_NAMED: int = 6;
+const TE_PTR: int = 7;
+const TE_ARRAY: int = 8;
+const TE_FN: int = 9;
+
+var te_kind: ivec;
+var te_a: ivec;                          // the target/element type expr, or the name
+var te_b: ivec;                          // the array length expr, or the return type
+var te_l: ivec;                          // fn parameters: list start
+var te_n: ivec;
+
+fn new_te(kind: int, a: int, b: int, l: int, n: int) -> int {
+    iv_push(&te_kind, kind);
+    iv_push(&te_a, a);
+    iv_push(&te_b, b);
+    iv_push(&te_l, l);
+    return iv_push(&te_n, n);
+}
+
+// statements
+const S_VAR: int = 1;
+const S_EXPR: int = 2;
+const S_BLOCK: int = 3;
+const S_IF: int = 4;
+const S_WHILE: int = 5;
+const S_LOOP: int = 6;
+const S_FOR: int = 7;
+const S_SIGN: int = 8;
+const S_SWITCH: int = 9;
+const S_BREAK: int = 10;
+const S_CONTINUE: int = 11;
+const S_RETURN: int = 12;
+const S_ASM: int = 13;
+
+var st_kind: ivec;
+var st_a: ivec;
+var st_b: ivec;
+var st_c: ivec;
+var st_d: ivec;
+var st_l: ivec;                          // a list start (blocks, asm lines, cases)
+var st_n: ivec;
+var st_pos: ivec;
+
+fn new_stmt(kind: int, a: int, b: int, c: int, d: int, l: int, n: int, pos: int) -> int {
+    iv_push(&st_kind, kind);
+    iv_push(&st_a, a);
+    iv_push(&st_b, b);
+    iv_push(&st_c, c);
+    iv_push(&st_d, d);
+    iv_push(&st_l, l);
+    iv_push(&st_n, n);
+    return iv_push(&st_pos, pos);
+}
+
+// var declarations (S_VAR: st_a = the decl): name, type, init (-1), pos
+var vd_name: ivec;
+var vd_ty: ivec;
+var vd_init: ivec;
+var vd_pos: ivec;
+
+fn new_decl(name: int, ty: int, init: int, pos: int) -> int {
+    iv_push(&vd_name, name);
+    iv_push(&vd_ty, ty);
+    iv_push(&vd_init, init);
+    return iv_push(&vd_pos, pos);
+}
+
+// switch cases: values (list), body (a block statement)
+var cs_vals: ivec;
+var cs_nvals: ivec;
+var cs_body: ivec;
+
+// items
+const I_VAR: int = 1;
+const I_CONST: int = 2;
+const I_STRUCT: int = 3;
+const I_FN: int = 4;
+
+var it_kind: ivec;
+var it_name: ivec;
+var it_a: ivec;                          // var/const: the decl; fn: params list; struct: fields list
+var it_n: ivec;                          // the list length
+var it_b: ivec;                          // fn: return type; var: align expr (-1)
+var it_c: ivec;                          // fn: body block (-1 extern); var: at expr (-1)
+var it_d: ivec;                          // fn: interrupt; var: external
+var it_pos: ivec;
+
+fn new_item(kind: int, name: int, a: int, n: int, b: int, c: int, d: int, pos: int) -> int {
+    iv_push(&it_kind, kind);
+    iv_push(&it_name, name);
+    iv_push(&it_a, a);
+    iv_push(&it_n, n);
+    iv_push(&it_b, b);
+    iv_push(&it_c, c);
+    iv_push(&it_d, d);
+    return iv_push(&it_pos, pos);
+}
+
+// parameters and fields: name, type expr
+var pm_name: ivec;
+var pm_ty: ivec;
+
+// ---- the parser ------------------------------------------------------------------------------
+
+var tix: int;                             // the token
+var imports: ivec;                       // the file's imports: string ids
+var import_pos: ivec;
+
+fn tkind() -> int { return tk_kind.p[tix]; }
+fn tval() -> int { return tk_val.p[tix]; }
+fn tpos() -> int { return tk_pos.p[tix]; }
+fn advance() { if (tix < tk_kind.n - 1) { tix += 1; } }
+
+// Is the token the punctuation or keyword `s`?
+fn is(s: *char) -> int {
+    var k: int = tkind();
+    if (k == T_PUNCT) { return streq(pu_text[tval()], s); }
+    if (k == T_KW) { return name_is(kw_name[tval()], s); }
+    return 0;
+}
+
+fn eat(s: *char) -> int {
+    if (is(s)) { advance(); return 1; }
+    return 0;
+}
+
+// The token, as the host's parser describes it, onto the message.
+fn describe() {
+    var k: int = tkind();
+    if (k == T_INT) { ms("number "); mi(tval()); }
+    else if (k == T_REAL) { ms("number "); cv_push(&mb, 0); mb.n -= 1; ms_n(str_at(tval()), str_n(tval())); }
+    else if (k == T_CHAR) { ms("a character literal"); }
+    else if (k == T_STR) { ms("a string"); }
+    else if (k == T_IDENT) { mq(name_str(tval())); }
+    else if (k == T_KW) { mq(name_str(kw_name[tval()])); }
+    else if (k == T_PUNCT) { mq(pu_text[tval()]); }
+    else { ms("end of file"); }
+}
+
+fn ms_n(s: *char, n: int) {
+    var k: int = 0;
+    while (k < n) { cv_push(&mb, s[k]); k += 1; }
+}
+
+// "<what>, found <the token>" at the token
+fn fail_found(what: *char) {
+    m0();
+    ms(what);
+    ms(", found ");
+    describe();
+    fail(tpos());
+}
+
+fn expect(s: *char) {
+    if (eat(s)) { return; }
+    m0();
+    ms("expected ");
+    mq(s);
+    ms(", found ");
+    describe();
+    fail(tpos());
+}
+
+fn ident() -> int {
+    if (tkind() != T_IDENT) { fail_found("expected a name"); }
+    var v: int = tval();
+    advance();
+    return v;
+}
+
+// a list from a run of values pushed on a temporary stack
+var tmp_stack: ivec;
+
+fn take_list(from: int) -> int {
+    var start: int = lists.n;
+    var k: int = from;
+    while (k < tmp_stack.n) { iv_push(&lists, tmp_stack.p[k]); k += 1; }
+    tmp_stack.n = from;
+    return start;
+}
+
+fn parse_type() -> int {
+    var k: int = tkind();
+    var pos: int = tpos();
+    if (k == T_KW) {
+        var kw: *char = name_str(kw_name[tval()]);
+        if (streq(kw, "int")) { advance(); return new_te(TE_INT, 0, 0, 0, 0); }
+        if (streq(kw, "real")) { advance(); return new_te(TE_REAL, 0, 0, 0, 0); }
+        if (streq(kw, "tryte") || streq(kw, "char")) { advance(); return new_te(TE_TRYTE, 0, 0, 0, 0); }
+        if (streq(kw, "trit")) { advance(); return new_te(TE_TRIT, 0, 0, 0, 0); }
+        if (streq(kw, "void")) { advance(); return new_te(TE_VOID, 0, 0, 0, 0); }
+        if (streq(kw, "fn")) {
+            advance();
+            expect("(");
+            var from: int = tmp_stack.n;
+            if (!eat(")")) {
+                loop {
+                    iv_push(&tmp_stack, parse_type());
+                    if (eat(")")) { break; }
+                    expect(",");
+                }
+            }
+            var n: int = tmp_stack.n - from;
+            var l: int = take_list(from);
+            var ret: int = eat("->") ? parse_type() : new_te(TE_VOID, 0, 0, 0, 0);
+            return new_te(TE_FN, 0, ret, l, n);
+        }
+    }
+    if (k == T_IDENT) { var id: int = tval(); advance(); return new_te(TE_NAMED, id, 0, 0, 0); }
+    if (is("*")) { advance(); return new_te(TE_PTR, parse_type(), 0, 0, 0); }
+    if (is("[")) {
+        advance();
+        var len: int = parse_expr();
+        expect("]");
+        var el: int = parse_type();
+        return new_te(TE_ARRAY, el, len, 0, 0);
+    }
+    fail_found("expected a type");
+    return 0;
+}
+
+// ---- expressions ----
+
+fn parse_expr() -> int {
+    var lhs: int = parse_cond();
+    var pos: int = tpos();
+    var op: int = -1;
+    if (is("=")) { op = 0; }
+    else if (is("+=")) { op = B_ADD; }
+    else if (is("-=")) { op = B_SUB; }
+    else if (is("*=")) { op = B_MUL; }
+    else if (is("/=")) { op = B_DIV; }
+    else if (is("%=")) { op = B_MOD; }
+    else if (is("<<=")) { op = B_SHL; }
+    else if (is(">>=")) { op = B_SHR; }
+    else if (is("&=")) { op = B_MIN; }
+    else if (is("|=")) { op = B_MAX; }
+    if (op < 0) { return lhs; }
+    advance();
+    var rhs: int = parse_expr();
+    return new_expr(E_ASSIGN, op, lhs, rhs, 0, 0, 0, pos);
+}
+
+fn parse_cond() -> int {
+    var c: int = parse_binary(0);
+    if (is("?")) {
+        var pos: int = tpos();
+        advance();
+        var a: int = parse_expr();
+        expect(":");
+        var b: int = parse_cond();
+        return new_expr(E_COND, 0, c, a, b, 0, 0, pos);
+    }
+    return c;
+}
+
+// the operators of a level: (text, op) pairs, levels as the host's
+fn level_op(level: int) -> int {
+    if (tkind() != T_PUNCT) { return 0; }
+    var p: *char = pu_text[tval()];
+    if (level == 0) { return streq(p, "||") ? B_OR : 0; }
+    if (level == 1) { return streq(p, "&&") ? B_AND : 0; }
+    if (level == 2) { return streq(p, "==") ? B_EQ : streq(p, "!=") ? B_NE : 0; }
+    if (level == 3) { return streq(p, "<") ? B_LT : streq(p, "<=") ? B_LE : streq(p, ">") ? B_GT : streq(p, ">=") ? B_GE : 0; }
+    if (level == 4) { return streq(p, "<=>") ? B_CMP3 : 0; }
+    if (level == 5) { return streq(p, "|") ? B_MAX : 0; }
+    if (level == 6) { return streq(p, "&") ? B_MIN : 0; }
+    if (level == 7) { return streq(p, "<<") ? B_SHL : streq(p, ">>") ? B_SHR : 0; }
+    if (level == 8) { return streq(p, "+") ? B_ADD : streq(p, "-") ? B_SUB : 0; }
+    return streq(p, "*") ? B_MUL : streq(p, "/") ? B_DIV : streq(p, "%") ? B_MOD : 0;
+}
+
+fn parse_binary(level: int) -> int {
+    if (level == 10) { return parse_unary(); }
+    var lhs: int = parse_binary(level + 1);
+    loop {
+        var op: int = level_op(level);
+        if (op == 0) { return lhs; }
+        var pos: int = tpos();
+        advance();
+        var rhs: int = parse_binary(level + 1);
+        lhs = new_expr(E_BINARY, op, lhs, rhs, 0, 0, 0, pos);
+    }
+    return lhs;
+}
+
+fn parse_unary() -> int {
+    var e: int = parse_prefix();
+    while (is("as")) {
+        var pos: int = tpos();
+        advance();
+        var t: int = parse_type();
+        e = new_expr(E_CAST, 0, e, 0, 0, t, 0, pos);
+    }
+    return e;
+}
+
+fn parse_prefix() -> int {
+    var pos: int = tpos();
+    var op: int = 0;
+    if (is("-") || is("~")) { op = U_NEG; }
+    else if (is("!")) { op = U_NOT; }
+    else if (is("*")) { op = U_DEREF; }
+    else if (is("&")) { op = U_ADDR; }
+    if (op != 0) {
+        advance();
+        var e: int = parse_prefix();
+        return new_expr(E_UNARY, op, e, 0, 0, 0, 0, pos);
+    }
+    return parse_postfix();
+}
+
+fn parse_postfix() -> int {
+    var e: int = parse_primary();
+    loop {
+        var pos: int = tpos();
+        if (eat("(")) {
+            var from: int = tmp_stack.n;
+            if (!eat(")")) {
+                loop {
+                    iv_push(&tmp_stack, parse_expr());
+                    if (eat(")")) { break; }
+                    expect(",");
+                }
+            }
+            var n: int = tmp_stack.n - from;
+            var l: int = take_list(from);
+            e = new_expr(E_CALL, 0, e, 0, 0, l, n, pos);
+        } else if (eat("[")) {
+            var i: int = parse_expr();
+            expect("]");
+            e = new_expr(E_INDEX, 0, e, i, 0, 0, 0, pos);
+        } else if (eat(".")) {
+            var f: int = ident();
+            e = new_expr(E_FIELD, 0, e, 0, 0, f, 0, pos);
+        } else {
+            return e;
+        }
+    }
+    return e;
+}
+
+fn parse_primary() -> int {
+    var pos: int = tpos();
+    var k: int = tkind();
+    var v: int = tval();
+    if (k == T_INT) { advance(); return new_expr(E_INT, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_REAL) { advance(); return new_expr(E_REAL, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_CHAR) { advance(); return new_expr(E_CHAR, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_STR) { advance(); return new_expr(E_STR, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_IDENT) { advance(); return new_expr(E_NAME, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_KW) {
+        var kw: *char = name_str(kw_name[v]);
+        if (streq(kw, "true")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 1, 0, pos); }
+        if (streq(kw, "false")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 0, 0, pos); }
+        if (streq(kw, "null")) { advance(); return new_expr(E_NULL, 0, 0, 0, 0, 0, 0, pos); }
+        if (streq(kw, "trit") && tix + 1 < tk_kind.n && tk_kind.p[tix + 1] == T_PUNCT && streq(pu_text[tk_val.p[tix + 1]], "(")) {
+            advance();
+            return new_expr(E_NAME, 0, 0, 0, 0, intern_c("trit"), 0, pos);
+        }
+        if (streq(kw, "sizeof")) {
+            advance();
+            expect("(");
+            var t: int = parse_type();
+            expect(")");
+            return new_expr(E_SIZEOF, 0, 0, 0, 0, t, 0, pos);
+        }
+    }
+    if (is("(")) {
+        advance();
+        var e: int = parse_expr();
+        expect(")");
+        return e;
+    }
+    fail_found("expected an expression");
+    return 0;
+}
+
+fn parse_init() -> int {
+    var pos: int = tpos();
+    if (eat("{")) {
+        var from: int = tmp_stack.n;
+        if (!eat("}")) {
+            loop {
+                iv_push(&tmp_stack, parse_init());
+                if (eat("}")) { break; }
+                expect(",");
+                if (eat("}")) { break; }
+            }
+        }
+        var n: int = tmp_stack.n - from;
+        var l: int = take_list(from);
+        return new_expr(E_LIST, 0, 0, 0, 0, l, n, pos);
+    }
+    return parse_expr();
+}
+
+// ---- statements ----
+
+fn var_decl() -> int {
+    var pos: int = tpos();
+    expect("var");
+    var name: int = ident();
+    expect(":");
+    var ty: int = parse_type();
+    var init: int = -1;
+    if (eat("=")) { init = parse_init(); }
+    expect(";");
+    return new_decl(name, ty, init, pos);
+}
+
+fn parse_block() -> int {
+    var pos: int = tpos();
+    expect("{");
+    var from: int = tmp_stack.n;
+    while (!eat("}")) {
+        if (tkind() == T_EOF) { fail_at(tpos(), "unterminated block: expected `}`", null); }
+        iv_push(&tmp_stack, parse_stmt());
+    }
+    var n: int = tmp_stack.n - from;
+    var l: int = take_list(from);
+    return new_stmt(S_BLOCK, 0, 0, 0, 0, l, n, pos);
+}
+
+// `neg`, `zero`, `pos` followed by `:` (not keywords): 1, 2, 3, or 0
+fn arm_label() -> int {
+    if (tkind() != T_IDENT || tix + 1 >= tk_kind.n) { return 0; }
+    if (tk_kind.p[tix + 1] != T_PUNCT || !streq(pu_text[tk_val.p[tix + 1]], ":")) { return 0; }
+    if (name_is(tval(), "neg")) { return 1; }
+    if (name_is(tval(), "zero")) { return 2; }
+    if (name_is(tval(), "pos")) { return 3; }
+    return 0;
+}
+
+// Statements until `}` or (arms) an arm label, or (cases) case/default: a block.
+fn stmts_until(arms: int) -> int {
+    var pos: int = tpos();
+    var from: int = tmp_stack.n;
+    loop {
+        if (is("}")) { break; }
+        if (arms && arm_label() != 0) { break; }
+        if (!arms && (is("case") || is("default"))) { break; }
+        if (tkind() == T_EOF) { fail_at(tpos(), "unexpected end of file", null); }
+        iv_push(&tmp_stack, parse_stmt());
+    }
+    var n: int = tmp_stack.n - from;
+    var l: int = take_list(from);
+    return new_stmt(S_BLOCK, 0, 0, 0, 0, l, n, pos);
+}
+
+fn parse_stmt() -> int {
+    var pos: int = tpos();
+    if (is("var")) { return new_stmt(S_VAR, var_decl(), 0, 0, 0, 0, 0, pos); }
+    if (is("{")) { return parse_block(); }
+    if (eat("if")) {
+        expect("(");
+        var c: int = parse_expr();
+        expect(")");
+        var t: int = parse_stmt();
+        var e: int = -1;
+        if (eat("else")) { e = parse_stmt(); }
+        return new_stmt(S_IF, c, t, e, 0, 0, 0, pos);
+    }
+    if (eat("while")) {
+        expect("(");
+        var c2: int = parse_expr();
+        expect(")");
+        return new_stmt(S_WHILE, c2, parse_stmt(), 0, 0, 0, 0, pos);
+    }
+    if (eat("loop")) { return new_stmt(S_LOOP, 0, parse_stmt(), 0, 0, 0, 0, pos); }
+    if (eat("for")) {
+        expect("(");
+        var init: int = -1;
+        if (eat(";")) { init = -1; }
+        else if (is("var")) {
+            var vp: int = tpos();
+            init = new_stmt(S_VAR, var_decl(), 0, 0, 0, 0, 0, vp);
+        } else {
+            var ep: int = tpos();
+            var ie: int = parse_expr();
+            expect(";");
+            init = new_stmt(S_EXPR, ie, 0, 0, 0, 0, 0, ep);
+        }
+        var cond: int = -1;
+        if (!is(";")) { cond = parse_expr(); }
+        expect(";");
+        var step: int = -1;
+        if (!is(")")) { step = parse_expr(); }
+        expect(")");
+        var body: int = parse_stmt();
+        return new_stmt(S_FOR, init, cond, step, body, 0, 0, pos);
+    }
+    if (eat("sign")) {
+        expect("(");
+        var se: int = parse_expr();
+        expect(")");
+        expect("{");
+        var arms: [4]int;
+        arms[1] = -1;
+        arms[2] = -1;
+        arms[3] = -1;
+        while (!eat("}")) {
+            var which: int = arm_label();
+            if (which == 0) { fail_found("expected `neg:`, `zero:` or `pos:`"); }
+            if (arms[which] >= 0) { fail_at(tpos(), "this arm appears twice", null); }
+            advance();
+            expect(":");
+            arms[which] = stmts_until(1);
+        }
+        var k: int = 1;
+        while (k <= 3) {
+            if (arms[k] < 0) { arms[k] = new_stmt(S_BLOCK, 0, 0, 0, 0, lists.n, 0, pos); }
+            k += 1;
+        }
+        return new_stmt(S_SIGN, se, arms[1], arms[2], arms[3], 0, 0, pos);
+    }
+    if (eat("switch")) {
+        expect("(");
+        var sw: int = parse_expr();
+        expect(")");
+        expect("{");
+        var deflt: int = -1;
+        var cfrom: int = cs_vals.n;
+        var cases: ivec;
+        cases.p = null;
+        cases.n = 0;
+        cases.cap = 0;
+        while (!eat("}")) {
+            if (eat("default")) {
+                expect(":");
+                if (deflt >= 0) { fail_at(tpos(), "two `default` arms", null); }
+                deflt = stmts_until(0);
+                continue;
+            }
+            expect("case");
+            var vfrom: int = tmp_stack.n;
+            iv_push(&tmp_stack, parse_expr());
+            while (eat(",")) { iv_push(&tmp_stack, parse_expr()); }
+            var nv: int = tmp_stack.n - vfrom;
+            var vl: int = take_list(vfrom);
+            expect(":");
+            var bodyb: int = stmts_until(0);
+            iv_push(&cases, vl);
+            iv_push(&cases, nv);
+            iv_push(&cases, bodyb);
+        }
+        // the cases, contiguous
+        var first: int = cs_vals.n;
+        var q: int = 0;
+        while (q < cases.n) {
+            iv_push(&cs_vals, cases.p[q]);
+            iv_push(&cs_nvals, cases.p[q + 1]);
+            iv_push(&cs_body, cases.p[q + 2]);
+            q += 3;
+        }
+        var nc: int = cases.n / 3;
+        free(cases.p as *tryte);
+        return new_stmt(S_SWITCH, sw, deflt, 0, 0, first, nc, pos);
+    }
+    if (eat("break")) { expect(";"); return new_stmt(S_BREAK, 0, 0, 0, 0, 0, 0, pos); }
+    if (eat("continue")) { expect(";"); return new_stmt(S_CONTINUE, 0, 0, 0, 0, 0, 0, pos); }
+    if (eat("return")) {
+        var re: int = -1;
+        if (!is(";")) { re = parse_expr(); }
+        expect(";");
+        return new_stmt(S_RETURN, re, 0, 0, 0, 0, 0, pos);
+    }
+    if (eat("asm")) {
+        expect("{");
+        var afrom: int = tmp_stack.n;
+        while (!eat("}")) {
+            if (tkind() != T_STR) { fail_found("expected an assembly string"); }
+            iv_push(&tmp_stack, tval());
+            advance();
+        }
+        var an: int = tmp_stack.n - afrom;
+        var al: int = take_list(afrom);
+        return new_stmt(S_ASM, 0, 0, 0, 0, al, an, pos);
+    }
+    var x: int = parse_expr();
+    expect(";");
+    return new_stmt(S_EXPR, x, 0, 0, 0, 0, 0, pos);
+}
+
+// ---- items ----
+
+// (name, params list, n, ret)
+var sig_name: int;
+var sig_params: int;
+var sig_n: int;
+var sig_ret: int;
+
+fn fn_sig() {
+    sig_name = ident();
+    expect("(");
+    var from: int = tmp_stack.n;
+    if (!eat(")")) {
+        loop {
+            var p: int = ident();
+            expect(":");
+            var t: int = parse_type();
+            iv_push(&pm_name, p);
+            iv_push(&tmp_stack, iv_push(&pm_ty, t));
+            if (eat(")")) { break; }
+            expect(",");
+        }
+    }
+    sig_n = tmp_stack.n - from;
+    sig_params = take_list(from);
+    sig_ret = eat("->") ? parse_type() : new_te(TE_VOID, 0, 0, 0, 0);
+}
+
+// Parse the file's tokens: items appended; its imports in `imports`.
+fn parse_program() {
+    tix = 0;
+    imports.n = 0;
+    import_pos.n = 0;
+    while (tkind() != T_EOF) {
+        var pos: int = tpos();
+        if (eat("import")) {
+            if (tkind() != T_STR) { fail_at(tpos(), "expected a file name string", null); }
+            iv_push(&imports, tval());
+            iv_push(&import_pos, pos);
+            advance();
+            expect(";");
+            continue;
+        }
+        var align: int = -1;
+        var at: int = -1;
+        var nattrs: int = 0;
+        while (eat("@")) {
+            var an: int = ident();
+            expect("(");
+            var ae: int = parse_expr();
+            expect(")");
+            if (name_is(an, "align")) { align = ae; }
+            else if (name_is(an, "at")) { at = ae; }
+            else { m0(); ms("unknown attribute `@"); ms(name_str(an)); ms("`"); fail(pos); }
+            nattrs += 1;
+        }
+        if (is("var")) {
+            var d: int = var_decl();
+            new_item(I_VAR, vd_name.p[d], d, 0, align, at, 0, pos);
+            continue;
+        }
+        if (nattrs > 0) { fail_at(tpos(), "attributes apply to `var` declarations", null); }
+        if (eat("const")) {
+            var cn: int = ident();
+            expect(":");
+            var ct: int = parse_type();
+            expect("=");
+            var ci: int = parse_expr();
+            expect(";");
+            new_item(I_CONST, cn, new_decl(cn, ct, ci, pos), 0, -1, -1, 0, pos);
+            continue;
+        }
+        if (eat("struct")) {
+            var sn: int = ident();
+            expect("{");
+            var from: int = tmp_stack.n;
+            while (!eat("}")) {
+                var f: int = ident();
+                expect(":");
+                var ft: int = parse_type();
+                expect(";");
+                iv_push(&pm_name, f);
+                iv_push(&tmp_stack, iv_push(&pm_ty, ft));
+            }
+            var nf: int = tmp_stack.n - from;
+            new_item(I_STRUCT, sn, take_list(from), nf, -1, -1, 0, pos);
+            continue;
+        }
+        if (eat("extern")) {
+            if (is("var")) {
+                advance();
+                var en: int = ident();
+                expect(":");
+                var et: int = parse_type();
+                expect(";");
+                new_item(I_VAR, en, new_decl(en, et, -1, pos), 0, -1, -1, 1, pos);
+                continue;
+            }
+            expect("fn");
+            fn_sig();
+            expect(";");
+            new_item(I_FN, sig_name, sig_params, sig_n, sig_ret, -1, 0, pos);
+            continue;
+        }
+        var intr: int = eat("interrupt");
+        if (eat("fn")) {
+            fn_sig();
+            var nm: int = sig_name;
+            var ps: int = sig_params;
+            var pn: int = sig_n;
+            var rt: int = sig_ret;
+            var body: int = parse_block();
+            new_item(I_FN, nm, ps, pn, rt, body, intr, pos);
+            continue;
+        }
+        fail_found("expected a declaration");
+    }
+}

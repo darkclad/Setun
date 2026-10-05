@@ -1,6 +1,8 @@
-//! Trinux building its own programs (docs/SELFHOST.md): the assembler `tas`,
-//! written in Trine, must turn the host compiler's assembly into exactly the
-//! executables the host's own assembler made.
+//! Trinux building its own programs (docs/SELFHOST.md): the assembler `tas`
+//! and the compiler `tric`, written in Trine. `tas` must turn the host
+//! compiler's assembly into exactly the executables the host's own assembler
+//! made; `tric` must write exactly the host compiler's unoptimized assembly,
+//! and its error messages; and `tric` must build itself to a fixed point.
 
 mod common;
 use common::*;
@@ -39,6 +41,198 @@ fn same_as_host(s: &mut Session, p: &str) {
     let o = s.cmd_max(&format!("tas -o /tmp/{p} /usr/src/{p}.s; echo status $?; md5sum /tmp/{p} /bin/{p}"), 60_000_000_000);
     assert!(o.contains("status 0"), "{p}: {o}");
     assert_eq!(md5_of(&o, &format!("/tmp/{p}")), md5_of(&o, &format!("/bin/{p}")), "{p}: tas and the host differ:\n{o}");
+}
+
+/// A disk with the Trine sources: the programs' and the library's under
+/// /usr/src (as in the repository: bin/, lib/), the standard library in
+/// /usr/lib/trine, and for each program the host compiler's unoptimized
+/// assembly as /usr/src/P.s.
+fn disk_with_trine(progs: &[&str], extra: &[(&str, &str)]) -> Vec<i16> {
+    let dir = std::env::temp_dir().join(format!("setun-tric-{}-{}", std::process::id(), progs.join("-")));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = trinux::default_files();
+    let user = trinux::user_dir();
+    // (a target named `.tri` goes onto the disk as a source, not compiled)
+    let add = |files: &mut Vec<(String, std::path::PathBuf)>, target: String, src: &std::path::Path| {
+        files.push((target, src.to_path_buf()));
+    };
+    let tree = |d: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "tri")).collect();
+        v.sort();
+        v
+    };
+    for p in tree(&user.join("lib")) {
+        add(&mut files, format!("/usr/src/lib/{}", p.file_name().unwrap().to_str().unwrap()), &p);
+    }
+    for p in tree(&user.join("bin/tric")) {
+        add(&mut files, format!("/usr/src/bin/tric/{}", p.file_name().unwrap().to_str().unwrap()), &p);
+    }
+    for p in tree(&user.join("../crates/trine/lib")) {
+        add(&mut files, format!("/usr/lib/trine/{}", p.file_name().unwrap().to_str().unwrap()), &p);
+    }
+    let opts = trine::Options { optimize: false, ..trine::Options::user() };
+    for p in progs {
+        let src = user.join(format!("bin/{p}.tri"));
+        add(&mut files, format!("/usr/src/bin/{p}.tri"), &src);
+        let b = trine::build_file(&src, &opts).unwrap_or_else(|e| panic!("{p}: {e}"));
+        let path = dir.join(format!("{p}.s"));
+        std::fs::write(&path, &b.asm).unwrap();
+        files.push((format!("/usr/src/{p}.s"), path));
+    }
+    for (name, text) in extra {
+        let path = dir.join(format!("{name}.txt"));
+        std::fs::write(&path, text).unwrap();
+        files.push((format!("/usr/src/{name}"), path));
+    }
+    trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Tfs { blocks: 1944, inodes: 729 })
+        .unwrap_or_else(|e| panic!("{e}"))
+        .trytes
+}
+
+/// Compile /usr/src/bin/P.tri in Trinux: the assembly must be the host's.
+fn tric_same_as_host(s: &mut Session, p: &str) {
+    tric_compare(s, p, &format!("/usr/src/bin/{p}.tri"));
+}
+
+/// Compile `src` in Trinux: the assembly must be /usr/src/P.s.
+fn tric_compare(s: &mut Session, p: &str, src: &str) {
+    // (on the disk: a big program's assembly does not fit in a RAM file in /tmp)
+    let o = s.cmd_max(&format!("mkdir -p /usr/obj; tric -v -S -o /usr/obj/{p}.s {src}; echo status $?; md5sum /usr/obj/{p}.s /usr/src/{p}.s"), 200_000_000_000);
+    eprintln!("{p}: {o}");
+    assert!(o.contains("status 0"), "{p}: {o}");
+    let (a, b) = (md5_of(&o, &format!("/usr/obj/{p}.s")), md5_of(&o, &format!("/usr/src/{p}.s")));
+    if a != b {
+        let d = s.cmd_max(&format!("diff /usr/src/{p}.s /usr/obj/{p}.s | head -20"), 20_000_000_000);
+        panic!("{p}: tric and the host differ:\n{d}");
+    }
+}
+
+/// Real literals: the decimal is converted exactly and rounded once, ties to
+/// even, as the host does; subnormals, overflow to ∞, the far cut-offs,
+/// negated constants and integers as reals.
+const REALS: &str = "\
+const A: real = 1.5;
+const B: real = -A;
+const C: real = 7;
+const D: real = -C;
+const N: int = -12;
+const E: real = N;
+const BIG: real = 1e300;
+const TINY: real = 1e-300;
+const SUB: real = 2.5e-4700;
+const HUGE: real = 1e5000;
+const OVER: real = 1e20001;
+const UNDER: real = 1e-20001;
+const ZERO: real = 0.0;
+fn main() -> int {
+    var x: real = 0.1 + 0.2 + A + B + C + D + E + BIG + TINY + SUB + HUGE + OVER + UNDER + ZERO;
+    x = x * 3.14159265358979323846264338327950288 + 2.718281828459045e0 - 1e-5 / 6.02214076e23;
+    x = x + 0.5 + 1.0 + 1_000.000_1 + 9.99999999999999999999e-1 + 123456789012345678901234567890.123;
+    x = x + 0.3333333333333333333333333333333333333 + 1e-4695 + 5e-4696 + 3e+20 + 0e5 + 4.5e-1;
+    return x as int;
+}
+";
+
+#[test]
+fn tric_converts_reals_as_the_host_does() {
+    let opts = trine::Options { optimize: false, ..trine::Options::user() };
+    let want = trine::build_source("/usr/src/reals.tri", REALS, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
+    let disk = disk_with_trine(&["calc", "fputest"], &[("reals.tri", REALS), ("reals.s", &want)]);
+    let mut s = Session::boot_disk(&disk, false);
+    tric_compare(&mut s, "reals", "/usr/src/reals.tri");
+    for p in ["calc", "fputest"] {
+        tric_same_as_host(&mut s, p);
+    }
+}
+
+#[test]
+fn tric_matches_the_host_compiler() {
+    let progs = ["echo", "cat", "sh", "edit", "tas", "tric", "libctest", "wget"];
+    let disk = disk_with_trine(&progs, &[]);
+    let mut s = Session::boot_disk(&disk, false);
+    for p in progs {
+        tric_same_as_host(&mut s, p);
+    }
+}
+
+/// The fixed point: tric (built by the host) builds tric; that one builds
+/// tric again, and the two are the same program, the one the host's own
+/// unoptimized assembly makes. What the second builds runs.
+#[test]
+fn tric_builds_itself() {
+    let disk = disk_with_trine(&["tric", "echo"], &[]);
+    let mut s = Session::boot_disk(&disk, false);
+    let o = s.cmd_max(
+        "mkdir -p /usr/obj; cd /usr/obj; tric -o tric2 /usr/src/bin/tric.tri; echo status $?; \
+         ./tric2 -o tric3 /usr/src/bin/tric.tri; echo status $?; tas -o tric.host /usr/src/tric.s; md5sum tric2 tric3 tric.host; ls",
+        400_000_000_000,
+    );
+    assert_eq!(o.matches("status 0").count(), 2, "{o}");
+    let (a, b, c) = (md5_of(&o, " tric2"), md5_of(&o, " tric3"), md5_of(&o, " tric.host"));
+    assert_eq!(a, b, "not a fixed point:\n{o}");
+    assert_eq!(a, c, "not the host's:\n{o}");
+    assert!(!o.contains(".tmp.s"), "the assembly was left behind:\n{o}");
+    has(&s.cmd_max("./tric3 -o echo3 /usr/src/bin/echo.tri && ./echo3 built by tric3", 100_000_000_000), &["built by tric3\n"]);
+}
+
+/// The stock disk has what a user needs to build a program: tric, tas and
+/// the sources, with imports found next to the file.
+#[test]
+fn tric_on_the_default_disk() {
+    let mut s = Session::boot_with(false);
+    let o = s.cmd_max("cd /usr/src; tric -o /root/hello hello.tri; echo status $?; /root/hello one two; ls /root; df", 60_000_000_000);
+    eprintln!("{o}");
+    has(&o, &["status 0", "argc 3: [/root/hello] [one] [two]"]);
+    assert!(!o.contains("hello.tmp.s"), "the assembly was left behind:\n{o}");
+}
+
+/// Errors: for each bad program, tric says what the host compiler says,
+/// at the same place, exits 1 and leaves no output behind.
+#[test]
+fn tric_reports_errors_as_the_host_does() {
+    let bad: &[(&str, &str)] = &[
+        ("unknown.tri", "fn main() -> int { return x; }\n"),
+        ("twice.tri", "fn main() -> int {\n    var a: int = 1;\n    var a: int = 2;\n    return a;\n}\n"),
+        ("types.tri", "fn main() -> int { return \"s\"; }\n"),
+        ("syntax.tri", "fn main() -> int { return 1 +; }\n"),
+        ("charlit.tri", "fn main() -> int { var c: char = 'ab'; return 0; }\n"),
+        ("args.tri", "fn f(a: int) -> int { return a; }\nfn main() -> int { return f(1, 2); }\n"),
+        ("field.tri", "struct s { a: int; a: int; }\nfn main() -> int { return 0; }\n"),
+        ("break.tri", "fn main() -> int { break; }\n"),
+        ("hex.tri", "fn main() -> int { return 0x; }\n"),
+        ("import.tri", "import \"nosuch.tri\";\nfn main() -> int { return 0; }\n"),
+        ("nomain.tri", "fn helper() {}\n"),
+        ("init.tri", "fn main() -> int { var x: [3]int = {1, 2, 3, 4}; return x[0]; }\n"),
+        ("case.tri", "fn main() -> int { switch (1) { case 1: return 1; case 2, 1: return 2; } return 0; }\n"),
+        ("fits.tri", "const c: tryte = 20000;\nfn main() -> int { return 0; }\n"),
+        ("ptr.tri", "fn main() -> int { var p: *int; var q: *char; return p - q; }\n"),
+        ("sizeof.tri", "fn main() -> int { return sizeof(nosuch); }\n"),
+        ("comment.tri", "fn main() -> int { /* open\n"),
+        ("ternary.tri", "fn main() -> int { return 0t1+1; }\n"),
+        ("mainargs.tri", "fn main(a: int, b: int, c: int) -> int { return 0; }\n"),
+        ("reserved.tri", "var r1: int;\nfn main() -> int { return 0; }\n"),
+        ("creg.tri", "fn main() -> int { return mfc(foo); }\n"),
+        ("cond.tri", "struct s { a: int; }\nvar v: s;\nfn main() -> int { if (v) { return 1; } return 0; }\n"),
+        ("deref.tri", "fn main() -> int { var p: *void; return *p; }\n"),
+        ("noaddr.tri", "fn main() -> int { var p: *int = &5; return 0; }\n"),
+        ("block.tri", "fn main() -> int {\n"),
+        ("escape.tri", "fn main() -> int { return '\\q'; }\n"),
+    ];
+    let disk = disk_with_trine(&[], bad);
+    let mut s = Session::boot_disk(&disk, false);
+    s.cmd("mkdir /usr/obj");
+    let opts = trine::Options { optimize: false, ..trine::Options::user() };
+    for (name, text) in bad {
+        let want = match trine::build_source(&format!("/usr/src/{name}"), text, None, &opts) {
+            Err(e) => e,
+            Ok(_) => panic!("{name}: the host compiles it"),
+        };
+        let o = s.cmd_max(&format!("tric -S -o /usr/obj/bad.s /usr/src/{name}; echo status $?; ls /usr/obj"), 20_000_000_000);
+        has(&o, &[want.as_str(), "status 1"]);
+        assert!(!o.contains("bad.s"), "{name}: output left behind:\n{o}");
+    }
+    has(&s.cmd("tric; echo status $?; tric /nosuch.tri; echo status $?"), &["usage: tric [-S] [-o out] file.tri\nstatus 2", "tric: /nosuch.tri: No such file or directory\nstatus 1"]);
 }
 
 #[test]

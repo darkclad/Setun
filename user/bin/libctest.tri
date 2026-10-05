@@ -108,6 +108,15 @@ fn heap() {
         free(big);
     }
     ok("malloc 600000 trytes", bigok);
+    // realloc keeps a word array whole (its first word starts a tryte
+    // below the pointer: once that tryte was lost)
+    var wa: *int = malloc(9) as *int;
+    wa[0] = -3812798742493;
+    wa[1] = 1234567;
+    wa[2] = 3812798742493;
+    var wb: *int = realloc(wa as *tryte, 3000) as *int;
+    ok("realloc keeps words", wb != null && wb[0] == -3812798742493 && wb[1] == 1234567 && wb[2] == 3812798742493);
+    free(wb as *tryte);
     var huge: *tryte = malloc(100000000);
     ok("malloc too much is ENOMEM", huge == null && errno == ENOMEM);
     ok("malloc(-1) is null", malloc(-1) == null);

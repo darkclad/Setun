@@ -104,7 +104,8 @@ fn realloc(ptr: *tryte, n: int) -> *tryte {
     if (n <= have) { return ptr; }
     var q: *tryte = malloc(n);
     if (q == null) { return null; }
-    memcpy(q, ptr, have);
+    // from the first word's low tryte: a word array starts at ptr - 1
+    memcpy(q - 1, ptr - 1, have + 1);
     free(ptr);
     return q;
 }

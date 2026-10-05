@@ -136,7 +136,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "x509", "certgen", "tas", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
+        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -179,13 +179,20 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     v
 }
 
-/// The bytes of an initramfs file: `.tri` sources are compiled to TEF,
-/// anything else is copied as text (one code point per tryte).
-pub fn initramfs_file(src: &Path) -> Result<Vec<i16>, String> {
+/// Is the file at `name` a program compiled from `src` (a `.tri` source
+/// put at a name that is not itself a `.tri`)?
+fn compiled(name: &str, src: &Path) -> bool {
+    src.extension().is_some_and(|e| e == "tri") && !name.ends_with(".tri")
+}
+
+/// The trytes of the file at `name` on a disk: a `.tri` source is compiled
+/// to TEF, unless it goes in as a source (a name ending in `.tri`); anything
+/// else is copied as text (one code point per tryte).
+pub fn disk_file(name: &str, src: &Path) -> Result<Vec<i16>, String> {
     if src == Path::new(FONT_SOURCE) {
         return Ok(font8x8_table());
     }
-    if src.extension().is_some_and(|e| e == "tri") {
+    if compiled(name, src) {
         return tef(src);
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -221,8 +228,39 @@ pub fn tef(path: &Path) -> Result<Vec<i16>, String> {
 }
 
 /// Compile the loader, the kernel and the default files; lay out the disk.
+/// The disk also carries the Trine sources `tric` needs (docs/SELFHOST.md).
 pub fn build_disk(kernel_dir: &Path) -> Result<Disk, String> {
-    build_disk_with(kernel_dir, &default_files())
+    let mut files = default_files();
+    files.extend(source_files());
+    build_disk_with(kernel_dir, &files)
+}
+
+/// Sources for building programs in Trinux: the libraries in /usr/src/lib,
+/// the standard library in /usr/lib/trine, the compiler's own sources (so
+/// it can rebuild itself) and /usr/src/hello.tri.
+pub fn source_files() -> Vec<(String, PathBuf)> {
+    let u = user_dir();
+    let tree = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d)
+            .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "tri")).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+    let mut v = Vec::new();
+    for p in tree(&u.join("lib")) {
+        v.push((format!("/usr/src/lib/{}", name(&p)), p));
+    }
+    for p in tree(&u.join("../crates/trine/lib")) {
+        v.push((format!("/usr/lib/trine/{}", name(&p)), p));
+    }
+    v.push(("/usr/src/bin/tric.tri".into(), u.join("bin/tric.tri")));
+    for p in tree(&u.join("bin/tric")) {
+        v.push((format!("/usr/src/bin/tric/{}", name(&p)), p));
+    }
+    v.push(("/usr/src/hello.tri".into(), u.join("hello.tri")));
+    v
 }
 
 /// The default layout (a tfs root) with these files.
@@ -237,14 +275,15 @@ pub fn build_tfs(files: &[(String, PathBuf)], blocks: usize, inodes: usize) -> R
         fs.mkdir_p(d)?;
     }
     // The same source under several names becomes hard links to one file.
+    // (a source and the program compiled from it are different files)
     let mut written: Vec<(&PathBuf, String)> = Vec::new();
     for (name, src) in files {
-        if let Some((_, first)) = written.iter().find(|(p, _)| *p == src) {
+        if let Some((_, first)) = written.iter().find(|(p, n)| *p == src && compiled(n, p) == compiled(name, src)) {
             fs.link(first, name).map_err(|e| format!("{name}: {e}"))?;
             continue;
         }
-        let data = initramfs_file(src)?;
-        let perm = if src.extension().is_some_and(|e| e == "tri") { 0o755 } else { 0o644 };
+        let data = disk_file(name, src)?;
+        let perm = if compiled(name, src) { 0o755 } else { 0o644 };
         fs.write_file(name, &data, perm).map_err(|e| format!("{name}: {e}"))?;
         written.push((src, name.clone()));
     }
@@ -303,7 +342,7 @@ fn build_boot_area(kernel_dir: &Path, files: &[(String, PathBuf)], root: &Root) 
         if chars.len() > 26 {
             return Err(format!("initramfs path too long: {name}"));
         }
-        let file = initramfs_file(src)?;
+        let file = disk_file(name, src)?;
         let mut n: Vec<i16> = chars.iter().map(|&c| c as i16).collect();
         n.resize(27, 0);
         entries.extend_from_slice(&n);

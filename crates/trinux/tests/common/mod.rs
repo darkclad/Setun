@@ -29,7 +29,12 @@ impl Session {
 
     /// Boot from this disk image (logged in as root).
     pub fn boot_disk(disk: &[i16], link: bool) -> Session {
-        let mut m = trinux::boot_trytes(disk, 729, 0, "");
+        Self::boot_disk_ram(disk, link, 729)
+    }
+
+    /// `boot_disk` on a machine with this many frames of RAM.
+    pub fn boot_disk_ram(disk: &[i16], link: bool, frames: i64) -> Session {
+        let mut m = trinux::boot_trytes(disk, frames, 0, "");
         let net = Network::attach(&mut m);
         if !link {
             m.dev.nic.link = false;

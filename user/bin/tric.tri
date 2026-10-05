@@ -1,0 +1,402 @@
+// tric [-S] [-o OUT] FILE.tri: the Trine compiler, in Trine.
+//
+// It compiles as the host's `trine build --user --no-opt` does: the same
+// assembly, character for character (docs/SELFHOST.md). With -S that
+// assembly is the output; otherwise tas assembles it into a Trinux
+// executable. Imports resolve as on the host: next to the importing file
+// first, then the standard library (in /usr/lib/trine). Not yet: real
+// literals, and the optimizer.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/string.tri";
+import "../lib/getopt.tri";
+import "tric/front.tri";
+import "tric/gen.tri";
+import "tric/real.tri";
+
+const USER_BASE: int = -847288609443;
+const USER_DATA: int = -847288078002;   // USER_BASE + 27 pages
+
+var stdlib_dir: *char = "/usr/lib/trine/";
+var stdlib_names: *char = "ports.tri rt.tri console.tri keymap.tri real.tri math.tri ";
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: tric [-S] [-o out] file.tri\n");
+    return 2;
+}
+
+// ---- files -----------------------------------------------------------------------------------
+
+var src_n: int;
+
+// The whole file (src_n characters), or null.
+fn read_file(path: *char) -> *char {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return null; }
+    var st: stat_t;
+    fstat(fd, &st);
+    var s: *char = malloc(st.st_size + 1) as *char;
+    if (s == null) { oom(); }
+    src_n = 0;
+    loop {
+        var r: int = read(fd, s + src_n, st.st_size - src_n);
+        if (r <= 0) { break; }
+        src_n += r;
+    }
+    close(fd);
+    return s;
+}
+
+fn is_file(path: *char) -> int {
+    var st: stat_t;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// `path` with `.` and `dir/..` taken out: the name an imported file is
+// known by (the host's canonical path).
+fn normalize(path: *char) -> int {
+    var n: int = strlen(path);
+    var out: *char = malloc(n + 2) as *char;
+    if (out == null) { oom(); }
+    var o_n: int = 0;
+    var abs: int = path[0] == '/';
+    var k: int = 0;
+    while (k <= n) {
+        while (k < n && path[k] == '/') { k += 1; }
+        if (k >= n) { break; }
+        var e: int = k;
+        while (e < n && path[e] != '/') { e += 1; }
+        var len: int = e - k;
+        if (len == 1 && path[k] == '.') {
+            // nothing
+        } else if (len == 2 && path[k] == '.' && path[k + 1] == '.' && o_n > 0 && !ends_dotdot(out, o_n)) {
+            while (o_n > 0 && out[o_n - 1] != '/') { o_n -= 1; }
+            if (o_n > 0) { o_n -= 1; }
+        } else {
+            if (o_n > 0 || abs) { out[o_n] = '/'; o_n += 1; }
+            var q: int = k;
+            while (q < e) { out[o_n] = path[q]; o_n += 1; q += 1; }
+        }
+        k = e;
+    }
+    if (o_n == 0) { out[0] = abs ? '/' : '.'; o_n = 1; }
+    var id: int = intern(out, o_n);
+    free(out as *tryte);
+    return id;
+}
+
+fn ends_dotdot(s: *char, n: int) -> int {
+    return n >= 2 && s[n - 1] == '.' && s[n - 2] == '.' && (n == 2 || s[n - 3] == '/');
+}
+
+// The directory part of `path` ("" for none): a new string.
+fn dir_of(path: *char) -> *char {
+    var n: int = strlen(path);
+    while (n > 0 && path[n - 1] != '/') { n -= 1; }
+    if (n > 1) { n -= 1; }               // "a/b" -> "a", "/b" -> "/"
+    return strndup(path, n);
+}
+
+fn join(dir: *char, path: *char) -> *char {
+    if (path[0] == '/' || dir[0] == 0) { return strdup(path); }
+    var s: *char = malloc(strlen(dir) + strlen(path) + 2) as *char;
+    if (s == null) { oom(); }
+    strcpy(s, dir);
+    if (dir[strlen(dir) - 1] != '/') { strcat(s, "/"); }
+    strcat(s, path);
+    return s;
+}
+
+fn is_stdlib(name: *char) -> int {
+    var k: int = 0;
+    while (stdlib_names[k] != 0) {
+        var j: int = 0;
+        while (name[j] != 0 && stdlib_names[k + j] == name[j]) { j += 1; }
+        if (name[j] == 0 && stdlib_names[k + j] == ' ') { return 1; }
+        while (stdlib_names[k] != ' ') { k += 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+// ---- loading ---------------------------------------------------------------------------------
+
+var seen: *int;                          // by name: a file already loaded
+var imp_sid: ivec;                       // the imports being loaded, a stack
+var imp_pos: ivec;
+
+// Load a file: its imports (depth first) go before its own items, as the
+// host's loader orders them. `dir` is where its imports are looked for
+// first (null: none, for the standard library).
+fn load_file(name: int, src: *char, n: int, dir: *char) {
+    var file: int = iv_push(&file_names, name);
+    lex(src, n, file);
+    free(src as *tryte);
+    var first: int = it_kind.n;
+    parse_program();
+    var last: int = it_kind.n;
+    var base: int = imp_sid.n;
+    var k: int = 0;
+    while (k < imports.n) {
+        iv_push(&imp_sid, imports.p[k]);
+        iv_push(&imp_pos, import_pos.p[k]);
+        k += 1;
+    }
+    var count: int = imp_sid.n - base;
+    k = 0;
+    while (k < count) {
+        var sid: int = imp_sid.p[base + k];
+        var path: *char = strndup(str_at(sid), str_n(sid));
+        var key: int = -1;
+        var text: *char = null;
+        var sub: *char = null;
+        if (dir != null) {
+            var p: *char = join(dir, path);
+            if (is_file(p)) {
+                key = normalize(p);
+                text = read_file(p);
+                if (text == null) { perror2("tric", p); exit(1); }
+                sub = dir_of(name_str(key));
+            }
+            free(p as *tryte);
+        }
+        if (key < 0) {
+            if (!is_stdlib(path)) {
+                m0(); ms("cannot find "); mq(path); fail(imp_pos.p[base + k]);
+            }
+            var std: *char = join(stdlib_dir, path);
+            var sname: *char = join("<std>", path);
+            key = intern_c(sname);
+            free(sname as *tryte);
+            if (!seen[key]) {
+                text = read_file(std);
+                if (text == null) { perror2("tric", std); exit(1); }
+            }
+            free(std as *tryte);
+        }
+        if (!seen[key]) {
+            seen[key] = 1;
+            load_file(key, text, src_n, sub);
+        } else if (text != null) {
+            free(text as *tryte);
+        }
+        if (sub != null) { free(sub as *tryte); }
+        free(path as *tryte);
+        k += 1;
+    }
+    imp_sid.n = base;
+    imp_pos.n = base;
+    k = first;
+    while (k < last) { iv_push(&order, k); k += 1; }
+}
+
+// ---- output ----------------------------------------------------------------------------------
+
+var out: cvec;
+
+fn put(s: *char) { cv_str(&out, s); }
+fn put_i(v: int) { cv_int(&out, v); }
+
+// The startup code, as the host's crt0_user writes it.
+fn crt0(environ: int) {
+    put("; ---- crt0 (user): generated by trine ------------------------------------------\n");
+    put("_trine_data_start = "); put_i(data_start); put("      ; the globals, for the TEF header (tas)\n");
+    put("_trine_data_end = "); put_i(data_cursor); put("\n");
+    put("        .org "); put_i(USER_BASE); put("\n");
+    put("_start: mov   r-1, r1                ; argc, argv, envp (set up by the kernel, as is sp)\n");
+    put("        mov   r-2, r2\n");
+    put("        mov   r-3, r3\n");
+    put("        li    r1, "); put_i(data_start); put("\n");
+    put("        li    r2, "); put_i(data_cursor); put("\n");
+    put("_trine_zero:\n");
+    put("        cmp   r1, r2\n");
+    put("        bge   _trine_zeroed\n");
+    put("        stw   r0, [r1]\n");
+    put("        add   r1, r1, 3\n");
+    put("        b     _trine_zero\n");
+    put("_trine_zeroed:\n");
+    put("        call  _trine_init\n");
+    if (environ) { put("        stw   r-3, [environ]          ; envp, for getenv\n"); }
+    put("        mov   r1, r-1\n");
+    put("        mov   r2, r-2\n");
+    put("        call  main\n");
+    put("        sys   93                      ; exit(main's result)\n");
+    put("_trine_halt:\n");
+    put("        b     _trine_halt\n");
+    put("; ---- program -----------------------------------------------------------------\n");
+}
+
+// the string escaped as the host writes it in a .string
+fn put_escaped(sid: int) {
+    var p: *char = str_at(sid);
+    var k: int = 0;
+    while (k < str_n(sid)) {
+        var c: int = p[k];
+        if (c == '"') { put("\\\""); }
+        else if (c == '\\') { put("\\\\"); }
+        else if (c == '\n') { put("\\n"); }
+        else if (c == '\t') { put("\\t"); }
+        else if (c == '\r') { put("\\r"); }
+        else if (c == 0) { put("\\0"); }
+        else { cv_push(&out, c); }
+        k += 1;
+    }
+}
+
+// Sort names by their text (merge sort; `tmp` as long as `a`).
+fn sort_names(a: *int, tmp: *int, n: int) {
+    if (n < 2) { return; }
+    var h: int = n / 2;
+    sort_names(a, tmp, h);
+    sort_names(a + h, tmp, n - h);
+    var i: int = 0;
+    var j: int = h;
+    var k: int = 0;
+    while (i < h || j < n) {
+        if (j >= n || (i < h && strcmp(name_str(a[i]), name_str(a[j])) <= 0)) { tmp[k] = a[i]; i += 1; }
+        else { tmp[k] = a[j]; j += 1; }
+        k += 1;
+    }
+    k = 0;
+    while (k < n) { a[k] = tmp[k]; k += 1; }
+}
+
+// The output begins (the globals are laid out): crt0. A failed compile
+// takes the file away again.
+fn start_output() {
+    out_fd = open(out_path, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (out_fd < 0) { perror2("tric", out_path); exit(1); }
+    fail_unlink = out_path;
+    crt0(g_kind[intern_c("environ")] == G_VAR);
+    write_all(out_fd, out_path, out.p, out.n);
+    out.n = 0;
+}
+
+// The pools and the equates after the code.
+fn finish_output() {
+    var k: int = 0;
+    while (k < rp_w0.n) {
+        put(".Lreal");
+        put_i(k);
+        put(": .word ");
+        put_i(rp_w0.p[k]);
+        put(", ");
+        put_i(rp_w1.p[k]);
+        put(", ");
+        put_i(rp_w2.p[k]);
+        put("\n");
+        k += 1;
+    }
+    k = 0;
+    while (k < pool.n) {
+        put(".Lstr");
+        put_i(k);
+        put(": .string \"");
+        put_escaped(pool.p[k]);
+        put("\"\n");
+        k += 1;
+    }
+    // the global variables as assembler constants, by name
+    var vars: ivec;
+    vars.p = null;
+    vars.n = 0;
+    vars.cap = 0;
+    k = 0;
+    while (k < nm_count) { if (g_kind[k] == G_VAR) { iv_push(&vars, k); } k += 1; }
+    var tmp: *int = malloc(vars.n * 3 + 3) as *int;
+    if (tmp == null) { oom(); }
+    sort_names(vars.p, tmp, vars.n);
+    k = 0;
+    while (k < vars.n) {
+        put(name_str(vars.p[k]));
+        put(" = ");
+        put_i(g_val[vars.p[k]]);
+        put("\n");
+        k += 1;
+    }
+    write_all(out_fd, out_path, out.p, out.n);
+    close(out_fd);
+    fail_unlink = null;
+}
+
+var verbose: int;
+
+// -v: how big the program was
+fn stat_line(what: *char, n: int) {
+    m0();
+    ms("tric: ");
+    mi(n);
+    ms(" ");
+    ms(what);
+    ms("\n");
+    cv_push(&mb, 0);
+    fputs(STDERR_FILENO, mb.p);
+}
+
+// ---- main ------------------------------------------------------------------------------------
+
+fn main(argc: int, argv: **char) -> int {
+    var asm_only: int = 0;
+    var outpath: *char = null;
+    var c: int = getopt(argc, argv, "So:v");
+    while (c != -1) {
+        if (c == 'S') { asm_only = 1; }
+        else if (c == 'o') { outpath = optarg; }
+        else if (c == 'v') { verbose = 1; }
+        else { return usage(); }
+        c = getopt(argc, argv, "So:v");
+    }
+    if (optind != argc - 1) { return usage(); }
+    var path: *char = argv[optind];
+    if (outpath == null) { outpath = asm_only ? "a.s" : "a.out"; }
+    names_init();
+    lex_init();
+    types_init();
+    seen = calloc(NAME_CAP, 3) as *int;
+    if (seen == null) { oom(); }
+    var src: *char = read_file(path);
+    if (src == null) { perror2("tric", path); return 1; }
+    load_file(intern_c(path), src, src_n, dir_of(path));
+    free(seen as *tryte);
+    globals_init();
+    // the assembly: the output, or (assembling) OUT.tmp.s beside it (not
+    // in /tmp: a big program's would not fit in a RAM file there)
+    out_path = outpath;
+    if (!asm_only) {
+        out_path = malloc(strlen(outpath) + 7) as *char;
+        if (out_path == null) { oom(); }
+        strcpy(out_path, outpath);
+        strcat(out_path, ".tmp.s");
+    }
+    compile(USER_DATA);
+    finish_output();
+    if (verbose) {
+        stat_line("expressions", ex_kind.n);
+        stat_line("statements", st_kind.n);
+        stat_line("items", it_kind.n);
+        stat_line("names", nm_count);
+        stat_line("code trytes", code_total);
+        stat_line("heap trytes", heap_hi - heap_lo);
+    }
+    if (asm_only) { return 0; }
+    // assemble: tas OUT from the temporary .s
+    var targv: [5]*char;
+    targv[0] = "tas";
+    targv[1] = "-o";
+    targv[2] = outpath;
+    targv[3] = out_path;
+    targv[4] = null;
+    var pid: int = fork();
+    if (pid < 0) { perror2("tric", "fork"); return 1; }
+    if (pid == 0) {
+        execv("/bin/tas", &targv[0]);
+        perror2("tric", "/bin/tas");
+        exit(127);
+    }
+    var status: int = 0;
+    waitpid(pid, &status, 0);
+    unlink(out_path);
+    if (!WIFEXITED(status)) { return 1; }
+    return WEXITSTATUS(status);
+}

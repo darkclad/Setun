@@ -1,0 +1,2157 @@
+// tric/gen.tri: type checking and code generation, after the host's
+// crates/trine/src/compile.rs with `optimize` off. The output must be the
+// host's, character for character: the same instructions, the same label
+// numbers (the labels a look-ahead takes stay taken), the same pools.
+
+const W_MAX: int = 3812798742493;
+
+// ---- output ----------------------------------------------------------------------------------
+
+var code: cvec;
+
+fn o(s: *char) { cv_str(&code, s); }
+fn oc(c: int) { cv_push(&code, c); }
+fn oi(v: int) { cv_int(&code, v); }
+fn ln() { o("        "); }
+fn nl() { oc('\n'); }
+fn ol(l: int) { o(".L"); oi(l); }
+fn lab(l: int) { ol(l); o(":\n"); }
+fn em(s: *char) { ln(); o(s); nl(); }
+fn e_l(s: *char, l: int) { ln(); o(s); ol(l); nl(); }   // "b .L5"
+fn e_i(s: *char, v: int) { ln(); o(s); oi(v); nl(); }  // "li r1, 5"
+
+// [base], [base+off], [base-off]
+fn om(base: *char, off: int) {
+    oc('[');
+    o(base);
+    if (off > 0) { oc('+'); oi(off); }
+    else if (off < 0) { oi(off); }
+    oc(']');
+}
+
+// a place: in the frame (`frame`) or at an absolute address
+fn op_place(frame: int, off: int) {
+    if (frame) { om("fp", off); } else { oc('['); oi(off); oc(']'); }
+}
+
+// Insert a line at `at` in the code (a prologue's `sub sp`).
+fn insert_line(at: int, line: *cvec) {
+    var n: int = line.n;
+    var k: int = 0;
+    while (k < n) { cv_push(&code, 0); k += 1; }
+    memmove((code.p + at + n) as *tryte, (code.p + at) as *tryte, code.n - n - at);
+    k = 0;
+    while (k < n) { code.p[at + k] = line.p[k]; k += 1; }
+}
+
+// the assembly file, written as the code is made
+var out_fd: int = -1;
+var out_path: *char;
+
+fn write_all(fd: int, path: *char, s: *char, n: int) {
+    var done: int = 0;
+    while (done < n) {
+        var w: int = write(fd, s + done, n - done);
+        if (w <= 0) {
+            perror2("tric", path);
+            if (fail_unlink != null) { unlink(fail_unlink); }
+            exit(1);
+        }
+        done += w;
+    }
+}
+
+var code_total: int;
+
+fn flush_code() {
+    write_all(out_fd, out_path, code.p, code.n);
+    code_total += code.n;
+    code.n = 0;
+}
+
+var labels: int;
+fn new_label() -> int { labels += 1; return labels; }
+
+// ---- types -----------------------------------------------------------------------------------
+
+const TY_INT: int = 1;
+const TY_REAL: int = 2;
+const TY_TRYTE: int = 3;
+const TY_TRIT: int = 4;
+const TY_VOID: int = 5;
+const TY_NULL: int = 6;
+const TY_PTR: int = 7;
+const TY_ARRAY: int = 8;
+const TY_STRUCT: int = 9;
+const TY_FN: int = 10;
+
+// PTR: a = target; ARRAY: a = element, b = length; STRUCT: b = id;
+// FN: a = result, b = first parameter in ty_list, c = parameter count.
+// Types are interned: equal types are the same number.
+var ty_kind: ivec;
+var ty_a: ivec;
+var ty_b: ivec;
+var ty_c: ivec;
+var ty_list: ivec;
+
+const TH_CAP: int = 6561;
+var th: *int;
+
+var t_int: int;
+var t_real: int;
+var t_tryte: int;
+var t_trit: int;
+var t_void: int;
+var t_null: int;
+var t_str: int;                          // *tryte
+
+fn mk(kind: int, a: int, b: int, c: int, l: *int) -> int {
+    var h: int = kind * 7 + a * 31 + b * 131 + c * 17;
+    var k: int = 0;
+    if (kind == TY_FN) {
+        h = kind * 7 + a * 31 + c * 17;
+        while (k < c) { h = (h * 3 + l[k]) % 1000003; k += 1; }
+    }
+    h = h % TH_CAP;
+    if (h < 0) { h = -h; }
+    loop {
+        var t: int = th[h];
+        if (t < 0) { break; }
+        if (ty_kind.p[t] == kind && ty_a.p[t] == a && ty_c.p[t] == c) {
+            if (kind != TY_FN) {
+                if (ty_b.p[t] == b) { return t; }
+            } else {
+                var same: int = 1;
+                k = 0;
+                while (k < c && same) { if (ty_list.p[ty_b.p[t] + k] != l[k]) { same = 0; } k += 1; }
+                if (same) { return t; }
+            }
+        }
+        h = (h + 1) % TH_CAP;
+    }
+    if (ty_kind.n >= TH_CAP - TH_CAP / 9) { fputs(STDERR_FILENO, "tric: too many types\n"); exit(1); }
+    if (kind == TY_FN) {
+        b = ty_list.n;
+        k = 0;
+        while (k < c) { iv_push(&ty_list, l[k]); k += 1; }
+    }
+    iv_push(&ty_kind, kind);
+    iv_push(&ty_a, a);
+    iv_push(&ty_b, b);
+    var id: int = iv_push(&ty_c, c);
+    th[h] = id;
+    return id;
+}
+
+fn mk_ptr(t: int) -> int { return mk(TY_PTR, t, 0, 0, null); }
+
+fn types_init() {
+    th = malloc(TH_CAP * 3) as *int;
+    if (th == null) { oom(); }
+    var k: int = 0;
+    while (k < TH_CAP) { th[k] = -1; k += 1; }
+    t_int = mk(TY_INT, 0, 0, 0, null);
+    t_real = mk(TY_REAL, 0, 0, 0, null);
+    t_tryte = mk(TY_TRYTE, 0, 0, 0, null);
+    t_trit = mk(TY_TRIT, 0, 0, 0, null);
+    t_void = mk(TY_VOID, 0, 0, 0, null);
+    t_null = mk(TY_NULL, 0, 0, 0, null);
+    t_str = mk_ptr(t_tryte);
+}
+
+fn tk(t: int) -> int { return ty_kind.p[t]; }
+fn is_integer(t: int) -> int { var k: int = tk(t); return k == TY_INT || k == TY_TRYTE || k == TY_TRIT; }
+fn is_pointer(t: int) -> int { return tk(t) == TY_PTR || tk(t) == TY_NULL; }
+fn is_scalar(t: int) -> int { var k: int = tk(t); return is_integer(t) || k == TY_PTR || k == TY_FN || k == TY_NULL; }
+fn is_real(t: int) -> int { return t == t_real; }
+fn is_tsz(t: int) -> int { return t == t_tryte || t == t_trit; }
+fn decay(t: int) -> int { return tk(t) == TY_ARRAY ? mk_ptr(ty_a.p[t]) : t; }
+fn ptr_elem(t: int) -> int { return tk(t) == TY_PTR ? ty_a.p[t] : -1; }
+
+// ---- structs ----
+
+var sd_name: ivec;
+var sd_size: ivec;
+var sd_state: ivec;                      // 0 declared, 1 laying out, 2 done
+var sd_item: ivec;
+var sd_f0: ivec;                         // its fields in fd_*
+var sd_fn: ivec;
+var fd_name: ivec;
+var fd_ty: ivec;
+var fd_off: ivec;
+var s_of: *int;                          // name -> struct id + 1
+
+fn size(t: int) -> int {
+    var k: int = tk(t);
+    if (k == TY_INT || k == TY_PTR || k == TY_FN || k == TY_NULL) { return 3; }
+    if (k == TY_REAL) { return 9; }
+    if (k == TY_TRYTE || k == TY_TRIT) { return 1; }
+    if (k == TY_VOID) { return 0; }
+    if (k == TY_ARRAY) { return ty_b.p[t] * size(ty_a.p[t]); }
+    return sd_size.p[ty_b.p[t]];
+}
+
+// Word-addressed objects are addressed by the centre of their first word.
+fn word_addr(t: int) -> int {
+    var k: int = tk(t);
+    if (k == TY_TRYTE || k == TY_TRIT || k == TY_VOID) { return 0; }
+    if (k == TY_ARRAY) { return word_addr(ty_a.p[t]); }
+    return 1;
+}
+
+fn words(t: int) -> int {
+    var w: int = (size(t) + 2) / 3;
+    return w < 1 ? 1 : w;
+}
+
+// The type's name, onto the message.
+fn mty(t: int) {
+    var k: int = tk(t);
+    if (k == TY_INT) { ms("int"); }
+    else if (k == TY_REAL) { ms("real"); }
+    else if (k == TY_TRYTE) { ms("tryte"); }
+    else if (k == TY_TRIT) { ms("trit"); }
+    else if (k == TY_VOID) { ms("void"); }
+    else if (k == TY_NULL) { ms("null"); }
+    else if (k == TY_PTR) { ms("*"); mty(ty_a.p[t]); }
+    else if (k == TY_ARRAY) { ms("["); mi(ty_b.p[t]); ms("]"); mty(ty_a.p[t]); }
+    else if (k == TY_STRUCT) { ms(name_str(sd_name.p[ty_b.p[t]])); }
+    else {
+        ms("fn(");
+        var j: int = 0;
+        while (j < ty_c.p[t]) {
+            if (j > 0) { ms(", "); }
+            mty(ty_list.p[ty_b.p[t] + j]);
+            j += 1;
+        }
+        ms(") -> ");
+        mty(ty_a.p[t]);
+    }
+}
+
+// ---- globals ---------------------------------------------------------------------------------
+
+const G_VAR: int = 1;
+const G_EXTERN: int = 2;
+const G_CONST: int = 3;
+const G_FUNC: int = 4;
+
+const CV_INT: int = 1;
+const CV_STR: int = 2;
+const CV_REAL: int = 3;
+
+// by name: kind (0 = none), type, value (a variable's address, a
+// constant's value or string number), constant kind, a function defined
+var g_kind: *int;
+var g_ty: *int;
+var g_val: *int;
+var g_cv: *int;
+var g_def: *int;
+
+// By name, for every name there is once the sources are read (the
+// compiler makes no new ones after that but `main` and `environ`).
+fn globals_init() {
+    intern_c("main");
+    intern_c("environ");
+    var n: int = nm_count;
+    g_kind = calloc(n, 3) as *int;
+    g_ty = calloc(n, 3) as *int;
+    g_val = calloc(n, 3) as *int;
+    g_cv = calloc(n, 3) as *int;
+    g_def = calloc(n, 3) as *int;
+    s_of = calloc(n, 3) as *int;
+    if (g_kind == null || g_ty == null || g_val == null || g_cv == null || g_def == null || s_of == null) { oom(); }
+}
+
+// ---- strings ---------------------------------------------------------------------------------
+
+var pool: ivec;                          // string ids, by .Lstr number
+
+fn str_eq(a: int, b: int) -> int {
+    var n: int = str_n(a);
+    if (str_n(b) != n) { return 0; }
+    var p: *char = str_at(a);
+    var q: *char = str_at(b);
+    var k: int = 0;
+    while (k < n) { if (p[k] != q[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+// The pool number of a string (deduplicated).
+fn intern_str(s: int) -> int {
+    var k: int = 0;
+    while (k < pool.n) { if (str_eq(pool.p[k], s)) { return k; } k += 1; }
+    return iv_push(&pool, s);
+}
+
+// ---- per function ----------------------------------------------------------------------------
+
+var lc_name: ivec;
+var lc_ty: ivec;
+var lc_off: ivec;
+var scopes: ivec;
+var lp_cont: ivec;                       // per loop or switch: continue (0: none), break
+var lp_brk: ivec;
+var next_slot: int;
+var lowest_slot: int;
+var ret_ty: int;
+var ret_label: int;
+
+fn lookup_local(n: int) -> int {
+    var k: int = lc_name.n - 1;
+    while (k >= 0) { if (lc_name.p[k] == n) { return k; } k -= 1; }
+    return -1;
+}
+
+fn alloc_local(name: int, ty: int, pos: int) -> int {
+    var k: int = scopes.p[scopes.n - 1];
+    while (k < lc_name.n) {
+        if (lc_name.p[k] == name) { m0(); mq(name_str(name)); ms(" is already declared in this block"); fail(pos); }
+        k += 1;
+    }
+    var first: int = next_slot - 3 * (words(ty) - 1);
+    var off: int = first - !word_addr(ty);
+    next_slot = first - 3;
+    if (first < lowest_slot) { lowest_slot = first; }
+    iv_push(&lc_name, name);
+    iv_push(&lc_ty, ty);
+    iv_push(&lc_off, off);
+    return off;
+}
+
+fn begin_fn(ret: int) {
+    lc_name.n = 0;
+    lc_ty.n = 0;
+    lc_off.n = 0;
+    scopes.n = 0;
+    iv_push(&scopes, 0);
+    next_slot = -3;
+    lowest_slot = 0;
+    lp_cont.n = 0;
+    lp_brk.n = 0;
+    ret_ty = ret;
+    ret_label = new_label();
+}
+
+// ---- constants -------------------------------------------------------------------------------
+
+var ce_ok: int;
+
+fn wrap_trits(v: int, m: int) -> int {
+    var h: int = (m - 1) / 2;
+    var r: int = (v + h) % m;
+    if (r < 0) { r += m; }
+    return r - h;
+}
+
+// The value of a constant expression; ce_ok = 0 if it is not one.
+fn const_eval(x: int) -> int {
+    ce_ok = 1;
+    var k: int = ex_kind.p[x];
+    if (k == E_INT || k == E_CHAR) { return ex_v.p[x]; }
+    if (k == E_NAME) {
+        var n: int = ex_v.p[x];
+        if (lookup_local(n) < 0 && g_kind[n] == G_CONST && g_cv[n] == CV_INT) { return g_val[n]; }
+        ce_ok = 0;
+        return 0;
+    }
+    if (k == E_UNARY) {
+        var op: int = ex_op.p[x];
+        if (op != U_NEG && op != U_NOT) { ce_ok = 0; return 0; }
+        var v: int = const_eval(ex_a.p[x]);
+        if (!ce_ok) { return 0; }
+        return op == U_NEG ? -v : v == 0;
+    }
+    if (k == E_BINARY) {
+        var a: int = const_eval(ex_a.p[x]);
+        if (!ce_ok) { return 0; }
+        var b: int = const_eval(ex_b.p[x]);
+        if (!ce_ok) { return 0; }
+        switch (ex_op.p[x]) {
+            case B_ADD: return a + b;
+            case B_SUB: return a - b;
+            case B_MUL: return a * b;
+            case B_DIV: if (b != 0) { return a / b; }
+            case B_MOD: if (b != 0) { return a % b; }
+            case B_SHL:
+                if (b >= 0 && b < 27) {
+                    while (b > 0) { a *= 3; b -= 1; }
+                    return a;
+                }
+            case B_LT: return a < b;
+            case B_LE: return a <= b;
+            case B_GT: return a > b;
+            case B_GE: return a >= b;
+            case B_EQ: return a == b;
+            case B_NE: return a != b;
+            case B_CMP3: return a <=> b;
+        }
+        ce_ok = 0;
+        return 0;
+    }
+    if (k == E_CAST) {
+        var c: int = const_eval(ex_a.p[x]);
+        if (!ce_ok) { return 0; }
+        var tek: int = te_kind.p[ex_v.p[x]];
+        if (tek == TE_TRYTE) { return wrap_trits(c, 19683); }
+        if (tek == TE_TRIT) { return wrap_trits(c, 3); }
+        if (tek == TE_INT || tek == TE_PTR) { return c; }
+        ce_ok = 0;
+        return 0;
+    }
+    if (k == E_SIZEOF) { return sizeof_const(ex_v.p[x]); }
+    ce_ok = 0;
+    return 0;
+}
+
+fn sizeof_const(te: int) -> int {
+    ce_ok = 1;
+    var k: int = te_kind.p[te];
+    if (k == TE_INT || k == TE_PTR || k == TE_FN) { return 3; }
+    if (k == TE_REAL) { return 9; }
+    if (k == TE_TRYTE || k == TE_TRIT) { return 1; }
+    if (k == TE_NAMED) {
+        var s: int = s_of[te_a.p[te]] - 1;
+        if (s < 0 || sd_state.p[s] != 2) { ce_ok = 0; return 0; }
+        return sd_size.p[s];
+    }
+    if (k == TE_ARRAY) {
+        var n: int = const_eval(te_b.p[te]);
+        if (!ce_ok) { return 0; }
+        var el: int = sizeof_const(te_a.p[te]);
+        if (!ce_ok) { return 0; }
+        return n * el;
+    }
+    ce_ok = 0;
+    return 0;
+}
+
+fn const_int(x: int) -> int {
+    var v: int = const_eval(x);
+    if (!ce_ok) { fail_at(ex_pos.p[x], "a constant integer expression is required here", null); }
+    return v;
+}
+
+// ---- real constants ----
+
+// constants' values (a constant's g_val is its number here) and the pool
+// of literals the code loads (.Lreal0, ...), as real.tri leaves them
+var rc_e: ivec;
+var rc_hi: ivec;
+var rc_mid: ivec;
+var rc_lo: ivec;
+var rp_w0: ivec;
+var rp_w1: ivec;
+var rp_w2: ivec;
+
+fn real_save() -> int {
+    iv_push(&rc_e, r_e);
+    iv_push(&rc_hi, r_hi);
+    iv_push(&rc_mid, r_mid);
+    return iv_push(&rc_lo, r_lo);
+}
+
+fn real_get(k: int) {
+    r_e = rc_e.p[k];
+    r_hi = rc_hi.p[k];
+    r_mid = rc_mid.p[k];
+    r_lo = rc_lo.p[k];
+}
+
+// A constant real: a literal, an integer constant, or one negated.
+fn const_real(x: int) {
+    var k: int = ex_kind.p[x];
+    if (k == E_REAL) {
+        var sid: int = ex_v.p[x];
+        real_from_decimal(str_at(sid), str_n(sid));
+        return;
+    }
+    if (k == E_UNARY && ex_op.p[x] == U_NEG) {
+        const_real(ex_a.p[x]);
+        real_neg();
+        return;
+    }
+    if (k == E_NAME && lookup_local(ex_v.p[x]) < 0) {
+        var n: int = ex_v.p[x];
+        if (g_kind[n] == G_CONST && g_cv[n] == CV_REAL) { real_get(g_val[n]); return; }
+    }
+    real_from_int(const_int(x));
+}
+
+// f1 := the real in r_*
+fn load_real() {
+    if (real_is_zero()) { em("fmov f1, f0"); return; }
+    var w0: int = real_word0();
+    var k: int = 0;
+    while (k < rp_w0.n) {
+        if (rp_w0.p[k] == w0 && rp_w1.p[k] == r_mid && rp_w2.p[k] == r_lo) { break; }
+        k += 1;
+    }
+    if (k == rp_w0.n) {
+        iv_push(&rp_w0, w0);
+        iv_push(&rp_w1, r_mid);
+        iv_push(&rp_w2, r_lo);
+    }
+    ln(); o("fldd f1, [.Lreal"); oi(k); o("]"); nl();
+}
+
+// ---- type expressions ----
+
+fn resolve(te: int, pos: int) -> int {
+    var k: int = te_kind.p[te];
+    if (k == TE_INT) { return t_int; }
+    if (k == TE_REAL) { return t_real; }
+    if (k == TE_TRYTE) { return t_tryte; }
+    if (k == TE_TRIT) { return t_trit; }
+    if (k == TE_VOID) { return t_void; }
+    if (k == TE_NAMED) { return named_type(te_a.p[te], pos); }
+    if (k == TE_PTR) {
+        var target: int = te_a.p[te];
+        // pointer targets may be structs that are not laid out yet
+        if (te_kind.p[target] == TE_NAMED) { return mk_ptr(named_type(te_a.p[target], pos)); }
+        return mk_ptr(resolve(target, pos));
+    }
+    if (k == TE_ARRAY) {
+        var len: int = const_int(te_b.p[te]);
+        if (len <= 0) { m0(); ms("array length must be positive, not "); mi(len); fail(pos); }
+        var el: int = resolve(te_a.p[te], pos);
+        complete(el);
+        if (el == t_void) { fail_at(pos, "arrays of void are not allowed", null); }
+        return mk(TY_ARRAY, el, len, 0, null);
+    }
+    // fn(...) -> r
+    var from: int = tmp_stack.n;
+    var j: int = 0;
+    while (j < te_n.p[te]) {
+        var pt: int = resolve(lists.p[te_l.p[te] + j], pos);
+        iv_push(&tmp_stack, pt);
+        j += 1;
+    }
+    var r: int = resolve(te_b.p[te], pos);
+    var t: int = mk(TY_FN, r, 0, te_n.p[te], tmp_stack.p + from);
+    tmp_stack.n = from;
+    return t;
+}
+
+fn named_type(n: int, pos: int) -> int {
+    var s: int = s_of[n] - 1;
+    if (s < 0) { fail_at(pos, "unknown type", name_str(n)); }
+    return mk(TY_STRUCT, 0, s, 0, null);
+}
+
+// A struct used by value needs its layout.
+fn complete(t: int) {
+    if (tk(t) == TY_STRUCT) { layout_struct(ty_b.p[t]); }
+    else if (tk(t) == TY_ARRAY) { complete(ty_a.p[t]); }
+}
+
+fn layout_struct(id: int) {
+    if (sd_state.p[id] == 2) { return; }
+    var it: int = sd_item.p[id];
+    var spos: int = it_pos.p[it];
+    if (sd_state.p[id] == 1) { m0(); ms("struct "); mq(name_str(sd_name.p[id])); ms(" contains itself"); fail(spos); }
+    sd_state.p[id] = 1;
+    var at: int = 0;                     // the next free tryte from the struct's first
+    var f0: int = fd_name.n;
+    var j: int = 0;
+    while (j < it_n.p[it]) {
+        var pm: int = lists.p[it_a.p[it] + j];
+        var t: int = resolve(pm_ty.p[pm], spos);
+        complete(t);
+        var fname: int = pm_name.p[pm];
+        if (t == t_void) { m0(); ms("field "); mq(name_str(fname)); ms(" cannot be void"); fail(spos); }
+        var q: int = f0;
+        while (q < fd_name.n) {
+            if (fd_name.p[q] == fname) { m0(); ms("field "); mq(name_str(fname)); ms(" appears twice"); fail(spos); }
+            q += 1;
+        }
+        var wa: int = word_addr(t);
+        if (wa) { at = (at + 2) / 3 * 3; }
+        iv_push(&fd_name, fname);
+        iv_push(&fd_ty, t);
+        iv_push(&fd_off, at - 1 + wa);   // a struct's address is its first word's centre
+        at += size(t);
+        j += 1;
+    }
+    sd_f0.p[id] = f0;
+    sd_fn.p[id] = fd_name.n - f0;
+    var sz: int = (at + 2) / 3 * 3;
+    sd_size.p[id] = sz < 3 ? 3 : sz;
+    sd_state.p[id] = 2;
+}
+
+// The field of struct `id` named `f`: its index in fd_*, or -1.
+fn field_of(id: int, f: int) -> int {
+    var q: int = sd_f0.p[id];
+    var end: int = q + sd_fn.p[id];
+    while (q < end) { if (fd_name.p[q] == f) { return q; } q += 1; }
+    return -1;
+}
+
+// ---- the program -----------------------------------------------------------------------------
+
+var order: ivec;                         // the items, in the host loader's order
+var data_cursor: int;
+var data_start: int;
+var in_addr: ivec;                       // global initialisers: address, type, expression
+var in_ty: ivec;
+var in_x: ivec;
+
+fn is_register_name(s: *char) -> int {
+    if (streq(s, "sp") || streq(s, "lr") || streq(s, "fp") || streq(s, "zero")) { return 1; }
+    if (s[0] != 'r') { return 0; }
+    // the rest parses as an integer (an i64, as the host reads it)
+    var k: int = 1;
+    if (s[k] == '+' || s[k] == '-') { k += 1; }
+    if (s[k] == 0) { return 0; }
+    var digits: int = 0;
+    while (s[k] != 0) {
+        if (s[k] < '0' || s[k] > '9') { return 0; }
+        digits += 1;
+        k += 1;
+    }
+    return digits <= 18;
+}
+
+fn define(name: int, kind: int, ty: int, val: int, pos: int) {
+    var s: *char = name_str(name);
+    if (is_register_name(s) || strncmp(s, "_trine", 6) == 0) { m0(); mq(s); ms(" is a reserved name"); fail(pos); }
+    if (g_kind[name] != 0) { m0(); mq(s); ms(" is already defined"); fail(pos); }
+    g_kind[name] = kind;
+    g_ty[name] = ty;
+    g_val[name] = val;
+}
+
+fn check_fits(v: int, ty: int, pos: int) {
+    var lim: int = 0;
+    if (ty == t_tryte) { lim = 9841; }
+    else if (ty == t_trit) { lim = 1; }
+    else if (ty == t_int || tk(ty) == TY_PTR) { lim = W_MAX; }
+    else { m0(); ms("a constant of type "); mty(ty); ms(" is not supported"); fail(pos); }
+    if (v > lim || v < -lim) { m0(); mi(v); ms(" does not fit in "); mty(ty); fail(pos); }
+}
+
+fn alloc_global(ty: int, align: int, has_align: int, pos: int) -> int {
+    if (has_align) {
+        if (align <= 0 || align % 3 != 0) { m0(); ms("@align("); mi(align); ms(") must be a positive multiple of 3"); fail(pos); }
+        var c: int = data_cursor + align - 1;
+        var q: int = c / align;
+        if (c % align < 0) { q -= 1; }   // div_euclid
+        data_cursor = q * align;
+    }
+    var first: int = data_cursor;
+    data_cursor += 3 * words(ty);
+    return first - !word_addr(ty);
+}
+
+fn fn_signature(it: int) {
+    var pos: int = it_pos.p[it];
+    var from: int = tmp_stack.n;
+    var n: int = it_n.p[it];
+    var j: int = 0;
+    var nreal: int = 0;
+    while (j < n) {
+        var t: int = resolve(pm_ty.p[lists.p[it_a.p[it] + j]], pos);
+        iv_push(&tmp_stack, t);
+        if (is_real(t)) { nreal += 1; }
+        j += 1;
+    }
+    var ret: int = resolve(it_b.p[it], pos);
+    j = 0;
+    while (j < n) {
+        var p: int = tmp_stack.p[from + j];
+        if (!is_scalar(p) && !is_real(p)) { m0(); ms("parameter of type "); mty(p); ms(" must be passed as a pointer"); fail(pos); }
+        j += 1;
+    }
+    if (nreal > 9 || (nreal > 0 && n - nreal > 6)) { fail_at(pos, "a function with real parameters takes at most 9 reals and 6 other parameters", null); }
+    if (!is_scalar(ret) && ret != t_void && !is_real(ret)) { m0(); ms("cannot return "); mty(ret); ms(" by value; return a pointer"); fail(pos); }
+    var intr: int = it_c.p[it] >= 0 && it_d.p[it];
+    if (intr && (n > 0 || ret != t_void)) { fail_at(pos, "an interrupt fn takes no parameters and returns nothing", null); }
+    var ty: int = mk(TY_FN, ret, 0, n, tmp_stack.p + from);
+    tmp_stack.n = from;
+    var defined: int = it_c.p[it] >= 0;
+    var name: int = it_name.p[it];
+    if (g_kind[name] == G_FUNC) {
+        if (g_ty[name] == ty && !(defined && g_def[name])) {
+            g_def[name] = defined || g_def[name];
+            return;
+        }
+        m0(); mq(name_str(name)); ms(" is already defined"); fail(pos);
+    }
+    if (g_kind[name] != 0) { m0(); mq(name_str(name)); ms(" is already defined"); fail(pos); }
+    define(name, G_FUNC, ty, 0, pos);
+    g_def[name] = defined;
+}
+
+fn compile(data_org: int) {
+    data_cursor = data_org;
+    data_start = data_org;
+    var k: int = 0;
+    // pass 1: struct names, then their layouts
+    while (k < order.n) {
+        var it: int = order.p[k];
+        if (it_kind.p[it] == I_STRUCT) {
+            var sn: int = it_name.p[it];
+            if (s_of[sn] != 0) { m0(); ms("struct "); mq(name_str(sn)); ms(" is defined twice"); fail(it_pos.p[it]); }
+            iv_push(&sd_name, sn);
+            iv_push(&sd_size, 0);
+            iv_push(&sd_state, 0);
+            iv_push(&sd_item, it);
+            iv_push(&sd_f0, 0);
+            s_of[sn] = iv_push(&sd_fn, 0) + 1;
+        }
+        k += 1;
+    }
+    k = 0;
+    while (k < sd_name.n) { layout_struct(k); k += 1; }
+    // pass 2: constants, function signatures, globals (in order)
+    k = 0;
+    while (k < order.n) {
+        var it2: int = order.p[k];
+        var kind: int = it_kind.p[it2];
+        if (kind == I_CONST) {
+            var d: int = it_a.p[it2];
+            var ty: int = resolve(vd_ty.p[d], vd_pos.p[d]);
+            var x: int = vd_init.p[d];
+            if (ex_kind.p[x] == E_STR && ty == t_str) {
+                define(vd_name.p[d], G_CONST, ty, intern_str(ex_v.p[x]), vd_pos.p[d]);
+                g_cv[vd_name.p[d]] = CV_STR;
+            } else if (ty == t_real) {
+                const_real(x);
+                define(vd_name.p[d], G_CONST, ty, real_save(), vd_pos.p[d]);
+                g_cv[vd_name.p[d]] = CV_REAL;
+            } else {
+                var v: int = const_int(x);
+                check_fits(v, ty, ex_pos.p[x]);
+                define(vd_name.p[d], G_CONST, ty, v, vd_pos.p[d]);
+                g_cv[vd_name.p[d]] = CV_INT;
+            }
+        } else if (kind == I_FN) {
+            fn_signature(it2);
+        } else if (kind == I_VAR) {
+            var d2: int = it_a.p[it2];
+            var vty: int = resolve(vd_ty.p[d2], vd_pos.p[d2]);
+            if (vty == t_void) { fail_at(vd_pos.p[d2], "a variable cannot be void", null); }
+            if (it_d.p[it2]) {
+                define(vd_name.p[d2], G_EXTERN, vty, 0, vd_pos.p[d2]);
+            } else {
+                var align: int = 0;
+                var at: int = 0;
+                if (it_b.p[it2] >= 0) { align = const_int(it_b.p[it2]); }
+                if (it_c.p[it2] >= 0) { at = const_int(it_c.p[it2]); }
+                var addr: int = it_c.p[it2] >= 0 ? at : alloc_global(vty, align, it_b.p[it2] >= 0, vd_pos.p[d2]);
+                if (vd_init.p[d2] >= 0) {
+                    iv_push(&in_addr, addr);
+                    iv_push(&in_ty, vty);
+                    iv_push(&in_x, vd_init.p[d2]);
+                }
+                define(vd_name.p[d2], G_VAR, vty, addr, vd_pos.p[d2]);
+            }
+        }
+        k += 1;
+    }
+    // the globals are laid out: the startup code can go first, and each
+    // function as it is done (only the one being compiled is ever edited)
+    start_output();
+    // pass 3: function bodies
+    k = 0;
+    while (k < order.n) {
+        var it3: int = order.p[k];
+        if (it_kind.p[it3] == I_FN && it_c.p[it3] >= 0) {
+            function(it3);
+            flush_code();
+        }
+        k += 1;
+    }
+    // global initialisers
+    o("_trine_init:\n");
+    em("push lr");
+    em("push fp");
+    em("mov fp, sp");
+    begin_fn(t_void);
+    var body_start: int = code.n;
+    k = 0;
+    while (k < in_x.n) { init_object(0, in_addr.p[k], in_ty.p[k], in_x.p[k]); k += 1; }
+    insert_frame(body_start, -lowest_slot);
+    em("mov sp, fp");
+    em("pop fp");
+    em("pop lr");
+    em("ret");
+    flush_code();
+    var main: int = intern_c("main");
+    if (g_kind[main] != G_FUNC || !g_def[main]) { fail_at(0, "no `fn main()` defined", null); }
+    var mt: int = g_ty[main];
+    var np: int = ty_c.p[mt];
+    var bad: int = np > 2;
+    k = 0;
+    while (k < np) {
+        var p: int = ty_list.p[ty_b.p[mt] + k];
+        if (!is_integer(p) && !is_pointer(p)) { bad = 1; }
+        k += 1;
+    }
+    if (bad) { fail_at(0, "`main` takes at most two parameters: (disk, ram) or (argc, argv)", null); }
+}
+
+// "        sub sp, sp, N" at `at`, for a frame of N > 0
+fn insert_frame(at: int, frame: int) {
+    if (frame <= 0) { return; }
+    var line: cvec;
+    line.p = null;
+    line.n = 0;
+    line.cap = 0;
+    cv_str(&line, "        sub sp, sp, ");
+    cv_int(&line, frame);
+    cv_push(&line, '\n');
+    insert_line(at, &line);
+    free(line.p as *tryte);
+}
+
+var saved_regs: *char = "r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r-10 r-11 r-12 r-13 ";
+
+// push or pop the registers an interrupt fn saves (pop: in reverse)
+fn interrupt_regs(pop: int) {
+    var at: [14]int;
+    var n: int = 0;
+    var k: int = 0;
+    while (saved_regs[k] != 0) {
+        at[n] = k;
+        n += 1;
+        while (saved_regs[k] != ' ') { k += 1; }
+        k += 1;
+    }
+    var j: int = 0;
+    while (j < n) {
+        var r: int = pop ? at[n - 1 - j] : at[j];
+        ln();
+        o(pop ? "pop " : "push ");
+        while (saved_regs[r] != ' ') { oc(saved_regs[r]); r += 1; }
+        nl();
+        j += 1;
+    }
+}
+
+fn function(it: int) {
+    var name: int = it_name.p[it];
+    var fty: int = g_ty[name];
+    var pos: int = it_pos.p[it];
+    var intr: int = it_d.p[it];
+    begin_fn(ty_a.p[fty]);
+    o(name_str(name));
+    o(":\n");
+    if (intr) { interrupt_regs(0); }
+    em("push lr");
+    em("push fp");
+    em("mov fp, sp");
+    var frame_at: int = code.n;
+    // parameters: integers in r1..r6, then the stack (fp+6, fp+9, ...);
+    // reals in f1..f9; each copied into its slot
+    var i: int = 0;
+    var j: int = 0;
+    var k: int = 0;
+    while (k < it_n.p[it]) {
+        var pm: int = lists.p[it_a.p[it] + k];
+        var t: int = ty_list.p[ty_b.p[fty] + k];
+        var off: int = alloc_local(pm_name.p[pm], t, pos);
+        k += 1;
+        if (is_real(t)) {
+            j += 1;
+            ln(); o("fstd f"); oi(j); o(", "); om("fp", off); nl();
+            continue;
+        }
+        var st: *char = is_tsz(t) ? "stt r" : "stw r";
+        if (i < 6) {
+            ln(); o(st); oi(i + 1); o(", "); om("fp", off); nl();
+        } else {
+            ln(); o("ldw r1, "); om("fp", 6 + 3 * (i - 6)); nl();
+            ln(); o(st); o("1, "); om("fp", off); nl();
+        }
+        i += 1;
+    }
+    var body: int = it_c.p[it];
+    k = 0;
+    while (k < st_n.p[body]) { stmt(lists.p[st_l.p[body] + k]); k += 1; }
+    insert_frame(frame_at, -lowest_slot);
+    lab(ret_label);
+    em("mov sp, fp");
+    em("pop fp");
+    em("pop lr");
+    if (intr) {
+        interrupt_regs(1);
+        em("iret");
+    } else {
+        em("ret");
+    }
+}
+
+// ---- statements ------------------------------------------------------------------------------
+
+fn scope_open() {
+    iv_push(&scopes, lc_name.n);
+}
+
+fn scope_close() {
+    scopes.n -= 1;
+    var start: int = scopes.p[scopes.n];
+    lc_name.n = start;
+    lc_ty.n = start;
+    lc_off.n = start;
+}
+
+// A block of statements: a scope of its own.
+fn block(l: int, n: int) {
+    scope_open();
+    var saved: int = next_slot;
+    var k: int = 0;
+    while (k < n) { stmt(lists.p[l + k]); k += 1; }
+    scope_close();
+    next_slot = saved;
+}
+
+// One statement as a block (the bodies of if, while, ...).
+fn block1(s: int) {
+    scope_open();
+    var saved: int = next_slot;
+    stmt(s);
+    scope_close();
+    next_slot = saved;
+}
+
+fn need_integer(t: int, pos: int) {
+    if (!is_integer(t)) { m0(); ms("expected an integer, found "); mty(t); fail(pos); }
+}
+
+fn stmt(s: int) {
+    var k: int = st_kind.p[s];
+    var pos: int = st_pos.p[s];
+    if (k == S_VAR) {
+        var d: int = st_a.p[s];
+        var ty: int = resolve(vd_ty.p[d], vd_pos.p[d]);
+        if (ty == t_void) { fail_at(vd_pos.p[d], "a variable cannot be void", null); }
+        var init: int = vd_init.p[d];
+        if (init >= 0) {
+            // the slot first, then the initialiser (which must not see
+            // the new name), then the name at that slot
+            var saved: int = next_slot;
+            var first: int = saved - 3 * (words(ty) - 1);
+            var off: int = first - !word_addr(ty);
+            next_slot = first - 3;
+            if (first < lowest_slot) { lowest_slot = first; }
+            init_object(1, off, ty, init);
+            next_slot = saved;
+        }
+        alloc_local(vd_name.p[d], ty, vd_pos.p[d]);
+        return;
+    }
+    if (k == S_EXPR) { expr(st_a.p[s]); return; }
+    if (k == S_BLOCK) { block(st_l.p[s], st_n.p[s]); return; }
+    if (k == S_IF) {
+        var lelse: int = new_label();
+        var lend: int = new_label();
+        cond_jump_false(st_a.p[s], lelse);
+        block1(st_b.p[s]);
+        if (st_c.p[s] >= 0) {
+            e_l("b ", lend);
+            lab(lelse);
+            block1(st_c.p[s]);
+            lab(lend);
+        } else {
+            lab(lelse);
+        }
+        return;
+    }
+    if (k == S_WHILE || k == S_LOOP) {
+        var top: int = new_label();
+        var end: int = new_label();
+        lab(top);
+        if (k == S_WHILE) { cond_jump_false(st_a.p[s], end); }
+        iv_push(&lp_cont, top);
+        iv_push(&lp_brk, end);
+        block1(st_b.p[s]);
+        lp_cont.n -= 1;
+        lp_brk.n -= 1;
+        e_l("b ", top);
+        lab(end);
+        return;
+    }
+    if (k == S_FOR) {
+        scope_open();
+        var fsaved: int = next_slot;
+        if (st_a.p[s] >= 0) { stmt(st_a.p[s]); }
+        var ftop: int = new_label();
+        var cont: int = new_label();
+        var fend: int = new_label();
+        new_label();                     // the rotated loop's test (unused here)
+        lab(ftop);
+        if (st_b.p[s] >= 0) { cond_jump_false(st_b.p[s], fend); }
+        iv_push(&lp_cont, cont);
+        iv_push(&lp_brk, fend);
+        block1(st_d.p[s]);
+        lp_cont.n -= 1;
+        lp_brk.n -= 1;
+        lab(cont);
+        if (st_c.p[s] >= 0) { expr(st_c.p[s]); }
+        e_l("b ", ftop);
+        lab(fend);
+        scope_close();
+        next_slot = fsaved;
+        return;
+    }
+    if (k == S_SIGN) {
+        var x: int = st_a.p[s];
+        if (ex_kind.p[x] == E_BINARY && ex_op.p[x] == B_CMP3) {
+            compare(ex_a.p[x], ex_b.p[x]);
+        } else {
+            need_integer(expr(x), ex_pos.p[x]);
+            em("cmp r1, 0");
+        }
+        var ln_: int = new_label();
+        var lp: int = new_label();
+        var lz: int = new_label();
+        var lend2: int = new_label();
+        var tn: int = new_label();
+        var tp: int = new_label();
+        ln(); o("br3 "); ol(tn); o(", "); ol(tp); nl();
+        e_l("b ", lz);
+        lab(tn);
+        e_l("b ", ln_);
+        lab(tp);
+        e_l("b ", lp);
+        // zero, neg, pos
+        var arm: [3]int;
+        var at: [3]int;
+        arm[0] = st_c.p[s];
+        at[0] = lz;
+        arm[1] = st_b.p[s];
+        at[1] = ln_;
+        arm[2] = st_d.p[s];
+        at[2] = lp;
+        var q: int = 0;
+        while (q < 3) {
+            lab(at[q]);
+            block(st_l.p[arm[q]], st_n.p[arm[q]]);
+            e_l("b ", lend2);
+            q += 1;
+        }
+        lab(lend2);
+        return;
+    }
+    if (k == S_SWITCH) { switch_stmt(s); return; }
+    if (k == S_BREAK) {
+        if (lp_brk.n == 0) { fail_at(pos, "`break` outside a loop or switch", null); }
+        e_l("b ", lp_brk.p[lp_brk.n - 1]);
+        return;
+    }
+    if (k == S_CONTINUE) {
+        var c: int = lp_cont.n - 1;
+        while (c >= 0 && lp_cont.p[c] == 0) { c -= 1; }
+        if (c < 0) { fail_at(pos, "`continue` outside a loop", null); }
+        e_l("b ", lp_cont.p[c]);
+        return;
+    }
+    if (k == S_RETURN) {
+        var r: int = st_a.p[s];
+        if (r < 0) {
+            if (ret_ty != t_void) { m0(); ms("this function must return a "); mty(ret_ty); fail(pos); }
+        } else if (ret_ty == t_void) {
+            fail_at(ex_pos.p[r], "a void function cannot return a value", null);
+        } else if (ret_ty == t_real) {
+            expr_real(r);
+        } else {
+            check_assign(ret_ty, expr(r), r);
+        }
+        e_l("b ", ret_label);
+        return;
+    }
+    // asm: the lines as they are
+    var a: int = 0;
+    while (a < st_n.p[s]) {
+        var sid: int = lists.p[st_l.p[s] + a];
+        var p: *char = str_at(sid);
+        var m: int = 0;
+        while (m < str_n(sid)) { oc(p[m]); m += 1; }
+        nl();
+        a += 1;
+    }
+}
+
+fn switch_stmt(s: int) {
+    var x: int = st_a.p[s];
+    need_integer(expr(x), ex_pos.p[x]);
+    var end: int = new_label();
+    var first: int = st_l.p[s];
+    var nc: int = st_n.p[s];
+    var arm0: int = new_label() - 1;     // the arms' labels are arm0+1 .. arm0+nc
+    labels = arm0;
+    var seen: ivec;
+    seen.p = null;
+    seen.n = 0;
+    seen.cap = 0;
+    var c: int = 0;
+    while (c < nc) {
+        var l: int = new_label();
+        var v: int = 0;
+        while (v < cs_nvals.p[first + c]) {
+            var vx: int = lists.p[cs_vals.p[first + c] + v];
+            var val: int = const_int(vx);
+            var q: int = 0;
+            while (q < seen.n) {
+                if (seen.p[q] == val) { m0(); ms("case "); mi(val); ms(" appears twice"); fail(ex_pos.p[vx]); }
+                q += 1;
+            }
+            iv_push(&seen, val);
+            e_i("cmp r1, ", val);
+            e_l("beq ", l);
+            v += 1;
+        }
+        c += 1;
+    }
+    if (seen.p != null) { free(seen.p as *tryte); }
+    var dl: int = new_label();
+    var deflt: int = st_b.p[s];
+    e_l("b ", deflt >= 0 ? dl : end);
+    iv_push(&lp_cont, lp_cont.n > 0 ? lp_cont.p[lp_cont.n - 1] : 0);
+    iv_push(&lp_brk, end);
+    c = 0;
+    while (c < nc) {
+        lab(arm0 + 1 + c);
+        var b: int = cs_body.p[first + c];
+        block(st_l.p[b], st_n.p[b]);
+        e_l("b ", end);
+        c += 1;
+    }
+    if (deflt >= 0) {
+        lab(dl);
+        block(st_l.p[deflt], st_n.p[deflt]);
+    }
+    lp_cont.n -= 1;
+    lp_brk.n -= 1;
+    lab(end);
+}
+
+// ---- conditions ----
+
+fn is_comparison(op: int) -> int { return op >= B_LT && op <= B_NE; }
+
+// Jump to `target` when `c` is false (zero).
+fn cond_jump_false(c: int, target: int) {
+    if (ex_kind.p[c] == E_BINARY && is_comparison(ex_op.p[c])) {
+        var op: int = ex_op.p[c];
+        var is_r: int = compare(ex_a.p[c], ex_b.p[c]);
+        var inv: *char = op == B_LT ? "bge " : op == B_LE ? "bgt " : op == B_GT ? "ble " : op == B_GE ? "blt " : op == B_EQ ? "bne " : "beq ";
+        if (is_r && op == B_NE) {
+            // unordered: != is true, so do not jump
+            var skip: int = new_label();
+            e_l("bov ", skip);
+            e_l(inv, target);
+            lab(skip);
+        } else {
+            if (is_r) { e_l("bov ", target); }
+            e_l(inv, target);
+        }
+        return;
+    }
+    condition_value(c);
+    em("cmp r1, 0");
+    e_l("beq ", target);
+}
+
+// After a real is in f1: r1 := 1 if it is non-zero (a NaN counts), else 0.
+fn real_truth() {
+    var done: int = new_label();
+    em("fcmp f1, f0");
+    em("li r1, 1");
+    e_l("bov ", done);
+    e_l("bne ", done);
+    em("li r1, 0");
+    lab(done);
+}
+
+fn condition_value(x: int) {
+    var t: int = expr(x);
+    if (is_real(t)) { real_truth(); return; }
+    if (!is_scalar(decay(t))) { m0(); mty(t); ms(" cannot be used as a condition"); fail(ex_pos.p[x]); }
+}
+
+fn push_f1() { em("sub sp, sp, 9"); em("fstd f1, [sp]"); }
+fn pop_f1() { em("fldd f1, [sp]"); em("add sp, sp, 9"); }
+
+fn peek_type(x: int) -> int {
+    if (ex_pk.p[x] >= 0) { return ex_pk.p[x]; }
+    var c: int = code.n;
+    var ns: int = next_slot;
+    var lo: int = lowest_slot;
+    var t: int = expr(x);
+    code.n = c;
+    next_slot = ns;
+    lowest_slot = lo;
+    ex_pk.p[x] = t;
+    return t;
+}
+
+fn peek_real(x: int) -> int { return is_real(peek_type(x)); }
+
+// f1 := x as a real (an integer converted).
+fn expr_real(x: int) {
+    var t: int = expr(x);
+    if (is_real(t)) { return; }
+    if (is_integer(t)) { em("fcvtif f1, r1"); return; }
+    m0(); ms("expected a real, found "); mty(t); fail(ex_pos.p[x]);
+}
+
+fn comparable(ta: int, tb: int) -> int {
+    var fa: int = tk(ta) == TY_FN || ta == t_null;
+    var fb: int = tk(tb) == TY_FN || tb == t_null;
+    return (is_integer(ta) && is_integer(tb)) || (is_pointer(ta) && is_pointer(tb)) || (fa && fb);
+}
+
+// Set S = sign(a - b); 1 if compared as reals.
+fn compare(a: int, b: int) -> int {
+    if (peek_real(a) || peek_real(b)) {
+        expr_real(a);
+        push_f1();
+        expr_real(b);
+        em("fmov f2, f1");
+        pop_f1();
+        em("fcmp f1, f2");
+        return 1;
+    }
+    var v: int = const_eval(b);
+    var bc: int = ce_ok;
+    var ta: int = decay(expr(a));
+    if (bc) {
+        if (!(is_integer(ta) || (is_pointer(ta) && v == 0))) { m0(); ms("cannot compare "); mty(ta); ms(" with a number"); fail(ex_pos.p[b]); }
+        e_i("cmp r1, ", v);
+        return 0;
+    }
+    em("push r1");
+    var tb: int = decay(expr(b));
+    if (!comparable(ta, tb)) { m0(); ms("cannot compare "); mty(ta); ms(" with "); mty(tb); fail(ex_pos.p[b]); }
+    em("mov r2, r1");
+    em("pop r1");
+    em("cmp r1, r2");
+    return 0;
+}
+
+// ---- initialisers ----
+
+fn init_object(frame: int, off: int, ty: int, x: int) {
+    var xk: int = ex_kind.p[x];
+    var k: int = tk(ty);
+    if (k == TY_ARRAY && ty_a.p[ty] == t_tryte && xk == E_STR) {
+        var n: int = ty_b.p[ty];
+        var sid: int = ex_v.p[x];
+        if (str_n(sid) > n) { m0(); ms("string of "); mi(str_n(sid)); ms(" characters does not fit in ["); mi(n); ms("]char"); fail(ex_pos.p[x]); }
+        var i: int = 0;
+        while (i < n) {
+            e_i("li r1, ", i < str_n(sid) ? str_at(sid)[i] : 0);
+            ln(); o("stt r1, "); op_place(frame, off + i); nl();
+            i += 1;
+        }
+        return;
+    }
+    if (k == TY_ARRAY && xk == E_LIST) {
+        var an: int = ty_b.p[ty];
+        if (ex_n.p[x] > an) { m0(); mi(ex_n.p[x]); ms(" initialisers for an array of "); mi(an); fail(ex_pos.p[x]); }
+        var el: int = ty_a.p[ty];
+        var stride: int = size(el);
+        var j: int = 0;
+        while (j < an) {
+            if (j < ex_n.p[x]) { init_object(frame, off + j * stride, el, lists.p[ex_v.p[x] + j]); }
+            else { zero_object(frame, off + j * stride, el); }
+            j += 1;
+        }
+        return;
+    }
+    if (k == TY_STRUCT && xk == E_LIST) {
+        var id: int = ty_b.p[ty];
+        if (ex_n.p[x] > sd_fn.p[id]) { m0(); mi(ex_n.p[x]); ms(" initialisers for a struct with "); mi(sd_fn.p[id]); ms(" fields"); fail(ex_pos.p[x]); }
+        var f: int = 0;
+        while (f < sd_fn.p[id]) {
+            var fi: int = sd_f0.p[id] + f;
+            if (f < ex_n.p[x]) { init_object(frame, off + fd_off.p[fi], fd_ty.p[fi], lists.p[ex_v.p[x] + f]); }
+            else { zero_object(frame, off + fd_off.p[fi], fd_ty.p[fi]); }
+            f += 1;
+        }
+        return;
+    }
+    if (xk == E_LIST) { m0(); ms("a list cannot initialise "); mty(ty); fail(ex_pos.p[x]); }
+    if (ty == t_real) {
+        expr_real(x);
+        ln(); o("fstd f1, "); op_place(frame, off); nl();
+        return;
+    }
+    if (is_scalar(ty)) {
+        check_assign(ty, expr(x), x);
+        ln(); o(is_tsz(ty) ? "stt r1, " : "stw r1, "); op_place(frame, off); nl();
+        return;
+    }
+    m0(); mty(ty); ms(" must be initialised with { … }"); fail(ex_pos.p[x]);
+}
+
+fn zero_object(frame: int, off: int, ty: int) {
+    var k: int = tk(ty);
+    if (k == TY_ARRAY) {
+        var el: int = ty_a.p[ty];
+        var stride: int = size(el);
+        var j: int = 0;
+        while (j < ty_b.p[ty]) { zero_object(frame, off + j * stride, el); j += 1; }
+        return;
+    }
+    if (k == TY_STRUCT) {
+        var id: int = ty_b.p[ty];
+        var f: int = 0;
+        while (f < sd_fn.p[id]) {
+            var fi: int = sd_f0.p[id] + f;
+            zero_object(frame, off + fd_off.p[fi], fd_ty.p[fi]);
+            f += 1;
+        }
+        return;
+    }
+    if (ty == t_real) { ln(); o("fstd f0, "); op_place(frame, off); nl(); return; }
+    ln(); o(is_tsz(ty) ? "stt r0, " : "stw r0, "); op_place(frame, off); nl();
+}
+
+// ---- type rules ----
+
+fn check_assign(dst: int, src: int, x: int) {
+    src = decay(src);
+    var ok: int = 0;
+    if (dst == src) { ok = 1; }
+    else if (dst == t_int && is_integer(src)) { ok = 1; }
+    else if (dst == t_tryte && src == t_trit) { ok = 1; }
+    else if ((dst == t_tryte || dst == t_trit) && (src == t_int || src == t_tryte)) {
+        var lim: int = dst == t_tryte ? 9841 : 1;
+        var v: int = const_eval(x);
+        ok = ce_ok && v <= lim && v >= -lim;
+    }
+    else if ((tk(dst) == TY_PTR || tk(dst) == TY_FN) && src == t_null) { ok = 1; }
+    else if (tk(dst) == TY_PTR && tk(src) == TY_PTR) {
+        ok = ty_a.p[dst] == t_void || ty_a.p[src] == t_void || ty_a.p[dst] == ty_a.p[src];
+    }
+    if (ok) { return; }
+    m0();
+    ms("expected ");
+    mty(dst);
+    ms(", found ");
+    mty(src);
+    if (is_integer(dst) && is_integer(src)) { ms(" (use `as` to narrow)"); }
+    else if (is_integer(dst) && is_real(src)) { ms(" (use `as` to convert)"); }
+    fail(ex_pos.p[x]);
+}
+
+// ---- expressions -----------------------------------------------------------------------------
+
+fn load(t: int) {
+    if (is_real(t)) { em("fldd f1, [r1]"); }
+    else if (is_scalar(t)) { em(is_tsz(t) ? "ldt r1, [r1]" : "ldw r1, [r1]"); }
+}
+
+// a global variable's label: its address, or (extern) its name
+fn o_label(n: int) {
+    if (g_kind[n] == G_EXTERN) { o(name_str(n)); } else { oi(g_val[n]); }
+}
+
+// Evaluate x into r1 (a real into f1): its type. Arrays and structs
+// evaluate to their address.
+fn expr(x: int) -> int {
+    var k: int = ex_kind.p[x];
+    var pos: int = ex_pos.p[x];
+    var v: int = const_eval(x);
+    if (ce_ok) {
+        var t: int = t_int;
+        if (k == E_CHAR) { t = t_tryte; }
+        else if (k == E_NAME) { t = g_ty[ex_v.p[x]]; }
+        else if (k == E_CAST) { t = resolve(ex_v.p[x], pos); }
+        else if (k == E_BINARY && ex_op.p[x] == B_CMP3) { t = t_trit; }
+        e_i("li r1, ", v);
+        return t;
+    }
+    if (k == E_REAL) {
+        var sid: int = ex_v.p[x];
+        if (!real_from_decimal(str_at(sid), str_n(sid))) { m0(); ms("bad number "); ms_n(str_at(sid), str_n(sid)); fail(pos); }
+        load_real();
+        return t_real;
+    }
+    if (k == E_STR) {
+        ln(); o("la r1, .Lstr"); oi(intern_str(ex_v.p[x])); nl();
+        em("sub r1, r1, 1");
+        return t_str;
+    }
+    if (k == E_NULL) { em("li r1, 0"); return t_null; }
+    if (k == E_NAME) {
+        var n: int = ex_v.p[x];
+        var l: int = lookup_local(n);
+        if (l >= 0) {
+            var lt: int = lc_ty.p[l];
+            var off: int = lc_off.p[l];
+            if (is_real(lt)) { ln(); o("fldd f1, "); om("fp", off); nl(); }
+            else if (is_scalar(lt)) { ln(); o(is_tsz(lt) ? "ldt r1, " : "ldw r1, "); om("fp", off); nl(); }
+            else { e_i("add r1, fp, ", off); }
+            return lt;
+        }
+        var g: int = g_kind[n];
+        if (g == G_VAR || g == G_EXTERN) {
+            var gt: int = g_ty[n];
+            if (is_real(gt)) { ln(); o("fldd f1, ["); o_label(n); o("]"); nl(); }
+            else if (is_scalar(gt)) { ln(); o(is_tsz(gt) ? "ldt r1, [" : "ldw r1, ["); o_label(n); o("]"); nl(); }
+            else { ln(); o("la r1, "); o_label(n); nl(); }
+            return gt;
+        }
+        if (g == G_CONST) {
+            if (g_cv[n] == CV_STR) {
+                ln(); o("la r1, .Lstr"); oi(g_val[n]); nl();
+                em("sub r1, r1, 1");
+                return g_ty[n];
+            }
+            real_get(g_val[n]);
+            load_real();
+            return g_ty[n];
+        }
+        if (g == G_FUNC) {
+            ln(); o("la r1, "); o(name_str(n)); nl();
+            return g_ty[n];
+        }
+        fail_at(pos, "unknown name", name_str(n));
+    }
+    if (k == E_UNARY) {
+        var op: int = ex_op.p[x];
+        var a: int = ex_a.p[x];
+        if (op == U_NEG) {
+            var nt: int = expr(a);
+            if (is_real(nt)) { em("fneg f1, f1"); return t_real; }
+            need_integer(nt, ex_pos.p[a]);
+            em("neg r1, r1");
+            return t_int;
+        }
+        if (op == U_NOT) {
+            condition_value(a);
+            var nl_: int = new_label();
+            em("cmp r1, 0");
+            em("li r1, 1");
+            e_l("beq ", nl_);
+            em("li r1, 0");
+            lab(nl_);
+            return t_int;
+        }
+        if (op == U_DEREF) {
+            var dt: int = addr(x);
+            load(dt);
+            return dt;
+        }
+        // &x: a function's address is the function
+        if (ex_kind.p[a] == E_NAME && lookup_local(ex_v.p[a]) < 0 && g_kind[ex_v.p[a]] == G_FUNC) {
+            ln(); o("la r1, "); o(name_str(ex_v.p[a])); nl();
+            return g_ty[ex_v.p[a]];
+        }
+        return mk_ptr(addr(a));
+    }
+    if (k == E_BINARY) { return binary(ex_op.p[x], ex_a.p[x], ex_b.p[x], pos); }
+    if (k == E_ASSIGN) { return assign(ex_op.p[x], ex_a.p[x], ex_b.p[x]); }
+    if (k == E_CALL) { return gen_call(x); }
+    if (k == E_INDEX || k == E_FIELD) {
+        var it: int = addr(x);
+        load(it);
+        return it;
+    }
+    if (k == E_CAST) {
+        var to: int = resolve(ex_v.p[x], pos);
+        var from: int = decay(expr(ex_a.p[x]));
+        if (is_real(to) || is_real(from)) {
+            if (is_real(to) && is_real(from)) { return t_real; }
+            if (is_real(to) && is_integer(from)) { em("fcvtif f1, r1"); return t_real; }
+            if (is_integer(to) && is_real(from)) {
+                em("fcvtfi r1, f1");
+                if (to == t_tryte) { em("ext r1, r1, 19, 9"); }
+                else if (to == t_trit) { em("ext r1, r1, 27, 1"); }
+                return to;
+            }
+            m0(); ms("cannot convert "); mty(from); ms(" to "); mty(to); fail(pos);
+        }
+        var src_ok: int = is_integer(from) || is_pointer(from) || tk(from) == TY_FN;
+        var ok: int = (is_integer(to) || tk(to) == TY_PTR || tk(to) == TY_FN) && src_ok;
+        if (!ok) { m0(); ms("cannot convert "); mty(from); ms(" to "); mty(to); fail(pos); }
+        if (to == t_tryte && from != t_tryte && from != t_trit) { em("ext r1, r1, 19, 9"); }
+        else if (to == t_trit && from != t_trit) { em("ext r1, r1, 27, 1"); }
+        return to;
+    }
+    if (k == E_SIZEOF) {
+        e_i("li r1, ", size(resolve(ex_v.p[x], pos)));
+        return t_int;
+    }
+    if (k == E_COND) {
+        var lelse: int = new_label();
+        var lend: int = new_label();
+        var c: int = ex_a.p[x];
+        var ca: int = ex_b.p[x];
+        var cb: int = ex_c.p[x];
+        if (peek_real(ca) || peek_real(cb)) {
+            cond_jump_false(c, lelse);
+            expr_real(ca);
+            e_l("b ", lend);
+            lab(lelse);
+            expr_real(cb);
+            lab(lend);
+            return t_real;
+        }
+        cond_jump_false(c, lelse);
+        var ta: int = decay(expr(ca));
+        e_l("b ", lend);
+        lab(lelse);
+        var tb: int = decay(expr(cb));
+        lab(lend);
+        if (ta == tb) { return ta; }
+        if (is_integer(ta) && is_integer(tb)) { return t_int; }
+        if (is_pointer(ta) && tb == t_null) { return ta; }
+        if (is_pointer(tb) && ta == t_null) { return tb; }
+        m0(); ms("the branches have different types: "); mty(ta); ms(" and "); mty(tb); fail(pos);
+    }
+    fail_at(pos, "a `{ … }` list is only allowed as an initialiser", null);
+    return 0;
+}
+
+// The address of an lvalue into r1: the object's type.
+fn addr(x: int) -> int {
+    var k: int = ex_kind.p[x];
+    var pos: int = ex_pos.p[x];
+    if (k == E_NAME) {
+        var n: int = ex_v.p[x];
+        var l: int = lookup_local(n);
+        if (l >= 0) { e_i("add r1, fp, ", lc_off.p[l]); return lc_ty.p[l]; }
+        var g: int = g_kind[n];
+        if (g == G_VAR || g == G_EXTERN) { ln(); o("la r1, "); o_label(n); nl(); return g_ty[n]; }
+        if (g != 0) { m0(); mq(name_str(n)); ms(" is not a variable"); fail(pos); }
+        fail_at(pos, "unknown name", name_str(n));
+    }
+    if (k == E_UNARY && ex_op.p[x] == U_DEREF) {
+        var t: int = decay(expr(ex_a.p[x]));
+        if (tk(t) == TY_PTR) {
+            if (ty_a.p[t] == t_void) { fail_at(pos, "cannot dereference a *void", null); }
+            return ty_a.p[t];
+        }
+        m0(); ms("cannot dereference "); mty(t); fail(pos);
+    }
+    if (k == E_INDEX) {
+        var a: int = ex_a.p[x];
+        var i: int = ex_b.p[x];
+        var at: int = expr(a);
+        if (tk(at) != TY_ARRAY && tk(at) != TY_PTR) { m0(); ms("cannot index "); mty(at); fail(ex_pos.p[a]); }
+        var el: int = ty_a.p[at];
+        if (el == t_void) { fail_at(ex_pos.p[a], "cannot index a *void", null); }
+        var sz: int = size(el);
+        var kv: int = const_eval(i);
+        if (ce_ok) {
+            if (kv != 0) { e_i("add r1, r1, ", kv * sz); }
+        } else {
+            em("push r1");
+            need_integer(expr(i), ex_pos.p[i]);
+            if (sz != 1) { e_i("mul r1, r1, ", sz); }
+            em("mov r2, r1");
+            em("pop r1");
+            em("add r1, r1, r2");
+        }
+        return el;
+    }
+    if (k == E_FIELD) {
+        var sx: int = ex_a.p[x];
+        var st: int = expr(sx);
+        var id: int = -1;
+        if (tk(st) == TY_STRUCT) { id = ty_b.p[st]; }
+        else if (tk(st) == TY_PTR && tk(ty_a.p[st]) == TY_STRUCT) { id = ty_b.p[ty_a.p[st]]; }
+        else { m0(); mty(st); ms(" has no fields"); fail(ex_pos.p[sx]); }
+        var f: int = field_of(id, ex_v.p[x]);
+        if (f < 0) { m0(); ms("struct "); ms(name_str(sd_name.p[id])); ms(" has no field "); mq(name_str(ex_v.p[x])); fail(pos); }
+        if (fd_off.p[f] != 0) { e_i("add r1, r1, ", fd_off.p[f]); }
+        return fd_ty.p[f];
+    }
+    fail_at(pos, "this expression has no address (it is not a variable, element or field)", null);
+    return 0;
+}
+
+var op_names: *char = "Add Sub Mul Div Mod Shl Shr Min Max Cmp3 Lt Le Gt Ge Eq Ne And Or ";
+
+// the operator's name as the host's Debug prints it
+fn m_op(op: int) {
+    var k: int = 0;
+    var n: int = 1;
+    while (n < op) {
+        while (op_names[k] != ' ') { k += 1; }
+        k += 1;
+        n += 1;
+    }
+    while (op_names[k] != ' ') { cv_push(&mb, op_names[k]); k += 1; }
+}
+
+// the right operand: the immediate, or r2
+fn o_operand(imm: int, has_imm: int) {
+    if (has_imm) { oi(imm); } else { o("r2"); }
+}
+
+// r1 := r1 op (an immediate, or r2); lt, rt the operand types
+fn arith(op: int, lt: int, rt: int, imm: int, has_imm: int, pos: int) -> int {
+    if (op == B_ADD || op == B_SUB) {
+        var le: int = ptr_elem(lt);
+        var re: int = ptr_elem(rt);
+        if (le >= 0 && is_integer(rt)) {
+            var sz: int = size(le);
+            if (sz < 1) { sz = 1; }
+            ln();
+            if (has_imm) {
+                o(op == B_ADD ? "add r1, r1, " : "sub r1, r1, ");
+                oi(imm * sz);
+            } else if (sz != 1) {
+                o("mul r2, r2, ");
+                oi(sz);
+                nl();
+                ln();
+                o(op == B_ADD ? "add r1, r1, r2" : "sub r1, r1, r2");
+            } else {
+                o(op == B_ADD ? "add r1, r1, r2" : "sub r1, r1, r2");
+            }
+            nl();
+            return lt;
+        }
+        if (is_integer(lt) && re >= 0 && op == B_ADD) {
+            var sz2: int = size(re);
+            if (sz2 < 1) { sz2 = 1; }
+            if (sz2 != 1) {
+                e_i("mul r1, r1, ", sz2);
+                ln(); o("add r1, r1, "); o_operand(imm, has_imm); nl();
+            } else {
+                ln(); o("add r1, r1, "); o_operand(imm, has_imm); nl();
+            }
+            return rt;
+        }
+        if (le >= 0 && re >= 0 && op == B_SUB) {
+            if (le != re) { m0(); ms("cannot subtract "); mty(rt); ms(" from "); mty(lt); fail(pos); }
+            ln(); o("sub r1, r1, "); o_operand(imm, has_imm); nl();
+            var sz3: int = size(le);
+            if (sz3 < 1) { sz3 = 1; }
+            if (sz3 != 1) { e_i("div r1, r1, ", sz3); }
+            return t_int;
+        }
+    }
+    if (!is_integer(lt) || !is_integer(rt)) {
+        m0(); ms("cannot apply "); m_op(op); ms(" to "); mty(lt); ms(" and "); mty(rt); fail(pos);
+    }
+    var m: *char = op == B_ADD ? "add" : op == B_SUB ? "sub" : op == B_MUL ? "mul" : op == B_DIV ? "div" : op == B_MOD ? "mod" : op == B_MIN ? "min" : op == B_MAX ? "max" : "sh";
+    if (op == B_SHR) {
+        if (has_imm) {
+            e_i("sh r1, r1, ", -imm);
+        } else {
+            em("neg r2, r2");
+            em("sh r1, r1, r2");
+        }
+        return t_int;
+    }
+    if ((op == B_DIV || op == B_MOD) && has_imm && imm == 0) { fail_at(pos, "division by zero", null); }
+    ln(); o(m); o(" r1, r1, "); o_operand(imm, has_imm); nl();
+    return t_int;
+}
+
+fn real_mnemonic(op: int) -> *char {
+    return op == B_ADD ? "fadd" : op == B_SUB ? "fsub" : op == B_MUL ? "fmul" : op == B_DIV ? "fdiv" : op == B_MOD ? "frem" : op == B_MIN ? "fmin" : "fmax";
+}
+
+fn real_op(op: int) { ln(); o(real_mnemonic(op)); o(" f1, f1, f2"); nl(); }
+
+fn is_real_arith(op: int) -> int {
+    return op == B_ADD || op == B_SUB || op == B_MUL || op == B_DIV || op == B_MOD || op == B_MIN || op == B_MAX;
+}
+
+fn binary(op: int, a: int, b: int, pos: int) -> int {
+    if (op == B_AND || op == B_OR) {
+        var short: int = new_label();
+        var end: int = new_label();
+        var vs: int = op == B_AND ? 0 : 1;
+        condition_value(a);
+        em("cmp r1, 0");
+        e_l(op == B_AND ? "beq " : "bne ", short);
+        condition_value(b);
+        em("cmp r1, 0");
+        e_l(op == B_AND ? "beq " : "bne ", short);
+        e_i("li r1, ", 1 - vs);
+        e_l("b ", end);
+        lab(short);
+        e_i("li r1, ", vs);
+        lab(end);
+        return t_int;
+    }
+    if (is_comparison(op)) {
+        var is_r: int = compare(a, b);
+        var br: *char = op == B_LT ? "blt " : op == B_LE ? "ble " : op == B_GT ? "bgt " : op == B_GE ? "bge " : op == B_EQ ? "beq " : "bne ";
+        var l: int = new_label();
+        var zero: int = new_label();
+        em("li r1, 1");
+        if (is_r) { e_l("bov ", op == B_NE ? l : zero); }
+        e_l(br, l);
+        lab(zero);
+        em("li r1, 0");
+        lab(l);
+        return t_int;
+    }
+    if (op == B_CMP3) {
+        compare(a, b);
+        var l3: int = new_label();
+        em("li r1, 0");
+        e_l("beq ", l3);
+        em("li r1, 1");
+        e_l("bgt ", l3);
+        em("li r1, -1");
+        lab(l3);
+        return t_trit;
+    }
+    if (is_real_arith(op) && (peek_real(a) || peek_real(b))) {
+        expr_real(a);
+        push_f1();
+        expr_real(b);
+        em("fmov f2, f1");
+        pop_f1();
+        real_op(op);
+        return t_real;
+    }
+    var v: int = const_eval(b);
+    if (ce_ok) {
+        var lt: int = decay(expr(a));
+        return arith(op, lt, t_int, v, 1, pos);
+    }
+    var lt2: int = decay(expr(a));
+    em("push r1");
+    var rt: int = decay(expr(b));
+    em("mov r2, r1");
+    em("pop r1");
+    return arith(op, lt2, rt, 0, 0, pos);
+}
+
+fn assign_real(op: int, lhs: int, rhs: int) -> int {
+    if (op == 0) {
+        expr_real(rhs);
+        push_f1();
+        addr(lhs);
+        pop_f1();
+        em("fstd f1, [r1]");
+        return t_real;
+    }
+    if (!is_real_arith(op)) { m0(); ms("cannot apply "); m_op(op); ms(" to a real"); fail(ex_pos.p[lhs]); }
+    addr(lhs);
+    em("push r1");
+    expr_real(rhs);
+    em("fmov f2, f1");
+    em("pop r3");
+    em("fldd f1, [r3]");
+    real_op(op);
+    em("fstd f1, [r3]");
+    return t_real;
+}
+
+fn whole(t: int, pos: int, what: *char) {
+    m0(); ms(what); mty(t); fail(pos);
+}
+
+fn assign(op: int, lhs: int, rhs: int) -> int {
+    if (peek_real(lhs)) { return assign_real(op, lhs, rhs); }
+    if (op == 0) {
+        // a named variable: straight to it
+        if (ex_kind.p[lhs] == E_NAME) {
+            var n: int = ex_v.p[lhs];
+            var l: int = lookup_local(n);
+            var g: int = g_kind[n];
+            if (l >= 0 || g == G_VAR || g == G_EXTERN) {
+                var ty: int = l >= 0 ? lc_ty.p[l] : g_ty[n];
+                if (!is_scalar(ty)) {
+                    m0(); ms("cannot assign a whole "); mty(ty); ms("; copy it field by field"); fail(ex_pos.p[lhs]);
+                }
+                check_assign(ty, expr(rhs), rhs);
+                ln();
+                o(is_tsz(ty) ? "stt r1, " : "stw r1, ");
+                if (l >= 0) { om("fp", lc_off.p[l]); } else { oc('['); o_label(n); oc(']'); }
+                nl();
+                return ty;
+            }
+        }
+        var rt: int = expr(rhs);
+        em("push r1");
+        var lt: int = addr(lhs);
+        if (!is_scalar(lt)) { m0(); ms("cannot assign a whole "); mty(lt); ms("; copy it field by field"); fail(ex_pos.p[lhs]); }
+        check_assign(lt, rt, rhs);
+        em("pop r2");
+        em(is_tsz(lt) ? "stt r2, [r1]" : "stw r2, [r1]");
+        em("mov r1, r2");
+        return lt;
+    }
+    var at: int = addr(lhs);
+    if (!is_scalar(at)) { m0(); ms("cannot apply an operator to a whole "); mty(at); fail(ex_pos.p[lhs]); }
+    em("push r1");
+    var rt2: int = decay(expr(rhs));
+    em("mov r2, r1");
+    em("pop r3");
+    em("push r3");
+    em(is_tsz(at) ? "ldt r1, [r3]" : "ldw r1, [r3]");
+    var res: int = arith(op, at, rt2, 0, 0, ex_pos.p[rhs]);
+    if (!(is_integer(res) && is_tsz(at))) { check_assign(at, res, rhs); }   // x += 1 on a tryte narrows
+    em("pop r3");
+    em(is_tsz(at) ? "stt r1, [r3]" : "stw r1, [r3]");
+    return at;
+}
+
+// ---- calls ----
+
+var builtin_names: *char = "sgn abs divr modr tmul tsat cons mulh trit ext ins tlz band bor bxor bandn bsh bext brot bytes in out mfc mtc hlt brk tlbflush tlbinv fence syscall sqrt trunc round rem scale3 exponent3 fconst fsr set_fsr fclass real27 ";
+
+fn is_builtin(s: *char) -> int {
+    var k: int = 0;
+    while (builtin_names[k] != 0) {
+        var j: int = 0;
+        while (s[j] != 0 && builtin_names[k + j] == s[j]) { j += 1; }
+        if (s[j] == 0 && builtin_names[k + j] == ' ') { return 1; }
+        while (builtin_names[k] != ' ') { k += 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+fn gen_call(x: int) -> int {
+    var f: int = ex_a.p[x];
+    var args: int = ex_v.p[x];
+    var na: int = ex_n.p[x];
+    var pos: int = ex_pos.p[x];
+    var direct: int = -1;
+    if (ex_kind.p[f] == E_NAME) {
+        var n: int = ex_v.p[f];
+        if (lookup_local(n) < 0) {
+            if (g_kind[n] == 0 && is_builtin(name_str(n))) { return builtin(name_str(n), args, na, pos); }
+            if (g_kind[n] == G_FUNC) { direct = n; }
+        }
+    }
+    var fty: int = 0;
+    if (direct >= 0) {
+        fty = g_ty[direct];
+    } else {
+        var t: int = expr(f);
+        em("push r1");
+        if (tk(t) == TY_PTR && tk(ty_a.p[t]) == TY_FN) { fty = ty_a.p[t]; }
+        else if (tk(t) == TY_FN) { fty = t; }
+        else { m0(); ms("cannot call "); mty(t); fail(ex_pos.p[f]); }
+    }
+    var np: int = ty_c.p[fty];
+    var ps: int = ty_b.p[fty];
+    if (np != na) { m0(); ms("expected "); mi(np); ms(" argument(s), found "); mi(na); fail(pos); }
+    var nreal: int = 0;
+    var k: int = 0;
+    while (k < np) { if (is_real(ty_list.p[ps + k])) { nreal += 1; } k += 1; }
+    if (nreal > 0) {
+        if (nreal > 9 || np - nreal > 6) { fail_at(pos, "a call with real arguments takes at most 9 reals and 6 other arguments", null); }
+        var total: int = 0;
+        k = 0;
+        while (k < na) {
+            var a: int = lists.p[args + k];
+            var p: int = ty_list.p[ps + k];
+            if (is_real(p)) {
+                expr_real(a);
+                push_f1();
+                total += 9;
+            } else {
+                check_assign(p, expr(a), a);
+                em("push r1");
+                total += 3;
+            }
+            k += 1;
+        }
+        var i: int = 0;
+        var j: int = 0;
+        var off: int = total;
+        k = 0;
+        while (k < np) {
+            if (is_real(ty_list.p[ps + k])) {
+                off -= 9;
+                j += 1;
+                ln(); o("fldd f"); oi(j); o(", "); om("sp", off); nl();
+            } else {
+                off -= 3;
+                i += 1;
+                ln(); o("ldw r"); oi(i); o(", "); om("sp", off); nl();
+            }
+            k += 1;
+        }
+        if (direct >= 0) {
+            ln(); o("call "); o(name_str(direct)); nl();
+        } else {
+            ln(); o("ldw r7, "); om("sp", total); nl();
+            em("jalr lr, r7");
+        }
+        e_i("add sp, sp, ", total + (direct >= 0 ? 0 : 3));
+        return ty_a.p[fty];
+    }
+    k = 0;
+    while (k < na) {
+        var a2: int = lists.p[args + k];
+        check_assign(ty_list.p[ps + k], expr(a2), a2);
+        em("push r1");
+        k += 1;
+    }
+    var m: int = na < 6 ? na : 6;
+    k = 0;
+    while (k < m) {
+        ln(); o("ldw r"); oi(k + 1); o(", "); om("sp", 3 * (na - 1 - k)); nl();
+        k += 1;
+    }
+    // stack arguments: reversed, so the seventh is lowest
+    var sk: int = na - 6;
+    if (sk < 0) { sk = 0; }
+    k = 0;
+    while (k < sk / 2) {
+        var lo: int = 3 * k;
+        var hi: int = 3 * (sk - 1 - k);
+        ln(); o("ldw r7, "); om("sp", lo); nl();
+        ln(); o("ldw r8, "); om("sp", hi); nl();
+        ln(); o("stw r8, "); om("sp", lo); nl();
+        ln(); o("stw r7, "); om("sp", hi); nl();
+        k += 1;
+    }
+    var cleanup: int = na;
+    if (direct >= 0) {
+        ln(); o("call "); o(name_str(direct)); nl();
+    } else {
+        ln(); o("ldw r7, "); om("sp", 3 * na); nl();
+        em("jalr lr, r7");
+        cleanup += 1;
+    }
+    if (cleanup > 0) { e_i("add sp, sp, ", 3 * cleanup); }
+    return ty_a.p[fty];
+}
+
+// two operands into r1 (the first) and r2
+fn two(a: int, b: int) {
+    var ta: int = decay(expr(a));
+    em("push r1");
+    var tb: int = decay(expr(b));
+    em("mov r2, r1");
+    em("pop r1");
+    two_a = ta;
+    two_b = tb;
+}
+
+var two_a: int;
+var two_b: int;
+
+fn arg(args: int, k: int) -> int { return lists.p[args + k]; }
+
+fn want(n: *char, na: int, k: int, pos: int) {
+    if (na != k) { m0(); mq(n); ms(" takes "); mi(k); ms(" argument(s), found "); mi(na); fail(pos); }
+}
+
+var cregs: *char = "MODE PTB FADDR FCAUSE ITB EPC EMODE KSP SCRATCH CPUID CYCLE ";
+
+fn builtin(n: *char, args: int, na: int, pos: int) -> int {
+    if (streq(n, "abs") && na == 1 && peek_real(arg(args, 0))) {
+        expr(arg(args, 0));
+        em("fabs f1, f1");
+        return t_real;
+    }
+    if (streq(n, "sqrt") || streq(n, "trunc") || streq(n, "round")) {
+        want(n, na, 1, pos);
+        expr_real(arg(args, 0));
+        em(streq(n, "sqrt") ? "fsqrt f1, f1" : streq(n, "trunc") ? "ftrunc f1, f1" : "frnd f1, f1");
+        return t_real;
+    }
+    if (streq(n, "rem")) {
+        want(n, na, 2, pos);
+        expr_real(arg(args, 0));
+        push_f1();
+        expr_real(arg(args, 1));
+        em("fmov f2, f1");
+        pop_f1();
+        em("frem f1, f1, f2");
+        return t_real;
+    }
+    if (streq(n, "scale3")) {
+        want(n, na, 2, pos);
+        expr_real(arg(args, 0));
+        push_f1();
+        need_integer(expr(arg(args, 1)), ex_pos.p[arg(args, 1)]);
+        pop_f1();
+        em("fscl f1, f1, r1");
+        return t_real;
+    }
+    if (streq(n, "exponent3") || streq(n, "fclass")) {
+        want(n, na, 1, pos);
+        expr_real(arg(args, 0));
+        em(streq(n, "fclass") ? "fclass r1, f1" : "fexp r1, f1");
+        return t_int;
+    }
+    if (streq(n, "real27")) {
+        want(n, na, 1, pos);
+        expr_real(arg(args, 0));
+        em("ftow r1, f1");
+        em("ffrw f1, r1");
+        return t_real;
+    }
+    if (streq(n, "fconst")) {
+        want(n, na, 1, pos);
+        var fk: int = const_int(arg(args, 0));
+        if (fk < 0 || fk > 6) { fail_at(ex_pos.p[arg(args, 0)], "fconst takes 0..6: zero, one, pi, e, ln 3, log3 e, log3 10", null); }
+        e_i("fconst f1, ", fk);
+        return t_real;
+    }
+    if (streq(n, "fsr")) {
+        want(n, na, 0, pos);
+        em("fmfs r1");
+        return t_int;
+    }
+    if (streq(n, "set_fsr")) {
+        want(n, na, 1, pos);
+        need_integer(expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        em("fmts r1");
+        return t_void;
+    }
+    if (streq(n, "sgn") || streq(n, "abs") || streq(n, "tlz")) {
+        want(n, na, 1, pos);
+        need_integer(expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        ln(); o(n); o(" r1, r1"); nl();
+        return streq(n, "sgn") ? t_trit : t_int;
+    }
+    if (streq(n, "divr") || streq(n, "modr") || streq(n, "tmul") || streq(n, "tsat") || streq(n, "cons") || streq(n, "mulh")
+        || streq(n, "band") || streq(n, "bor") || streq(n, "bxor") || streq(n, "bandn") || streq(n, "bsh")) {
+        want(n, na, 2, pos);
+        two(arg(args, 0), arg(args, 1));
+        need_integer(two_a, ex_pos.p[arg(args, 0)]);
+        need_integer(two_b, ex_pos.p[arg(args, 1)]);
+        ln(); o(n); o(" r1, r1, r2"); nl();
+        return t_int;
+    }
+    if (streq(n, "trit")) {
+        want(n, na, 2, pos);
+        var ti: int = const_int(arg(args, 1));
+        if (ti < 1 || ti > 27) { fail_at(ex_pos.p[arg(args, 1)], "trit position must be 1..27", null); }
+        need_integer(expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        e_i("trit r1, r1, ", ti);
+        return t_trit;
+    }
+    if (streq(n, "ext") || streq(n, "bext") || streq(n, "brot")) {
+        want(n, na, 3, pos);
+        var p: int = const_int(arg(args, 1));
+        var l: int = const_int(arg(args, 2));
+        if (!streq(n, "ext")) {
+            var ok: int = l >= 1 && l <= 41 && (streq(n, "bext") ? p >= 0 && p <= 80 : p >= 0 && p < l);
+            if (!ok) {
+                m0(); mq(n); ms(" needs a bit position in "); ms(streq(n, "bext") ? "0..80" : "0..len-1"); ms(" and a length in 1..41");
+                fail(ex_pos.p[arg(args, 1)]);
+            }
+        }
+        need_integer(expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        ln(); o(n); o(" r1, r1, "); oi(p); o(", "); oi(l); nl();
+        return t_int;
+    }
+    if (streq(n, "ins")) {
+        want(n, na, 4, pos);
+        var ip: int = const_int(arg(args, 2));
+        var il: int = const_int(arg(args, 3));
+        two(arg(args, 0), arg(args, 1));
+        need_integer(two_a, ex_pos.p[arg(args, 0)]);
+        need_integer(two_b, ex_pos.p[arg(args, 1)]);
+        ln(); o("ins r1, r2, "); oi(ip); o(", "); oi(il); nl();
+        return t_int;
+    }
+    if (streq(n, "bytes")) {
+        want(n, na, 1, pos);
+        var bt: int = decay(expr(arg(args, 0)));
+        if (!is_pointer(bt)) { m0(); ms("`bytes` takes a pointer, found "); mty(bt); fail(ex_pos.p[arg(args, 0)]); }
+        em("sub r1, r1, 1");
+        return t_str;
+    }
+    if (streq(n, "in")) {
+        want(n, na, 1, pos);
+        var port: int = const_eval(arg(args, 0));
+        if (ce_ok) {
+            e_i("in r1, ", port);
+        } else {
+            need_integer(expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+            em("in r1, [r1]");
+        }
+        return t_int;
+    }
+    if (streq(n, "out")) {
+        want(n, na, 2, pos);
+        var oport: int = const_eval(arg(args, 0));
+        if (ce_ok) {
+            expr(arg(args, 1));
+            e_i("out r1, ", oport);
+        } else {
+            two(arg(args, 0), arg(args, 1));
+            em("out r2, [r1]");
+        }
+        return t_void;
+    }
+    if (streq(n, "mfc") || streq(n, "mtc")) {
+        var mfc: int = streq(n, "mfc");
+        want(n, na, mfc ? 1 : 2, pos);
+        var a0: int = arg(args, 0);
+        if (ex_kind.p[a0] != E_NAME) { m0(); mq(n); ms(" needs a control register name: "); m_cregs(); fail(ex_pos.p[a0]); }
+        var reg: *char = name_str(ex_v.p[a0]);
+        var up: [28]char;
+        var q: int = 0;
+        while (reg[q] != 0 && q < 27) { up[q] = (reg[q] >= 'a' && reg[q] <= 'z' ? reg[q] - 32 : reg[q]) as char; q += 1; }
+        up[q] = 0;
+        if (!is_creg(&up[0])) { m0(); ms("unknown control register "); mq(reg); ms("; one of "); m_cregs(); fail(ex_pos.p[a0]); }
+        var low: [28]char;
+        q = 0;
+        while (up[q] != 0) { low[q] = (up[q] >= 'A' && up[q] <= 'Z' ? up[q] + 32 : up[q]) as char; q += 1; }
+        low[q] = 0;
+        if (mfc) {
+            ln(); o("mfc r1, "); o(&low[0]); nl();
+            return t_int;
+        }
+        if (!is_scalar(decay(expr(arg(args, 1))))) { fail_at(ex_pos.p[arg(args, 1)], "`mtc` needs a word value", null); }
+        ln(); o("mtc "); o(&low[0]); o(", r1"); nl();
+        return t_void;
+    }
+    if (streq(n, "hlt") || streq(n, "brk") || streq(n, "tlbflush") || streq(n, "fence")) {
+        want(n, na, 0, pos);
+        em(n);
+        return t_void;
+    }
+    if (streq(n, "tlbinv")) {
+        want(n, na, 1, pos);
+        expr(arg(args, 0));
+        em("tlbinv r1");
+        return t_void;
+    }
+    // syscall
+    if (na == 0 || na > 7) { fail_at(pos, "`syscall` takes a constant number and up to 6 arguments", null); }
+    var num: int = const_int(arg(args, 0));
+    var k: int = 1;
+    while (k < na) { expr(arg(args, k)); em("push r1"); k += 1; }
+    var rest: int = na - 1;
+    k = 0;
+    while (k < rest) {
+        ln(); o("ldw r"); oi(k + 1); o(", "); om("sp", 3 * (rest - 1 - k)); nl();
+        k += 1;
+    }
+    if (rest > 0) { e_i("add sp, sp, ", 3 * rest); }
+    e_i("sys ", num);
+    return t_int;
+}
+
+fn is_creg(s: *char) -> int {
+    var k: int = 0;
+    while (cregs[k] != 0) {
+        var j: int = 0;
+        while (s[j] != 0 && cregs[k + j] == s[j]) { j += 1; }
+        if (s[j] == 0 && cregs[k + j] == ' ') { return 1; }
+        while (cregs[k] != ' ') { k += 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+// "MODE, PTB, ..." onto the message
+fn m_cregs() {
+    var k: int = 0;
+    while (cregs[k] != 0) {
+        if (cregs[k] == ' ') {
+            if (cregs[k + 1] != 0) { ms(", "); }
+        } else {
+            cv_push(&mb, cregs[k]);
+        }
+        k += 1;
+    }
+}
