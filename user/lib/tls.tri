@@ -1,0 +1,757 @@
+// tls.tri: a TLS 1.3 client (RFC 8446) over a connected socket.
+//
+// One cipher suite, TLS_CHACHA20_POLY1305_SHA256, and one key exchange,
+// X25519. The server proves itself with its certificate chain (x509.tri,
+// checked against the trust store and the host name) and a CertificateVerify
+// signature: ECDSA P-256/P-384, RSA-PSS or Ed25519. No session resumption,
+// no early data, no TLS 1.2: a server that cannot speak TLS 1.3 with this
+// suite is refused. A server that asks for a client certificate gets none.
+
+import "x509.tri";
+import "hmac.tri";
+import "chacha.tri";
+
+const TLS_E_FAIL: int = -1;                 // the handshake or a record failed
+const TLS_E_CERT: int = -2;                 // the certificate did not verify
+
+const TLS_REC_MAX: int = 16640;             // 2^14 + 256: the largest record body
+const TLS_MSG_MAX: int = 59049;             // the largest handshake message taken
+
+struct tls {
+    fd: int;
+    host: *char;                            // checked against the certificate (null: not)
+    verify: int;                            // check the chain (0: --no-check-certificate)
+    now: int;                               // seconds since 1970, for the validity check
+    why: [243]char;                         // what went wrong
+    cert_err: int;                          // X509_E_* when the certificate failed
+    done: int;                              // the handshake is over
+    eof: int;                               // close_notify came
+    unclean: int;                           // the connection ended without close_notify
+    th: hash_ctx;                           // the transcript
+    // traffic secrets and record keys
+    rsec: [32]tryte;
+    wsec: [32]tryte;
+    rkey: [32]tryte;
+    riv: [12]tryte;
+    rseq: int;
+    wkey: [32]tryte;
+    wiv: [12]tryte;
+    wseq: int;
+    rprot: int;                             // records are protected (each way)
+    wprot: int;
+    // the record being read
+    rec: [16650]tryte;
+    rtype: int;
+    rpos: int;
+    rn: int;
+    // the handshake message being read, header and all
+    msg: [59049]tryte;
+    mlen: int;
+    sigscheme: int;                         // the server's CertificateVerify scheme
+}
+
+// The server's certificates (the chain as sent).
+var tls_certs: [9]x509;
+var tls_ncerts: int;
+var _tls_der: [59049]tryte;
+var _tls_out: [16700]tryte;
+
+// ---- failing ----------------------------------------------------------------------------------
+
+fn _alert_name(d: int) -> *char {
+    if (d == 0) { return "close notify"; }
+    if (d == 10) { return "unexpected message"; }
+    if (d == 20) { return "bad record mac"; }
+    if (d == 22) { return "record overflow"; }
+    if (d == 40) { return "handshake failure"; }
+    if (d == 42) { return "bad certificate"; }
+    if (d == 43) { return "unsupported certificate"; }
+    if (d == 44) { return "certificate revoked"; }
+    if (d == 45) { return "certificate expired"; }
+    if (d == 46) { return "certificate unknown"; }
+    if (d == 47) { return "illegal parameter"; }
+    if (d == 48) { return "unknown ca"; }
+    if (d == 50) { return "decode error"; }
+    if (d == 51) { return "decrypt error"; }
+    if (d == 70) { return "protocol version"; }
+    if (d == 71) { return "insufficient security"; }
+    if (d == 80) { return "internal error"; }
+    if (d == 86) { return "inappropriate fallback"; }
+    if (d == 90) { return "user canceled"; }
+    if (d == 109) { return "missing extension"; }
+    if (d == 110) { return "unsupported extension"; }
+    if (d == 112) { return "unrecognized name"; }
+    if (d == 116) { return "certificate required"; }
+    if (d == 120) { return "no application protocol"; }
+    return "unknown alert";
+}
+
+fn _why(t: *tls, a: *char, b: *char) {
+    strcpy(&t.why[0], a);
+    strncat(&t.why[0], b, 242 - strlen(&t.why[0]));
+}
+
+// Tell the server (alert d, fatal), note why; TLS_E_FAIL.
+fn _fail(t: *tls, d: int, why: *char) -> int {
+    if (t.why[0] == 0) { _why(t, why, ""); }
+    if (d > 0) {
+        var a: [2]tryte;
+        a[0] = 2;
+        a[1] = d as tryte;
+        _send_record(t, 21, &a[0], 2);
+    }
+    return TLS_E_FAIL;
+}
+
+// ---- records ----------------------------------------------------------------------------------
+
+fn _write_all(fd: int, p: *tryte, n: int) -> int {
+    var done: int = 0;
+    while (done < n) {
+        var w: int = write(fd, (p + done) as *char, n - done);
+        if (w <= 0) { return -1; }
+        done += w;
+    }
+    return 0;
+}
+
+// n octets: n, 0 at a clean end before any, -1 otherwise.
+fn _read_full(fd: int, p: *tryte, n: int) -> int {
+    var got: int = 0;
+    while (got < n) {
+        var r: int = read(fd, (p + got) as *char, n - got);
+        if (r <= 0) { return got == 0 && r == 0 ? 0 : -1; }
+        got += r;
+    }
+    return n;
+}
+
+// The per-record nonce: the IV with the sequence number XORed into its end.
+fn _nonce(out: *tryte, iv: *tryte, seq: int) {
+    var k: int = 0;
+    while (k < 12) { out[k] = iv[k]; k += 1; }
+    k = 11;
+    while (seq > 0) {
+        out[k] = xor8(out[k], seq % 256) as tryte;
+        seq = seq / 256;
+        k -= 1;
+    }
+}
+
+// Send one record (protected once the keys are set).
+fn _send_record(t: *tls, type: int, p: *tryte, n: int) -> int {
+    var o: *tryte = &_tls_out[0];
+    var k: int = 0;
+    while (k < n) { o[5 + k] = p[k]; k += 1; }
+    var len: int = n;
+    o[0] = type as tryte;
+    if (t.wprot) {
+        o[5 + n] = type as tryte;               // TLSInnerPlaintext: content, type
+        len = n + 1 + 16;
+        o[0] = 23;
+    }
+    o[1] = 3;
+    o[2] = (type == 22 && !t.wprot ? 1 : 3) as tryte;    // a ClientHello's record says TLS 1.0
+    o[3] = (len / 256) as tryte;
+    o[4] = (len % 256) as tryte;
+    if (t.wprot) {
+        var nonce: [12]tryte;
+        _nonce(&nonce[0], &t.wiv[0], t.wseq);
+        aead_seal(&t.wkey[0], &nonce[0], o, 5, o + 5, n + 1);
+        t.wseq += 1;
+    }
+    return _write_all(t.fd, o, 5 + len);
+}
+
+// Read the next record (opened if protected) into t.rec: 1, 0 at the end
+// of the connection or a close_notify, or TLS_E_FAIL. Alerts end here.
+fn _record_in(t: *tls) -> int {
+    loop {
+        var h: [5]tryte;
+        var r: int = _read_full(t.fd, &h[0], 5);
+        if (r == 0) {
+            t.unclean = 1;
+            if (!t.done) { return _fail(t, 0, "the server closed the connection during the handshake"); }
+            return 0;
+        }
+        if (r < 0) { return _fail(t, 0, "the connection broke"); }
+        var type: int = h[0];
+        var len: int = h[3] * 256 + h[4];
+        if (h[1] != 3 || len > TLS_REC_MAX || (!t.rprot && len > 16384)) {
+            return _fail(t, 22, h[1] != 3 ? "not a TLS server" : "record overflow");
+        }
+        if (len == 0 && type != 23) { return _fail(t, 10, "an empty record"); }
+        if (_read_full(t.fd, &t.rec[0], len) != len) { return _fail(t, 0, "the connection broke"); }
+        // the compatibility ChangeCipherSpec: one octet 1, during the handshake
+        if (type == 20) {
+            if (t.done || len != 1 || t.rec[0] != 1) { return _fail(t, 10, "an unexpected change_cipher_spec"); }
+            continue;
+        }
+        if (t.rprot) {
+            if (type != 23) { return _fail(t, 10, "an unprotected record after the handshake keys"); }
+            if (len < 17) { return _fail(t, 50, "a record too short"); }
+            var nonce: [12]tryte;
+            _nonce(&nonce[0], &t.riv[0], t.rseq);
+            if (!aead_open(&t.rkey[0], &nonce[0], &h[0], 5, &t.rec[0], len - 16)) {
+                return _fail(t, 20, "bad record MAC");
+            }
+            t.rseq += 1;
+            var n: int = len - 16;
+            while (n > 0 && t.rec[n - 1] == 0) { n -= 1; }
+            if (n == 0) { return _fail(t, 10, "a record with no content type"); }
+            t.rtype = t.rec[n - 1];
+            t.rn = n - 1;
+        } else {
+            if (type != 22 && type != 21) { return _fail(t, 10, "an unexpected record"); }
+            t.rtype = type;
+            t.rn = len;
+        }
+        t.rpos = 0;
+        if (t.rtype == 21) {
+            if (t.rn != 2) { return _fail(t, 50, "a bad alert"); }
+            if (t.rec[1] == 0) { t.eof = 1; return 0; }
+            if (t.rec[1] == 90) { continue; }    // user_canceled: a close_notify follows
+            _why(t, "the server sent an alert: ", _alert_name(t.rec[1]));
+            return TLS_E_FAIL;
+        }
+        if (t.rtype != 22 && t.rtype != 23) { return _fail(t, 10, "an unexpected record type"); }
+        if (t.rtype == 23 && !t.done) { return _fail(t, 10, "application data during the handshake"); }
+        if (t.rn == 0 && t.rtype == 22) { return _fail(t, 10, "an empty handshake record"); }
+        return 1;
+    }
+    return TLS_E_FAIL;
+}
+
+// The next handshake message into t.msg (t.mlen octets, header and all):
+// its type, or TLS_E_FAIL.
+fn _hs_msg(t: *tls) -> int {
+    var have: int = 0;
+    var need: int = 4;
+    while (have < need) {
+        if (t.rpos >= t.rn) {
+            var r: int = _record_in(t);
+            if (r == 0) { return _fail(t, 0, "the connection ended in a handshake message"); }
+            if (r < 0) { return r; }
+            if (t.rtype != 22) { return _fail(t, 10, "a record inside a handshake message"); }
+        }
+        while (have < need && t.rpos < t.rn) {
+            t.msg[have] = t.rec[t.rpos];
+            have += 1;
+            t.rpos += 1;
+        }
+        if (have == 4 && need == 4) {
+            need = 4 + (t.msg[1] * 256 + t.msg[2]) * 256 + t.msg[3];
+            if (need > TLS_MSG_MAX) { return _fail(t, 22, "a handshake message too long"); }
+        }
+    }
+    t.mlen = need;
+    return t.msg[0];
+}
+
+// ---- the key schedule -------------------------------------------------------------------------
+
+fn _derive(secret: *tryte, label: *char, th: *tryte, out: *tryte) {
+    hkdf_expand_label(HASH_SHA256, secret, label, th, th == null ? 0 : 32, out, 32);
+}
+
+// Record keys from a traffic secret.
+fn _keys(sec: *tryte, key: *tryte, iv: *tryte) {
+    var none: [1]tryte;
+    hkdf_expand_label(HASH_SHA256, sec, "key", &none[0], 0, key, 32);
+    hkdf_expand_label(HASH_SHA256, sec, "iv", &none[0], 0, iv, 12);
+}
+
+fn _set_read(t: *tls, sec: *tryte) {
+    var k: int = 0;
+    while (k < 32) { t.rsec[k] = sec[k]; k += 1; }
+    _keys(&t.rsec[0], &t.rkey[0], &t.riv[0]);
+    t.rseq = 0;
+    t.rprot = 1;
+}
+
+fn _set_write(t: *tls, sec: *tryte) {
+    var k: int = 0;
+    while (k < 32) { t.wsec[k] = sec[k]; k += 1; }
+    _keys(&t.wsec[0], &t.wkey[0], &t.wiv[0]);
+    t.wseq = 0;
+    t.wprot = 1;
+}
+
+// HMAC(finished_key(base), transcript hash)
+fn _finished(base: *tryte, th: *tryte, out: *tryte) {
+    var fk: [32]tryte;
+    var none: [1]tryte;
+    hkdf_expand_label(HASH_SHA256, base, "finished", &none[0], 0, &fk[0], 32);
+    hmac(HASH_SHA256, &fk[0], 32, th, 32, out);
+}
+
+// ---- building messages ------------------------------------------------------------------------
+
+var _b: *tryte;
+var _bn: int;
+
+fn _p8(v: int) { _b[_bn] = v as tryte; _bn += 1; }
+fn _p16(v: int) { _p8(v / 256); _p8(v % 256); }
+fn _p24(v: int) { _p8(v / 65536); _p16(v % 65536); }
+fn _pn(p: *tryte, n: int) { var k: int = 0; while (k < n) { _p8(p[k]); k += 1; } }
+// fill in a 16- or 24-bit length at off, counting from it
+fn _len16(off: int) { var n: int = _bn - off - 2; _b[off] = (n / 256) as tryte; _b[off + 1] = (n % 256) as tryte; }
+fn _len24(off: int) { var n: int = _bn - off - 3; _b[off] = (n / 65536) as tryte; _b[off + 1] = (n / 256 % 256) as tryte; _b[off + 2] = (n % 256) as tryte; }
+
+fn _is_ipv4(h: *char) -> int {
+    var k: int = 0;
+    while (h[k] != 0) {
+        if ((h[k] < '0' || h[k] > '9') && h[k] != '.') { return 0; }
+        k += 1;
+    }
+    return k > 0;
+}
+
+fn _client_hello(t: *tls, buf: *tryte, pub: *tryte, sid: *tryte) -> int {
+    _b = buf;
+    _bn = 0;
+    _p8(1);
+    var hl: int = _bn;
+    _p24(0);
+    _p16(771);                                  // legacy_version 0x0303
+    var random: [32]tryte;
+    getrandom(&random[0], 32, 0);
+    _pn(&random[0], 32);
+    _p8(32);                                     // a session id, for middleboxes
+    _pn(sid, 32);
+    _p16(2);
+    _p16(4867);                                  // TLS_CHACHA20_POLY1305_SHA256 0x1303
+    _p8(1);
+    _p8(0);                                      // no compression
+    var el: int = _bn;
+    _p16(0);
+    if (t.host != null && !_is_ipv4(t.host)) {  // server_name
+        var n: int = strlen(t.host);
+        _p16(0);
+        _p16(n + 5);
+        _p16(n + 3);
+        _p8(0);
+        _p16(n);
+        var k: int = 0;
+        while (k < n) { _p8(t.host[k]); k += 1; }
+    }
+    _p16(10);                                    // supported_groups: x25519
+    _p16(4);
+    _p16(2);
+    _p16(29);
+    _p16(13);                                    // signature_algorithms
+    var algs: [9]int = { 1027, 1283, 2052, 2053, 2054, 2055, 1025, 1281, 1537 };
+    _p16(20);
+    _p16(18);
+    var i: int = 0;
+    while (i < 9) { _p16(algs[i]); i += 1; }
+    _p16(43);                                    // supported_versions: TLS 1.3
+    _p16(3);
+    _p8(2);
+    _p16(772);
+    _p16(51);                                    // key_share: x25519
+    _p16(38);
+    _p16(36);
+    _p16(29);
+    _p16(32);
+    _pn(pub, 32);
+    _len16(el);
+    _len24(hl);
+    return _bn;
+}
+
+// ---- reading messages -------------------------------------------------------------------------
+
+var _m: *tryte;
+var _mp: int;
+var _mend: int;
+var _mbad: int;
+
+fn _g8() -> int {
+    if (_mp >= _mend) { _mbad = 1; return 0; }
+    _mp += 1;
+    return _m[_mp - 1];
+}
+fn _g16() -> int { var a: int = _g8(); return a * 256 + _g8(); }
+fn _g24() -> int { var a: int = _g8(); return a * 65536 + _g16(); }
+fn _skip(n: int) { if (n < 0 || _mp + n > _mend) { _mbad = 1; _mp = _mend; } else { _mp += n; } }
+
+fn _mstart(t: *tls) {
+    _m = &t.msg[0];
+    _mp = 4;
+    _mend = t.mlen;
+    _mbad = 0;
+}
+
+// ServerHello: the server's X25519 key into spub; 0 or TLS_E_FAIL.
+fn _server_hello(t: *tls, sid: *tryte, spub: *tryte) -> int {
+    _mstart(t);
+    var ver: int = _g16();
+    var random: *tryte = _m + _mp;
+    _skip(32);
+    // a HelloRetryRequest has this "random" (SHA-256 of "HelloRetryRequest")
+    if (der_is(random, 32, "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")) {
+        return _fail(t, 40, "the server asked for a key exchange other than X25519");
+    }
+    var sl: int = _g8();
+    if (sl != 32 || !octets_equal(_m + _mp, sid, 32)) { return _fail(t, 47, "a bad session id echo"); }
+    _skip(32);
+    var suite: int = _g16();
+    var comp: int = _g8();
+    var have_ver: int = 0;
+    var have_key: int = 0;
+    if (_mp == _mend) {
+        // no extensions: TLS 1.2 or older
+        return _fail(t, 70, "the server does not speak TLS 1.3");
+    }
+    var el: int = _g16();
+    if (_mp + el != _mend) { return _fail(t, 50, "a malformed ServerHello"); }
+    while (_mp < _mend && !_mbad) {
+        var et: int = _g16();
+        var len: int = _g16();
+        var end: int = _mp + len;
+        if (end > _mend) { return _fail(t, 50, "a malformed ServerHello"); }
+        if (et == 43) {
+            if (len != 2 || _g16() != 772) { return _fail(t, 47, "the server chose another TLS version"); }
+            have_ver = 1;
+        } else if (et == 51) {
+            if (_g16() != 29 || _g16() != 32 || len != 36) { return _fail(t, 47, "the server chose another key exchange"); }
+            var k: int = 0;
+            while (k < 32) { spub[k] = _m[_mp + k]; k += 1; }
+            have_key = 1;
+        } else {
+            return _fail(t, 110, "an unexpected ServerHello extension");
+        }
+        _mp = end;
+    }
+    if (_mbad) { return _fail(t, 50, "a malformed ServerHello"); }
+    if (!have_ver) { return _fail(t, 70, "the server does not speak TLS 1.3"); }
+    if (ver != 771 || comp != 0) { return _fail(t, 47, "a bad ServerHello"); }
+    if (suite != 4867) { return _fail(t, 47, "the server chose another cipher suite"); }
+    if (!have_key) { return _fail(t, 109, "no key share from the server"); }
+    return 0;
+}
+
+fn _encrypted_extensions(t: *tls) -> int {
+    _mstart(t);
+    var el: int = _g16();
+    if (_mp + el != _mend) { return _fail(t, 50, "malformed EncryptedExtensions"); }
+    while (_mp < _mend && !_mbad) {
+        var et: int = _g16();
+        var len: int = _g16();
+        // what only a ServerHello may carry must not come here
+        if (et == 43 || et == 51 || et == 41) { return _fail(t, 47, "a ServerHello extension in EncryptedExtensions"); }
+        _skip(len);
+    }
+    if (_mbad) { return _fail(t, 50, "malformed EncryptedExtensions"); }
+    return 0;
+}
+
+fn _certificate(t: *tls) -> int {
+    _mstart(t);
+    var cl: int = _g8();
+    _skip(cl);                                   // the request context: empty from a server
+    var ll: int = _g24();
+    if (_mbad || _mp + ll != _mend) { return _fail(t, 50, "a malformed Certificate"); }
+    tls_ncerts = 0;
+    var used: int = 0;
+    while (_mp < _mend && !_mbad) {
+        var n: int = _g24();
+        if (_mbad || n == 0 || _mp + n > _mend) { return _fail(t, 50, "a malformed Certificate"); }
+        if (tls_ncerts < X509_MAX_CHAIN && used + n <= 59049) {
+            var d: *tryte = &_tls_der[used];
+            var k: int = 0;
+            while (k < n) { d[k] = _m[_mp + k]; k += 1; }
+            var r: int = x509_parse(&tls_certs[tls_ncerts], d, n);
+            if (r < 0) {
+                if (tls_ncerts == 0) {
+                    t.cert_err = r;
+                    _why(t, "the server's certificate: ", x509_error(r));
+                    _fail(t, r == X509_E_ALG ? 43 : 42, "");
+                    return TLS_E_CERT;
+                }
+                // a spare certificate this cannot read: leave it out
+            } else {
+                used += n;
+                tls_ncerts += 1;
+            }
+        }
+        _skip(n);
+        var xl: int = _g16();
+        _skip(xl);
+    }
+    if (_mbad || tls_ncerts == 0) { return _fail(t, 50, "a malformed Certificate"); }
+    if (t.verify) {
+        var r: int = x509_verify_chain(&tls_certs[0], tls_ncerts, t.host, t.now);
+        if (r < 0) {
+            t.cert_err = r;
+            _why(t, x509_error(r), "");
+            var a: int = 42;
+            if (r == X509_E_EXPIRED || r == X509_E_NOTYET) { a = 45; }
+            else if (r == X509_E_ISSUER || r == X509_E_SELF) { a = 48; }
+            else if (r == X509_E_ALG) { a = 43; }
+            _fail(t, a, "");
+            return TLS_E_CERT;
+        }
+    }
+    return 0;
+}
+
+// CertificateVerify, over the transcript hash th
+fn _certificate_verify(t: *tls, th: *tryte) -> int {
+    _mstart(t);
+    var scheme: int = _g16();
+    var sl: int = _g16();
+    if (_mbad || _mp + sl != _mend) { return _fail(t, 50, "a malformed CertificateVerify"); }
+    var leaf: *x509 = &tls_certs[0];
+    var sig: int = 0;
+    var id: int = 0;
+    var key: int = 0;
+    if (scheme == 1027) { sig = SIG_ECDSA; id = HASH_SHA256; key = KEY_P256; }
+    else if (scheme == 1283) { sig = SIG_ECDSA; id = HASH_SHA384; key = KEY_P384; }
+    else if (scheme == 2052) { sig = SIG_RSA_PSS; id = HASH_SHA256; key = KEY_RSA; }
+    else if (scheme == 2053) { sig = SIG_RSA_PSS; id = HASH_SHA384; key = KEY_RSA; }
+    else if (scheme == 2054) { sig = SIG_RSA_PSS; id = HASH_SHA512; key = KEY_RSA; }
+    else if (scheme == 2055) { sig = SIG_ED25519; key = KEY_ED25519; }
+    if (sig == 0 || leaf.key != key) { return _fail(t, 47, "a CertificateVerify scheme not offered or not the key's"); }
+    t.sigscheme = scheme;
+    // 64 spaces, the context string, a zero, the transcript hash
+    var content: [130]tryte;
+    var k: int = 0;
+    while (k < 64) { content[k] = 32; k += 1; }
+    var ctx: *char = "TLS 1.3, server CertificateVerify";
+    k = 0;
+    while (k < 33) { content[64 + k] = ctx[k] as tryte; k += 1; }
+    content[97] = 0;
+    k = 0;
+    while (k < 32) { content[98 + k] = th[k]; k += 1; }
+    if (!pk_verify(leaf, sig, id, &content[0], 130, _m + _mp, sl)) {
+        return _fail(t, 51, "the server's CertificateVerify signature is wrong");
+    }
+    return 0;
+}
+
+// ---- the handshake ----------------------------------------------------------------------------
+
+// Shake hands over the connected socket fd: 0, TLS_E_CERT if the
+// certificate did not verify, TLS_E_FAIL otherwise (t.why says why).
+fn tls_connect(t: *tls, fd: int, host: *char, verify: int, now: int) -> int {
+    t.fd = fd;
+    t.host = host;
+    t.verify = verify;
+    t.now = now;
+    t.why[0] = 0;
+    t.cert_err = 0;
+    t.done = 0;
+    t.eof = 0;
+    t.unclean = 0;
+    t.rprot = 0;
+    t.wprot = 0;
+    t.rpos = 0;
+    t.rn = 0;
+    t.sigscheme = 0;
+    tls_ncerts = 0;
+    bin32_init();
+    hash_init(&t.th, HASH_SHA256);
+    // ClientHello
+    var priv: [32]tryte;
+    var pub: [32]tryte;
+    var sid: [32]tryte;
+    getrandom(&priv[0], 32, 0);
+    getrandom(&sid[0], 32, 0);
+    x25519_base(&pub[0], &priv[0]);
+    var n: int = _client_hello(t, &t.msg[0], &pub[0], &sid[0]);
+    hash_update(&t.th, &t.msg[0], n);
+    if (_send_record(t, 22, &t.msg[0], n) < 0) { return _fail(t, 0, "the connection broke"); }
+    // ServerHello
+    var type: int = _hs_msg(t);
+    if (type < 0) { return type; }
+    if (type != 2) { return _fail(t, 10, "no ServerHello"); }
+    var spub: [32]tryte;
+    if (_server_hello(t, &sid[0], &spub[0]) < 0) { return TLS_E_FAIL; }
+    if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after the ServerHello"); }
+    hash_update(&t.th, &t.msg[0], t.mlen);
+    var shared: [32]tryte;
+    x25519(&shared[0], &priv[0], &spub[0]);
+    var z: int = 0;
+    var k: int = 0;
+    while (k < 32) { z = z + shared[k]; k += 1; }
+    if (z == 0) { return _fail(t, 47, "a degenerate X25519 key"); }
+    // the handshake secrets
+    var zero: [32]tryte;
+    k = 0;
+    while (k < 32) { zero[k] = 0; k += 1; }
+    var early: [32]tryte;
+    hkdf_extract(HASH_SHA256, &zero[0], 32, &zero[0], 32, &early[0]);
+    var empty: [32]tryte;
+    sha256(&zero[0], 0, &empty[0]);
+    var derived: [32]tryte;
+    _derive(&early[0], "derived", &empty[0], &derived[0]);
+    var hs: [32]tryte;
+    hkdf_extract(HASH_SHA256, &derived[0], 32, &shared[0], 32, &hs[0]);
+    var th: [32]tryte;
+    hash_peek(&t.th, &th[0]);
+    var chs: [32]tryte;
+    var shs: [32]tryte;
+    _derive(&hs[0], "c hs traffic", &th[0], &chs[0]);
+    _derive(&hs[0], "s hs traffic", &th[0], &shs[0]);
+    _set_read(t, &shs[0]);
+    // EncryptedExtensions
+    type = _hs_msg(t);
+    if (type < 0) { return type; }
+    if (type != 8) { return _fail(t, 10, "no EncryptedExtensions"); }
+    if (_encrypted_extensions(t) < 0) { return TLS_E_FAIL; }
+    hash_update(&t.th, &t.msg[0], t.mlen);
+    // CertificateRequest?
+    type = _hs_msg(t);
+    if (type < 0) { return type; }
+    var creq: [256]tryte;
+    var creqlen: int = -1;
+    if (type == 13) {
+        _mstart(t);
+        creqlen = _g8();
+        if (_mbad || _mp + creqlen > _mend) { return _fail(t, 50, "a malformed CertificateRequest"); }
+        k = 0;
+        while (k < creqlen) { creq[k] = _m[_mp + k]; k += 1; }
+        hash_update(&t.th, &t.msg[0], t.mlen);
+        type = _hs_msg(t);
+        if (type < 0) { return type; }
+    }
+    // Certificate, CertificateVerify
+    if (type != 11) { return _fail(t, 10, "no Certificate"); }
+    var r: int = _certificate(t);
+    if (r < 0) { return r; }
+    hash_update(&t.th, &t.msg[0], t.mlen);
+    type = _hs_msg(t);
+    if (type < 0) { return type; }
+    if (type != 15) { return _fail(t, 10, "no CertificateVerify"); }
+    hash_peek(&t.th, &th[0]);
+    if (_certificate_verify(t, &th[0]) < 0) { return TLS_E_FAIL; }
+    hash_update(&t.th, &t.msg[0], t.mlen);
+    // the server's Finished
+    type = _hs_msg(t);
+    if (type < 0) { return type; }
+    if (type != 20 || t.mlen != 36) { return _fail(t, 10, "no Finished"); }
+    hash_peek(&t.th, &th[0]);
+    var want: [32]tryte;
+    _finished(&shs[0], &th[0], &want[0]);
+    if (!octets_equal(&want[0], &t.msg[4], 32)) { return _fail(t, 51, "the server's Finished is wrong"); }
+    if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after the Finished"); }
+    hash_update(&t.th, &t.msg[0], t.mlen);
+    // the application secrets, from the transcript up to here
+    hash_peek(&t.th, &th[0]);
+    _derive(&hs[0], "derived", &empty[0], &derived[0]);
+    var master: [32]tryte;
+    hkdf_extract(HASH_SHA256, &derived[0], 32, &zero[0], 32, &master[0]);
+    var cap: [32]tryte;
+    var sap: [32]tryte;
+    _derive(&master[0], "c ap traffic", &th[0], &cap[0]);
+    _derive(&master[0], "s ap traffic", &th[0], &sap[0]);
+    // our flight: (a compatibility ChangeCipherSpec), [an empty Certificate], Finished
+    var ccs: [1]tryte;
+    ccs[0] = 1;
+    if (_send_record(t, 20, &ccs[0], 1) < 0) { return _fail(t, 0, "the connection broke"); }
+    _set_write(t, &chs[0]);
+    var out: [300]tryte;
+    if (creqlen >= 0) {
+        _b = &out[0];
+        _bn = 0;
+        _p8(11);
+        _p24(creqlen + 4);
+        _p8(creqlen);
+        _pn(&creq[0], creqlen);
+        _p24(0);
+        hash_update(&t.th, &out[0], _bn);
+        if (_send_record(t, 22, &out[0], _bn) < 0) { return _fail(t, 0, "the connection broke"); }
+    }
+    hash_peek(&t.th, &th[0]);
+    out[0] = 20;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 32;
+    _finished(&chs[0], &th[0], &out[4]);
+    if (_send_record(t, 22, &out[0], 36) < 0) { return _fail(t, 0, "the connection broke"); }
+    _set_read(t, &sap[0]);
+    _set_write(t, &cap[0]);
+    t.done = 1;
+    return 0;
+}
+
+// ---- after the handshake ----------------------------------------------------------------------
+
+// The handshake messages that come later: tickets (unused) and key updates.
+fn _post_handshake(t: *tls) -> int {
+    var type: int = _hs_msg(t);
+    if (type < 0) { return type; }
+    if (type == 4) { return 0; }                 // NewSessionTicket: no resumption here
+    if (type == 24) {                            // KeyUpdate
+        if (t.mlen != 5 || t.msg[4] > 1) { return _fail(t, 50, "a malformed KeyUpdate"); }
+        if (t.rpos < t.rn) { return _fail(t, 10, "more in the record after a KeyUpdate"); }
+        var next: [32]tryte;
+        var none: [1]tryte;
+        hkdf_expand_label(HASH_SHA256, &t.rsec[0], "traffic upd", &none[0], 0, &next[0], 32);
+        _set_read(t, &next[0]);
+        if (t.msg[4] == 1) {
+            // update_requested: answer with ours, then change our keys
+            var ku: [5]tryte;
+            ku[0] = 24; ku[1] = 0; ku[2] = 0; ku[3] = 1; ku[4] = 0;
+            if (_send_record(t, 22, &ku[0], 5) < 0) { return _fail(t, 0, "the connection broke"); }
+            hkdf_expand_label(HASH_SHA256, &t.wsec[0], "traffic upd", &none[0], 0, &next[0], 32);
+            _set_write(t, &next[0]);
+        }
+        return 0;
+    }
+    return _fail(t, 10, "an unexpected handshake message");
+}
+
+// Read application data: up to n octets, 0 at the end, TLS_E_FAIL.
+fn tls_read(t: *tls, p: *tryte, n: int) -> int {
+    while (t.rpos >= t.rn || t.rtype != 23) {
+        if (t.eof || t.unclean) { return 0; }
+        if (t.rpos < t.rn && t.rtype == 22) {
+            if (_post_handshake(t) < 0) { return TLS_E_FAIL; }
+            continue;
+        }
+        var r: int = _record_in(t);
+        if (r <= 0) { return r; }
+        if (t.rtype == 22) {
+            if (_post_handshake(t) < 0) { return TLS_E_FAIL; }
+        }
+    }
+    var k: int = 0;
+    while (k < n && t.rpos < t.rn) {
+        p[k] = t.rec[t.rpos];
+        k += 1;
+        t.rpos += 1;
+    }
+    return k;
+}
+
+// Send application data: 0 or TLS_E_FAIL.
+fn tls_write(t: *tls, p: *tryte, n: int) -> int {
+    var done: int = 0;
+    while (done < n) {
+        var m: int = n - done > 16384 ? 16384 : n - done;
+        if (_send_record(t, 23, p + done, m) < 0) { return _fail(t, 0, "the connection broke"); }
+        done += m;
+    }
+    return 0;
+}
+
+// Say goodbye (close_notify); the socket stays open.
+fn tls_close(t: *tls) {
+    var a: [2]tryte;
+    a[0] = 1;
+    a[1] = 0;
+    _send_record(t, 21, &a[0], 2);
+}
+
+fn tls_signature_name(scheme: int) -> *char {
+    if (scheme == 1027) { return "ecdsa_secp256r1_sha256"; }
+    if (scheme == 1283) { return "ecdsa_secp384r1_sha384"; }
+    if (scheme == 2052) { return "rsa_pss_rsae_sha256"; }
+    if (scheme == 2053) { return "rsa_pss_rsae_sha384"; }
+    if (scheme == 2054) { return "rsa_pss_rsae_sha512"; }
+    if (scheme == 2055) { return "ed25519"; }
+    return "?";
+}

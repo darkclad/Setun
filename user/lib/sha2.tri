@@ -413,3 +413,27 @@ fn hash_final(h: *hash_ctx, out: *tryte) {
     else if (h.id == HASH_SHA384) { sha384_final(&h.s512, out); }
     else { sha512_final(&h.s512, out); }
 }
+
+// The hash of what h has taken so far, leaving h running (a TLS transcript).
+fn hash_peek(h: *hash_ctx, out: *tryte) {
+    var c: hash_ctx;
+    c.id = h.id;
+    var k: int = 0;
+    while (k < 8) {
+        c.s256.h[k] = h.s256.h[k];
+        c.s512.hi[k] = h.s512.hi[k];
+        c.s512.lo[k] = h.s512.lo[k];
+        k += 1;
+    }
+    c.s256.total = h.s256.total;
+    c.s256.n = h.s256.n;
+    c.s512.total = h.s512.total;
+    c.s512.n = h.s512.n;
+    k = 0;
+    while (k < 128) {
+        if (k < 64) { c.s256.buf[k] = h.s256.buf[k]; }
+        c.s512.buf[k] = h.s512.buf[k];
+        k += 1;
+    }
+    hash_final(&c, out);
+}

@@ -33,7 +33,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
 - [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K8 running: a POSIX-like system with a scripting shell, core utilities and a window system with a terminal)
-- [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet logins
+- [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet and SSH logins, TLS for `wget`
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
 

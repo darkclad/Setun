@@ -1,16 +1,22 @@
-// wget [-q] [-b] [-O FILE] URL: fetch a file over HTTP/1.0.
+// wget [-q] [-b] [-O FILE] [--no-check-certificate] [--ca-certificate=FILE] URL:
+// fetch a file over HTTP/1.0, or HTTPS (TLS 1.3, lib/tls.tri).
 //
-// Only http:// (there is no TLS). The body is saved to FILE (- for
-// standard output), or to the last part of the URL's path (index.html for
-// "/"). Text arrives as UTF-8 and is stored as characters; -b keeps the
-// octets as they are. Exit status: 0 for a 2xx answer, 4 network trouble,
-// 8 an error answer from the server, 1 anything else.
+// The body is saved to FILE (- for standard output), or to the last part
+// of the URL's path (index.html for "/"). Text arrives as UTF-8 and is
+// stored as characters; -b keeps the octets as they are. A server's
+// certificate must chain to a root in /etc/ssl/cert.pem (and to those in
+// --ca-certificate's file) and name the host, unless --no-check-certificate.
+// Exit status: 0 for a 2xx answer, 4 network trouble (TLS included),
+// 5 a certificate that does not verify, 8 an error answer from the server,
+// 1 anything else.
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
 import "../lib/stdlib.tri";
 import "../lib/getopt.tri";
 import "../lib/socket.tri";
+import "../lib/time.tri";
+import "../lib/tls.tri";
 
 var quiet: int;
 var binary: int;
@@ -18,6 +24,9 @@ var net: [2187]tryte;
 var head: [2187]char;
 var text: [2187]char;
 var dec: utf8_state;
+var secure: int;
+var tl: tls;
+var sock: int;
 
 fn say(a: *char, b: *char) {
     if (quiet) { return; }
@@ -25,41 +34,82 @@ fn say(a: *char, b: *char) {
     fputs(STDERR_FILENO, b);
 }
 
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] [--no-check-certificate] [--ca-certificate=file] http[s]://host[:port]/path\n");
+    return 1;
+}
+
+// Octets from the server: a count, 0 at the end, < 0 on trouble.
+fn conn_read(p: *tryte, n: int) -> int {
+    if (secure) { return tls_read(&tl, p, n); }
+    return read(sock, p as *char, n);
+}
+
+fn conn_write(p: *char, n: int) -> int {
+    if (secure) {
+        var o: [729]tryte;
+        var k: int = 0;
+        while (k < n) { o[k] = p[k] as tryte; k += 1; }
+        return tls_write(&tl, &o[0], n);
+    }
+    return write(sock, p, n);
+}
+
+fn tls_trouble() -> int {
+    fputs(STDERR_FILENO, "wget: TLS: ");
+    fputs(STDERR_FILENO, &tl.why[0]);
+    fputs(STDERR_FILENO, "\n");
+    return 4;
+}
+
 fn main(argc: int, argv: **char) -> int {
     var outname: *char = null;
+    var check: int = 1;
+    var cafile: *char = null;
+    // the long options first (getopt knows only short ones)
+    var args: [81]*char;
+    var na: int = 0;
+    var i: int = 0;
+    while (i < argc && na < 80) {
+        var a: *char = argv[i];
+        if (streq(a, "--no-check-certificate")) { check = 0; }
+        else if (strncmp(a, "--ca-certificate=", 17) == 0) { cafile = a + 17; }
+        else if (i > 0 && strncmp(a, "--", 2) == 0) { return usage(); }
+        else { args[na] = a; na += 1; }
+        i += 1;
+    }
+    args[na] = null;
+    argc = na;
+    argv = &args[0];
     var c: int = getopt(argc, argv, "qbO:");
     while (c != -1) {
         switch (c) {
             case 'q': quiet = 1;
             case 'b': binary = 1;
             case 'O': outname = optarg;
-            default: {
-                fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] http://host[:port]/path\n");
-                return 1;
-            }
+            default: return usage();
         }
         c = getopt(argc, argv, "qbO:");
     }
-    if (optind != argc - 1) {
-        fputs(STDERR_FILENO, "usage: wget [-q] [-b] [-O file] http://host[:port]/path\n");
-        return 1;
-    }
+    if (optind != argc - 1) { return usage(); }
     var url: *char = argv[optind];
+    var k: int = 0;
+    var port: int = 80;
     if (strncmp(url, "https://", 8) == 0) {
-        fputs(STDERR_FILENO, "wget: https is not supported (there is no TLS)\n");
-        return 1;
-    }
-    if (strncmp(url, "http://", 7) != 0) {
-        fputs(STDERR_FILENO, "wget: only http:// URLs\n");
+        secure = 1;
+        port = 443;
+        k = 8;
+    } else if (strncmp(url, "http://", 7) == 0) {
+        k = 7;
+    } else {
+        fputs(STDERR_FILENO, "wget: only http:// and https:// URLs\n");
         return 1;
     }
     // host[:port] and path
     var host: [243]char;
-    var k: int = 7;
     var h: int = 0;
     while (url[k] != 0 && url[k] != '/' && url[k] != ':' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
     host[h] = 0;
-    var port: int = 80;
     if (url[k] == ':') {
         k += 1;
         port = 0;
@@ -68,6 +118,18 @@ fn main(argc: int, argv: **char) -> int {
     }
     var path: *char = url[k] == 0 ? "/" : &url[k];
     if (h == 0) { fputs(STDERR_FILENO, "wget: no host in the URL\n"); return 1; }
+    if (secure && check) {
+        if (x509_load_store("/etc/ssl/cert.pem") < 0 && cafile == null) {
+            fputs(STDERR_FILENO, "wget: cannot read /etc/ssl/cert.pem\n");
+            return 1;
+        }
+        if (cafile != null && x509_load_store(cafile) < 0) {
+            fputs(STDERR_FILENO, "wget: cannot read ");
+            fputs(STDERR_FILENO, cafile);
+            fputs(STDERR_FILENO, "\n");
+            return 1;
+        }
+    }
     var addr: int = 0;
     if (!resolve_host(&host[0], &addr)) {
         say("wget: unable to resolve host address '", &host[0]);
@@ -77,41 +139,73 @@ fn main(argc: int, argv: **char) -> int {
     say("Connecting to ", &host[0]);
     say(" (", inet_ntoa(addr));
     say(")... ", "");
-    var s: int = socket(AF_INET, SOCK_STREAM, 0);
+    sock = socket(AF_INET, SOCK_STREAM, 0);
     var a: sockaddr_in;
     sockaddr_set(&a, addr, port);
-    if (s < 0 || connect(s, &a, sizeof(sockaddr_in)) < 0) {
+    if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
         var e: *char = strerror(errno);
         say("failed: ", e);
         say(".\n", "");
         return 4;
     }
     say("connected.\n", "");
+    if (secure) {
+        var r: int = tls_connect(&tl, sock, &host[0], check, time(null));
+        if (r == TLS_E_CERT) {
+            var issuer: [81]char;
+            issuer[0] = 0;
+            if (tls_ncerts > 0) { x509_name(&tls_certs[0], 1, &issuer[0], 81); }
+            fputs(STDERR_FILENO, "wget: cannot verify ");
+            fputs(STDERR_FILENO, &host[0]);
+            fputs(STDERR_FILENO, "'s certificate, issued by '");
+            fputs(STDERR_FILENO, &issuer[0]);
+            fputs(STDERR_FILENO, "':\n  ");
+            fputs(STDERR_FILENO, &tl.why[0]);
+            fputs(STDERR_FILENO, "\nTo connect to ");
+            fputs(STDERR_FILENO, &host[0]);
+            fputs(STDERR_FILENO, " insecurely, use `--no-check-certificate'.\n");
+            return 5;
+        }
+        if (r < 0) { return tls_trouble(); }
+        if (!check) {
+            say("WARNING: the certificate of ", &host[0]);
+            say(" was not checked.\n", "");
+        }
+        say("TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, ", tls_signature_name(tl.sigscheme));
+        say("\n", "");
+    }
     // the request (ASCII: the path's own characters must be octets too)
     var req: [729]char;
     strcpy(&req[0], "GET ");
     strncat(&req[0], path, 500);
     strcat(&req[0], " HTTP/1.0\r\nHost: ");
     strncat(&req[0], &host[0], 100);
-    strcat(&req[0], "\r\nUser-Agent: Trinux-wget/0.1\r\nConnection: close\r\n\r\n");
-    if (write(s, &req[0], strlen(&req[0])) < 0) {
+    strcat(&req[0], "\r\nUser-Agent: Trinux-wget/0.2\r\nConnection: close\r\n\r\n");
+    if (conn_write(&req[0], strlen(&req[0])) < 0) {
+        if (secure) { return tls_trouble(); }
         perror2("wget", "write");
         return 4;
     }
     // the status line and headers
+    // (only the start is kept: the status line is all that is used)
     var hn: int = 0;
     var body_start: int = -1;
     var n: int = 0;
+    var last4: int = 0;                                  // the last four octets, as one number
+    var seen: int = 0;
     while (body_start < 0) {
-        n = read(s, &net[0] as *char, 2187);
-        if (n <= 0) { fputs(STDERR_FILENO, "wget: no answer\n"); return 4; }
+        n = conn_read(&net[0], 2187);
+        if (n < 0 && secure) { return tls_trouble(); }
+        if (n <= 0) { fputs(STDERR_FILENO, seen == 0 ? "wget: no answer\n" : "wget: the headers did not end\n"); return 4; }
         var j: int = 0;
         while (j < n && body_start < 0) {
             if (hn < 2186) { head[hn] = net[j] as char; hn += 1; }
-            if (hn >= 4 && head[hn - 4] == '\r' && head[hn - 3] == '\n' && head[hn - 2] == '\r' && head[hn - 1] == '\n') { body_start = j + 1; }
+            last4 = last4 % 16777216 * 256 + net[j];
+            seen += 1;
+            if (seen >= 4 && last4 == 218762506) { body_start = j + 1; }   // \r\n\r\n
             j += 1;
         }
-        if (hn >= 2186 && body_start < 0) { fputs(STDERR_FILENO, "wget: headers too long\n"); return 1; }
+        if (seen > 1594323) { fputs(STDERR_FILENO, "wget: headers too long\n"); return 1; }
     }
     head[hn] = 0;
     // "HTTP/1.x NNN reason"
@@ -158,12 +252,16 @@ fn main(argc: int, argv: **char) -> int {
                 write(fd, &text[0], t);
             }
         }
-        n = read(s, &net[0] as *char, 2187);
+        n = conn_read(&net[0], 2187);
         from = 0;
         if (n <= 0) { break; }
     }
-    close(s);
+    var status2: int = 0;
+    if (n < 0 && secure) { status2 = tls_trouble(); }
+    if (secure && n == 0) { tls_close(&tl); }
+    close(sock);
     if (fd != STDOUT_FILENO) { close(fd); }
+    if (status2 != 0) { return status2; }
     if (!quiet) {
         var num: [15]char;
         fputs(STDERR_FILENO, "Saved ");

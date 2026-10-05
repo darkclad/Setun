@@ -162,8 +162,8 @@ fn wget_over_http() {
     has(&o, &["Saved 23893 octets to 'big'", "\n5000\n", "5000 big"]);
     let o = cmd_serving(&mut s, &mut srv, &format!("wget http://web.test:{p}/missing; echo status $?"));
     has(&o, &["wget: HTTP/1.0 404 Not Found\nstatus 8"]);
-    let o = s.cmd("wget https://web.test/; echo status $?; wget http://nosuch.invalid/; echo status $?");
-    has(&o, &["wget: https is not supported (there is no TLS)\nstatus 1", "wget: unable to resolve host address 'nosuch.invalid'\nstatus 4"]);
+    let o = s.cmd("wget ftp://web.test/; echo status $?; wget --bogus http://web.test/; echo status $?; wget http://nosuch.invalid/; echo status $?");
+    has(&o, &["wget: only http:// and https:// URLs\nstatus 1\nusage: wget", "status 1\n", "wget: unable to resolve host address 'nosuch.invalid'\nstatus 4"]);
 }
 
 // ---- UDP through the NAT, and NTP -----------------------------------------------------------

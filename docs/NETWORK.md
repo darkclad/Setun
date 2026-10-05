@@ -160,6 +160,7 @@ Each step comes with negative tests, the same as the kernel milestones.
 | N10 | `scp` and `sftp` clients in Trinux (§12) ✅ | both against Trinux's sshd: Russian text and 2000 lines both ways with equal MD5s, several sources into a directory, missing files on either side, a file as the target of several, local-to-local; an sftp batch with mkdir, put, ls, get, rename, rm, rmdir, a `-` command that may fail, and one that may not |
 | N11 | UDP through the NAT; `clock_settime`; `ntpdate` (§13) ✅ | a host echo server reached as 10.0.2.2 and as an outside address, text both ways, DNS and test ports untouched, the NAT off; ntpdate querying, setting the clock, refused to a user, a wrong originate time, kiss-o'-death, an unknown name, usage |
 | N12 | `scp -r`, `sftp` `put -r`/`get -r` (§12) ✅ | a tree with Russian text, nested and empty directories out and back by `scp -r` and by `sftp`, into an existing directory, refused without `-r`, partly unwritable; the host's `scp -r` into Trinux and back, binary and text identical |
+| N13 | TLS 1.3 for `wget`; X.509 chains and a trust store; `x509` (§14) ✅ | RFC and FIPS vectors, signatures from Python's `cryptography` and forged ones; good chains for each key type and ten kinds of bad one, broken PEM; `wget` against OpenSSL's `s_server` with each key type, and refusals of a wrong name, an unknown CA, an expired certificate, TLS 1.2, AES-only, a required client certificate, a non-TLS server, a changed record |
 
 **SSH and binary operations**: SHA-2 and ChaCha20 need binary XOR, AND and
 rotate. They are done in software, with no change to the ISA (§8): rotates
@@ -356,7 +357,7 @@ Not covered:
 - `/etc/resolv.conf` names 10.0.2.3.
 - `resolve_host()` in `socket.tri` tries, in order: a dotted quad, `/etc/hosts`, `localhost`, then DNS (`dns_lookup`: one A question, 3 tries of 2 s, compressed names, answers checked against the query's id and the server). `nc`, `ping` and `wget` all go through it.
 - `host [-s server] name` asks DNS only, the way bind's `host` does.
-- `wget [-q] [-b] [-O file] URL`: HTTP/1.0 GET over `http://` only (no TLS). Text arrives as UTF-8 and is stored as characters (`-b` keeps the octets). The exit codes follow GNU wget: 4 for network trouble, 8 for an error answer.
+- `wget [-q] [-b] [-O file] URL`: HTTP/1.0 GET over `http://` (and `https://`, §14). Text arrives as UTF-8 and is stored as characters (`-b` keeps the octets). The exit codes follow GNU wget: 4 for network trouble, 8 for an error answer.
 - Tests: `crates/trinux/tests/outbound.rs` runs real servers on the host inside the test (an echo server and a small HTTP server).
 
 ## 10. The `ssh` client and `ssh-keygen` (N8)
@@ -482,3 +483,49 @@ $ ntpdate pool.ntp.org                        # and set the clock (root)
 - it prints the server, stratum, offset and time, and without `-q` sets the clock.
 
 It was tried once by hand against the real `pool.ntp.org` and agreed with the host's clock to the second. The tests use NTP servers run inside the test.
+
+## 14. TLS for `wget` (N13)
+
+```
+$ wget -O - https://example.com/
+Connecting to example.com (104.20.23.154)... connected.
+TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, ecdsa_secp256r1_sha256
+HTTP request sent, awaiting response... 200 OK
+<!doctype html><html lang="en"><head><title>Example Domain</title>...
+$ x509 -n web.test chain.pem                  # check a chain the same way
+0: web.test (issued by Setun Test CA 1)
+1: Setun Test CA 1 (issued by Setun Test Root RSA)
+verify: ok
+```
+
+**The client** (`user/lib/tls.tri`) is TLS 1.3 (RFC 8446) and nothing else:
+- one cipher suite, `TLS_CHACHA20_POLY1305_SHA256`, and one group, X25519 (the ChaCha20, Poly1305 and X25519 of §8, with the IETF 96-bit nonce);
+- the server signs with ECDSA P-256 or P-384, RSA-PSS (SHA-256/384/512) or Ed25519; certificates may also use RSA PKCS #1 v1.5;
+- the ClientHello carries SNI (not for an address), a session id and the compatibility ChangeCipherSpec, as browsers do;
+- after the handshake: NewSessionTicket is ignored (no resumption), KeyUpdate is followed (and answered when asked), close_notify ends the stream;
+- a server that asks for a client certificate gets an empty one;
+- any failure sends the matching alert, and the reason is kept for the caller.
+
+Not there: TLS 1.2, AES-GCM, P-256 key exchange, HelloRetryRequest, resumption, early data, OCSP and revocation. A server that needs one of them is refused with the alert it sends or the reason found.
+
+**Certificates** (`user/lib/x509.tri`):
+- a DER reader (definite lengths, no high tag numbers, the shortest length form);
+- the fields a client needs: names, validity, key (RSA, P-256, P-384, Ed25519), signature, subject alternative names, basicConstraints, keyUsage, extKeyUsage;
+- an unknown critical extension fails the chain that uses it, an unknown signature algorithm (SHA-1, say) only where that signature has to be checked, so old roots still load;
+- chains are built from the server's certificate: a trusted root that names and signed the current one ends the walk, otherwise a CA the server sent (it must be a v3 CA with keyCertSign and room in its path length). At most 9 certificates;
+- every certificate on the way must be valid at the time of the check; the leaf must name the host in its subject alternative names (one leftmost wildcard label, never `*.tld`; IPv4 addresses as iPAddress), and allow serverAuth and digitalSignature when it says what it is for. The common name is not used.
+
+**Bignums** (`user/lib/bignum.tri`): 16-bit limbs in words, Montgomery multiplication (CIOS), up to 4096 bits. On top: ECDSA verification on P-256 and P-384 (Jacobian coordinates, Shamir's trick), RSA verification (PKCS #1 v1.5 and PSS), and SHA-384, HMAC and HKDF with TLS's `HKDF-Expand-Label`.
+
+**The trust store** is `/etc/ssl/cert.pem`: 27 roots from the Mozilla bundle (ISRG, Google Trust Services, DigiCert, Amazon, Sectigo/USERTrust, GlobalSign, GoDaddy/Starfield, Microsoft, Entrust, SSL.com), made by `crates/trinux/tests/fixtures/tls/make_roots.py`. `x509 -l` lists it.
+
+**`wget`** takes `https://` (port 443 by default), `--ca-certificate=FILE` (more roots) and `--no-check-certificate`. Exit status 5 when the certificate does not verify, 4 for any other TLS trouble, as GNU wget.
+
+**Real sites.** Tried by hand (`wget_real_https_sites`, ignored by default): example.com, www.google.com, letsencrypt.org, github.com, www.cloudflare.com, en.wikipedia.org and www.amazon.com all completed the handshake and the certificate checks, with ECDSA P-256 or RSA-PSS signatures; all of them offer ChaCha20-Poly1305 and X25519.
+
+**What a fetch costs.** Emulated time per check: ECDSA P-256 7 s, P-384 21 s, RSA-2048 2 s, RSA-4096 9 s; X25519 and the record crypto are small beside them. A server with a P-256 key under an RSA-2048 intermediate takes about 16 s of emulated time to trust.
+
+**Tests** (`crates/trinux/tests/tls.rs`; the TLS ones skipped without an `openssl` on the host):
+- `pktest` checks the primitives against RFC 4231, RFC 5869, RFC 8439 and FIPS 180-4, and against signatures made by Python's `cryptography`, including forged and mismatched ones;
+- `x509` checks chains made by Python's `cryptography` (`tests/fixtures/tls`): good ones with each key type, and expired, not yet valid, self-signed, issued by a non-CA, too deep, a changed signature, an unknown critical extension, client-only, an impostor root, the wrong names, broken PEM;
+- `wget` against OpenSSL's `s_server` with each key type; refusals for the wrong host, an unknown CA, an expired certificate, a TLS 1.2 server, an AES-only server, a server that requires a client certificate, a server that is not TLS, and a record changed on the way.

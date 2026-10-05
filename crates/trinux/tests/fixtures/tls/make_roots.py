@@ -6,7 +6,7 @@ want = ["ISRG Root X1", "ISRG Root X2", "GTS Root R1", "GTS Root R2", "GTS Root 
         "DigiCert Global Root CA", "DigiCert Global Root G2", "DigiCert Global Root G3", "DigiCert High Assurance EV Root CA",
         "DigiCert TLS RSA4096 Root G5", "DigiCert TLS ECC P384 Root G5",
         "Amazon Root CA 1", "Amazon Root CA 2", "Amazon Root CA 3", "Amazon Root CA 4",
-        "USERTrust RSA Certification Authority", "USERTrust ECC Certification Authority", "SSL.com TLS RSA Root CA 2022", "Certum Trusted Network CA",
+        "USERTrust RSA Certification Authority", "USERTrust ECC Certification Authority", "SSL.com TLS RSA Root CA 2022", "SSL.com TLS ECC Root CA 2022",
         "Starfield Root Certificate Authority - G2", "Go Daddy Root Certificate Authority - G2",
         "Microsoft RSA Root Certificate Authority 2017", "Microsoft ECC Root Certificate Authority 2017",
         "Entrust Root Certification Authority - G2"]
