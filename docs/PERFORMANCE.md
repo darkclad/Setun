@@ -169,8 +169,17 @@ about half again what the host needs). Both run 95% compiled.
 
 - **Trine:** more locals in registers (more than nine), and branch
   inversion (`if (c) break;` still costs a branch around a branch).
-- **JIT coverage:** FADD/FMUL/FDIV still call the interpreter's code; the
-  browser JIT also leaves the FPU and the tritwise functions to the helpers
-  and the interpreter.
+- **FPU arithmetic:** FALU's arithmetic and FCVTIF/FFRW go to one direct
+  helper (no flag or register syncing): FCVTIF 12 -> 5 ns, but FADD, FMUL
+  and FDIV stay at 20-30 ns, nearly all of it the arithmetic itself (a
+  multiply needs four 128/64 divisions by powers of 3). Dividing by a
+  precomputed reciprocal instead was tried and is slower than the Ryzen's
+  hardware divider; faster still would mean another representation of a
+  `Real`.
 - **Compile latency:** hot code waits for its region (about 2.5M of the shell
-  workload's 28M instructions run interpreted meanwhile).
+  workload's 28M instructions run interpreted meanwhile, at about 37 cycles
+  each against 9 compiled: 10-15% of the host's time). Two tiers were
+  tried and dropped: Cranelift's "none" level first and "speed" after
+  50k or 1M steps (within 1% of one tier over 12 interleaved runs: the
+  quick code is slow until replaced, and "none" compiles only about a
+  third faster), and both at once (12% slower: twice the compile work).
