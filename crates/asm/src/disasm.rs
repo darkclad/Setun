@@ -181,6 +181,7 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
         }
         op::MEMR => match f.b {
             memr::STWM => format!("stwm {}, [{}], {}", r(f.x), r(f.y), r(f.z)),
+            memr::CAS3 => format!("cas3 {}, [{}], {}", r(f.x), r(f.y), r(f.z)),
             _ => return None,
         },
         op::IO | op::IOI => {

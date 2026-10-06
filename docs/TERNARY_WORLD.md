@@ -347,7 +347,9 @@ Negative tests: unaligned `STWM`; `STWM` to a read-only page; `MRG` with an all-
 
 Negative tests: `b` outside 0…27 raises `ILL`; `b` = 9 on a tryte value; results on 0 and on the extreme words ±3,812,798,742,493.
 
-### A4. Three-state atomics
+### A4. Three-state atomics ✅
+
+**Done (2026-10-06):** `CAS3` (MEMR function 2) in the interpreter, both JITs (by the interpreter's code), the assemblers (host and `tas`) and the disassembler; Trine builtins `cas3` and `swap` in both compilers. Trinux got what the mutex needs: shared anonymous memory (`mmap` with `MAP_SHARED | MAP_ANONYMOUS`: pages fork shares instead of copying, counted and freed with their last sharer) and `futex` (system call 98, WAIT and WAKE, keyed by the word's physical address). tlibc has `mtx_lock`/`mtx_unlock`. `/bin/mtxtest` checks all of it, with four processes hammering one counter under preemption (exact with the mutex; a run without it loses updates). Breaking the reference counting either way, the wake-up, or CAS3's store makes a test fail.
 
 | Instruction | Encoding | Operation |
 |---|---|---|

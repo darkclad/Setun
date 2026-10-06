@@ -20,6 +20,7 @@ fn idioms_round_trip() {
         "trev r6, r7, 27",
         "stwm r1, [r2], r3",
         "stwm r-13, [r13], r0",
+        "cas3 r1, [r2], r3",
     ] {
         let w = words(src);
         let (text, n) = disasm::disasm_one(w[0], w.get(1).copied(), 0);
@@ -37,4 +38,6 @@ fn idioms_refused() {
     assert!(e("stwm r1, [r2], 5").contains("register expected"), "{}", e("stwm r1, [r2], 5"));
     assert!(e("stwm r1, r2, r3").contains("bad operands"), "{}", e("stwm r1, r2, r3"));
     assert!(e("mrg r1, r2").contains("bad operands"), "{}", e("mrg r1, r2"));
+    assert!(e("cas3 r1, [r2-3], r3").contains("no offset"), "{}", e("cas3 r1, [r2-3], r3"));
+    assert!(e("cas3 r1, r2, r3").contains("bad operands"), "{}", e("cas3 r1, r2, r3"));
 }

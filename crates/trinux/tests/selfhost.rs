@@ -230,6 +230,8 @@ fn tric_reports_errors_as_the_host_does() {
         // ternary idiom builtins (A2, A3)
         ("stwmptr.tri", "fn main() -> int { var x: int = 1; stwm(x, 1, 1); return 0; }\n"),
         ("mrgargs.tri", "fn main() -> int { return mrg(1, 2); }\n"),
+        ("cas3ptr.tri", "fn main() -> int { var x: int = 1; return cas3(x, 0, 1); }\n"),
+        ("swapptr.tri", "fn main() -> int { var x: tryte = 1; return swap(&x, 0); }\n"),
     ];
     let disk = disk_with_trine(&[], bad);
     let mut s = Session::boot_disk(&disk, false);
@@ -249,7 +251,7 @@ fn tric_reports_errors_as_the_host_does() {
 
 #[test]
 fn tas_matches_the_host_assembler() {
-    let progs = ["echo", "cat", "edit", "calc", "tas"];
+    let progs = ["echo", "cat", "edit", "calc", "tas", "mtxtest"];
     let disk = disk_with_sources(&progs, &[]);
     let mut s = Session::boot_disk(&disk, false);
     for p in progs {
@@ -334,6 +336,7 @@ fn main() -> int {
     var m: int = mrg(old, -1000000007, 3141592653589);
     var c: int = tcp(m, 0) + tcn(m, 9) + trev(old, 13);
     stwm(&page[1], m, -9);
+    c += cas3(&page[0], 0, 1) + swap(&page[0], -1);
     return c;
 }
 ";

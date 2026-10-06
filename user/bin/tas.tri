@@ -488,8 +488,8 @@ fn parse_operand(s: *char, n: int) {
 
 // ---- mnemonics -------------------------------------------------------------------------------
 //
-// Codes: 1..22 the ALU functions (= their B), 30 cmp, 40.. unary ALU,
-// 50.. branches, 60.. memory, 70.. FPU memory, 80.. FALU binary,
+// Codes: 1..26 the ALU functions (see alu_b), 30 cmp, 40.. unary ALU,
+// 50.. branches, 60.. memory (65, 66: MEMR), 70.. FPU memory, 80.. FALU binary,
 // 90.. FALU unary, 100.. the other FPU ones, 120.. SYS, 140.. the rest.
 
 const M_CMP: int = 30;
@@ -499,6 +499,7 @@ const M_ABS: int = 42;
 const M_TLZ: int = 43;
 const M_B: int = 50;                     // 50..59: b blt beq bgt ble bge bne bov bnov bnever
 const M_LDT: int = 60;                   // ldt ldw stt stw swap
+const M_STWM: int = 65;                  // stwm cas3: MEMR, R format
 const M_FLDS: int = 70;                  // flds fldd fsts fstd
 const M_FADD: int = 80;                  // fadd fsub fmul fdiv frem fmin fmax
 const M_FSQRT: int = 90;                 // fsqrt fneg fabs frnd ftrunc
@@ -517,13 +518,14 @@ fn mn_add(name: *char, code: int) {
 }
 
 fn mn_init() {
-    var alu: *char = "add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit band bor bxor bandn bsh ";
+    var alu: *char = "add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit band bor bxor bandn bsh mrg tcp tcn trev ";
     var groups: [12]*char;
     var firsts: [12]int;
     groups[0] = "cmp "; firsts[0] = M_CMP;
     groups[1] = "neg sgn abs tlz "; firsts[1] = M_NEG;
     groups[2] = "b blt beq bgt ble bge bne bov bnov bnever "; firsts[2] = M_B;
     groups[3] = "ldt ldw stt stw swap "; firsts[3] = M_LDT;
+    groups[11] = "stwm cas3 "; firsts[11] = M_STWM;
     groups[4] = "flds fldd fsts fstd "; firsts[4] = M_FLDS;
     groups[5] = "fadd fsub fmul fdiv frem fmin fmax "; firsts[5] = M_FADD;
     groups[6] = "fsqrt fneg fabs frnd ftrunc "; firsts[6] = M_FSQRT;
@@ -532,7 +534,7 @@ fn mn_init() {
     groups[9] = "mov li la lea jal call jalr ret br3 in out push pop ext ins bext brot tlbinv sys mfc mtc "; firsts[9] = M_MOV;
     groups[10] = alu; firsts[10] = 1;
     var g: int = 0;
-    while (g < 11) {
+    while (g < 12) {
         var s: *char = groups[g];
         var code: int = firsts[g];
         var k: int = 0;
@@ -778,13 +780,13 @@ fn parse_line(s: *char, n: int) {
 
 // ---- instruction sizes and encoding ----------------------------------------------------------
 
-fn is_alu_binary(m: int) -> int { return m >= 1 && m <= 22; }
+fn is_alu_binary(m: int) -> int { return m >= 1 && m <= 26; }
 
-// The function B for an ALU code (1..22 map to 1..16, 18, 23..27).
+// The function B for an ALU code (1..26 map to 1..16, 18, 23..31).
 fn alu_b(m: int) -> int {
     if (m <= 16) { return m; }
     if (m == 17) { return 18; }                // trit
-    return m + 5;                              // band.. = 23..27
+    return m + 5;                              // band.. = 23..27, mrg.. = 28..31
 }
 
 fn op_small(o: int, lim: int, long: int) -> int {
@@ -900,6 +902,12 @@ fn encode(i: int, size: int) -> int {
     if (m >= M_NEG && m <= M_TLZ) {
         if (n != 2) { bad(m); }
         emit(rrr(1, 19 + m - M_NEG, reg_of(o), reg_of(o + 1), 0));
+        return 0;
+    }
+    if (m == M_STWM || m == M_STWM + 1) {
+        // stwm / cas3 rd, [ra], rb: no offset
+        if (n != 3 || o_kind[o + 1] != O_MEM || value(o_e[o + 1], here) != 0) { bad(m); }
+        emit(rrr(8, m - M_STWM + 1, reg_of(o), o_reg[o + 1], reg_of(o + 2)));
         return 0;
     }
     if (m >= M_LDT && m <= M_LDT + 4) {

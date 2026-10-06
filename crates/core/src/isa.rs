@@ -140,6 +140,7 @@ pub mod alu {
 /// Read-modify-write memory functions (tryte B, for MEMR).
 pub mod memr {
     pub const STWM: i64 = 1;
+    pub const CAS3: i64 = 2;
 }
 
 /// Memory functions (tryte B).

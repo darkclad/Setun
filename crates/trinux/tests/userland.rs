@@ -1000,3 +1000,15 @@ fn sh_backquotes_and_prompt_expansion() {
         ],
     );
 }
+
+#[test]
+fn mutex_futex_and_shared_memory() {
+    // TERNARY_WORLD A4: /bin/mtxtest (shared anonymous memory across fork,
+    // freed with its last sharer; futex wait/wake and their errors; the
+    // one-trit mutex under preemption, against a run without it)
+    let out = session(&["mtxtest", "exit"], 3_000_000_000);
+    assert!(!out.contains("FAILED"), "{out}");
+    assert_has(&out, &["mtxtest: all passed", "with the mutex, 4 x 300 increments make 1200 ok", "the race is real) ok"]);
+    let n = out.matches(" ok\n").count();
+    assert!(n >= 18, "only {n} checks:\n{out}");
+}

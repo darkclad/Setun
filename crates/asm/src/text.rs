@@ -820,13 +820,14 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
     let fcv = |b: i64, x: i64, y: i64, z: i64| one(isa::rrr(op::FCVT, b, x, y, z));
     match (m, ops) {
         // masked store: the address in a register, no offset (R format)
-        ("stwm", [d, Operand::Mem(base, off), k]) => {
+        ("stwm" | "cas3", [d, Operand::Mem(base, off), k]) => {
             if env.val(off)? != 0 {
-                return err(line, "`stwm` takes no offset: [ra] only");
+                return err(line, format!("`{m}` takes no offset: [ra] only"));
             }
-            return one(isa::rrr(op::MEMR, memr::STWM, reg(d)?, *base, reg(k)?));
+            let f = if m == "stwm" { memr::STWM } else { memr::CAS3 };
+            return one(isa::rrr(op::MEMR, f, reg(d)?, *base, reg(k)?));
         }
-        ("stwm", _) => return bad(),
+        ("stwm" | "cas3", _) => return bad(),
         ("fcmp", [a, b]) => return one(isa::rrr(op::FALU, falu::FCMP, 0, freg(a)?, freg(b)?)),
         ("fmov", [d, a]) => return fcv(fcvt::FMOV, freg(d)?, freg(a)?, 0),
         ("fcvtif", [d, a]) => return fcv(fcvt::FCVTIF, freg(d)?, reg(a)?, 0),

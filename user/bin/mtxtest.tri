@@ -1,0 +1,158 @@
+// /bin/mtxtest: shared memory, futex and the one-trit mutex (TERNARY_WORLD
+// A4), and the trit idioms MRG, STWM, TCP, TCN, TREV and CAS3 from user
+// mode (A2-A4); one line per check, failure paths included.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+
+var failures: int;
+
+fn ok(what: *char, cond: int) {
+    puts("mtxtest: ");
+    puts(what);
+    if (cond) { puts(" ok\n"); } else { puts(" FAILED\n"); failures += 1; }
+}
+
+fn fails(r: int, e: int) -> int { return r == -1 && errno == e; }
+
+fn free_ram() -> int {
+    var si: sysinfo_t;
+    sysinfo(&si);
+    return si.freeram;
+}
+
+fn shared(len: int) -> *int {
+    return mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *int;
+}
+
+fn wait_all(n: int) {
+    var st: int;
+    var k: int = 0;
+    while (k < n) { waitpid(-1, &st, 0); k += 1; }
+}
+
+fn shared_memory() {
+    var p: *int = shared(3 * 19683);
+    ok("mmap MAP_SHARED|MAP_ANONYMOUS", p as int != MAP_FAILED);
+    ok("the pages start zeroed", p[0] == 0 && p[6560] == 0 && p[19682] == 0);
+    var pid: int = fork();
+    if (pid == 0) { p[1] = 4242; p[19682] = -7; _exit(0); }
+    wait_all(1);
+    ok("a child's writes are seen by the parent (shared, not copied)", p[1] == 4242 && p[19682] == -7);
+    var q: *int = shared(100);
+    ok("a second mapping goes elsewhere", q as int != MAP_FAILED && q != p);
+    ok("EINVAL: length 0", mmap(0, 0, PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL);
+    ok("EINVAL: more than 243 pages", mmap(0, 244 * 19683, PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL);
+    ok("EBADF: MAP_PRIVATE anonymous memory is not offered", mmap(0, 100, PROT_WRITE, 2 | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EBADF);
+    // freed when the last sharer goes: a child maps, forks, and both exit.
+    // Once to warm the kernel's caches (page tables kept for reuse), then
+    // again, measured: a leak would keep the 3 pages each time
+    var st: int = sharers();
+    var before: int = free_ram();
+    var st2: int = sharers();
+    ok("a grandchild's write reached its parent", WIFEXITED(st) && WEXITSTATUS(st) == 0 && st2 == st);
+    ok("the pages are freed when the last sharer exits", free_ram() == before);
+}
+
+// A child maps 3 shared pages and forks; the grandchild writes; both exit.
+fn sharers() -> int {
+    var pid: int = fork();
+    if (pid == 0) {
+        var s: *int = shared(3 * 19683);
+        s[0] = 1;
+        if (fork() == 0) { s[0] = 2; _exit(0); }
+        var cst: int;
+        waitpid(-1, &cst, 0);
+        _exit(s[0] == 2 ? 0 : 1);
+    }
+    var st: int;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+fn futexes() {
+    var p: *int = shared(100);
+    p[0] = 5;
+    ok("EAGAIN: wait when the word is not the value", fails(futex_wait(&p[0], 6), EAGAIN));
+    ok("EINVAL: a misaligned address", fails(syscall(98, (&p[0] as int) + 1, 0, 5), EINVAL) || futex_wait(((&p[0] as int) + 1) as *int, 5) == -1 && errno == EINVAL);
+    ok("EINVAL: an unknown operation", fails(_ret(syscall(98, &p[0], 7, 0)), EINVAL));
+    ok("EFAULT: a kernel address", fails(futex_wait(3 as *int, 0), EFAULT));
+    ok("wake with nobody waiting wakes 0", futex_wake(&p[0], 5) == 0);
+    // a child waits on p[1] while it is 0; the parent sets it and wakes it
+    p[1] = 0;
+    p[2] = 0;
+    var pid: int = fork();
+    if (pid == 0) {
+        p[2] = 1;                                   // about to wait
+        while (p[1] == 0) { futex_wait(&p[1], 0); }
+        _exit(p[1] == 9 ? 0 : 1);
+    }
+    while (p[2] == 0) { sched_yield(); }
+    var k: int = 0;
+    while (k < 20) { sched_yield(); k += 1; }       // let it fall asleep
+    p[1] = 9;
+    var woken: int = futex_wake(&p[1], 1);
+    var st: int;
+    waitpid(pid, &st, 0);
+    ok("wait sleeps until woken, wake reports the sleeper", woken == 1 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+// Four processes add 1 to a shared counter 300 times each, yielding inside
+// the critical section; `locked` says whether they take the mutex.
+fn hammer(m: *int, counter: *int, locked: int) -> int {
+    *counter = 0;
+    var c: int = 0;
+    while (c < 4) {
+        if (fork() == 0) {
+            var i: int = 0;
+            while (i < 300) {
+                if (locked) { mtx_lock(m); }
+                var v: int = *counter;
+                if (i % 7 == 0) { sched_yield(); }      // the window a lost update needs
+                *counter = v + 1;
+                if (locked) { mtx_unlock(m); }
+                i += 1;
+            }
+            _exit(0);
+        }
+        c += 1;
+    }
+    wait_all(4);
+    return *counter;
+}
+
+fn mutexes() {
+    var s: *int = shared(100);
+    var m: *int = &s[0];
+    *m = 0;
+    mtx_lock(m);
+    ok("lock a free mutex: +1 (held)", *m == 1);
+    mtx_unlock(m);
+    ok("unlock: 0 (free)", *m == 0);
+    var racy: int = hammer(m, &s[3], 0);
+    ok("without the mutex, updates are lost (the race is real)", racy < 1200);
+    var counted: int = hammer(m, &s[3], 1);
+    ok("with the mutex, 4 x 300 increments make 1200", counted == 1200);
+    ok("and the mutex ends free", *m == 0);
+}
+
+fn idioms() {
+    var w: [2]int;
+    w[0] = 40;                                      // 0t1111 = 1 1 1 1 in balanced ternary
+    ok("tcp, tcn: +1 and -1 trits", tcp(40, 0) == 4 && tcn(-40, 0) == 4 && tcp(-40, 0) == 0 && tcp(40, 2) == 2);
+    ok("trev: 0t1T0 reversed is 0t0T1", trev(6, 3) == -2);
+    ok("mrg: keep, take, clear", mrg(4, -1, 0) == 3 && mrg(13, 0, -13) == 13 && mrg(0, 13, -13) == -13);
+    stwm(&w[0], -40, 1);                            // the lowest trit from -40 (-1)
+    ok("stwm merges into memory", w[0] == 38);
+    ok("cas3: not the expected value, nothing stored", cas3(&w[0], 0, 5) == 38 && w[0] == 38);
+    ok("cas3: the expected value, swapped", cas3(&w[0], 38, 5) == 38 && w[0] == 5);
+}
+
+fn main() -> int {
+    idioms();
+    shared_memory();
+    futexes();
+    mutexes();
+    if (failures == 0) { puts("mtxtest: all passed\n"); }
+    return failures;
+}

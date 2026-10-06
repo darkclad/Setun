@@ -679,3 +679,23 @@ fn ternary_idiom_builtins() {
     assert!(compile_err("fn main() -> int { var x: int = 1; stwm(x, 1, 1); return 0; }").contains("`stwm` needs a pointer to an int"));
     assert!(compile_err("fn main() -> int { return mrg(1, 2); }").contains("argument"));
 }
+
+#[test]
+fn cas3_and_swap_builtins() {
+    // cas3 swaps only when *p is the expected value and always returns the
+    // old one; swap exchanges
+    let src = "var lock: int;
+    fn main() -> int {
+        var r: int = 0;
+        lock = 0;
+        if (cas3(&lock, 0, 1) != 0 || lock != 1) { r += 1; }       // free: taken
+        if (cas3(&lock, 0, 1) != 1 || lock != 1) { r += 10; }      // held: not taken
+        if (swap(&lock, -1) != 1 || lock != -1) { r += 100; }      // held, with waiters
+        if (cas3(&lock, 5, 7) != -1 || lock != -1) { r += 1000; }  // larger expected: no
+        if (swap(&lock, 0) != -1 || lock != 0) { r += 10000; }     // released
+        return r;
+    }";
+    assert_eq!(exit(src), 0);
+    assert!(compile_err("fn main() -> int { var x: int = 1; return cas3(x, 0, 1); }").contains("`cas3` needs a pointer to an int"));
+    assert!(compile_err("fn main() -> int { var x: tryte = 1; return swap(&x, 0); }").contains("`swap` needs a pointer to an int"));
+}

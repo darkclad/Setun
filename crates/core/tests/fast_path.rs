@@ -1113,3 +1113,57 @@ fn ternary_idioms_refused() {
         assert_eq!(st[word], 5, "case {k}: memory changed");
     }
 }
+
+#[test]
+fn cas3_has_three_outcomes() {
+    // CAS3 r1, [r2], r3 against a word smaller than, equal to and larger
+    // than r1: a BR3 right after sees S < 0, = 0 (swapped) and > 0, and r1
+    // gets the old word every time
+    use setun_core::isa::memr;
+    let at = PAGE + 300;
+    for (word, expect, sign) in [(5i64, 9i64, -1i64), (9, 9, 0), (12, 9, 1)] {
+        let mut prog = Vec::new();
+        prog.extend(isa::wide(op::LI, 0, 1, 0, expect)); // 0, 3
+        prog.extend(isa::wide(op::LI, 0, 2, 0, at)); // 6, 9
+        prog.extend(isa::wide(op::LI, 0, 3, 0, 777)); // 12, 15
+        prog.push(isa::rrr(op::MEMR, memr::CAS3, 1, 2, 3)); // 18
+        prog.extend(isa::br3(4, 6)); // 21, 24: S<0 -> 33, S>0 -> 39
+        prog.push(isa::s6(op::LIQ, 0, 10, 0)); // 27: equal
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        prog.push(isa::s6(op::LIQ, 0, 10, -1)); // 33: smaller
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        prog.push(isa::s6(op::LIQ, 0, 10, 1)); // 39: larger
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let st = both_ways(move |m: &mut Machine| { m.mem.write_word(at, w(word)).unwrap(); m.cpu.set_reg(10, w(99)); }, &prog, 30);
+        assert_eq!(reg_in(&st, 10), sign, "word {word}: the branch");
+        assert_eq!(reg_in(&st, 1), word, "word {word}: rd gets the old word");
+        let mem_word = st[27 * 5 + 5 + 6561 + ((at - PAGE + 9840) / 3) as usize];
+        assert_eq!(mem_word, if sign == 0 { 777 } else { word }, "word {word}: memory");
+    }
+}
+
+#[test]
+fn cas3_refused() {
+    use setun_core::isa::{memr, vector};
+    let at = PAGE + 300;
+    for (addr, read_only, want) in [(at + 1, false, vector::MISALIGNED), (at, true, vector::PROTECTION), (at - 9 + 2, true, vector::MISALIGNED)] {
+        // the word does not match: a read-only page traps even so
+        let mut prog = Vec::new();
+        prog.extend(isa::wide(op::LI, 0, 1, 0, 4));
+        prog.extend(isa::wide(op::LI, 0, 2, 0, addr));
+        prog.extend(isa::wide(op::LI, 0, 3, 0, 777));
+        prog.push(isa::rrr(op::MEMR, memr::CAS3, 1, 2, 3));
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let setup = move |m: &mut Machine| {
+            m.mem.write_word(at, w(5)).unwrap();
+            if read_only {
+                paged(m);
+                m.mem.write_word(4 * PAGE + 3, w(pte(1, -1, 1, -1))).unwrap();
+            }
+        };
+        let st = both_ways(setup, &prog, 30);
+        assert_eq!(vector_in(&st), want, "{addr}: the trap");
+        assert_eq!(reg_in(&st, 1), 4, "{addr}: rd changed");
+        assert_eq!(st[27 * 5 + 5 + 6561 + ((at - PAGE + 9840) / 3) as usize], 5, "{addr}: memory changed");
+    }
+}

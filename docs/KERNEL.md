@@ -954,3 +954,12 @@ The server keeps every window's pixels (server-side rendering), so clients never
 ## 24. Networking
 
 The TCP/IP stack, sockets and the network programs are described in [`NETWORK.md`](NETWORK.md). In short: `kernel/drivers/tnic.tri` and `kernel/net/` (Ethernet, ARP, IPv4, ICMP, UDP, TCP); sockets are anonymous `I_SOCK` inodes behind file descriptors, with Linux's system calls 198..210 and 242; `/proc/net/{dev,arp,tcp,udp,stat}`; init starts `/sbin/telnetd` when `eth0` is up.
+
+## 25. Shared memory, futex and the one-trit mutex
+
+TERNARY_WORLD A4 needs a lock shared between processes, and Trinux has no threads, so two things were added:
+
+- **Shared anonymous memory:** `mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0)` maps fresh zeroed frames (up to 243 pages) at the first free run of pages above the framebuffer's mapping. Their entries carry the SW trit at −1, as the framebuffer's do, so fork shares them instead of copying them; unlike the framebuffer's (device frames), they are reference counted, and the last process to drop one frees it. Other anonymous mappings (`MAP_PRIVATE`) are not offered: anonymous private memory comes from `brk`.
+- **`futex(uaddr, op, val)`** (system call 98, as Linux numbers it): `FUTEX_WAIT` sleeps while the word at `uaddr` still holds `val` (`EAGAIN` if it does not), `FUTEX_WAKE` wakes up to `val` tasks sleeping on it and returns how many. The wait channel is the word's physical address, so processes sharing the page meet there; the kernel does not preempt itself, so looking at the word and going to sleep happen at once. `EINVAL` for a misaligned address or an unknown operation, `EFAULT` outside user space.
+- **tlibc** has `futex_wait`, `futex_wake`, and the mutex of ISA §3.4.1: `mtx_lock` (`CAS3` 0 → +1, else `SWAP` in −1 and wait until the swap finds 0) and `mtx_unlock` (`SWAP` in 0, waking one waiter if the old value was −1).
+- **`/bin/mtxtest`** checks all of this: sharing across fork and freeing with the last sharer (free memory before and after), the futex errors and a cross-process wait and wake, and four processes adding 1 to a shared counter 300 times each, yielding inside the critical section: exactly 1200 with the mutex, fewer without it.

@@ -36,7 +36,7 @@ Version history:
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
-- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), and trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3).
+- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), and the three-way compare-and-swap `CAS3` (§3.4.1).
 
 ---
 
@@ -300,8 +300,10 @@ In the 1-word MEM form the offset is `q3` **elements**: `LDW r1, [r13 + 2]` read
 | B | Mnemonic | Operation |
 |---|---|---|
 | 1 | `STWM rd, [ra], rb` | the word at `ra` := `MRG`(that word, mask `rb`, `rd`), as one atomic read-modify-write: per trit, `rb` = 0 keeps the memory trit, +1 takes `rd`'s, −1 clears it |
+| 2 | `CAS3 rd, [ra], rb` | `old` := the word at `ra`; **S := sign(`old` − `rd`)**, exact; if S = 0 the word := `rb`; then `rd` := `old`. Atomic. A `BR3` right after sees three outcomes: smaller than expected, equal (swapped), larger |
 
-- There is no offset (the R format holds three registers and no immediate): the address is computed first. It must be a multiple of 3 (vector −5), and the page must be writable (vector −4); a trap leaves memory unchanged.
+- There is no offset (the R format holds three registers and no immediate): the address is computed first. It must be a multiple of 3 (vector −5), and the page must be writable (vector −4); a trap leaves memory and `rd` unchanged. `CAS3` needs a writable page even when the comparison fails (it is a write access either way, like x86's `CMPXCHG`).
+- A mutex fits one trit: 0 free, +1 held, −1 held with waiters. Lock is `CAS3` from 0 to +1, else `SWAP` in −1 and sleep until the swap finds 0; unlock is `SWAP` in 0, waking a waiter if the old value was −1 (Trinux: `mtx_lock`, `mtx_unlock` in tlibc, over `futex`).
 - Uses: page-table entry flags (`V`, `AD`, `RING`) set or cleared in one store, device control registers, flag words shared between the kernel and drivers.
 - Other functions are reserved and raise `ILL`.
 

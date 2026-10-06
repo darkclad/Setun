@@ -145,6 +145,8 @@ fn info(i: &Ins) -> Option<Info> {
         "mrg" if a.len() == 3 => inf(src(0), reg0() | FLAGS, true, false),
         "tcp" | "tcn" | "trev" if a.len() == 3 => inf(src(1), reg0() | FLAGS, false, true),
         "stwm" if a.len() == 3 => inf(src(0), 0, false, false),
+        "cas3" if a.len() == 3 => inf(src(0), reg0() | FLAGS, false, false),
+        "swap" if a.len() == 2 => inf(src(0), reg0(), false, false),
         "in" if a.len() == 2 => inf(src(1), reg0(), false, false),
         "out" if a.len() == 2 => inf(src(0), 0, false, false),
         "mfc" if a.len() == 2 => inf(0, reg0(), false, false),

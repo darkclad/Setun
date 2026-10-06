@@ -574,7 +574,7 @@ fn is_register_name(s: &str) -> bool {
 const CREGS: &[&str] = &["MODE", "PTB", "FADDR", "FCAUSE", "ITB", "EPC", "EMODE", "KSP", "SCRATCH", "CPUID", "CYCLE"];
 
 const BUILTINS: &[&str] = &[
-    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "band", "bor", "bxor", "bandn", "bsh", "bext", "brot", "tcp", "tcn", "trev", "mrg", "stwm", "bytes", "in", "out",
+    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "band", "bor", "bxor", "bandn", "bsh", "bext", "brot", "tcp", "tcn", "trev", "mrg", "stwm", "cas3", "swap", "bytes", "in", "out",
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
     // the FPU
     "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
@@ -3551,6 +3551,33 @@ impl Compiler {
                 self.emit("pop r3");
                 self.emit("mrg r3, r1, r2");
                 self.emit("mov r1, r3");
+                Ok(Ty::Int)
+            }
+            "cas3" => {
+                // cas3(p, expected, new): the old *p; *p := new if it was expected
+                want(3)?;
+                let t = self.expr(&args[0])?;
+                if t.clone().decay() != Ty::Ptr(Box::new(Ty::Int)) {
+                    return err(args[0].pos, "`cas3` needs a pointer to an int");
+                }
+                self.emit("push r1");
+                let (ta, tb) = self.two(&args[1], &args[2])?;
+                self.need_integer(&ta, args[1].pos)?;
+                self.need_integer(&tb, args[2].pos)?;
+                self.emit("pop r3");
+                self.emit("cas3 r1, [r3], r2");
+                Ok(Ty::Int)
+            }
+            "swap" => {
+                // swap(p, v): the old *p, and *p := v, at once
+                want(2)?;
+                let (ta, tb) = self.two(&args[0], &args[1])?;
+                if ta.clone().decay() != Ty::Ptr(Box::new(Ty::Int)) {
+                    return err(args[0].pos, "`swap` needs a pointer to an int");
+                }
+                self.need_integer(&tb, args[1].pos)?;
+                self.emit("swap r2, [r1]");
+                self.emit("mov r1, r2");
                 Ok(Ty::Int)
             }
             "stwm" => {

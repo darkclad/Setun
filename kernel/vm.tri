@@ -5,8 +5,9 @@
 //   heap   from the bss start to brk, demand-zero
 //   stack  27 pages below USER_LIMIT, demand-zero
 // After fork, writable pages are shared read-only with the SW trit set
-// (copy on write); frame_ref counts the sharers. Device pages (the mapped
-// framebuffer) have the SW trit at -1: shared as they are, never counted.
+// (copy on write); frame_ref counts the sharers. Pages with the SW trit at
+// -1 are shared as they are, never copied: the mapped framebuffer (negative
+// frames, never counted) and shared memory from mmap (RAM frames, counted).
 
 import "params.tri";
 import "mm.tri";
@@ -85,6 +86,15 @@ fn map_device_page(l1: int, va: int, frame: int) -> int {
     return 1;
 }
 
+// A RAM frame shared as it is (mmap MAP_SHARED|MAP_ANONYMOUS): writable, SW
+// trit -1, its reference already counted by the caller.
+fn map_shared_page(l1: int, va: int, frame: int) -> int {
+    var slot: *int = pte_slot(l1, va, 1);
+    if (slot == null) { return 0; }
+    *slot = user_pte(frame, 1, 0) - PTE_SW;
+    return 1;
+}
+
 fn unmap_device_page(l1: int, va: int) {
     var slot: *int = pte_slot(l1, va, 0);
     if (slot != null && *slot != 0 && trit(*slot, 24) == -1) { *slot = 0; }
@@ -119,7 +129,7 @@ fn free_address_space(l1: int) {
             while (i2 <= tbl_hi[l2]) {
                 var s2: *int = table_entry(l2, i2);
                 var p: int = *s2;
-                if (p != 0 && trit(p, 24) != -1) { put_page(pte_frame(p)); }   // device pages are not counted
+                if (p != 0 && (trit(p, 24) != -1 || !is_device_frame(pte_frame(p)))) { put_page(pte_frame(p)); }   // device pages are not counted
                 *s2 = 0;
                 i2 += 1;
             }
@@ -153,7 +163,8 @@ fn copy_address_space(parent: int) -> int {
             while (i2 <= tbl_hi[pl2]) {
                 var p: int = *table_entry(pl2, i2);
                 if (p != 0 && trit(p, 24) == -1) {
-                    *table_entry(cl2, i2) = p;                 // a device page: shared as it is
+                    *table_entry(cl2, i2) = p;                 // shared as it is
+                    if (!is_device_frame(pte_frame(p))) { get_page(pte_frame(p)); }
                 } else if (p != 0) {
                     if (trit(p, 19) == 1) {                    // writable: share copy-on-write
                         p = p - 2 * PTE_V + PTE_SW;

@@ -1500,6 +1500,20 @@ impl Cpu {
                     let new = old.tritwise_merge(self.reg(z), self.reg(x));
                     self.store_word(m, va, new)?;
                 }
+                memr::CAS3 => {
+                    // old := the word at ra; S := sign(old - rd), exact; if
+                    // equal, the word := rb; rd := old. All at once. A write
+                    // access either way, checked before anything happens
+                    let va = self.reg(y).value();
+                    self.data_pa(m, va, Access::Write, true)?;
+                    let old = self.load_word_as(m, va, Access::Read)?;
+                    let s = (old.value() - self.reg(x).value()).signum();
+                    if s == 0 {
+                        self.store_word(m, va, self.reg(z))?;
+                    }
+                    self.set_s(Trit::from_i64(s));
+                    self.set_reg(x, old);
+                }
                 _ => return Err(ill()),
             },
             op::IO | op::IOI => {

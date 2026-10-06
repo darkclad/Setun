@@ -1818,7 +1818,7 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
 
 // ---- calls ----
 
-var builtin_names: *char = "sgn abs divr modr tmul tsat cons mulh trit ext ins tlz band bor bxor bandn bsh bext brot tcp tcn trev mrg stwm bytes in out mfc mtc hlt brk tlbflush tlbinv fence syscall sqrt trunc round rem scale3 exponent3 fconst fsr set_fsr fclass real27 ";
+var builtin_names: *char = "sgn abs divr modr tmul tsat cons mulh trit ext ins tlz band bor bxor bandn bsh bext brot tcp tcn trev mrg stwm cas3 swap bytes in out mfc mtc hlt brk tlbflush tlbinv fence syscall sqrt trunc round rem scale3 exponent3 fconst fsr set_fsr fclass real27 ";
 
 fn is_builtin(s: *char) -> int {
     var k: int = 0;
@@ -2040,6 +2040,28 @@ fn builtin(n: *char, args: int, na: int, pos: int) -> int {
         need_integer(two_a, ex_pos.p[arg(args, 0)]);
         need_integer(two_b, ex_pos.p[arg(args, 1)]);
         ln(); o(n); o(" r1, r1, r2"); nl();
+        return t_int;
+    }
+    if (streq(n, "cas3")) {
+        // cas3(p, expected, new): the old *p; *p := new if it was expected
+        want(n, na, 3, pos);
+        if (decay(expr(arg(args, 0))) != mk_ptr(t_int)) { fail_at(ex_pos.p[arg(args, 0)], "`cas3` needs a pointer to an int", null); }
+        em("push r1");
+        two(arg(args, 1), arg(args, 2));
+        need_integer(two_a, ex_pos.p[arg(args, 1)]);
+        need_integer(two_b, ex_pos.p[arg(args, 2)]);
+        em("pop r3");
+        em("cas3 r1, [r3], r2");
+        return t_int;
+    }
+    if (streq(n, "swap")) {
+        // swap(p, v): the old *p, and *p := v, at once
+        want(n, na, 2, pos);
+        two(arg(args, 0), arg(args, 1));
+        if (decay(two_a) != mk_ptr(t_int)) { fail_at(ex_pos.p[arg(args, 0)], "`swap` needs a pointer to an int", null); }
+        need_integer(two_b, ex_pos.p[arg(args, 1)]);
+        em("swap r2, [r1]");
+        em("mov r1, r2");
         return t_int;
     }
     if (streq(n, "mrg") || streq(n, "stwm")) {

@@ -327,6 +327,32 @@ fn mmap(addr: int, len: int, prot: int, flags: int, fd: int, off: int) -> int {
 }
 fn munmap(addr: int, len: int) -> int { return _ret(syscall(215, addr, len)); }
 
+// Shared memory: mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED |
+// MAP_ANONYMOUS, -1, 0) gives zeroed pages that fork shares, not copies.
+const MAP_ANONYMOUS: int = 32;
+
+// ---- futex and the one-trit mutex ------------------------------------------------------
+
+const FUTEX_WAIT: int = 0;
+const FUTEX_WAKE: int = 1;
+
+// Sleep while *p holds val (EAGAIN if it does not); wake up to n sleepers.
+fn futex_wait(p: *int, val: int) -> int { return _ret(syscall(98, p, FUTEX_WAIT, val)); }
+fn futex_wake(p: *int, n: int) -> int { return _ret(syscall(98, p, FUTEX_WAKE, n)); }
+
+// A mutex in one word, one trit of state: 0 free, +1 held, -1 held with
+// waiters (the futex mutex binary systems encode as 0/1/2). Lock: CAS3 from
+// free to held; failing that, mark it held with waiters and sleep until the
+// swap finds it free. Unlock: free it, and wake one sleeper if there were any.
+fn mtx_lock(m: *int) {
+    if (cas3(m, 0, 1) == 0) { return; }
+    while (swap(m, -1) != 0) { futex_wait(m, -1); }
+}
+
+fn mtx_unlock(m: *int) {
+    if (swap(m, 0) == -1) { futex_wake(m, 1); }
+}
+
 // ---- pseudo-terminals (stdlib.h) ------------------------------------------------------
 
 const TIOCGPTN: int = 2147767344;

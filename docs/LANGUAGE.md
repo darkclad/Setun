@@ -185,6 +185,8 @@ These are not functions: each compiles to one instruction or a few.
 | `trev(x, n)` | the low `n` trits reversed (0: all 27) | `TREV` |
 | `mrg(old, mask, src)` | per trit: mask 0 keeps `old`, +1 takes `src`, −1 gives 0 | `MRG` |
 | `stwm(p, value, mask)` | `*p := mrg(*p, mask, value)` in one store; `p` is an `*int` | `STWM` |
+| `cas3(p, expected, new)` | the old `*p`; `*p := new` if it was `expected`, atomically | `CAS3` |
+| `swap(p, v)` | the old `*p`, and `*p := v`, atomically | `SWAP` |
 | `band(a, b)` `bor(a, b)` `bxor(a, b)` `bandn(a, b)` | binary AND / OR / XOR / a AND NOT b, on two's-complement values (ISA §3.3.1) | `BAND` … `BANDN` |
 | `bsh(x, n)` | x·2^n, or ⌊x / 2^−n⌋ for n < 0 | `BSH` |
 | `bext(x, pos, len)` `brot(x, n, len)` | bits pos..pos+len−1; the low len bits rotated left by n (constant `pos`/`n`, `len`) | `BEXT`, `BROT` |

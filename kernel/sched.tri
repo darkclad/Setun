@@ -67,6 +67,7 @@ const SYS_FCNTL: int = 25;
 const SYS_PPOLL: int = 73;
 const SYS_MMAP: int = 222;
 const SYS_MUNMAP: int = 215;
+const SYS_FUTEX: int = 98;
 const SYS_LINKAT: int = 37;
 const SYS_FCHMODAT: int = 53;
 const SYS_CLOCK_GETTIME: int = 113;
@@ -693,6 +694,7 @@ fn do_syscall(f: *int, n: int) {
         case SYS_PPOLL: f[F_R1] = sys_ppoll(f[0], f[1], f[2], f[3]);
         case SYS_MMAP: f[F_R1] = sys_mmap(f[0], f[1], f[2], f[3], f[4], f[5]);
         case SYS_MUNMAP: f[F_R1] = sys_munmap(f[0], f[1]);
+        case SYS_FUTEX: f[F_R1] = sys_futex(f[0], f[1], f[2]);
         case SYS_LINKAT: f[F_R1] = sys_linkat(f[0], f[1], f[2], f[3]);
         case SYS_FCHMODAT: f[F_R1] = sys_fchmodat(f[0], f[1], f[2]);
         case SYS_CLOCK_GETTIME: f[F_R1] = sys_clock_gettime(f[0], f[1]);
