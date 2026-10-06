@@ -226,6 +226,24 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       crypto.getRandomValues(w);
       w.forEach((v, i) => wasm.setun_seed_word(i, v));
     }
+    // The JIT: hot code comes out as small WebAssembly modules, which import
+    // the emulator's memory and function table; they are compiled in the
+    // background and linked into the table, and the emulator is told where.
+    const table = wasm.__indirect_function_table;
+    const jitOn = table instanceof WebAssembly.Table && typeof wasm.setun_jit_enable === "function";
+    if (jitOn) wasm.setun_jit_enable(1);
+    function jitService() {
+      if (!jitOn) return;
+      for (;;) {
+        const n = wasm.setun_jit_take();
+        if (!n) return;
+        const code = new Uint8Array(wasm.memory.buffer, wasm.setun_jit_ptr(), n).slice();
+        const id = wasm.setun_jit_id();
+        WebAssembly.instantiate(code, { env: { memory: wasm.memory, table } })
+          .then(({ instance }) => { const idx = table.grow(1); table.set(idx, instance.exports.run); wasm.setun_jit_done(id, idx); })
+          .catch(() => wasm.setun_jit_done(id, 0));
+      }
+    }
     seed();
     wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
     showKind();
@@ -332,6 +350,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
         off = wasm.setun_run(n) === 1;
       }
       executed += n;
+      jitService();
 
       const ptr = wasm.setun_render(performance.now());
       const w = wasm.setun_width(), h = wasm.setun_height();

@@ -69,7 +69,7 @@ In rough order of payoff for effort (estimates from the benchmarks):
 | P6 | ✅ Tryte loads and stores, FMOV/FLDD/FLDS/FSTD inline; FCMP and the tritwise ALU functions by direct helpers | JIT | done; FADD/FMUL/FDIV still go through the interpreter's code |
 | P7 | ✅ Inlining (cost model), `a[i ± k]` folded into the address, local value numbering, `if (c) break/continue` as one jump, loops with a register test rotated | Trine | done: sieve+sort 13.3M → 5.5M instructions, mandel 70.9M → 67.7M |
 | P8 | ~~Two-tier compilation~~: IR per instruction cut by a fifth ✅; tiers dropped: region size (4–32 blocks) and acceptance thresholds made no measurable difference, compiles run in the background | JIT | — |
-| P9 | A WebAssembly JIT for the browser build, which only interprets | Web | several times in the artifact |
+| P9 | ✅ A WebAssembly JIT for the browser build: regions as small wasm modules the page compiles and links into the function table; tested with the native fast-path tests compiled to wasm (`crates/wtest`) | Web | Trinux under node 108 → 288 MIPS |
 | P10 | ✅ Fewer interpreted instructions: unreached functions left out of every program (shell workload 18.9M → 14.4M instructions); regions from 300 runs and 4 inline instructions (were 1000 and 16), compile threads on one shared queue (host cycles −15%) | Trine, JIT | what is left interpreted: cold code, and hot code waiting for its compile (about 2.5M of 28M instructions) |
 
 ## Later

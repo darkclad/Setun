@@ -82,9 +82,9 @@ prompt, or press **Window system** for `trwm term clock colors paint`.
 Power-cycle keeps the disk, so files written in the browser survive a reboot;
 **Fresh disk** restores it. The old demo ROM is still under **Boot**.
 
-Speed: about 20 MIPS native and 16 MIPS in the browser for the demo ROM; Trinux
-(paging, user mode) runs at about 4-5 MIPS in a browser tab. The clock can be
-paced or left at Max.
+Speed: the browser build compiles hot code to WebAssembly as it runs (a JIT,
+like the native one), and runs Trinux at a few hundred MIPS at Max (about
+290 under node; 110 interpreted). The clock can be paced or left at Max.
 
 ## Credits
 

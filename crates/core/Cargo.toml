@@ -20,3 +20,6 @@ cranelift-native = "0.135"
 
 [features]
 opstats = []
+# The browser JIT asks the host to compile each module at once (setun_jit_service):
+# for testing under node, where compiling can be synchronous.
+wasm-sync-jit = []

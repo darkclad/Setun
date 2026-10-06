@@ -7,8 +7,13 @@ use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
 use ternary::{wrap_trits, Trit, Tryte, Word};
 
+#[path = "jit_rt.rs"]
+mod jit_rt;
 #[cfg(not(target_arch = "wasm32"))]
 #[path = "jit.rs"]
+mod jit;
+#[cfg(target_arch = "wasm32")]
+#[path = "wjit.rs"]
 mod jit;
 
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
@@ -130,7 +135,6 @@ pub struct Cpu {
     arena_gen: u64,
     /// The JIT (native builds): created on first use; `jit_off` once it
     /// could not be. A block is compiled after `jit_threshold` runs.
-    #[cfg(not(target_arch = "wasm32"))]
     jit: Option<jit::JitThread>,
     jit_off: bool,
     /// Wait for each region to compile (tests: deterministic timing).
@@ -144,6 +148,9 @@ pub struct Cpu {
     jit_next: u64,
     /// A fault raised inside compiled code, for the block engine to deliver.
     jit_fault: Option<Fault>,
+    /// Where helpers called from compiled code put a loaded value (the
+    /// browser build's code has no stack of its own).
+    jit_scratch: [i64; 3],
     /// Regions compiled, entries into compiled code, steps run there.
     jit_stats: [u64; 4],
 }
@@ -154,6 +161,8 @@ const OFF_MODE: usize = std::mem::offset_of!(Cpu, mode_trits);
 const OFF_PC: usize = std::mem::offset_of!(Cpu, pc);
 const OFF_JWIN: usize = std::mem::offset_of!(Cpu, jwin);
 const OFF_FREGS: usize = std::mem::offset_of!(Cpu, fregs);
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const OFF_SCRATCH: usize = std::mem::offset_of!(Cpu, jit_scratch);
 const REAL_SIZE: usize = std::mem::size_of::<Real>();
 const REAL_E: usize = std::mem::offset_of!(Real, e);
 const REAL_M: usize = std::mem::offset_of!(Real, m);
@@ -364,14 +373,16 @@ impl Cpu {
             jwin: JW_EMPTY,
             jw_live: false,
             arena_gen: 0,
-            #[cfg(not(target_arch = "wasm32"))]
             jit: None,
-            jit_off: cfg!(target_arch = "wasm32"),
+            // (the browser build compiles only once the page says it will
+            // take the modules: `set_jit_enabled`)
+            jit_off: cfg!(target_arch = "wasm32") && !cfg!(feature = "wasm-sync-jit"),
             jit_wait: false,
             jit_threshold: 300,
             jit_pending: Vec::new(),
             jit_next: 0,
             jit_fault: None,
+            jit_scratch: [0; 3],
             jit_stats: [0; 4],
         };
         c.reset();
@@ -755,12 +766,10 @@ impl Cpu {
     /// PC are only brought up to date at the block's end, on a fault (where
     /// they are recomputed exactly) and before an instruction that is not
     /// handled inline.
-    #[cfg_attr(target_arch = "wasm32", allow(unused_variables, unused_assignments))]
     pub fn run_batch(&mut self, m: &mut Memory, io: &mut dyn Io, budget: u64) -> u64 {
         if self.mode(mode::TF) == 1 {
             return 0;
         }
-        #[cfg(not(target_arch = "wasm32"))]
         self.jit_install(false);
         let mut n = 0;
         self.batch = true;
@@ -769,7 +778,6 @@ impl Cpu {
         let mut blocks_run = 0u32;
         while n < budget {
             blocks_run = blocks_run.wrapping_add(1);
-            #[cfg(not(target_arch = "wasm32"))]
             if blocks_run.is_multiple_of(1024) && !self.jit_pending.is_empty() {
                 self.jit_install(false);
             }
@@ -825,13 +833,12 @@ impl Cpu {
                 }
                 continue;
             }
-            #[cfg(not(target_arch = "wasm32"))]
             {
                 let (native, entry) = (self.blocks[id as usize - 1].native, self.blocks[id as usize - 1].entry);
                 if native != 0 {
                     // SAFETY: compiled for this block, which is still current;
                     // the code only touches the CPU and memory it is given
-                    let f: jit::NativeFn = unsafe { std::mem::transmute::<usize, jit::NativeFn>(native) };
+                    let f: jit_rt::NativeFn = unsafe { std::mem::transmute::<usize, jit_rt::NativeFn>(native) };
                     let ran = unsafe { f(self as *mut Cpu, m as *mut Memory, pc - entry, (budget - n) as i64, entry) } as u64;
                     self.jit_stats[1] += 1;
                     self.jit_stats[2] += ran;
@@ -944,7 +951,6 @@ impl Cpu {
     /// Compile the region rooted at block `root` (word `i` of code slot
     /// `slot`, physical address `pa`): the blocks reachable by static jumps
     /// and branches within the frame.
-    #[cfg(not(target_arch = "wasm32"))]
     #[cold]
     fn compile_region(&mut self, m: &mut Memory, root: u32, slot: usize, i: usize, pa: i64) {
         const MAX_REGION: usize = 32;
@@ -995,14 +1001,14 @@ impl Cpu {
                 Op::Jalr | Op::Generic => {}
                 _ => todo.push(end),
             }
-            region.push(jit::RegionBlock { off, ops });
+            region.push(jit_rt::RegionBlock { off, ops });
             ids.push(id);
         }
         // only worth it with a loop inside, or a run of a few inline
         // instructions: entering and leaving compiled code costs a load and a
         // store per register (blocks of 4 and more pay: the return paths of
         // functions, restoring registers before JALR, are the common case)
-        let inline = |rb: &jit::RegionBlock| rb.ops.iter().take_while(|d| d.op != Op::Generic).count();
+        let inline = |rb: &jit_rt::RegionBlock| rb.ops.iter().take_while(|d| d.op != Op::Generic).count();
         let offs: std::collections::HashSet<i64> = region.iter().map(|rb| rb.off).collect();
         let has_loop = region.iter().any(|rb| {
             let mut o = rb.off;
@@ -1024,7 +1030,7 @@ impl Cpu {
         debug_assert_eq!(ids[0], root, "the region starts at its root");
         let id = self.jit_next;
         self.jit_next += 1;
-        if !self.jit.as_ref().expect("created above").send(jit::Request { id, region }) {
+        if !self.jit.as_ref().expect("created above").send(jit_rt::Request { id, region }) {
             self.jit_off = true;
             return;
         }
@@ -1045,7 +1051,6 @@ impl Cpu {
 
     /// Install compiled regions that have arrived (`wait`: until none is
     /// pending), if their blocks are still current.
-    #[cfg(not(target_arch = "wasm32"))]
     fn jit_install(&mut self, wait: bool) {
         let Some(j) = &self.jit else { return };
         while !self.jit_pending.is_empty() {
@@ -1076,6 +1081,27 @@ impl Cpu {
     /// run in compiled code, and microseconds spent compiling.
     pub fn jit_stats(&self) -> [u64; 4] {
         self.jit_stats
+    }
+
+    /// Turn the JIT on or off. The browser build starts with it off: its
+    /// code is compiled by the page (`jit_take`, `jit_finished`), which
+    /// turns it on once it does that.
+    pub fn set_jit_enabled(&mut self, on: bool) {
+        self.jit_off = !on;
+    }
+
+    /// The next region module for the page to compile (browser build):
+    /// (request id, wasm bytes).
+    #[cfg(target_arch = "wasm32")]
+    pub fn jit_take() -> Option<(u64, Vec<u8>)> {
+        jit::take_request()
+    }
+
+    /// The page compiled request `id` and put its `run` at `index` in the
+    /// function table (0: it failed).
+    #[cfg(target_arch = "wasm32")]
+    pub fn jit_finished(id: u64, index: u32) {
+        jit::finished(id, index);
     }
 
     /// Compile blocks after this many runs. 0 or 1 compiles every block at

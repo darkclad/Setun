@@ -33,6 +33,10 @@ struct Emu {
 
 thread_local! {
     static EMU: RefCell<Option<Emu>> = const { RefCell::new(None) };
+    /// The page compiles the JIT's modules (`setun_jit_enable`).
+    static JIT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The module `setun_jit_take` last handed out.
+    static JIT_OUT: RefCell<(u64, Vec<u8>)> = const { RefCell::new((0, Vec::new())) };
     /// Entropy for the next machine's TRNG, from the page's crypto.getRandomValues.
     static SEED: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
 }
@@ -98,6 +102,7 @@ fn new_machine_unseeded(kind: u32, ram: i64, unix: i64, disk: Option<Box<dyn set
         return setun_demo::machine(ram, unix);
     }
     let mut m = Machine::new(ram, unix);
+    m.cpu.set_jit_enabled(JIT_ON.with(|j| j.get()));
     m.load_rom(&trytes_le(BIOS));
     let store = disk.unwrap_or_else(|| Box::new(MemDisk::from_trytes(&trinux_disk())));
     m.dev.disks[0].attach(store);
@@ -152,6 +157,56 @@ pub extern "C" fn setun_disk_sectors() -> u32 {
 }
 
 const _: () = assert!(PAGE == 19_683);
+
+// ---- the JIT ---------------------------------------------------------------------------
+//
+// Hot code is compiled to small WebAssembly modules that import this
+// module's memory and function table. The page compiles them: once it
+// calls `setun_jit_enable(1)`, it takes each module with `setun_jit_take`
+// (then `setun_jit_ptr`, `setun_jit_id`), compiles and instantiates it in
+// the background with `{ env: { memory, table } }`, adds its `run` export to
+// `__indirect_function_table`, and reports the index with `setun_jit_done`.
+
+/// The page will compile modules (1) or not (0): the JIT on or off.
+#[no_mangle]
+pub extern "C" fn setun_jit_enable(on: u32) {
+    JIT_ON.with(|j| j.set(on != 0));
+    EMU.with(|e| {
+        if let Some(e) = e.borrow_mut().as_mut() {
+            e.m.cpu.set_jit_enabled(on != 0);
+        }
+    });
+}
+
+/// The next module to compile: its length in bytes (0: none waiting).
+#[no_mangle]
+pub extern "C" fn setun_jit_take() -> u32 {
+    match setun_core::cpu::Cpu::jit_take() {
+        Some(r) => JIT_OUT.with(|o| {
+            *o.borrow_mut() = r;
+            o.borrow().1.len() as u32
+        }),
+        None => 0,
+    }
+}
+
+/// The bytes of the module `setun_jit_take` handed out.
+#[no_mangle]
+pub extern "C" fn setun_jit_ptr() -> *const u8 {
+    JIT_OUT.with(|o| o.borrow().1.as_ptr())
+}
+
+/// Its request id.
+#[no_mangle]
+pub extern "C" fn setun_jit_id() -> f64 {
+    JIT_OUT.with(|o| o.borrow().0 as f64)
+}
+
+/// Request `id` compiled: its `run` is at `index` in the table (0: failed).
+#[no_mangle]
+pub extern "C" fn setun_jit_done(id: f64, index: u32) {
+    setun_core::cpu::Cpu::jit_finished(id as u64, index);
+}
 
 /// Run `n` instructions. Returns 1 if the machine has powered itself off.
 #[no_mangle]

@@ -7,6 +7,12 @@ use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // the JIT's modules call the emulator through its function table, and
+    // the page adds their code to it
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        println!("cargo:rustc-link-arg-cdylib=--export-table");
+        println!("cargo:rustc-link-arg-cdylib=--growable-table");
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     for dir in ["kernel", "user", "bios", "crates/trine/lib", "crates/trine/src", "crates/trinux/src", "crates/asm/src"] {
         println!("cargo:rerun-if-changed={}", root.join(dir).display());

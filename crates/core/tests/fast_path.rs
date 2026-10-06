@@ -894,3 +894,89 @@ fn binary_operations_in_a_compiled_loop() {
     }
     assert_eq!([reg_in(&st, 1), reg_in(&st, 2), reg_in(&st, 3), reg_in(&st, 4)], [a, b, c, d].map(|v| v as i64));
 }
+
+#[test]
+fn products_whose_estimate_is_off_by_one_in_a_compiled_loop() {
+    // MUL and MULH take the high word from an f64 estimate, then correct it
+    // by one either way: these products are ones where the estimate is off
+    // (found by search), both ways round
+    let pairs: [(i64, i64); 6] = [
+        (2_596_088_893_565, 3_375_464_135_754),
+        (3_628_523_341_252, -2_863_993_672_322),
+        (2_539_883_223_789, 1_759_679_610_871),
+        (3_571_409_154_934, -3_617_323_243_264),
+        (3_785_799_733_488, 2_775_773_052_891),
+        (1_794_840_808_341, -3_484_494_035_649),
+    ];
+    // the pairs three times over in a table, a short loop through them
+    let table = PAGE + 300;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 12, 0, table));
+    prog.push(isa::s6(op::LIQ, 0, 9, 18));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDW, 1, 12, 0));
+    prog.push(isa::rrr(op::MEM, mem::LDW, 2, 12, 1));
+    prog.push(isa::rrr(op::ALU, alu::MUL, 3, 1, 2));
+    prog.push(isa::rrr(op::ALU, alu::ADC, 8, 8, 0)); // C: the sign of the high word
+    prog.push(isa::rrr(op::ALU, alu::MULH, 4, 1, 2));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 10, 10, 3));
+    prog.push(isa::rrr(op::ALU, alu::ADD, 11, 11, 4));
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 12, 12, 6));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        let words: Vec<Word> = (0..3).flat_map(|_| pairs.iter().flat_map(|&(x, y)| [w(x), w(y)])).collect();
+        m.mem.load_words(table, &words);
+    };
+    let (st, fast) = both_ways_jit(1, setup, &prog, 400);
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(fast.cpu.jit_stats()[2] > 50, "compiled code ran: {:?}", fast.cpu.jit_stats());
+    let _ = fast;
+    assert_ne!(reg_in(&st, 11), 0);
+}
+
+#[test]
+fn a_word_load_one_past_its_page_misses_the_window() {
+    // the last word of page 1, then the first of page 2, which is mapped
+    // to frame 5 (frame 2, next in host memory, is not mapped)
+    let last = PAGE + 9840;
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, last));
+    prog.push(isa::s6(op::LIQ, 0, 9, 4));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::MEM, mem::LDW, 5, 2, 0));
+    prog.push(isa::rrr(op::MEM, mem::LDW, 6, 2, 1));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(5, 1, 1, -1))).unwrap(); // page 2 -> frame 5
+        m.mem.write_word(last, w(111)).unwrap();
+        m.mem.write_word(2 * PAGE - 9840, w(222)).unwrap();
+        m.mem.write_word(5 * PAGE - 9840, w(555)).unwrap();
+    };
+    let (st, _) = both_ways_jit(1, setup, &prog, 40);
+    assert_eq!((reg_in(&st, 5), reg_in(&st, 6)), (111, 555));
+}
+
+#[test]
+fn a_call_linking_into_its_target_register_in_compiled_code() {
+    // JALR r6, r6: the target is r6 as it was, then r6 gets the link
+    let mut prog = Vec::new();
+    prog.push(isa::s6(op::LIQ, 0, 9, 30)); // word 0
+    let top = prog.len() as i64; // word 1
+    prog.extend(isa::wide(op::LEA, 0, 6, 0, (7 - 1) * 3)); // words 1, 2: r6 = sub
+    prog.push(isa::rrr(op::JALR, 0, 6, 6, 0)); // 3: call sub, the link in r6
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1)); // 4
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here)); // 5
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0)); // 6
+    prog.push(isa::rrr(op::ALUQ, alu::ADD, 5, 5, 1)); // 7: sub
+    prog.push(isa::rrr(op::JALR, 0, 0, 6, 0)); // 8: return
+    let st = both_ways(|_| {}, &prog, 400);
+    assert_eq!(reg_in(&st, 5), 30, "every call reached sub");
+}

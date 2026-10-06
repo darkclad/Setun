@@ -130,8 +130,26 @@ time for the same work:
 
 The JIT compiles on background threads (all cores but one, at most 8),
 which take regions from one shared queue, so a long compile holds up no
-other (short workloads otherwise wait for code); `SETUN_JIT_OFF=1` measures the interpreter alone. The browser
-build (WebAssembly, no JIT) boots Trinux at about 125 MIPS, up from 11.
+other (short workloads otherwise wait for code); `SETUN_JIT_OFF=1` measures the interpreter alone.
+
+**The browser build has a JIT of its own** (`crates/core/src/wjit.rs`): the
+same regions, compiled to small WebAssembly modules instead of machine code.
+A module imports the emulator's memory and function table, keeps guest
+registers in wasm locals and S and C lazily, goes through the same windows
+for loads and stores, and calls the helpers by their index in the table (in
+wasm a function pointer is one); jumps within the region go round a
+`br_table` dispatch loop. The module cannot compile code itself, so the page
+does: it takes each module (`setun_jit_take`), compiles it in the
+background, adds its `run` to the table and reports the index
+(`setun_jit_done`); the CPU installs it at its next look, as with the native
+compiler threads. Trinux logging in and running md5sum over `/bin/sh` 20
+times (429M instructions) under node: 108 MIPS interpreted, 288 MIPS with the
+JIT (`tools/wjit.mjs`, which also checks the transcripts match). Its tests
+are the native ones: `crates/wtest` compiles `crates/core/tests/fast_path.rs`
+to wasm, with the host compiling each module as it is queued, and
+`tools/wtest.mjs` runs them under node; each deliberately broken piece of
+the code generator tried (carries, branches on C, the window's range, tryte
+stores, JALR, the product's correction) makes one fail.
 
 Against the same code compiled natively for the host (`setun-bench
 --vs-native`, Rust ports that follow the Trine source line by line, results
@@ -149,11 +167,10 @@ about half again what the host needs). Both run 95% compiled.
 
 ## Next
 
-- **Trine:** more locals in registers (tryte and `char` locals, more than
-  nine), word-at-a-time `memcpy`/`strlen` in the runtime, and branch
+- **Trine:** more locals in registers (more than nine), and branch
   inversion (`if (c) break;` still costs a branch around a branch).
-- **JIT coverage:** tryte loads and stores, FPU instructions and JALR (call
-  returns) still leave or call out; inlining them and following returns
-  would keep more code native.
-- **A WebAssembly JIT** for the browser build, which has only the
-  interpreter.
+- **JIT coverage:** FADD/FMUL/FDIV still call the interpreter's code; the
+  browser JIT also leaves the FPU and the tritwise functions to the helpers
+  and the interpreter.
+- **Compile latency:** hot code waits for its region (about 2.5M of the shell
+  workload's 28M instructions run interpreted meanwhile).
