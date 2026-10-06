@@ -20,18 +20,36 @@ The sections run bottom-up. Each has a lead, a table of components (the ternary-
 
 Setun-11̅ is ternary from the ISA up; silicon and native links remain. Eight layers stack from the number system up to software. Tooling (§10) checks all of them, and one border layer (§9) is the only place binary is allowed in.
 
-| § | Layer | State |
-|---|---|---|
-| 8 | Software stack | Core done: Trinux and self-hosting done; three-way idioms next |
-| 7 | Security and cryptography | Binary side done: border crypto done; lattice and GF(3) designs ahead |
-| 6 | Interconnect, I/O and networking | Binary side done: binary network stack done; native ternary links ahead |
-| 5 | Data formats | Binary side done: text and executables done; float standard and codecs ahead |
-| 4 | Memory and storage | Core done: addressing, paging and tfs done; ECC and caches ahead |
-| 3 | CPU and ISA | Core done: core ISA and FPU done; trit masks, atomics, vectors ahead |
-| 2 | Physical layer and circuits | Research only: requirements only; the emulator is the machine |
-| 1 | Number and logic foundations | Core done: balanced arithmetic and Kleene logic done; trit type ahead |
-| 9 | Binary border (beside all layers) | One layer of adapters: octets, text, integers, floats, hashes, gateway |
-| 10 | Tooling and verification (under all layers) | Reference interpreter, fuzzing, conformance |
+```mermaid
+flowchart LR
+    T["10 · Tooling and verification<br/>reference interpreter, fuzzing, conformance"]
+    subgraph stack ["Ternary-native layers, bottom-up"]
+        direction BT
+        L1["1 · Number and logic foundations<br/>balanced arithmetic, Kleene logic done; true/unknown/false next"]
+        L2["2 · Physical layer and circuits<br/>requirements only; the emulator is the machine"]
+        L3["3 · CPU and ISA<br/>core ISA and FPU done; masks, atomics, vectors next"]
+        L4["4 · Memory and storage<br/>addressing, paging, tfs done; ECC as a spec"]
+        L5["5 · Data formats<br/>text, executables done; float standard, codecs ahead"]
+        L6["6 · Interconnect, I/O, networking<br/>binary stack done; native ternary links ahead"]
+        L7["7 · Security and cryptography<br/>border crypto done; ML-KEM, GF(3) research ahead"]
+        L8["8 · Software stack<br/>Trinux, self-hosting done; ternary idioms next"]
+        L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7 --> L8
+    end
+    B["9 · Binary border<br/>octets, text, integers, floats, hashes, gateway"]
+    W(["binary world"])
+    T -. checks .-> stack
+    stack <--> B <--> W
+    classDef done fill:#dcefdc,stroke:#2e7d32,color:#111
+    classDef partial fill:#fdf0d0,stroke:#b7791f,color:#111
+    classDef research fill:#ececec,stroke:#777,color:#111,stroke-dasharray:4 3
+    classDef border fill:#dce9fb,stroke:#1f5fbf,color:#111,stroke-width:2px
+    class L1,L3,L4,L8 done
+    class L5,L6,L7 partial
+    class L2 research
+    class B border
+```
+
+Green: core done. Amber: the binary side is done, the ternary-native side is ahead. Grey: research only.
 
 ## 1. Number and logic foundations
 
@@ -43,13 +61,13 @@ The arithmetic is done: Setun-11̅ has balanced integers, tritwise logic and nat
 | Integers | Tryte ±9,841, word ±3.8×10¹²; no unsigned types | Symmetric ranges, no sign extension, one compare instruction | Done |
 | Division | `DIVR` rounds to nearest; `MODR` remainder with \|r\| ≤ \|b\|/2 | Rounding falls out of the arithmetic | Done |
 | Logic primitives | `MIN` (and), `MAX` (or), `NEG` (not), `TMUL`, `TSAT`, `CONS` (consensus) | Kleene logic in one instruction; consensus has no binary equivalent | Done |
-| Truth type in languages | A `trit` type: false / unknown / true, with Kleene `and`, `or`, `not`. A plain `if` on a trit is refused; a three-arm form (true / unknown / false) compiles to one `BR3` | NULL, `Option` and "not known yet" without a separate flag | Planned |
+| Truth type in languages | Trine already has `trit`, `&` (min), `\|` (max), `~` (= `-x`), `<=>` and `sign`. Missing: `true`/`unknown`/`false` as +1/0/−1, `b_true`/`b_false` for binary logic, and refusing `if` on a trit (§A1) | NULL, `Option` and "not known yet" without a separate flag | Partial |
 | Logic algebra and minimization | Canonical forms and minimizers (ternary Karnaugh maps, Quine–McCluskey) for 3-valued functions | Compilers and chip design need them; the binary versions don't apply | Research |
 | Packing two-state data | A tlibc flag-set module first: 3 flags in 2 trits, 19 flags in 12 trits (99.9% efficient) | Recovers the 0.415 bit lost per flag stored alone | Planned |
 
 Decided 2026-10-06:
 
-- Trine gets a `trit` type with Kleene `and`, `or`, `not`. An `if` on a trit does not compile; the program must say what unknown does, in a three-arm form.
+- Trine's existing `trit` type is the Kleene truth type, with `&`, `|` and `~` as and, or, not, and `true` = +1, `unknown` = 0, `false` = −1. Binary logic uses `b_false` = 0 and `b_true` = `!b_false`. An `if` on a trit does not compile; the program must say what unknown does, with `sign` (§A1).
 - Packed flags start as a tlibc library. They become a language feature only if they see heavy use.
 
 ## 2. Physical layer and circuits
@@ -173,8 +191,8 @@ The system software exists and builds itself: Trinux, tlibc, Trine and the `tas`
 | --- | --- | --- | --- |
 | Operating system | Trinux: POSIX interfaces, a tryte is the "byte" (`CHAR_BIT` = 9), text in code points | Unix programs port with few changes | Done |
 | Language and compiler | Trine; `tric` compiles itself to a fixed point | The ecosystem grows from inside the machine | Done |
-| Three-way control flow | `match` on a comparison with `<`, `=`, `>` arms, compiled to one `BR3` | The C convention (<0, 0, >0) becomes a first-class branch | Planned |
-| Trit operations in place of bit tricks | Count of + and − trits, leading-zero trits, trit reversal, packed flag sets | Replaces popcount, clz and bitmask idioms | Planned |
+| Three-way control flow | `sign (a <=> b) { neg: … zero: … pos: … }`, compiled to one `CMP` and one `BR3` | The C convention (<0, 0, >0) becomes a first-class branch | Done |
+| Trit operations in place of bit tricks | `TLZ` (leading zero trits) exists; add counts of + and − trits, trit reversal (§A3) and packed flag sets | Replaces popcount, clz and bitmask idioms | Partial |
 | Data structures | 3-ary heaps; B-trees with 27 or 81 keys per node; hash tables of 3^k buckets indexed by trits; ternary search tries | Wider fan-out means shallower trees | Planned |
 | Algorithms | Radix sort in base 27; radix-3 FFT and number-theoretic transforms | Natural digit size, no conversions | Planned |
 | Optimizer in `tric` | Port the host optimizer (register locals, peephole) into the self-hosted compiler | Optimized builds made on the machine itself | Planned |
@@ -217,12 +235,174 @@ The emulator's reference interpreter is the definition of the machine, and every
 
 Ternary idioms come first; hardware stays research. Phases run in order, and each gate must pass before the next phase starts.
 
-| Phase | Sections | Work | Gate to pass |
-|---|---|---|---|
-| Done (October 2026) | – | Balanced arithmetic, ISA v0.6, emulator with JIT, BIOS; Trinux, binary network stack to TLS 1.3, self-hosting S1–S3 | – |
-| **A · Ternary idioms** (next) | 1, 3, 5, 8 | `trit` type and three-arm `if` in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes | Programs branch with `BR3` and write with masks; negative tests pass |
-| B · Formats, reliability | 4, 5, 9, 10 | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine | Conformance suites published for the ISA, floats and formats |
-| C · Native networking | 6, 7 | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU | `ssh` between two Setun machines over the native stack |
-| Ongoing research (alongside every phase) | 1, 2, 7 | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator | – |
+```mermaid
+flowchart TB
+    D["Done, October 2026<br/>ISA v0.6, emulator with JIT, BIOS, Trinux,<br/>binary network stack to TLS 1.3, self-hosting S1–S3"]
+    A["A · Ternary idioms<br/>sections 1, 3, 5, 8"]
+    GA{{"Gate A: programs branch with BR3 and write<br/>with masks; negative tests pass"}}
+    B["B · Formats, reliability<br/>sections 4, 5, 9, 10"]
+    GB{{"Gate B: conformance suites published<br/>for the ISA, floats and formats"}}
+    C["C · Native networking<br/>sections 6, 7"]
+    GC{{"Gate C: ssh between two Setun machines<br/>over the native stack"}}
+    R["Ongoing research, alongside every phase<br/>sections 1, 2, 7"]
+    D --> A --> GA --> B --> GB --> C --> GC
+    R -.- A
+    R -.- B
+    R -.- C
+    classDef done fill:#ececec,stroke:#777,color:#111
+    classDef next fill:#dce9fb,stroke:#1f5fbf,color:#111,stroke-width:2px
+    classDef gate fill:#fff,stroke:#777,color:#111
+    classDef research fill:#fff,stroke:#777,color:#111,stroke-dasharray:4 3
+    class D done
+    class A next
+    class GA,GB,GC gate
+    class R research
+```
+
+| Phase | Work |
+|---|---|
+| **A · Ternary idioms** (next) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
+| B · Formats, reliability | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
+| C · Native networking | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
+| Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 
 Phase A comes first because it is software only and makes every later layer think in trits. There is no hardware phase: the emulator is the only machine, and devices, HDL and circuits stay ongoing research (decided 2026-10-06).
+
+## Phase A in detail
+
+Phase A is software and ISA work on the emulator, in six parts. Each part lists its design, what already exists, and the negative tests that gate it. Encodings use free slots: ALU functions above 27, 1-word majors 8 to 11, MODE trit 19 and vector −13 are all unused in ISA v0.6.
+
+### A1. Kleene logic in Trine
+
+Trine already has most of a three-valued logic. `trit` is a type, `&` and `|` are tritwise min and max, `~x` is `-x`, `<=>` returns a trit, and `sign (e)` branches three ways on one `BR3`. What is missing is a consistent meaning of true and false.
+
+**The conflict.** Kleene logic built on min and max needs false = −1, unknown = 0, true = +1. Trine today has `true` = 1 and `false` = 0, and a condition is true when it is non-zero. Under that rule a trit of −1 counts as true, which is the opposite of Kleene false.
+
+**Decided 2026-10-06: ternary first.** The plain names are the ternary truth values, and binary truth gets its own names for translated binary logic.
+
+| Name | Type | Value | Meaning |
+|---|---|---|---|
+| `true` | `trit` | +1 | Kleene true |
+| `unknown` | `trit` | 0 | Kleene unknown (a new keyword) |
+| `false` | `trit` | −1 | Kleene false |
+| `b_false` | `int` | 0 | binary false, as in C |
+| `b_true` | `int` | `!b_false` = 1 | binary true; any non-zero value tests as true |
+
+Binary logic keeps its usual rule, false is 0 and true is "not false", so +1 and −1 both test as binary true. That rule now lives only in the `b_` names and in conditions on integers.
+
+| a & b (min) | b = `false` | b = `unknown` | b = `true` |
+|---|---|---|---|
+| a = `false` | `false` | `false` | `false` |
+| a = `unknown` | `false` | `unknown` | `unknown` |
+| a = `true` | `false` | `unknown` | `true` |
+
+`|` is the same table with max, and `~` swaps `true` and `false`. Implication is `~a | b`. This is Kleene's logic, not Łukasiewicz's: unknown implies unknown gives unknown.
+
+Rules:
+
+- A condition (`if`, `while`, `for`, `?:`, `!`, `&&`, `||`) takes an integer, tested the binary way: zero is false, anything else is true.
+- An expression of type `trit` is refused as a condition, because the binary test would make `false` (−1) count as true. The error names the fix: `sign (t) { neg: … zero: … pos: … }`, or an explicit `t == true`.
+- `if (a <=> b)` is refused by the same rule; the message suggests `a != b`.
+- Comparisons (`<`, `==`, …) return `int` `b_true` or `b_false` and stay valid conditions.
+- `true`, `false` and `unknown` do not convert to `int` implicitly. `t as int` is the explicit form.
+
+**Migration.** This changes the value of `false` from 0 to −1, so silent changes of meaning must be impossible. The last rule makes every old use of `true` or `false` as an integer a compile error. `var done: int = false`, `while (true)` and `return true` from an `int` function each stop compiling, and the fix is `b_false`, `loop { }` or `b_true`. The compiler finds every line, and the fixes go in the same change as the rule. Today no Trine code uses `true`, `false` or `unknown` outside strings and comments, so the migration starts close to empty. The bootstrapped `tric` is rebuilt to its fixed point afterwards.
+
+Negative tests: each refused form above gives its error and message; `true`, `false` and `unknown` assigned to an `int` without `as`; `unknown` as an identifier now refused; `t as int` accepted as a condition, because the program has said it wants integer truth; the S1–S3 fixed point still reached after the migration.
+
+### A2. Trit-mask merge and masked store
+
+One mask trit per data trit says what happens: **0 keeps** the old trit, **+1 takes** the source trit, **−1 clears** to 0.
+
+| Instruction | Encoding | Operation |
+|---|---|---|
+| `MRG rd, ra, b` | ALU function 28, all three forms | per trit i: `ra[i]` = 0 → `rd[i]` unchanged; +1 → `b[i]`; −1 → 0. Reads `rd`; sets S from the result |
+| `STWM rd, [ra], rb` | new 1-word major 8 (`MEMR`), function 1, R format | the word at `ra` := merge(old word, `rd`, mask `rb`), as one atomic read-modify-write |
+
+- With today's instructions a merge takes six ALU operations and four temporaries: `TMUL m,m` (where the mask is non-zero), `TMUL` with `rd` and a `SUB` to clear those trits, `MAX m,0` (where it is +1), `TMUL` with the source, and an `ADD`. The trits are disjoint, so no carries occur. `MRG` does it in one.
+- `STWM` has no offset, because the R format has room for three registers and none for an immediate; the address is computed first (decided 2026-10-06). The address must be a multiple of 3 (else vector −5) and obeys page permissions (vector −4).
+- Uses: page-table entry flags (`V`, `AD`, `RING`) updated in one store, device control registers, flag words shared between the kernel and drivers, and window-system dirty flags.
+
+Negative tests: unaligned `STWM`; `STWM` to a read-only page; `MRG` with an all-zero mask (no change, S from the old value); reserved functions of major 8.
+
+### A3. Trit counting and reversal
+
+`TLZ` (ALU function 22) already counts leading zero trits. Three functions complete the set:
+
+| Instruction | ALU function | Operation |
+|---|---|---|
+| `TCP rd, ra, b` | 29 | number of +1 trits in the low `b` trits of `ra` (`b` = 0 means all 27) |
+| `TCN rd, ra, b` | 30 | number of −1 trits in the same field |
+| `TREV rd, ra, b` | 31 | the low `b` trits of `ra` in reverse order (`b` = 0: all 27) |
+
+- `TCP + TCN` is the number of non-zero trits; `TCP − TCN` is the trit balance. Together they replace binary popcount.
+- `TREV` gives the trit-reversal permutation of a radix-3 FFT, the job bit reversal does in a radix-2 FFT.
+- Trine gets builtins with the same names; packed flag sets (§1) use `TCP` to count set flags.
+
+Negative tests: `b` outside 0…27 raises `ILL`; `b` = 9 on a tryte value; results on 0 and on the extreme words ±3,812,798,742,493.
+
+### A4. Three-state atomics
+
+| Instruction | Encoding | Operation |
+|---|---|---|
+| `CAS3 rd, [ra], rb` | major 8 (`MEMR`), function 2 | `old` := word at `ra`; S := sign(`old` − `rd`), exact; if S = 0, the word := `rb`; then `rd` := `old`. Atomic |
+
+A `BR3` right after `CAS3` sees three outcomes: the word was smaller than expected, equal (swapped), or larger.
+
+A mutex fits one trit: **0 free, +1 held, −1 held with waiters**.
+
+1. Lock: `CAS3` expecting 0, new value +1. Equal → done. Otherwise `SWAP` in −1; if the old value was not 0, sleep in a futex-style wait until woken, then retry.
+2. Unlock: `SWAP` in 0. If the old value was −1, wake one waiter.
+
+This is the classic futex mutex, which binary systems encode as 0/1/2. Here "held" and "held with waiters" are the two signs of one trit. Trinux needs a new wait/wake system call for it.
+
+Negative tests: unaligned `CAS3`; `CAS3` on a read-only page leaves memory unchanged and raises vector −4; the three S outcomes each checked by a `BR3`; a lock stress test with preemption on.
+
+### A5. Vector unit
+
+- **Registers:** `v−13 … v13`, 81 trits each; `v0` reads as zero. A register is 9 tryte lanes or 3 word lanes.
+- **Enable and lazy switching:** MODE trit 19 becomes `VE`. With `VE` = 0, any vector instruction raises vector −13 (vector unit not available), so Trinux saves and restores the registers only for tasks that use them, as for the FPU. The state is 26 × 9 = 234 trytes per task.
+
+| Major | Name | Format | Operations |
+|---|---|---|---|
+| 9 | `VALU` | R on v registers | function 1–27: the ALU operation of that number on 9 tryte lanes; 28–54: the same on 3 word lanes. Only lane-wise operations are valid (`ADD`, `SUB`, `MIN`, `MAX`, `TMUL`, `TSAT`, `CONS`, `NEG`, `ABS`, `SGN`, `MRG`); others raise `ILL` |
+| 10 | `VMEM` | Q | `VLD`/`VST` 9 trytes at `ra + 9·q3`; the address must be a multiple of 9 |
+| 11 | `VMOV` | Q | lane `q3` to or from a general register; broadcast a general register to every lane |
+
+Two reductions go under `VALU`:
+
+- `VSUM rd, va`: `rd` (a general register) := the sum of the tryte lanes of `va`.
+- `VDOTW rd, va, vb`: `rd` := Σ `va.tryte[j]` × `vb.trit[j]`, with one weight trit per lane. Each product is a pass, a negation or a zero, so no multiplier is needed. This is the inner loop of a ternary-weight neural network.
+
+Trine gets these as builtins on a `[9]tryte` value first; a vector type can come later.
+
+Negative tests: any vector instruction with `VE` = 0 raises −13 and changes nothing; unaligned `VLD`; a non-lane-wise function under `VALU`; lane index out of range in `VMOV`; a context switch between two tasks that both use vectors.
+
+### A6. Text beyond U+2671
+
+A character is 1 or 3 trytes:
+
+| Character | Trytes |
+|---|---|
+| code point c ≤ 9841 | `c` |
+| the same, overlined (c ≥ 33) | `−c` |
+| code point c > 9841 | `−1`, then c as an 18-trit balanced number in 2 trytes (high, low) |
+| the same, overlined | `−2`, then the same 2 trytes |
+| `−3 … −32` | reserved: refused by every decoder |
+
+This gives meaning to trytes −1 and −2, which ISA §1.1 now reserves ("−1…−32 mean nothing"), so §1.1 changes with it.
+
+- Two trytes hold 3^18 values, far more than Unicode's 1,114,112, so every code point fits.
+- Every existing file stays valid, because all text today is at or below 9841.
+- The form is not self-synchronizing: a trailing tryte can look like an ordinary character. Text is decoded forward from a known start, as Trinux does now. Backward scanning restarts from the line start.
+- `strlen` keeps counting trytes. tlibc gets `tstr_next`, `tstr_chars` and a decoder that reports errors; `utf8_encode`/`utf8_decode` handle the escape at the border.
+- The font path needs glyphs beyond the current 353 (Latin-1, Cyrillic, №): a 16×16 font for CJK, shipped in the disk image and loaded on demand.
+
+Negative tests: a lead tryte at the end of a string; a code point above U+10FFFF; surrogates U+D800–U+DFFF; leads −3…−32; an escape that encodes a code point ≤ 9841 (an overlong form, refused as in UTF-8); round trips through UTF-8 for every edge value.
+
+### Decided for phase A (2026-10-06)
+
+- Truth values are ternary first: `true` = +1, `unknown` = 0, `false` = −1; binary logic uses `b_false` = 0 and `b_true` = `!b_false` (§A1).
+- `STWM` stays a 1-word instruction without an offset; the address is computed first.
+- `VDOTW` takes one weight trit per lane, in the low trit of each of the 9 tryte lanes of `vb`.
+- The 16×16 CJK font ships in the disk image, under `/usr/share` next to `font8x8`, and `gfx.tri` loads it on demand.
