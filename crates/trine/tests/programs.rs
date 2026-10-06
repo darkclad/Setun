@@ -525,3 +525,46 @@ fn binary_builtins_check_their_fields() {
     assert!(compile_err("fn main() -> int { return bxor(1); }").contains("argument"));
     assert!(compile_err("fn main() -> int { var r: real = 1.0; return band(r, 1); }").contains("int"));
 }
+
+#[test]
+fn unreached_functions_are_left_out() {
+    // kept: what main calls, a function only passed as a pointer, one only
+    // in a global initialiser, one named only in inline assembly, one with
+    // inline assembly of its own (its labels are used through `extern fn`),
+    // an interrupt handler and what each of them calls; left out: the rest,
+    // after their bodies are still checked
+    let src = "extern fn quad(x: int) -> int;
+    fn used(x: int) -> int { return helper(x) + 1; }
+    fn helper(x: int) -> int { return x * 2; }
+    fn by_pointer(x: int) -> int { return x + 100; }
+    fn in_table(x: int) -> int { return x + 1000; }
+    fn in_asm_text(x: int) -> int { return x + 10000; }
+    fn asm_lib() { asm { \"        b quad_end\" \"quad: mul r1, r1, 4\" \"        ret\" \"quad_end:\" } }
+    interrupt fn on_irq() { never_called_from_main(); }
+    fn never_called_from_main() { }
+    fn unused_leaf(x: int) -> int { return x * 777; }
+    fn unused_caller() -> int { return unused_leaf(3) + unused_too(); }
+    fn unused_too() -> int { return 5; }
+    var table: [1]fn(int) -> int = { in_table };
+    fn apply(f: fn(int) -> int, v: int) -> int { return f(v); }
+    fn main() -> int {
+        var r: int = used(1) + apply(&by_pointer, 0) + table[0](0) + quad(1);
+        asm { \"        li r1, 0\" \"        call in_asm_text\" }
+        return r;
+    }";
+    let b = build_source("test.tri", src, None, &Options::rom()).unwrap_or_else(|e| panic!("{e}"));
+    let labels: Vec<&str> = b.asm.lines().filter_map(|l| l.strip_suffix(':')).collect();
+    for f in ["main", "used", "helper", "by_pointer", "in_table", "in_asm_text", "asm_lib", "on_irq", "never_called_from_main", "apply"] {
+        assert!(labels.contains(&f), "{f} was left out");
+    }
+    for f in ["unused_leaf", "unused_caller", "unused_too"] {
+        assert!(!labels.contains(&f), "{f} was kept");
+    }
+    assert_eq!(exit(src), 3 + 100 + 1000 + 4);
+    // unoptimized output keeps them all (it is what tric matches)
+    let plain = build_source("test.tri", src, None, &Options { optimize: false, ..Options::rom() }).unwrap();
+    assert!(plain.asm.lines().any(|l| l == "unused_leaf:"), "unoptimized output keeps every function");
+    // a function nothing calls is still checked
+    let e = compile_err("fn unused() -> int { return nope; }\nfn main() -> int { return 0; }");
+    assert!(e.contains("unknown name `nope`"), "{e}");
+}

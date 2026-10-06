@@ -40,8 +40,88 @@ fn strings() {
     memmove(&m[2], &m[0], 5);
     ok("memmove overlapping", m[2] == 0 && m[6] == 4 && m[0] == 0);
     ok("memcmp", memcmp(&m[0], &m[0], 9) == 0);
+    word_wise_memory();
     ok("ctype", isdigit('7') && !isdigit('x') && isalpha('Q') && isspace('\t') && toupper('a') == 'A' && tolower('Z') == 'z' && ispunct('!'));
     ok("ctype overlined", isprint('1̅') && '1̅' == -'1' && !ispunct('1̅') && ispunct('!̅') && !isprint(-' ') && !isprint(-31));
+}
+
+// memcpy, memset, memmove and memcmp go by words where they can: against
+// tryte-by-tryte copies at every offset in the word and length up to 22,
+// overlapping both ways, with negative trytes; memcmp at every difference.
+var mw_a: [60]tryte;
+var mw_b: [60]tryte;
+var mw_r: [60]tryte;
+
+fn mw_fill(seed: int) {
+    var k: int = 0;
+    while (k < 60) {
+        mw_a[k] = ((k * 7919 + seed * 31) % 19683 - 9841) as tryte;
+        mw_b[k] = ((k * 104729 + seed) % 19683 - 9841) as tryte;
+        k += 1;
+    }
+}
+
+fn mw_same(x: *tryte) -> int {
+    var k: int = 0;
+    while (k < 60) { if (x[k] != mw_r[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+fn word_wise_memory() {
+    var good: [4]int = { 1, 1, 1, 1 };
+    var d: int = 0;
+    while (d < 6) {
+        var s: int = 0;
+        while (s < 6) {
+            var n: int = 0;
+            while (n <= 22) {
+                var k: int;
+                // memcpy, b into a
+                mw_fill(d + 7 * s + 49 * n);
+                k = 0; while (k < 60) { mw_r[k] = mw_a[k]; k += 1; }
+                k = 0; while (k < n) { mw_r[d + 3 + k] = mw_b[s + 3 + k]; k += 1; }
+                memcpy(&mw_a[d + 3], &mw_b[s + 3], n);
+                good[0] = good[0] && mw_same(&mw_a[0]);
+                // memset
+                mw_fill(n);
+                k = 0; while (k < 60) { mw_r[k] = mw_a[k]; k += 1; }
+                var v: tryte = (s * 3000 - 7000 + n) as tryte;
+                k = 0; while (k < n) { mw_r[d + 3 + k] = v; k += 1; }
+                memset(&mw_a[d + 3], v, n);
+                good[1] = good[1] && mw_same(&mw_a[0]);
+                // memmove within a, up and down by d - s (+ a word)
+                var to: int = d + 20;
+                var from: int = s + 20 + (n % 2 == 0 ? 3 : -3);
+                mw_fill(s + n);
+                k = 0; while (k < 60) { mw_r[k] = mw_a[k]; k += 1; }
+                var t: [60]tryte;
+                k = 0; while (k < n) { t[k] = mw_a[from + k]; k += 1; }
+                k = 0; while (k < n) { mw_r[to + k] = t[k]; k += 1; }
+                memmove(&mw_a[to], &mw_a[from], n);
+                good[2] = good[2] && mw_same(&mw_a[0]);
+                // memcmp: equal, then one tryte different at each place
+                mw_fill(d);
+                k = 0; while (k < 60) { mw_b[k] = mw_a[k]; k += 1; }
+                var eq: int = memcmp(&mw_a[d + 3], &mw_b[d + 3], n) == 0;
+                var at: int = 0;
+                while (at < n) {
+                    mw_b[d + 3 + at] = (mw_a[d + 3 + at] + (at % 2 == 0 ? 1 : -1)) as tryte;
+                    var want: int = at % 2 == 0 ? -1 : 1;
+                    eq = eq && memcmp(&mw_a[d + 3], &mw_b[d + 3], n) == want;
+                    mw_b[d + 3 + at] = mw_a[d + 3 + at];
+                    at += 1;
+                }
+                good[3] = good[3] && eq;
+                n += 1;
+            }
+            s += 1;
+        }
+        d += 1;
+    }
+    ok("memcpy by words", good[0]);
+    ok("memset by words", good[1]);
+    ok("memmove by words", good[2]);
+    ok("memcmp by words", good[3]);
 }
 
 fn numbers() {

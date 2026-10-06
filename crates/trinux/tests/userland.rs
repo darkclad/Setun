@@ -816,7 +816,16 @@ fn k7_utility_errors() {
 fn k7_libctest_passes() {
     let out = session(&["libctest", "exit"], 500_000_000);
     assert!(!out.contains("FAILED"), "{out}");
-    assert_has(&out, &["libctest: all passed"]);
+    assert_has(
+        &out,
+        &[
+            "libctest: all passed",
+            "memcpy by words ok",
+            "memset by words ok",
+            "memmove by words ok",
+            "memcmp by words ok",
+        ],
+    );
     let n = out.matches(" ok\n").count();
     assert!(n >= 75, "only {n} checks:\n{out}");
 }

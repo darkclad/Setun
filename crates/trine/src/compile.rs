@@ -398,6 +398,133 @@ fn calls_in(stmts: &[Stmt], out: &mut Vec<String>) {
     }
 }
 
+/// Every name `stmts` use (called or not), and each identifier-like word
+/// in their inline assembly: what keeps other functions in the program.
+fn names_in(stmts: &[Stmt], out: &mut Vec<String>) {
+    fn ex(e: &Expr, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Name(n) => out.push(n.clone()),
+            ExprKind::Call(f, args) => {
+                ex(f, out);
+                args.iter().for_each(|a| ex(a, out));
+            }
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => ex(a, out),
+            ExprKind::Binary(_, a, b) | ExprKind::Assign(_, a, b) | ExprKind::Index(a, b) => {
+                ex(a, out);
+                ex(b, out);
+            }
+            ExprKind::Cond(a, b, c) => {
+                ex(a, out);
+                ex(b, out);
+                ex(c, out);
+            }
+            ExprKind::List(xs) => xs.iter().for_each(|a| ex(a, out)),
+            _ => {}
+        }
+    }
+    let one = |s: &Stmt, out: &mut Vec<String>| names_in(std::slice::from_ref(s), out);
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Var(d) => {
+                if let Some(i) = &d.init {
+                    ex(i, out);
+                }
+            }
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => ex(e, out),
+            StmtKind::Block(b) => names_in(b, out),
+            StmtKind::If(c, t, e) => {
+                ex(c, out);
+                one(t, out);
+                if let Some(e) = e {
+                    one(e, out);
+                }
+            }
+            StmtKind::While(c, b) => {
+                ex(c, out);
+                one(b, out);
+            }
+            StmtKind::Loop(b) => one(b, out),
+            StmtKind::For(i, c, st, b) => {
+                if let Some(i) = i {
+                    one(i, out);
+                }
+                if let Some(c) = c {
+                    ex(c, out);
+                }
+                if let Some(st) = st {
+                    ex(st, out);
+                }
+                one(b, out);
+            }
+            StmtKind::Sign { e, neg, zero, pos } => {
+                ex(e, out);
+                for b in [neg, zero, pos] {
+                    names_in(b, out);
+                }
+            }
+            StmtKind::Switch { e, cases, default } => {
+                ex(e, out);
+                for (ks, b) in cases {
+                    ks.iter().for_each(|k| ex(k, out));
+                    names_in(b, out);
+                }
+                if let Some(d) = default {
+                    names_in(d, out);
+                }
+            }
+            StmtKind::Asm(lines) => {
+                for l in lines {
+                    out.extend(l.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(String::from));
+                }
+            }
+            StmtKind::Break | StmtKind::Continue | StmtKind::Return(None) => {}
+        }
+    }
+}
+
+/// The functions a program keeps: those reachable from `main`, the
+/// interrupt handlers, any with inline assembly (which may define labels
+/// that `extern fn`s name) and any named by a global initialiser, and what
+/// they in turn name. The rest are checked but left out (optimized
+/// builds only: the unoptimized output is what `tric` matches).
+fn reachable_fns(items: &[Item]) -> HashSet<String> {
+    let mut bodies: HashMap<&str, &FnDecl> = HashMap::new();
+    for it in items {
+        if let Item::Fn(f) = it {
+            if f.body.is_some() {
+                bodies.insert(f.name.as_str(), f);
+            }
+        }
+    }
+    let mut todo: Vec<String> = vec!["main".into()];
+    for it in items {
+        match it {
+            Item::Fn(f) if f.body.is_some() => {
+                let mut asm = false;
+                scan_body(f.body.as_ref().unwrap(), &mut HashSet::new(), &mut asm);
+                if f.interrupt || asm {
+                    todo.push(f.name.clone());
+                }
+            }
+            Item::Var { decl: d, .. } | Item::Const(d) => {
+                if let Some(e) = &d.init {
+                    names_in(&[Stmt { kind: StmtKind::Expr(e.clone()), pos: d.pos }], &mut todo);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut keep = HashSet::new();
+    while let Some(n) = todo.pop() {
+        if let Some(f) = bodies.get(n.as_str()) {
+            if keep.insert(n) {
+                names_in(f.body.as_ref().unwrap(), &mut todo);
+            }
+        }
+    }
+    keep
+}
+
 /// Where an object lives, for initialisers.
 #[derive(Clone, Copy)]
 enum Place {
@@ -1105,10 +1232,16 @@ impl Compiler {
                 }
             }
         }
+        let keep = reachable_fns(items);
         for it in items {
             if let Item::Fn(f) = it {
                 if f.body.is_some() {
+                    // an unreached one is still checked, then dropped
+                    let mark = self.code.len();
                     self.function(f)?;
+                    if self.optimize && !keep.contains(&f.name) {
+                        self.code.truncate(mark);
+                    }
                 }
             }
         }
