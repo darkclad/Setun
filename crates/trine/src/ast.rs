@@ -55,6 +55,8 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
+    /// A Kleene truth value, a `trit`: `true` +1, `unknown` 0, `false` −1.
+    Truth(i64),
     /// A decimal real literal.
     Real(String),
     Char(i64),

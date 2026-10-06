@@ -48,7 +48,9 @@ fn same_as_host(s: &mut Session, p: &str) {
 /// /usr/lib/trine, and for each program the host compiler's unoptimized
 /// assembly as /usr/src/P.s.
 fn disk_with_trine(progs: &[&str], extra: &[(&str, &str)]) -> Vec<i16> {
-    let dir = std::env::temp_dir().join(format!("setun-tric-{}-{}", std::process::id(), progs.join("-")));
+    // (one directory per call: tests run in parallel)
+    let first = extra.first().map_or("", |e| e.0);
+    let dir = std::env::temp_dir().join(format!("setun-tric-{}-{}-{first}", std::process::id(), progs.join("-")));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut files = trinux::default_files();
@@ -218,6 +220,13 @@ fn tric_reports_errors_as_the_host_does() {
         ("noaddr.tri", "fn main() -> int { var p: *int = &5; return 0; }\n"),
         ("block.tri", "fn main() -> int {\n"),
         ("escape.tri", "fn main() -> int { return '\\q'; }\n"),
+        // Kleene truth values (TERNARY_WORLD A1)
+        ("tritcond.tri", "fn main() -> int { var t: trit = unknown; if (t) { return 1; } return 0; }\n"),
+        ("truecond.tri", "fn main() -> int { while (true) { } return 0; }\n"),
+        ("cmp3cond.tri", "fn main() -> int { var a: int = 1; if (a <=> 2) { return 1; } return 0; }\n"),
+        ("truthint.tri", "fn main() -> int { var done: int = false; return done; }\n"),
+        ("truthret.tri", "fn f() -> int { return ~true | unknown; }\nfn main() -> int { return f(); }\n"),
+        ("unknownid.tri", "fn main() -> int { var unknown: int = 1; return unknown; }\n"),
     ];
     let disk = disk_with_trine(&[], bad);
     let mut s = Session::boot_disk(&disk, false);
@@ -291,3 +300,35 @@ fn tas_reports_errors_with_their_lines() {
     has(&o, &["status 0", "57 /tmp/r"]);
 }
 
+
+/// Kleene truth values (TERNARY_WORLD A1): true, unknown, false as trits,
+/// b_true and b_false, & | ~ on trits, a trit tested on purpose.
+const KLEENE: &str = "fn and3(a: trit, b: trit) -> trit { return a & b; }
+fn or3(a: trit, b: trit) -> trit { return a | b; }
+fn not3(a: trit) -> trit { return ~a; }
+fn main() -> int {
+    var v: [3]trit = { false, unknown, true };
+    var r: int = 0;
+    var i: int = 0;
+    while (i < 3) {
+        if (and3(v[i], true) != v[i] || or3(v[i], false) != v[i]) { r += 1; }
+        if (not3(v[i]) != v[2 - i]) { r += 10; }
+        i += 1;
+    }
+    var t: trit = ~true & unknown;
+    var n: int = 0;
+    while (b_true) { n += 1; if (n == 3 || b_false) { break; } }
+    sign (t) { neg: { r += 0; } zero: { r += 100; } pos: { r += 100; } }
+    if ((t as int) == -1 && t == false) { return r; }
+    return r + 1000;
+}
+";
+
+#[test]
+fn tric_compiles_truth_values_as_the_host_does() {
+    let opts = trine::Options { optimize: false, ..trine::Options::user() };
+    let want = trine::build_source("/usr/src/kleene.tri", KLEENE, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
+    let disk = disk_with_trine(&[], &[("kleene.tri", KLEENE), ("kleene.s", &want)]);
+    let mut s = Session::boot_disk(&disk, false);
+    tric_compare(&mut s, "kleene", "/usr/src/kleene.tri");
+}

@@ -272,7 +272,9 @@ Phase A comes first because it is software only and makes every later layer thin
 
 Phase A is software and ISA work on the emulator, in six parts. Each part lists its design, what already exists, and the negative tests that gate it. Encodings use free slots: ALU functions above 27, 1-word majors 8 to 11, MODE trit 19 and vector −13 are all unused in ISA v0.6.
 
-### A1. Kleene logic in Trine
+### A1. Kleene logic in Trine ✅
+
+**Done (2026-10-06):** in the host compiler and in `tric`, with the same messages (checked by the self-hosting tests, which also compile a program using the truth values with both and compare the assembly). The migration was empty: no Trine code used `true`, `false` or `unknown`, and no condition tested a trit. `&`, `|` and `*` of two trits and `~` of a trit are now typed `trit`, so Kleene functions can return them.
 
 Trine already has most of a three-valued logic. `trit` is a type, `&` and `|` are tritwise min and max, `~x` is `-x`, `<=>` returns a trit, and `sign (e)` branches three ways on one `BR3`. What is missing is a consistent meaning of true and false.
 

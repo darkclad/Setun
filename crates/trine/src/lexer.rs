@@ -30,7 +30,7 @@ pub struct Token {
 
 const KEYWORDS: &[&str] = &[
     "fn", "var", "const", "struct", "return", "if", "else", "while", "for", "loop", "break", "continue", "sign",
-    "switch", "case", "default", "as", "sizeof", "import", "extern", "interrupt", "asm", "true", "false",
+    "switch", "case", "default", "as", "sizeof", "import", "extern", "interrupt", "asm", "true", "false", "unknown", "b_true", "b_false",
     "null", "void", "trit", "tryte", "int", "char", "real",
 ];
 

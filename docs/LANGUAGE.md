@@ -34,7 +34,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 - **Real literals:** `2.5`, `1e10`, `6.02e-23`, `1_000.5`: digits with a point and digits, an exponent, or both (`1.` and `.5` are not reals). A letter right after a number is an error. The value is rounded to the nearest `real`.
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
-- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real`
+- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false unknown b_true b_false null void trit tryte int char real`
 - `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.
 
 ## 3. Types
@@ -52,7 +52,8 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 | `void` | – | | only as a return type or `*void` |
 
 - **There are no unsigned types.** Every integer is balanced signed, so negation is exact and `abs` never overflows.
-- **Truthiness:** a condition is true when it is non-zero. `true` = 1, `false` = 0, `null` = a pointer 0.
+- **Truth values are ternary (Kleene logic):** `true`, `unknown` and `false` are the `trit`s +1, 0 and −1, so `&`, `|` and `~` (min, max, negation) are Kleene's AND, OR and NOT: `unknown & false` is `false`, `unknown | false` is `unknown`. `&`, `|` and `*` of two trits, and `~` of a trit, are trits. The three names never become an `int` implicitly (`var done: int = false` is refused); `t as int` is the explicit form.
+- **Conditions are binary:** `if`, `while`, `for`, `?:`, `!`, `&&` and `||` take an integer, a pointer or a real, true when non-zero. The binary truth values are `b_true` = 1 and `b_false` = 0, both `int`s. **A `trit` is refused as a condition**, because tested that way `false` (−1) would hold: branch three ways with `sign (t) { neg: … zero: … pos: … }`, compare (`t == true`), or convert (`t as int`). `if (a <=> b)` is refused likewise; the fix is `a != b`. `null` is a pointer 0.
 - **Conversions:** implicit only when a value always fits (`trit` → `tryte` → `int`). Everything else needs `as`.
   - Narrowing keeps the low trits: `x as tryte` is `x` wrapped to 9 trits, and `x as trit` is its lowest trit. This is balanced wrapping, so `9842 as tryte` = −9841.
   - Use `sgn(x)` for the sign.

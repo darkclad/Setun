@@ -568,3 +568,64 @@ fn unreached_functions_are_left_out() {
     let e = compile_err("fn unused() -> int { return nope; }\nfn main() -> int { return 0; }");
     assert!(e.contains("unknown name `nope`"), "{e}");
 }
+
+#[test]
+fn kleene_truth_values() {
+    // true +1, unknown 0, false -1; & and | are min and max, ~ negates:
+    // Kleene's tables, checked at run time on variables (no folding)
+    let src = "fn and3(a: trit, b: trit) -> trit { return a & b; }
+    fn or3(a: trit, b: trit) -> trit { return a | b; }
+    fn not3(a: trit) -> trit { return ~a; }
+    fn main() -> int {
+        var v: [3]trit = { false, unknown, true };
+        var r: int = 0;
+        var i: int = 0;
+        while (i < 3) {
+            var j: int = 0;
+            while (j < 3) {
+                var want_and: trit = v[i < j ? i : j];
+                var want_or: trit = v[i > j ? i : j];
+                if (and3(v[i], v[j]) != want_and) { r = r + 1; }
+                if (or3(v[i], v[j]) != want_or) { r = r + 10; }
+                j += 1;
+            }
+            if (not3(v[i]) != v[2 - i]) { r = r + 100; }
+            i += 1;
+        }
+        var t: trit = ~true;
+        if (t != false) { r = r + 1000; }
+        if ((false as int) != -1 || (unknown as int) != 0 || (true as int) != 1) { r = r + 10000; }
+        // binary truth: b_true and b_false are ints; any non-zero value holds
+        var n: int = 0;
+        while (b_true) { n += 1; if (n == 3) { break; } }
+        if (b_false || !b_true || n != 3) { r = r + 100000; }
+        // a trit tested on purpose: as int, compared, or three ways
+        var k: trit = false;
+        if (k as int) { r = r + 0; } else { r = r + 1000000; }
+        if (k == true) { r = r + 1000000; }
+        sign (k) { neg: { r = r + 0; } zero: { r = r + 1000000; } pos: { r = r + 1000000; } }
+        return r;
+    }";
+    assert_eq!(exit(src), 0);
+}
+
+#[test]
+fn kleene_truth_values_refused() {
+    let cases: [(&str, &str); 11] = [
+        ("fn main() -> int { if (true) { return 1; } return 0; }", "a trit is not a condition"),
+        ("fn main() -> int { while (false) { } return 0; }", "a trit is not a condition"),
+        ("fn main() -> int { var t: trit = unknown; if (t) { return 1; } return 0; }", "sign (t)"),
+        ("fn main() -> int { var t: trit = 1; return !t; }", "a trit is not a condition"),
+        ("fn main() -> int { var t: trit = 1; return t && 1; }", "a trit is not a condition"),
+        ("fn main() -> int { var t: trit = 1; return t ? 2 : 3; }", "a trit is not a condition"),
+        ("fn main() -> int { var a: int = 1; if (a <=> 2) { return 1; } return 0; }", "use `a != b`"),
+        ("fn main() -> int { var done: int = false; return done; }", "binary truth is `b_true`/`b_false`"),
+        ("fn f() -> int { return true; } fn main() -> int { return f(); }", "binary truth is `b_true`/`b_false`"),
+        ("fn f(x: int) -> int { return x; } fn main() -> int { return f(unknown); }", "found a truth value"),
+        ("fn main() -> int { var unknown: int = 1; return unknown; }", ""),
+    ];
+    for (src, want) in cases {
+        let e = compile_err(src);
+        assert!(e.contains(want), "{src}\n  gave: {e}");
+    }
+}

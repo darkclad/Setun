@@ -201,14 +201,14 @@ const T_PUNCT: int = 7;
 const T_EOF: int = 8;
 
 // keywords, in the host's order: their codes are 1..
-var kw_list: *char = "fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real ";
+var kw_list: *char = "fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real unknown b_true b_false ";
 // punctuation, longest first (the host's order): codes 1..
 var pu_list: *char = "<<= >>= <=> -> << >> <= >= == != && || += -= *= /= %= &= |= + - * / % < > = ! ~ & | ? : ; , . ( ) [ ] { } @ ";
 
-const KW_COUNT: int = 31;
+const KW_COUNT: int = 34;
 const PU_COUNT: int = 43;
 
-var kw_name: [32]int;                    // keyword code -> name id
+var kw_name: [35]int;                    // keyword code -> name id
 var pu_text: [44]*char;
 
 fn lex_init() {
@@ -519,6 +519,7 @@ const E_CAST: int = 13;
 const E_SIZEOF: int = 14;
 const E_COND: int = 15;
 const E_LIST: int = 16;
+const E_TRUTH: int = 17;                // a Kleene truth value (a trit): v = +1, 0, -1
 
 // binary operators (the host's order)
 const B_ADD: int = 1;
@@ -928,8 +929,11 @@ fn parse_primary() -> int {
     if (k == T_IDENT) { advance(); return new_expr(E_NAME, 0, 0, 0, 0, v, 0, pos); }
     if (k == T_KW) {
         var kw: *char = name_str(kw_name[v]);
-        if (streq(kw, "true")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 1, 0, pos); }
-        if (streq(kw, "false")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 0, 0, pos); }
+        if (streq(kw, "true")) { advance(); return new_expr(E_TRUTH, 0, 0, 0, 0, 1, 0, pos); }
+        if (streq(kw, "unknown")) { advance(); return new_expr(E_TRUTH, 0, 0, 0, 0, 0, 0, pos); }
+        if (streq(kw, "false")) { advance(); return new_expr(E_TRUTH, 0, 0, 0, 0, -1, 0, pos); }
+        if (streq(kw, "b_true")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 1, 0, pos); }
+        if (streq(kw, "b_false")) { advance(); return new_expr(E_INT, 0, 0, 0, 0, 0, 0, pos); }
         if (streq(kw, "null")) { advance(); return new_expr(E_NULL, 0, 0, 0, 0, 0, 0, pos); }
         if (streq(kw, "trit") && tix + 1 < tk_kind.n && tk_kind.p[tix + 1] == T_PUNCT && streq(pu_text[tk_val.p[tix + 1]], "(")) {
             advance();

@@ -348,7 +348,7 @@ fn wrap_trits(v: int, m: int) -> int {
 fn const_eval(x: int) -> int {
     ce_ok = 1;
     var k: int = ex_kind.p[x];
-    if (k == E_INT || k == E_CHAR) { return ex_v.p[x]; }
+    if (k == E_INT || k == E_CHAR || k == E_TRUTH) { return ex_v.p[x]; }
     if (k == E_NAME) {
         var n: int = ex_v.p[x];
         if (lookup_local(n) < 0 && g_kind[n] == G_CONST && g_cv[n] == CV_INT) { return g_val[n]; }
@@ -1166,8 +1166,26 @@ fn real_truth() {
     lab(done);
 }
 
+// Is x made only of truth values (true, unknown, false, under ~, & and |)?
+// Those are trits and stay trits.
+fn is_truth(x: int) -> int {
+    var k: int = ex_kind.p[x];
+    if (k == E_TRUTH) { return 1; }
+    if (k == E_UNARY && ex_op.p[x] == U_NEG) { return is_truth(ex_a.p[x]); }
+    if (k == E_BINARY && (ex_op.p[x] == B_MIN || ex_op.p[x] == B_MAX)) { return is_truth(ex_a.p[x]) && is_truth(ex_b.p[x]); }
+    return 0;
+}
+
+// An expression used as a condition: its truth in r1. A trit is refused:
+// tested the binary way, false (-1) would hold.
 fn condition_value(x: int) {
+    if (ex_kind.p[x] == E_BINARY && ex_op.p[x] == B_CMP3) {
+        fail_at(ex_pos.p[x], "`<=>` gives a trit, which is not a condition: use `a != b` (or `sign (a <=> b) { ... }`)", null);
+    }
     var t: int = expr(x);
+    if (t == t_trit) {
+        fail_at(ex_pos.p[x], "a trit is not a condition (`false` is −1, which would hold): use `sign (t) { neg: ... zero: ... pos: ... }`, or compare, as in `t == true`", null);
+    }
     if (is_real(t)) { real_truth(); return; }
     if (!is_scalar(decay(t))) { m0(); mty(t); ms(" cannot be used as a condition"); fail(ex_pos.p[x]); }
 }
@@ -1314,6 +1332,9 @@ fn zero_object(frame: int, off: int, ty: int) {
 // ---- type rules ----
 
 fn check_assign(dst: int, src: int, x: int) {
+    if ((dst == t_int || dst == t_tryte) && is_truth(x)) {
+        m0(); ms("expected "); mty(dst); ms(", found a truth value (a trit): binary truth is `b_true`/`b_false`, or convert with `as`"); fail(ex_pos.p[x]);
+    }
     src = decay(src);
     var ok: int = 0;
     if (dst == src) { ok = 1; }
@@ -1363,6 +1384,7 @@ fn expr(x: int) -> int {
         else if (k == E_NAME) { t = g_ty[ex_v.p[x]]; }
         else if (k == E_CAST) { t = resolve(ex_v.p[x], pos); }
         else if (k == E_BINARY && ex_op.p[x] == B_CMP3) { t = t_trit; }
+        else if (is_truth(x)) { t = t_trit; }
         e_i("li r1, ", v);
         return t;
     }
@@ -1421,7 +1443,7 @@ fn expr(x: int) -> int {
             if (is_real(nt)) { em("fneg f1, f1"); return t_real; }
             need_integer(nt, ex_pos.p[a]);
             em("neg r1, r1");
-            return t_int;
+            return nt == t_trit ? t_trit : t_int;
         }
         if (op == U_NOT) {
             condition_value(a);
@@ -1645,7 +1667,8 @@ fn arith(op: int, lt: int, rt: int, imm: int, has_imm: int, pos: int) -> int {
     }
     if ((op == B_DIV || op == B_MOD) && has_imm && imm == 0) { fail_at(pos, "division by zero", null); }
     ln(); o(m); o(" r1, r1, "); o_operand(imm, has_imm); nl();
-    return t_int;
+    // min, max and the product of trits are trits
+    return (op == B_MIN || op == B_MAX || op == B_MUL) && lt == t_trit && rt == t_trit ? t_trit : t_int;
 }
 
 fn real_mnemonic(op: int) -> *char {
@@ -1712,7 +1735,7 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
     var v: int = const_eval(b);
     if (ce_ok) {
         var lt: int = decay(expr(a));
-        return arith(op, lt, t_int, v, 1, pos);
+        return arith(op, lt, is_truth(b) ? t_trit : t_int, v, 1, pos);
     }
     var lt2: int = decay(expr(a));
     em("push r1");

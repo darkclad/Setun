@@ -525,6 +525,17 @@ fn reachable_fns(items: &[Item]) -> HashSet<String> {
     keep
 }
 
+/// Is `e` made only of truth values (`true`, `unknown`, `false`, under
+/// `~`, `&`, `|` and parentheses)? Those are trits and stay trits.
+fn is_truth(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Truth(_) => true,
+        ExprKind::Unary(UnOp::Neg, a) => is_truth(a),
+        ExprKind::Binary(BinOp::Min | BinOp::Max, a, b) => is_truth(a) && is_truth(b),
+        _ => false,
+    }
+}
+
 /// Where an object lives, for initialisers.
 #[derive(Clone, Copy)]
 enum Place {
@@ -865,8 +876,18 @@ impl Compiler {
     }
 
     /// An expression used as a condition: its truth in r1 (reals included).
+    /// A trit is refused: tested the binary way, `false` (−1) would hold.
     fn condition_value(&mut self, e: &Expr) -> R<()> {
+        if let ExprKind::Binary(BinOp::Cmp3, ..) = &e.kind {
+            return err(e.pos, "`<=>` gives a trit, which is not a condition: use `a != b` (or `sign (a <=> b) { ... }`)");
+        }
         let t = self.expr(e)?;
+        if t == Ty::Trit {
+            return err(
+                e.pos,
+                "a trit is not a condition (`false` is −1, which would hold): use `sign (t) { neg: ... zero: ... pos: ... }`, or compare, as in `t == true`",
+            );
+        }
         if t.is_real() {
             self.real_truth();
             return Ok(());
@@ -992,7 +1013,7 @@ impl Compiler {
 
     fn const_eval(&self, e: &Expr) -> Option<i64> {
         Some(match &e.kind {
-            ExprKind::Int(v) | ExprKind::Char(v) => *v,
+            ExprKind::Int(v) | ExprKind::Char(v) | ExprKind::Truth(v) => *v,
             ExprKind::Name(n) => match self.lookup_local(n) {
                 Some(_) => return None,
                 None => match self.globals.get(n) {
@@ -2024,6 +2045,12 @@ impl Compiler {
     // ---- type rules ----------------------------------------------------------------
 
     fn check_assign(&self, dst: &Ty, src: &Ty, e: &Expr) -> R<()> {
+        if matches!(dst, Ty::Int | Ty::Tryte) && is_truth(e) {
+            return err(
+                e.pos,
+                format!("expected {}, found a truth value (a trit): binary truth is `b_true`/`b_false`, or convert with `as`", self.tyname(dst)),
+            );
+        }
         let src = src.clone().decay();
         let ok = match (dst, &src) {
             (a, b) if a == b => true,
@@ -2244,6 +2271,7 @@ impl Compiler {
                     },
                     ExprKind::Cast(_, t) => self.resolve(t, e.pos)?,
                     ExprKind::Binary(BinOp::Cmp3, ..) => Ty::Trit,
+                    _ if is_truth(e) => Ty::Trit,
                     _ => Ty::Int,
                 };
                 if !(-3_812_798_742_493..=3_812_798_742_493).contains(&v) {
@@ -2254,7 +2282,7 @@ impl Compiler {
             }
         }
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Char(_) => unreachable!("constants are folded"),
+            ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Truth(_) => unreachable!("constants are folded"),
             ExprKind::Real(t) => {
                 let (r, _) = setun_real::Real::from_decimal(t).map_err(|m| Error { pos: e.pos, msg: m })?;
                 self.load_real(r);
@@ -2329,7 +2357,7 @@ impl Compiler {
                     }
                     self.need_integer(&t, x.pos)?;
                     self.emit("neg r1, r1");
-                    Ok(Ty::Int)
+                    Ok(if t == Ty::Trit { Ty::Trit } else { Ty::Int })
                 }
                 UnOp::Not => {
                     self.condition_value(x)?;
@@ -2616,7 +2644,8 @@ impl Compiler {
             return err(pos, "division by zero");
         }
         self.emit(format!("{m} r1, {left}, {}", operand(imm)));
-        Ok(Ty::Int)
+        // min, max and the product of trits are trits
+        Ok(if matches!(op, BinOp::Min | BinOp::Max | BinOp::Mul) && *lt == Ty::Trit && *rt == Ty::Trit { Ty::Trit } else { Ty::Int })
     }
 
     /// The register holding local `e`, if it is a register local.
@@ -2805,7 +2834,8 @@ impl Compiler {
                 if b_const.is_some() || self.is_simple_operand(b) {
                     let (left, lt) = self.left_operand(a)?;
                     if let Some(v) = b_const {
-                        return self.arith_regs(op, &lt, &Ty::Int, left, Some(v), "r2", pos);
+                        let rt = if is_truth(b) { Ty::Trit } else { Ty::Int };
+                        return self.arith_regs(op, &lt, &rt, left, Some(v), "r2", pos);
                     }
                     let (rreg, rt) = self.simple_operand(b).expect("checked simple");
                     return self.arith_regs(op, &lt, &rt.decay(), left, None, rreg, pos);
