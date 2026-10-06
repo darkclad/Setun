@@ -91,3 +91,8 @@ like the native one), and runs Trinux at a few hundred MIPS at Max (about
 The Setun-70 reference material in `docs/reference/` was collected by Stanislav
 Maslovski ([smaslovski/Setun70](https://github.com/smaslovski/Setun70), GPL-3).
 It is included for study only.
+
+## License
+
+MIT, see [LICENSE](LICENSE). This covers everything in the repository except
+`docs/reference/`, which keeps its original license (GPL-3, see Credits).
