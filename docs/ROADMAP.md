@@ -8,6 +8,8 @@ the machine itself.
 
 ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating-point instructions, §14).
 
+Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole ternary-native world needs, layer by layer, with the decisions taken and a phased plan.
+
 ## Milestones
 
 1. **`ternary` crate** ✅: `Tern<N>`, 9-trit `Tryte`, 27-trit `Word`, trit fields, base-27 notation; the `0t`/`0z`/`0x` literal notation ([`NOTATION.md`](NOTATION.md))
