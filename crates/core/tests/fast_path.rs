@@ -985,3 +985,131 @@ fn a_call_linking_into_its_target_register_in_compiled_code() {
     let st = both_ways(|_| {}, &prog, 400);
     assert_eq!(reg_in(&st, 5), 30, "every call reached sub");
 }
+
+// ---- ternary idioms (ISA v0.7: MRG, TCP, TCN, TREV, STWM) -----------------
+
+/// The vector a trap was taken for (FCAUSE's low five trits).
+fn vector_in(st: &[i64]) -> i64 {
+    let cause = st[5 * (cr::FCAUSE + 13) as usize + 1].rem_euclid(243);
+    if cause > 121 { cause - 243 } else { cause }
+}
+
+#[test]
+fn trit_merge_counts_and_reversal_in_a_compiled_loop() {
+    // MRG in all three forms, TCP/TCN/TREV over all and part of a word,
+    // MRG with an all-zero mask (nothing changes, S from the old value)
+    use setun_core::isa::memr;
+    let (old, mask, src) = (2_222_333_444_555i64, -1_000_000_007i64, 3_141_592_653_589i64);
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, mask));
+    prog.extend(isa::wide(op::LI, 0, 3, 0, src));
+    prog.push(isa::s6(op::LIQ, 0, 9, 12));
+    let top = prog.len() as i64;
+    prog.extend(isa::wide(op::LI, 0, 4, 0, old));
+    prog.push(isa::rrr(op::ALU, alu::MRG, 4, 2, 3)); // r4 := merge(r4, mask r2, src r3)
+    prog.extend(isa::wide(op::LI, 0, 5, 0, old));
+    prog.push(isa::rrr(op::ALUQ, alu::MRG, 5, 2, -13)); // the source an immediate
+    prog.extend(isa::wide(op::LI, 0, 6, 0, old));
+    prog.extend(isa::wide(op::ALUI, alu::MRG, 6, 3, 5_555_555)); // the mask r3, a wide source
+    prog.push(isa::rrr(op::ALU, alu::TCP, 7, 3, 0)); // +1 trits of all 27
+    prog.push(isa::rrr(op::ALUQ, alu::TCN, 8, 3, 9)); // -1 trits of the low 9
+    prog.push(isa::rrr(op::ALU, alu::TREV, 10, 3, 0)); // all 27 reversed
+    prog.extend(isa::wide(op::ALUI, alu::TREV, 11, 2, 13)); // the low 13 reversed
+    prog.extend(isa::wide(op::LI, 0, 12, 0, -old));
+    prog.push(isa::rrr(op::ALU, alu::MRG, 12, 0, 3)); // mask 0: r12 stays, S = sign(-old) < 0
+    prog.push(isa::s6(op::BRQ, 0, cond::LT, 2));
+    prog.push(isa::s6(op::LIQ, 0, 1, 77)); // skipped when S < 0
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let _ = memr::STWM;
+    let (st, fast) = both_ways_jit(1, |_| {}, &prog, 600);
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(fast.cpu.jit_stats()[2] > 100, "the loop ran compiled: {:?}", fast.cpu.jit_stats());
+    let _ = fast;
+    let (o, m, s) = (w(old), w(mask), w(src));
+    assert_eq!(reg_in(&st, 4), o.tritwise_merge(m, s).value());
+    assert_eq!(reg_in(&st, 5), o.tritwise_merge(m, w(-13)).value());
+    assert_eq!(reg_in(&st, 6), o.tritwise_merge(s, w(5_555_555)).value());
+    assert_eq!(reg_in(&st, 7), s.count_pos_low(27) as i64);
+    assert_eq!(reg_in(&st, 8), s.count_neg_low(9) as i64);
+    assert_eq!(reg_in(&st, 10), s.reverse_low(27).value());
+    assert_eq!(reg_in(&st, 11), m.reverse_low(13).value());
+    assert_eq!(reg_in(&st, 12), -old, "a zero mask changes nothing");
+    assert_eq!(reg_in(&st, 1), 0, "S came from the old value");
+}
+
+#[test]
+fn a_masked_store_merges_into_memory() {
+    // STWM r1, [r2], r3: the word at r2 := merge(word, r1, mask r3)
+    use setun_core::isa::memr;
+    let (at, old, val, mask) = (PAGE + 300, 1_234_567_890_123i64, -2_000_000_000_001i64, 987_654_321i64);
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 1, 0, val));
+    prog.extend(isa::wide(op::LI, 0, 2, 0, at));
+    prog.extend(isa::wide(op::LI, 0, 3, 0, mask));
+    prog.push(isa::rrr(op::MEMR, memr::STWM, 1, 2, 3));
+    prog.push(isa::rrr(op::MEM, mem::LDW, 4, 2, 0));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let st = both_ways(move |m: &mut Machine| m.mem.write_word(at, w(old)).unwrap(), &prog, 20);
+    assert_eq!(reg_in(&st, 4), w(old).tritwise_merge(w(mask), w(val)).value());
+}
+
+#[test]
+fn ternary_idioms_refused() {
+    use setun_core::isa::{memr, vector};
+    // (program, setup, the vector it must trap with, a register that must stay 0)
+    let li = |r: i64, v: i64| isa::wide(op::LI, 0, r, 0, v);
+    let at = PAGE + 300;
+    let mut cases: Vec<(Vec<Word>, bool, i64)> = Vec::new();
+    // a field of 28 trits, or -1: ILL, and rd is not written
+    for b in [28, -1] {
+        let mut p = Vec::new();
+        p.extend(li(2, 12345));
+        p.extend(isa::wide(op::ALUI, alu::TCP, 5, 2, b));
+        p.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        cases.push((p, false, vector::ILLEGAL));
+    }
+    let mut p = Vec::new();
+    p.extend(li(2, 12345));
+    p.extend(isa::wide(op::ALUI, alu::TREV, 5, 2, 30));
+    p.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    cases.push((p, false, vector::ILLEGAL));
+    // STWM: a misaligned address
+    let mut p = Vec::new();
+    p.extend(li(2, at + 1));
+    p.extend(li(3, 1));
+    p.push(isa::rrr(op::MEMR, memr::STWM, 1, 2, 3));
+    p.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    cases.push((p, false, vector::MISALIGNED));
+    // STWM to a read-only page (paged: page 1 read-only)
+    let mut p = Vec::new();
+    p.extend(li(1, 777));
+    p.extend(li(2, at));
+    p.extend(li(3, 1));
+    p.push(isa::rrr(op::MEMR, memr::STWM, 1, 2, 3));
+    p.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    cases.push((p, true, vector::PROTECTION));
+    // a function MEMR does not have
+    let mut p = Vec::new();
+    p.extend(li(2, at));
+    p.push(isa::rrr(op::MEMR, 9, 1, 2, 3));
+    p.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    cases.push((p, false, vector::ILLEGAL));
+    for (k, (prog, read_only, want)) in cases.into_iter().enumerate() {
+        let setup = move |m: &mut Machine| {
+            m.mem.write_word(at, w(5)).unwrap();
+            if read_only {
+                paged(m);
+                m.mem.write_word(4 * PAGE + 3, w(pte(1, -1, 1, -1))).unwrap(); // page 1: read only
+            }
+        };
+        let st = both_ways(setup, &prog, 30);
+        assert_eq!(vector_in(&st), want, "case {k}: the trap");
+        assert_eq!(reg_in(&st, 5), 0, "case {k}: rd written");
+        // the word at `at` (frame 1) in the digest: nothing was stored
+        let word = 27 * 5 + 5 + 6561 + ((at - PAGE + 9840) / 3) as usize;
+        assert_eq!(st[word], 5, "case {k}: memory changed");
+    }
+}

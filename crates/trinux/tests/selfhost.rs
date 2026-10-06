@@ -227,6 +227,9 @@ fn tric_reports_errors_as_the_host_does() {
         ("truthint.tri", "fn main() -> int { var done: int = false; return done; }\n"),
         ("truthret.tri", "fn f() -> int { return ~true | unknown; }\nfn main() -> int { return f(); }\n"),
         ("unknownid.tri", "fn main() -> int { var unknown: int = 1; return unknown; }\n"),
+        // ternary idiom builtins (A2, A3)
+        ("stwmptr.tri", "fn main() -> int { var x: int = 1; stwm(x, 1, 1); return 0; }\n"),
+        ("mrgargs.tri", "fn main() -> int { return mrg(1, 2); }\n"),
     ];
     let disk = disk_with_trine(&[], bad);
     let mut s = Session::boot_disk(&disk, false);
@@ -324,11 +327,24 @@ fn main() -> int {
 }
 ";
 
+/// The ternary idiom builtins (TERNARY_WORLD A2, A3).
+const IDIOMS: &str = "var page: [4]int;
+fn main() -> int {
+    var old: int = 2222333444555;
+    var m: int = mrg(old, -1000000007, 3141592653589);
+    var c: int = tcp(m, 0) + tcn(m, 9) + trev(old, 13);
+    stwm(&page[1], m, -9);
+    return c;
+}
+";
+
 #[test]
 fn tric_compiles_truth_values_as_the_host_does() {
     let opts = trine::Options { optimize: false, ..trine::Options::user() };
     let want = trine::build_source("/usr/src/kleene.tri", KLEENE, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
-    let disk = disk_with_trine(&[], &[("kleene.tri", KLEENE), ("kleene.s", &want)]);
+    let want2 = trine::build_source("/usr/src/idioms.tri", IDIOMS, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
+    let disk = disk_with_trine(&[], &[("kleene.tri", KLEENE), ("kleene.s", &want), ("idioms.tri", IDIOMS), ("idioms.s", &want2)]);
     let mut s = Session::boot_disk(&disk, false);
     tric_compare(&mut s, "kleene", "/usr/src/kleene.tri");
+    tric_compare(&mut s, "idioms", "/usr/src/idioms.tri");
 }

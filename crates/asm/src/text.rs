@@ -23,7 +23,7 @@
 //! from binary systems); `'c'` (a Unicode character). `$` is the current address.
 //! Registers: `r-13`..`r13`, `zero` = r0, `fp` = r11, `lr` = r12, `sp` = r13.
 
-use setun_core::isa::{self, alu, cond, cr, falu, fcvt, fld, fmem, mem, op, sys};
+use setun_core::isa::{self, alu, cond, cr, falu, fcvt, fld, fmem, mem, memr, op, sys};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use ternary::Word;
@@ -563,6 +563,10 @@ fn alu_binary(m: &str) -> Option<i64> {
         "bxor" => alu::BXOR,
         "bandn" => alu::BANDN,
         "bsh" => alu::BSH,
+        "mrg" => alu::MRG,
+        "tcp" => alu::TCP,
+        "tcn" => alu::TCN,
+        "trev" => alu::TREV,
         _ => return None,
     })
 }
@@ -815,6 +819,14 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
     }
     let fcv = |b: i64, x: i64, y: i64, z: i64| one(isa::rrr(op::FCVT, b, x, y, z));
     match (m, ops) {
+        // masked store: the address in a register, no offset (R format)
+        ("stwm", [d, Operand::Mem(base, off), k]) => {
+            if env.val(off)? != 0 {
+                return err(line, "`stwm` takes no offset: [ra] only");
+            }
+            return one(isa::rrr(op::MEMR, memr::STWM, reg(d)?, *base, reg(k)?));
+        }
+        ("stwm", _) => return bad(),
         ("fcmp", [a, b]) => return one(isa::rrr(op::FALU, falu::FCMP, 0, freg(a)?, freg(b)?)),
         ("fmov", [d, a]) => return fcv(fcvt::FMOV, freg(d)?, freg(a)?, 0),
         ("fcvtif", [d, a]) => return fcv(fcvt::FCVTIF, freg(d)?, reg(a)?, 0),

@@ -629,3 +629,53 @@ fn kleene_truth_values_refused() {
         assert!(e.contains(want), "{src}\n  gave: {e}");
     }
 }
+
+/// MRG, TCP, TCN, TREV and STWM as builtins (TERNARY_WORLD A2, A3).
+const IDIOMS: &str = "var page: [4]int;
+fn main() -> int {
+    var old: int = 2222333444555;
+    var mask: int = -1000000007;
+    var src: int = 3141592653589;
+    var m: int = mrg(old, mask, src);
+    var z: int = mrg(old, 0, src);                 // a zero mask keeps old
+    var c: int = tcp(src, 0) * 1000000 + tcn(src, 9) * 1000 + tcp(-1, 1);
+    var r: int = trev(src, 0) % 1000003 + trev(mask, 13) % 1009;
+    page[1] = 5555;
+    stwm(&page[1], 777, 1);                        // trit 27: take value's
+    stwm(&page[1], 0, -9);                         // the low trits cleared where the mask is -1
+    return 0;
+}";
+
+#[test]
+fn ternary_idiom_builtins() {
+    let b = build_source("test.tri", IDIOMS, None, &Options::rom()).unwrap_or_else(|e| panic!("{e}"));
+    let r = run_rom(&b.image, 20_000_000, "");
+    assert!(matches!(r.outcome, Outcome::Exit(0)), "{:?}", r.outcome);
+    // the locals are gone by now: recompute and compare through a second
+    // program that returns each value in turn
+    let w = |v: i64| ternary::Word::new(v).unwrap();
+    let (old, mask, src) = (w(2222333444555), w(-1000000007), w(3141592653589));
+    let cases: [(&str, i64); 6] = [
+        ("mrg(old, mask, src)", old.tritwise_merge(mask, src).value()),
+        ("mrg(old, 0, src)", old.value()),
+        ("tcp(src, 0)", src.count_pos_low(27) as i64),
+        ("tcn(src, 9)", src.count_neg_low(9) as i64),
+        ("trev(mask, 13)", mask.reverse_low(13).value()),
+        ("mrg(page_after(), 0, 0)", w(5555).tritwise_merge(w(1), w(777)).tritwise_merge(w(-9), w(0)).value()),
+    ];
+    for (e, want) in cases {
+        let src_text = format!(
+            "var page: [4]int;
+            fn page_after() -> int {{ page[1] = 5555; stwm(&page[1], 777, 1); stwm(&page[1], 0, -9); return page[1]; }}
+            fn main() -> int {{
+                var old: int = 2222333444555; var mask: int = -1000000007; var src: int = 3141592653589;
+                var v: int = {e};
+                return v % 9841;
+            }}"
+        );
+        assert_eq!(exit(&src_text), want % 9841, "{e}");
+    }
+    // refused
+    assert!(compile_err("fn main() -> int { var x: int = 1; stwm(x, 1, 1); return 0; }").contains("`stwm` needs a pointer to an int"));
+    assert!(compile_err("fn main() -> int { return mrg(1, 2); }").contains("argument"));
+}

@@ -351,6 +351,32 @@ impl<const N: usize> Tern<N> {
         Self::from_masks(pa & pb, na & nb)
     }
 
+    /// Trit-mask merge (`MRG`): where `mask` has 0 the trit of `self` stays,
+    /// where it has +1 the trit of `src` is taken, where −1 the trit is 0.
+    pub fn tritwise_merge(self, mask: Self, src: Self) -> Self {
+        let ((pd, nd), (pm, nm), (ps, ns)) = (self.masks(), mask.masks(), src.masks());
+        let keep = !(pm | nm);
+        Self::from_masks((pd & keep) | (ps & pm), (nd & keep) | (ns & pm))
+    }
+
+    /// How many of the low `n` trits (1..=N) are +1 (`TCP`).
+    pub fn count_pos_low(self, n: usize) -> u32 {
+        (self.masks().0 & low_bits(n)).count_ones()
+    }
+
+    /// How many of the low `n` trits (1..=N) are −1 (`TCN`).
+    pub fn count_neg_low(self, n: usize) -> u32 {
+        (self.masks().1 & low_bits(n)).count_ones()
+    }
+
+    /// The low `n` trits (1..=N) in reverse order, the trits above them 0
+    /// (`TREV`).
+    pub fn reverse_low(self, n: usize) -> Self {
+        let (p, q) = self.masks();
+        let rev = |m: u64| (0..n).filter(|&i| m >> i & 1 != 0).fold(0u64, |acc, i| acc | 1 << (n - 1 - i));
+        Self::from_masks(rev(p), rev(q))
+    }
+
     /// The trits as two bit masks, least significant trit in bit 0: which
     /// are +1, and which are −1. Nine trits at a time by table, from the
     /// digits of value + MAX (each trit + 1: 0, 1 or 2).
@@ -627,6 +653,11 @@ impl<const N: usize> FromStr for Tern<N> {
     }
 }
 
+/// The low `n` bits set (n ≤ 64).
+fn low_bits(n: usize) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +780,37 @@ mod tests {
             let r = x.shift(-2).value() as f64;
             assert!((r - v as f64 / 9.0).abs() <= 0.5, "{v}");
         }
+    }
+
+    #[test]
+    fn merge_counts_and_reversal() {
+        // against trit-by-trit definitions, on a spread of words
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            Word::wrap((x % 7_625_597_484_987) as i128 - 3_812_798_742_493)
+        };
+        for _ in 0..3000 {
+            let (d, m, sv) = (next(), next(), next());
+            let (td, tm, ts) = (d.trits(), m.trits(), sv.trits());
+            let want: Vec<Trit> = (0..27).map(|i| match tm[i] { Trit::Z => td[i], Trit::P => ts[i], Trit::N => Trit::Z }).collect();
+            assert_eq!(d.tritwise_merge(m, sv), Word::from_trits(&want));
+            for n in [1usize, 9, 26, 27] {
+                let low = &td[27 - n..];
+                assert_eq!(d.count_pos_low(n) as usize, low.iter().filter(|&&t| t == Trit::P).count());
+                assert_eq!(d.count_neg_low(n) as usize, low.iter().filter(|&&t| t == Trit::N).count());
+                let mut r = vec![Trit::Z; 27 - n];
+                r.extend(low.iter().rev());
+                assert_eq!(d.reverse_low(n), Word::from_trits(&r));
+            }
+        }
+        // an all-zero mask keeps everything; the extreme words
+        let max = Word::wrap(3_812_798_742_493);
+        assert_eq!(max.tritwise_merge(Word::ZERO, -max), max);
+        assert_eq!((max.count_pos_low(27), (-max).count_neg_low(27)), (27, 27));
+        assert_eq!(max.reverse_low(27), max);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Setun-26 CPU: registers, decode/execute, traps and the MMU.
 
 use crate::io::Io;
-use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, mode, op, sys, vector};
+use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, memr, mode, op, sys, vector};
 use crate::memory::Memory;
 use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
@@ -1492,6 +1492,16 @@ impl Cpu {
                     _ => return Err(ill()),
                 }
             }
+            op::MEMR => match b {
+                memr::STWM => {
+                    // the word at ra := merge(old, rd, mask rb), all at once
+                    let va = self.reg(y).value();
+                    let old = self.load_word_as(m, va, Access::Read)?;
+                    let new = old.tritwise_merge(self.reg(z), self.reg(x));
+                    self.store_word(m, va, new)?;
+                }
+                _ => return Err(ill()),
+            },
             op::IO | op::IOI => {
                 if self.batch {
                     return Err(Fault::new(DEFER));
@@ -1849,6 +1859,13 @@ impl Cpu {
     }
 
     fn alu_to(&mut self, f: i64, rd: i64, a: Word, b: Word) -> Result<(), Fault> {
+        if f == alu::MRG {
+            // rd's trits where the mask `a` has 0, b's where +1, 0 where −1
+            let r = self.reg(rd).tritwise_merge(a, b);
+            self.set_s(r.sign());
+            self.set_reg(rd, r);
+            return Ok(());
+        }
         if let Some(r) = self.alu(f, a, b)? {
             self.set_reg(rd, r);
         }
@@ -1910,6 +1927,18 @@ impl Cpu {
             alu::ABS => ww(x.abs()),
             alu::TLZ => Word::new(a.leading_zero_trits() as i64).unwrap(),
             alu::BAND..=alu::BSH => Word::new(crate::isa::bin_alu(f, x, y)).expect("wrapped"),
+            alu::TCP | alu::TCN | alu::TREV => {
+                // the low b trits (0: all 27)
+                if !(0..=27).contains(&y) {
+                    return Err(Fault::new(vector::ILLEGAL));
+                }
+                let n = if y == 0 { 27 } else { y as usize };
+                match f {
+                    alu::TCP => Word::new(a.count_pos_low(n) as i64).unwrap(),
+                    alu::TCN => Word::new(a.count_neg_low(n) as i64).unwrap(),
+                    _ => a.reverse_low(n),
+                }
+            }
             _ => return Err(Fault::new(vector::ILLEGAL)),
         };
         self.set_s(r.sign());

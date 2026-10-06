@@ -756,3 +756,34 @@ fn a_very_long_function_is_optimized_in_pieces() {
     same_both_ways_src("long.tri", &src, 100_000_000);
     assert!(t.elapsed().as_secs() < 20, "compiling took {:?}", t.elapsed());
 }
+
+#[test]
+fn ternary_idiom_builtins_the_same_way() {
+    // mrg reads its destination; tcp/tcn/trev may trap; stwm writes memory:
+    // in a loop over register locals, optimized and plain must agree
+    let src = r#"
+        import "console.tri";
+        var flags: [9]int;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn main() -> int {
+            var acc: int = 1234567;
+            var mask: int = -987654321;
+            var k: int = 0;
+            while (k < 9) {
+                var v: int = acc * 7 - k * 1000003;
+                acc = mrg(acc, mask, v) + tcp(v, 0) - tcn(v, 13) * 3;
+                mask = trev(mask, 27) + k;
+                stwm(&flags[k % 9], v, mask);
+                stwm(&flags[(k + 4) % 9], acc, -mask);
+                k += 1;
+            }
+            var s: int = 0;
+            k = 0;
+            while (k < 9) { s = (s * 3 + flags[k]) % 1000003; k += 1; }
+            put(acc % 1000003);
+            put(s);
+            return (acc + s) % 9841;
+        }
+    "#;
+    same_both_ways_src("idioms.tri", src, 20_000_000);
+}

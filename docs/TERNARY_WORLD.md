@@ -312,7 +312,9 @@ Rules:
 
 Negative tests: each refused form above gives its error and message; `true`, `false` and `unknown` assigned to an `int` without `as`; `unknown` as an identifier now refused; `t as int` accepted as a condition, because the program has said it wants integer truth; the S1–S3 fixed point still reached after the migration.
 
-### A2. Trit-mask merge and masked store
+### A2. Trit-mask merge and masked store ✅
+
+**Done (2026-10-06):** ISA v0.7 (§3.3, §3.4.1), the interpreter and both JITs (which hand MRG and STWM to the interpreter's code), the assembler and disassembler, and the Trine builtins `mrg` and `stwm` in the host compiler and `tric`. The negative tests listed below pass, and breaking the merge, its operand order or STWM's operands makes a test fail.
 
 One mask trit per data trit says what happens: **0 keeps** the old trit, **+1 takes** the source trit, **−1 clears** to 0.
 
@@ -327,7 +329,9 @@ One mask trit per data trit says what happens: **0 keeps** the old trit, **+1 ta
 
 Negative tests: unaligned `STWM`; `STWM` to a read-only page; `MRG` with an all-zero mask (no change, S from the old value); reserved functions of major 8.
 
-### A3. Trit counting and reversal
+### A3. Trit counting and reversal ✅
+
+**Done (2026-10-06):** as A2, with the builtins `tcp`, `tcn` and `trev`. `TREV` leaves the trits above the reversed field 0.
 
 `TLZ` (ALU function 22) already counts leading zero trits. Three functions complete the set:
 

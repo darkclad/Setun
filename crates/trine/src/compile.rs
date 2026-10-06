@@ -574,7 +574,7 @@ fn is_register_name(s: &str) -> bool {
 const CREGS: &[&str] = &["MODE", "PTB", "FADDR", "FCAUSE", "ITB", "EPC", "EMODE", "KSP", "SCRATCH", "CPUID", "CYCLE"];
 
 const BUILTINS: &[&str] = &[
-    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "band", "bor", "bxor", "bandn", "bsh", "bext", "brot", "bytes", "in", "out",
+    "sgn", "abs", "divr", "modr", "tmul", "tsat", "cons", "mulh", "trit", "ext", "ins", "tlz", "band", "bor", "bxor", "bandn", "bsh", "bext", "brot", "tcp", "tcn", "trev", "mrg", "stwm", "bytes", "in", "out",
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
     // the FPU
     "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
@@ -3530,13 +3530,43 @@ impl Compiler {
                 self.emit(format!("{n} r1, r1"));
                 Ok(if n == "sgn" { Ty::Trit } else { Ty::Int })
             }
-            "divr" | "modr" | "tmul" | "tsat" | "cons" | "mulh" | "band" | "bor" | "bxor" | "bandn" | "bsh" => {
+            "divr" | "modr" | "tmul" | "tsat" | "cons" | "mulh" | "band" | "bor" | "bxor" | "bandn" | "bsh" | "tcp" | "tcn" | "trev" => {
                 want(2)?;
                 let (ta, tb) = self.two(&args[0], &args[1])?;
                 self.need_integer(&ta, args[0].pos)?;
                 self.need_integer(&tb, args[1].pos)?;
                 self.emit(format!("{n} r1, r1, r2"));
                 Ok(Ty::Int)
+            }
+            "mrg" => {
+                // mrg(old, mask, src): old's trits where the mask has 0,
+                // src's where +1, 0 where -1
+                want(3)?;
+                let t = self.expr(&args[0])?;
+                self.need_integer(&t, args[0].pos)?;
+                self.emit("push r1");
+                let (ta, tb) = self.two(&args[1], &args[2])?;
+                self.need_integer(&ta, args[1].pos)?;
+                self.need_integer(&tb, args[2].pos)?;
+                self.emit("pop r3");
+                self.emit("mrg r3, r1, r2");
+                self.emit("mov r1, r3");
+                Ok(Ty::Int)
+            }
+            "stwm" => {
+                // stwm(p, value, mask): *p := mrg(*p, mask, value), at once
+                want(3)?;
+                let t = self.expr(&args[0])?;
+                if t.clone().decay() != Ty::Ptr(Box::new(Ty::Int)) {
+                    return err(args[0].pos, "`stwm` needs a pointer to an int");
+                }
+                self.emit("push r1");
+                let (ta, tb) = self.two(&args[1], &args[2])?;
+                self.need_integer(&ta, args[1].pos)?;
+                self.need_integer(&tb, args[2].pos)?;
+                self.emit("pop r3");
+                self.emit("stwm r1, [r3], r2");
+                Ok(Ty::Void)
             }
             "trit" => {
                 want(2)?;

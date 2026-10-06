@@ -141,6 +141,10 @@ fn info(i: &Ins) -> Option<Info> {
         "pop" if a.len() == 1 => inf(bit(13), reg0() | bit(13) | FLAGS, false, false),
         "ext" | "bext" | "brot" if a.len() == 4 => inf(src(1), reg0() | FLAGS, true, true),
         "ins" if a.len() == 4 => inf(src(0), reg0() | FLAGS, true, false),
+        // MRG reads its destination too; TCP, TCN and TREV may trap (ILL)
+        "mrg" if a.len() == 3 => inf(src(0), reg0() | FLAGS, true, false),
+        "tcp" | "tcn" | "trev" if a.len() == 3 => inf(src(1), reg0() | FLAGS, false, true),
+        "stwm" if a.len() == 3 => inf(src(0), 0, false, false),
         "in" if a.len() == 2 => inf(src(1), reg0(), false, false),
         "out" if a.len() == 2 => inf(src(0), 0, false, false),
         "mfc" if a.len() == 2 => inf(0, reg0(), false, false),

@@ -16,6 +16,7 @@ pub mod op {
     pub const JALR: i64 = 5;
     pub const LIQ: i64 = 6;
     pub const BRQ: i64 = 7;
+    pub const MEMR: i64 = 8;
     // 2-word (A[1] = +)
     pub const ALUI: i64 = 6561;
     pub const MEMD: i64 = 6562;
@@ -129,6 +130,16 @@ pub mod alu {
     pub const BXOR: i64 = 25;
     pub const BANDN: i64 = 26;
     pub const BSH: i64 = 27;
+    // ternary idioms (v0.7)
+    pub const MRG: i64 = 28;
+    pub const TCP: i64 = 29;
+    pub const TCN: i64 = 30;
+    pub const TREV: i64 = 31;
+}
+
+/// Read-modify-write memory functions (tryte B, for MEMR).
+pub mod memr {
+    pub const STWM: i64 = 1;
 }
 
 /// Memory functions (tryte B).

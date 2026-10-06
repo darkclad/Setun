@@ -36,6 +36,7 @@ Version history:
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
+- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), and trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3).
 
 ---
 
@@ -204,6 +205,7 @@ word 2:                                                           [ imm27 ]
 | 5 | `JALR` | Q | `rd := PC + 3; PC := ra + 3·q3` (so `RET` = `JALR r0, r12, 0`) |
 | 6 | `LIQ` | S | `rd := imm6` |
 | 7 | `BRQ` | S | the `rd` field holds `cond`: if it holds, `PC += 3·imm6` (§3.5) |
+| 8 | MEMR | R | read-modify-write memory operations at the address in `ra` (§3.4.1) |
 | **2-word** | | | |
 | 6561 | ALUI | I | `rd := ra ⊕ imm27` |
 | 6562 | MEMD | I | load or store at `ra + imm27` (trytes) |
@@ -251,8 +253,15 @@ word 2:                                                           [ imm27 ]
 | 25 | `BXOR` | binary exclusive OR |
 | 26 | `BANDN` | `ra` AND NOT `b` |
 | 27 | `BSH` | `ra · 2^b` for b > 0, `⌊ra / 2^−b⌋` for b < 0 (b limited to ±81) |
+| 28 | `MRG` | trit-mask merge: per trit i, `ra[i]` = 0 keeps `rd[i]`, +1 takes `b[i]`, −1 gives 0. **Reads `rd`.** |
+| 29 | `TCP` | number of +1 trits among the low `b` trits of `ra` (`b` = 0: all 27) |
+| 30 | `TCN` | number of −1 trits among the low `b` trits of `ra` (`b` = 0: all 27) |
+| 31 | `TREV` | the low `b` trits of `ra` in reverse order, the trits above them 0 (`b` = 0: all 27) |
 
 `B = 0` and negative values are reserved and raise `ILL`. `MOV rd, ra` is `ADD rd, ra, r0`.
+
+- `MRG` replaces six ALU operations (`TMUL`, `SUB`, `MAX`, `TMUL`, `ADD` and a temporary): the merged trits are disjoint, so there are no carries. With an all-zero mask nothing changes, and S comes from the old value.
+- `TCP`, `TCN` and `TREV` raise `ILL` when `b` is outside 0…27. `TCP + TCN` counts the non-zero trits and `TCP − TCN` is the trit balance (the ternary popcount); `TREV` is the trit-reversal permutation of a radix-3 FFT.
 
 **FLD** (A = 6569):
 
@@ -285,6 +294,16 @@ Data from binary systems (octets, 32-bit words of SHA-2 and ChaCha20, checksums)
 | 5 | `SWAP` | atomically exchange `rd` with the word at the address |
 
 In the 1-word MEM form the offset is `q3` **elements**: `LDW r1, [r13 + 2]` reads the word at `r13 + 6`.
+
+#### 3.4.1 Read-modify-write (MEMR: A = 8, R format)
+
+| B | Mnemonic | Operation |
+|---|---|---|
+| 1 | `STWM rd, [ra], rb` | the word at `ra` := `MRG`(that word, mask `rb`, `rd`), as one atomic read-modify-write: per trit, `rb` = 0 keeps the memory trit, +1 takes `rd`'s, −1 clears it |
+
+- There is no offset (the R format holds three registers and no immediate): the address is computed first. It must be a multiple of 3 (vector −5), and the page must be writable (vector −4); a trap leaves memory unchanged.
+- Uses: page-table entry flags (`V`, `AD`, `RING`) set or cleared in one store, device control registers, flag words shared between the kernel and drivers.
+- Other functions are reserved and raise `ILL`.
 
 ### 3.5 Branch conditions (the 3-trit `cond` in the rd field)
 

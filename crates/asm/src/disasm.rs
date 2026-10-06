@@ -6,7 +6,7 @@
 //! So disassembly output always reassembles byte-for-byte.
 
 use crate::text;
-use setun_core::isa::{alu, cond, cr, falu, fcvt, fld, fmem, io, mem, op, sys};
+use setun_core::isa::{alu, cond, cr, falu, fcvt, fld, fmem, io, mem, memr, op, sys};
 use ternary::Word;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,10 @@ fn alu_name(f: i64) -> Option<&'static str> {
         alu::BXOR => "bxor",
         alu::BANDN => "bandn",
         alu::BSH => "bsh",
+        alu::MRG => "mrg",
+        alu::TCP => "tcp",
+        alu::TCN => "tcn",
+        alu::TREV => "trev",
         _ => return None,
     })
 }
@@ -175,6 +179,10 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
                 format!("{name}{dot} {}, {}", r(f.x), addr(f.y, imm))
             }
         }
+        op::MEMR => match f.b {
+            memr::STWM => format!("stwm {}, [{}], {}", r(f.x), r(f.y), r(f.z)),
+            _ => return None,
+        },
         op::IO | op::IOI => {
             let name = match f.b {
                 io::IN => "in",
