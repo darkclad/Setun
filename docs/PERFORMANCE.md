@@ -43,11 +43,16 @@ optimisation must keep that state **identical**, not just "working":
 Native builds compile hot code with [Cranelift](https://cranelift.dev/)
 (`crates/core/src/jit.rs`):
 
-- **Regions.** A block run 1000 times becomes the root of a region: the
+- **Regions.** A block run 300 times becomes the root of a region: the
   blocks reachable from it by static jumps and branches within the same
-  page (up to 32). Only regions with a loop or a long run of inline work
-  are compiled; entering and leaving native code costs a load and a store
-  per register, which short stretches do not repay.
+  page (up to 32). Only regions with a loop or at least four inline
+  instructions are compiled; entering and leaving native code costs a load
+  and a store per register, which shorter stretches do not repay. The
+  common short ones are the return paths of functions (registers restored,
+  then JALR), which a region never reaches from its caller. On the shell
+  workload (threshold 1000 and 16 instructions before) this cut the
+  host's cycles by about 15%: interpreted instructions cost about 37
+  cycles each there, compiled ones about 9.
 - **Registers in host registers.** Guest registers and the flags are
   Cranelift variables, loaded at entry and written back at every exit. S
   is kept lazily, as a value whose sign it is; C as the trit.
@@ -123,8 +128,9 @@ time for the same work:
 | shell (md5sum, sort, calc, ls with paging) | 486M | 162M | 76.9 s | 0.53 s |
 | fpu (math.tri) | 3.38M | 2.66M | 0.43 s | 0.09 s |
 
-The JIT compiles on four background threads (short workloads otherwise wait
-for code); `SETUN_JIT_OFF=1` measures the interpreter alone. The browser
+The JIT compiles on background threads (all cores but one, at most 8),
+which take regions from one shared queue, so a long compile holds up no
+other (short workloads otherwise wait for code); `SETUN_JIT_OFF=1` measures the interpreter alone. The browser
 build (WebAssembly, no JIT) boots Trinux at about 125 MIPS, up from 11.
 
 Against the same code compiled natively for the host (`setun-bench

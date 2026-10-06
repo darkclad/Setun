@@ -368,7 +368,7 @@ impl Cpu {
             jit: None,
             jit_off: cfg!(target_arch = "wasm32"),
             jit_wait: false,
-            jit_threshold: 1000,
+            jit_threshold: 300,
             jit_pending: Vec::new(),
             jit_next: 0,
             jit_fault: None,
@@ -998,9 +998,10 @@ impl Cpu {
             region.push(jit::RegionBlock { off, ops });
             ids.push(id);
         }
-        // only worth it with a loop inside, or a long run of inline work:
-        // entering and leaving compiled code costs a load and a store per
-        // register
+        // only worth it with a loop inside, or a run of a few inline
+        // instructions: entering and leaving compiled code costs a load and a
+        // store per register (blocks of 4 and more pay: the return paths of
+        // functions, restoring registers before JALR, are the common case)
         let inline = |rb: &jit::RegionBlock| rb.ops.iter().take_while(|d| d.op != Op::Generic).count();
         let offs: std::collections::HashSet<i64> = region.iter().map(|rb| rb.off).collect();
         let has_loop = region.iter().any(|rb| {
@@ -1016,7 +1017,7 @@ impl Cpu {
             })
         });
         let eager = self.jit_threshold <= 1; // tests: compile everything
-        if inline(&region[0]) == 0 || !(eager || has_loop || inline(&region[0]) >= 16) {
+        if inline(&region[0]) == 0 || !(eager || has_loop || inline(&region[0]) >= 4) {
             return; // heat stays past the threshold: not tried again
         }
         let offs_in_order: Vec<i64> = region.iter().map(|rb| rb.off).collect();

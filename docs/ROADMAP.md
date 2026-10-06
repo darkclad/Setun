@@ -31,7 +31,7 @@ ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating
 10. **Performance** ([`PERFORMANCE.md`](PERFORMANCE.md)): every step keeps the machine state bit-identical to the reference interpreter (golden state hashes, a fast-vs-reference fuzz test, directed tests each shown to catch its bug)
     - **Emulator** ✅: batched execution up to the next device event, an invisible software TLB, a basic-block interpreter with chaining, RAM stored as words, a Cranelift JIT for hot regions (compiled on background threads, registers in host registers), and fixed-width FPU arithmetic
     - **Trine optimizer** ✅: register locals, direct operands, a liveness-driven peephole pass; optimized and plain builds must give the same results
-    - Result so far: the Mandelbrot benchmark went from 312× slower than the same code compiled natively to about 19×; the Trinux shell workload from 77 s to 0.5 s
+    - Result so far: the Mandelbrot benchmark went from 312× slower than the same code compiled natively to about 7.8×
 
 11. **Networking** ([`NETWORK.md`](NETWORK.md)): the `TNIC` Ethernet card (one octet per tryte), `setun-net` (a user-mode gateway on smoltcp with port forwards, `setun --net`), and in Trinux: ARP, IPv4, ICMP, UDP, TCP (in order, go-back-N retransmission, RFC 6298 timers), BSD sockets with Linux's calls, `/proc/net`; `ifconfig`, `ping`, `nc`, `netstat`, `telnetd`
     - N1–N5 ✅: tested against smoltcp both ways, over a lossy link, through a real host socket, and with hand-made broken packets; `nettest` checks the socket calls and their errors
@@ -61,16 +61,16 @@ In rough order of payoff for effort (estimates from the benchmarks):
 
 | # | Work | Where | Expected |
 |---|---|---|---|
-| P1 | Word-at-a-time `memcpy`, `memset`, `strlen`, `strcmp` in the runtime (today one tryte per step) | Trine runtime | 2–3× on string-heavy code (int benchmark, shell tools, kernel copies) |
+| P1 | ✅ Word-at-a-time `memcpy`, `memset`, `memmove`, `memcmp` (from 18 trytes, when both ends sit alike in their words); `strlen`/`strcmp` stay tryte-wise (a zero tryte in a word costs as much to find as loading them) | Trine runtime | int 6.77M → 6.58M; the bigger runtime cost every program size until unreached functions were left out (below) |
 | P2 | ~~Division by a constant as a multiplication by its reciprocal~~ | JIT | not needed: Cranelift already multiplies (measured with `setun-bench --micro`) |
 | P3 | ~~`char` and tryte locals in registers~~ | Trine | dropped: built and measured, 0.04% on the text tools (their strings go through arrays and pointers, not `char` locals) |
 | P4 | ✅ Leaf functions use six more caller-saved registers, unsaved | Trine | done |
 | P5 | ~~Staying native across calls and returns~~ | JIT | dropped: at most about 5% measured (the calls that matter are inlined now) |
-| P6 | Inline tryte loads and stores, and FPU instructions, in compiled code | JIT | strings and floating point |
+| P6 | ✅ Tryte loads and stores, FMOV/FLDD/FLDS/FSTD inline; FCMP and the tritwise ALU functions by direct helpers | JIT | done; FADD/FMUL/FDIV still go through the interpreter's code |
 | P7 | ✅ Inlining (cost model), `a[i ± k]` folded into the address, local value numbering, `if (c) break/continue` as one jump, loops with a register test rotated | Trine | done: sieve+sort 13.3M → 5.5M instructions, mandel 70.9M → 67.7M |
 | P8 | ~~Two-tier compilation~~: IR per instruction cut by a fifth ✅; tiers dropped: region size (4–32 blocks) and acceptance thresholds made no measurable difference, compiles run in the background | JIT | — |
 | P9 | A WebAssembly JIT for the browser build, which only interprets | Web | several times in the artifact |
-| P10 | Fewer interpreted instructions: about a fifth of the shell workload still runs in the block interpreter (cold blocks, and short regions without loops); each new process's code starts cold | JIT, kernel | up to about 1.5× on the shell workload |
+| P10 | ✅ Fewer interpreted instructions: unreached functions left out of every program (shell workload 18.9M → 14.4M instructions); regions from 300 runs and 4 inline instructions (were 1000 and 16), compile threads on one shared queue (host cycles −15%) | Trine, JIT | what is left interpreted: cold code, and hot code waiting for its compile (about 2.5M of 28M instructions) |
 
 ## Later
 

@@ -1183,21 +1183,26 @@ pub(super) struct Done {
 /// Cranelift on its own thread: the CPU keeps running while regions
 /// compile, and installs the code when it arrives.
 pub(super) struct JitThread {
-    /// One request channel per compiler thread, used in turn.
-    tx: Vec<std::sync::mpsc::Sender<Request>>,
-    next: std::cell::Cell<usize>,
+    /// The request queue all compiler threads take from: whichever is free
+    /// takes the next region, so a long compile holds up nothing else.
+    tx: std::sync::mpsc::Sender<Request>,
     rx: std::sync::mpsc::Receiver<Done>,
 }
 
-/// Compiler threads: regions compile in parallel, so hot code waits less.
-const JIT_THREADS: usize = 4;
+/// Compiler threads: regions compile in parallel, so hot code waits less
+/// (all cores but the emulator's own, at most 8).
+fn jit_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    cores.saturating_sub(1).clamp(1, 8)
+}
 
 impl JitThread {
     pub(super) fn spawn() -> Option<JitThread> {
         let (done_tx, rx) = std::sync::mpsc::channel::<Done>();
-        let mut tx = Vec::new();
-        for k in 0..JIT_THREADS {
-            let (req_tx, req_rx) = std::sync::mpsc::channel::<Request>();
+        let (tx, req_rx) = std::sync::mpsc::channel::<Request>();
+        let req_rx = std::sync::Arc::new(std::sync::Mutex::new(req_rx));
+        for k in 0..jit_threads() {
+            let req_rx = req_rx.clone();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
             let done_tx = done_tx.clone();
             std::thread::Builder::new()
@@ -1210,7 +1215,9 @@ impl JitThread {
                     let _ = ready_tx.send(true);
                     // decoded instructions the code points at live here, with it
                     let mut keep = Vec::new();
-                    for req in req_rx {
+                    loop {
+                        // (the lock is held only while waiting for a request)
+                        let Ok(req) = req_rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ())) else { break };
                         let t0 = std::time::Instant::now();
                         let code = jit.compile(&req.region, &mut keep).map_or(0, |f| f as usize);
                         let done = Done { id: req.id, code, micros: t0.elapsed().as_micros() as u64 };
@@ -1223,15 +1230,12 @@ impl JitThread {
             if !ready_rx.recv().ok()? {
                 return None;
             }
-            tx.push(req_tx);
         }
-        Some(JitThread { tx, next: std::cell::Cell::new(0), rx })
+        Some(JitThread { tx, rx })
     }
 
     pub(super) fn send(&self, r: Request) -> bool {
-        let k = self.next.get();
-        self.next.set((k + 1) % self.tx.len());
-        self.tx[k].send(r).is_ok()
+        self.tx.send(r).is_ok()
     }
 
     pub(super) fn try_recv(&self) -> Option<Done> {
