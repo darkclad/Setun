@@ -726,10 +726,15 @@ fn compiled_fpu_code_traps_once_the_fpu_is_off() {
     // round, when it runs compiled: the next FPU instruction must trap
     // (FPU unavailable)
     use setun_core::isa::{falu, fcvt, fmem};
-    // FMOV or FCMP first: they use no window, so only the FE check stops
-    // them (a write to MODE also drops the windows, which sends FLDD the
-    // slow way)
-    for first in [isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0), isa::rrr(op::FALU, falu::FCMP, 0, 1, 3)] {
+    // FMOV, FCMP or FADD first: they use no window, so only the FE check
+    // stops them (a write to MODE also drops the windows, which sends FLDD
+    // the slow way)
+    let firsts = [
+        isa::rrr(op::FCVT, fcvt::FMOV, 3, 1, 0),
+        isa::rrr(op::FALU, falu::FCMP, 0, 1, 3),
+        isa::rrr(op::FALU, falu::FADD, 6, 1, 3),
+    ];
+    for first in firsts {
         let mut prog = Vec::new();
         prog.extend(isa::wide(op::LI, 0, 2, 0, PAGE + 300));
         prog.push(isa::s6(op::LIQ, 0, 9, 12));

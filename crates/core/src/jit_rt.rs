@@ -115,6 +115,30 @@ pub(super) unsafe extern "C" fn jit_store_tryte(cpu: *mut Cpu, mem: *mut Memory,
     }
 }
 
+/// FPU instructions compiled code hands to `jit_fpu_op`: FALU's
+/// arithmetic (all but FCMP) and FCVTIF/FFRW, which write only an f
+/// register and the FSR, so the flags and guest registers need no syncing.
+pub(super) fn fpu_by_helper(d: &Dec) -> bool {
+    d.op == Op::Fpu
+        && match d.a as i64 {
+            op::FALU => d.f as i64 != falu::FCMP,
+            op::FCVT => matches!(d.f as i64, fcvt::FCVTIF | fcvt::FFRW),
+            _ => false,
+        }
+}
+
+/// One of those (see `Cpu::jit_fpu`): OK, or FAULT with the fault kept.
+pub(super) unsafe extern "C" fn jit_fpu_op(cpu: *mut Cpu, d: *const Dec) -> i64 {
+    let cpu = &mut *cpu;
+    match cpu.jit_fpu(&*d) {
+        Ok(()) => OK,
+        Err(f) => {
+            cpu.jit_fault = Some(f);
+            FAULT
+        }
+    }
+}
+
 /// The ALU functions compiled code calls directly: pure, setting no flag
 /// but S (which is the result's sign), never faulting.
 pub(super) fn alu_by_helper(f: i64) -> bool {

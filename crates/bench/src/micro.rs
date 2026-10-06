@@ -37,7 +37,7 @@ const CASES: &[(&str, &str)] = &[
 
 fn program(body: &str) -> String {
     let mut s = String::from(
-        "        .org -59049\n        li sp, 6000\n        li r2, 7\n        li r9, 400000\n        fli f1, 1.5\n        fli f2, 1.25\n        fli f3, 0.999\nloop:\n",
+        "        .org -59049\n        li sp, 6000\n        li r2, 7\n        li r9, 400000\n        fli f1, 1.5\n        fli f2, 1.25\n        fli f3, 0.9999999\nloop:\n",
     );
     for _ in 0..27 {
         s.push_str("        ");

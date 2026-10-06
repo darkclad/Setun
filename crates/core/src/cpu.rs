@@ -1603,6 +1603,51 @@ impl Cpu {
         Ok(())
     }
 
+    /// FALU's arithmetic (every function but FCMP): fx := fy op fz, with
+    /// its exception flags (which may trap before anything is written).
+    fn falu_arith(&mut self, b: i64, x: i64, y: i64, z: i64) -> Result<(), Fault> {
+        let (fa, fb) = (self.freg(y), self.freg(z));
+        let (r, flags) = match b {
+            falu::FADD => fa.add(fb),
+            falu::FSUB => fa.sub(fb),
+            falu::FMUL => fa.mul(fb),
+            falu::FDIV => fa.div(fb),
+            falu::FREM => fa.rem(fb),
+            falu::FMIN => (fa.min(fb), 0),
+            falu::FMAX => (fa.max(fb), 0),
+            falu::FSQRT => fa.sqrt(),
+            falu::FNEG => (fa.neg(), 0),
+            falu::FABS => (fa.abs(), 0),
+            falu::FRND => fa.round_int(false),
+            falu::FTRUNC => fa.round_int(true),
+            _ => return Err(Fault::new(vector::ILLEGAL)),
+        };
+        self.fpu_flags(flags)?;
+        self.set_freg(x, r);
+        Ok(())
+    }
+
+    /// For compiled code: an FPU instruction that writes only an f
+    /// register and the FSR (`jit_fpu_by_helper`), with the FPU check;
+    /// the PC is the caller's business.
+    fn jit_fpu(&mut self, d: &Dec) -> Result<(), Fault> {
+        if self.mode(mode::FE) != 1 {
+            return Err(Fault::new(vector::FPU_UNAVAILABLE));
+        }
+        let (b, x, y, z) = (d.f as i64, d.x as i64, d.y as i64, d.z as i64);
+        match d.a as i64 {
+            op::FALU => self.falu_arith(b, x, y, z),
+            _ if b == fcvt::FCVTIF => {
+                self.set_freg(x, Real::from_i64(self.reg(y).value()));
+                Ok(())
+            }
+            _ => {
+                self.set_freg(x, Real::from_word27(self.reg(y).value()));
+                Ok(())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// `imm2`: the second word when the caller already has it.
     fn exec_fpu(&mut self, m: &mut Memory, a: i64, b: i64, x: i64, y: i64, z: i64, pc: i64, imm2: Option<i64>) -> Result<(), Fault> {
@@ -1626,39 +1671,19 @@ impl Cpu {
             _ => (0, pc + 3),
         };
         match a {
+            op::FALU if b != falu::FCMP => self.falu_arith(b, x, y, z)?,
             op::FALU => {
-                let (fa, fb) = (self.freg(y), self.freg(z));
-                let (r, flags) = match b {
-                    falu::FADD => fa.add(fb),
-                    falu::FSUB => fa.sub(fb),
-                    falu::FMUL => fa.mul(fb),
-                    falu::FDIV => fa.div(fb),
-                    falu::FREM => fa.rem(fb),
-                    falu::FMIN => (fa.min(fb), 0),
-                    falu::FMAX => (fa.max(fb), 0),
-                    falu::FSQRT => fa.sqrt(),
-                    falu::FNEG => (fa.neg(), 0),
-                    falu::FABS => (fa.abs(), 0),
-                    falu::FRND => fa.round_int(false),
-                    falu::FTRUNC => fa.round_int(true),
-                    falu::FCMP => {
-                        match fa.cmp(fb) {
-                            Some(o) => {
-                                self.set_mode(mode::S, o as i64);
-                                self.set_c(0);
-                            }
-                            None => {
-                                self.set_mode(mode::S, 0);
-                                self.set_c(1); // unordered
-                            }
-                        }
-                        self.pc = ww(next);
-                        return Ok(());
+                // FCMP
+                match self.freg(y).cmp(self.freg(z)) {
+                    Some(o) => {
+                        self.set_mode(mode::S, o as i64);
+                        self.set_c(0);
                     }
-                    _ => return Err(ill()),
-                };
-                self.fpu_flags(flags)?;
-                self.set_freg(x, r);
+                    None => {
+                        self.set_mode(mode::S, 0);
+                        self.set_c(1); // unordered
+                    }
+                }
             }
             op::FCVT => match b {
                 fcvt::FCVTIF => self.set_freg(x, Real::from_i64(self.reg(y).value())),

@@ -199,6 +199,7 @@ const T_STORE: u32 = 2; // (cpu, mem, va, v) -> status
 const T_EXEC: u32 = 3; // (cpu, mem, dec, pc) -> status
 const T_ALU: u32 = 4; // (f, x, y) -> r
 const T_FILL: u32 = 5; // (cpu, va, write, _) -> status
+const T_FPU: u32 = 6; // (cpu, dec) -> status
 
 /// The module for one region.
 #[allow(clippy::vec_box)]
@@ -207,13 +208,14 @@ pub(super) fn module(region: &[RegionBlock], keep: &mut Vec<Box<Dec>>) -> Vec<u8
     let mut m = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     // types
     let mut t = Vec::new();
-    let sigs: [(&[u8], u8); 6] = [
+    let sigs: [(&[u8], u8); 7] = [
         (&[I32, I32, I64T, I64T, I64T], I64T),
         (&[I32, I32, I64T, I32], I64T),
         (&[I32, I32, I64T, I64T], I64T),
         (&[I32, I32, I32, I64T], I64T),
         (&[I64T, I64T, I64T], I64T),
         (&[I32, I64T, I64T, I64T], I64T),
+        (&[I32, I32], I64T),
     ];
     leb_u(&mut t, sigs.len() as u64);
     for (params, ret) in sigs {
@@ -1096,6 +1098,18 @@ fn block(g: &mut Gen, rb: &RegionBlock, blocks: &HashMap<i64, u32>, keep: &mut V
             Op::Generic => {
                 g.leave_at(off, 0);
                 return;
+            }
+            _ if fpu_by_helper(d) => {
+                // FALU arithmetic and FCVTIF/FFRW: an f register and the
+                // FSR change, nothing the code keeps
+                let b = Box::new(*d);
+                let dp = &*b as *const Dec as usize;
+                keep.push(b);
+                g.get(P_CPU);
+                g.i32c(dp as i64);
+                g.call(T_FPU, jit_fpu_op as *const () as usize);
+                g.set(t0);
+                g.status_fault(t0, off, unrun);
             }
             _ => g.exec_one(d, off, next_off, unrun, keep),
         }

@@ -52,6 +52,7 @@ pub(super) struct Jit {
     fcmp: FuncId,
     real_words: FuncId,
     fill_window: FuncId,
+    fpu_op: FuncId,
     next_id: usize,
 }
 
@@ -482,6 +483,7 @@ impl Jit {
         jb.symbol("jit_fcmp", jit_fcmp as *const u8);
         jb.symbol("jit_real_words", jit_real_words as *const u8);
         jb.symbol("jit_fill_window", jit_fill_window as *const u8);
+        jb.symbol("jit_fpu_op", jit_fpu_op as *const u8);
         let mut module = JITModule::new(jb);
         let ptr = module.target_config().pointer_type();
         let mut decl = |name: &str, params: &[cranelift_codegen::ir::Type]| -> Option<FuncId> {
@@ -501,6 +503,7 @@ impl Jit {
         let fcmp = decl("jit_fcmp", &[ptr, I64, I64, I64])?;
         let real_words = decl("jit_real_words", &[ptr, I64, ptr, I64])?;
         let fill_window = decl("jit_fill_window", &[ptr, I64, I64, I64])?;
+        let fpu_op = decl("jit_fpu_op", &[ptr, ptr])?;
         Some(Jit {
             ctx: module.make_context(),
             module,
@@ -514,6 +517,7 @@ impl Jit {
             fcmp,
             real_words,
             fill_window,
+            fpu_op,
             next_id: 0,
         })
     }
@@ -547,6 +551,7 @@ impl Jit {
         let fcmp = self.module.declare_func_in_func(self.fcmp, b.func);
         let real_words = self.module.declare_func_in_func(self.real_words, b.func);
         let fill = self.module.declare_func_in_func(self.fill_window, b.func);
+        let fpu_f = self.module.declare_func_in_func(self.fpu_op, b.func);
 
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -929,6 +934,24 @@ impl Jit {
                         let pc = g.pc_in_page(off);
                         g.leave(pc, 0);
                         ended = true;
+                    }
+                    _ if fpu_by_helper(d) => {
+                        // FALU arithmetic and FCVTIF/FFRW: an f register and
+                        // the FSR change, nothing compiled code keeps
+                        let keep = Box::new(*d);
+                        let dp = g.b.ins().iconst(ptr, &*keep as *const Dec as i64);
+                        ops_keep.push(keep);
+                        let call = g.b.ins().call(fpu_f, &[cpu, dp]);
+                        let status = g.b.inst_results(call)[0];
+                        let fault = g.b.create_block();
+                        let ok = g.b.create_block();
+                        g.b.set_cold_block(fault);
+                        let bad = g.b.ins().icmp_imm_s(IntCC::Equal, status, FAULT);
+                        g.b.ins().brif(bad, fault, &[], ok, &[]);
+                        g.enter(fault);
+                        let pc = g.pc_in_page(off);
+                        g.leave(pc, unrun);
+                        g.enter(ok);
                     }
                     _ => {
                         // FMOV / FLDD / FLDS natively when they can be; the
