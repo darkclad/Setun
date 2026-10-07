@@ -4,6 +4,7 @@
 //! and docs/BOOT.md.
 
 pub mod tfs;
+pub mod unifont;
 
 use setun_core::memory::word_to_trytes;
 use setun_core::PAGE;
@@ -89,6 +90,15 @@ pub fn user_dir() -> PathBuf {
 
 /// A generated file rather than a source: the 8x8 font for the window system.
 pub const FONT_SOURCE: &str = "<font8x8>";
+
+/// Another: GNU Unifont, packed (unifont.rs).
+pub const UNIFONT_SOURCE: &str = "<unifont>";
+
+/// The packed Unifont, built once.
+pub fn unifont_file() -> Result<Vec<i16>, String> {
+    static FILE: std::sync::OnceLock<Result<Vec<i16>, String>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| unifont::load(&unifont::sources()).map(|g| unifont::build(&g))).clone()
+}
 
 /// Glyphs in the font file: code points 0..255, then the Cyrillic block
 /// U+0400..U+045F as glyphs 256..351, then № as glyph 352.
@@ -176,6 +186,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     }
     v.push(("/etc/ssl/cert.pem".into(), u.join("etc/ssl/cert.pem")));
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));
+    v.push(("/usr/share/unifont".into(), PathBuf::from(UNIFONT_SOURCE)));
     v
 }
 
@@ -191,6 +202,9 @@ fn compiled(name: &str, src: &Path) -> bool {
 pub fn disk_file(name: &str, src: &Path) -> Result<Vec<i16>, String> {
     if src == Path::new(FONT_SOURCE) {
         return Ok(font8x8_table());
+    }
+    if src == Path::new(UNIFONT_SOURCE) {
+        return unifont_file();
     }
     if compiled(name, src) {
         return tef(src);

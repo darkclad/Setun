@@ -309,7 +309,7 @@ fn text_arg(args: *int, from: int, n: int, out: *char, max: int) {
     var k: int = 0;
     while (from + k < n && k < max - 1) {
         var c: int = args[from + k];
-        out[k] = c >= 0 && c <= 9841 ? c as char : '?';
+        out[k] = c != 0 && c >= -9841 && c <= 9841 ? c as char : '?';     // any tryte but NUL: drawing decodes it
         k += 1;
     }
     out[k] = 0;
@@ -363,6 +363,12 @@ fn handle_request(i: int, op: int, args: *int, n: int) -> int {
             var t: [243]char;
             text_arg(args, 5, n, &t[0], 243);
             draw_text(&s, args[0], args[1], &t[0], args[2], args[3], args[4]);
+        }
+        case TRW_TEXT16: {
+            if (n < 4) { bad_request(i, "bad TEXT16"); return -1; }
+            var t16: [243]char;
+            text_arg(args, 4, n, &t16[0], 243);
+            draw_text16(&s, args[0], args[1], &t16[0], args[2], args[3]);
         }
         case TRW_PIXELS: {
             if (n < 4 || args[2] <= 0 || args[3] <= 0 || args[2] * args[3] != n - 4) { bad_request(i, "bad PIXELS"); return -1; }

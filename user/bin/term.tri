@@ -1,19 +1,23 @@
 // term: a terminal window. It runs /bin/sh on a pseudo-terminal, so the
 // shell has job control and ^C works; output goes through a small VT100
-// subset (CR, LF, BS, TAB, ESC [ H J K A-D m) onto a 76 x 24 grid.
+// subset (CR, LF, BS, TAB, ESC [ H J K A-D m) onto a 76 x 24 grid, drawn
+// in Unifont (8 x 16 cells). A character above U+2671 arrives as 3 trytes;
+// an East Asian wide one takes two cells.
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
 import "../lib/stdlib.tri";
 import "../lib/gfx.tri";
 import "../lib/trw.tri";
+import "../lib/wcwidth.tri";
 
 const COLS: int = 76;
 const ROWS: int = 24;
 const CW: int = 8;
-const CH: int = 9;                    // a pixel of leading between rows
+const CH: int = 16;
+const WIDE_RIGHT: int = 200000;       // in a cell: the right half of the wide character before it
 
-var grid: [1824]char;                 // ROWS x COLS
+var grid: [1824]int;                  // ROWS x COLS code points (negative: overlined)
 var row_dirty: [24]int;
 var cx: int;
 var cy: int;
@@ -22,10 +26,19 @@ var par: [9]int;
 var npar: int;
 var master: int = -1;
 var child: int;
+var big: [3]char;                     // a 3-tryte character being received
+var big_n: int;
 const FG: int = 9841;
 const BG: int = -9841;
 
-fn cell(r: int, c: int) -> *char { return &grid[r * COLS + c]; }
+fn cell(r: int, c: int) -> *int { return &grid[r * COLS + c]; }
+
+// Write cp into a cell, blanking the other half of a wide character it cuts.
+fn set_cell(r: int, c: int, cp: int) {
+    if (*cell(r, c) == WIDE_RIGHT && c > 0) { *cell(r, c - 1) = ' '; }
+    if (c + 1 < COLS && *cell(r, c + 1) == WIDE_RIGHT && cp != WIDE_RIGHT) { *cell(r, c + 1) = ' '; }
+    *cell(r, c) = cp;
+}
 
 fn clear_rows(from: int, to: int) {
     var r: int = from;
@@ -74,13 +87,13 @@ fn csi(f: char) {
             if (par[0] == 2) { clear_rows(0, ROWS); }
             else {
                 var c: int = cx;
-                while (c < COLS) { *cell(cy, c) = ' '; c += 1; }
+                while (c < COLS) { set_cell(cy, c, ' '); c += 1; }
                 clear_rows(cy + 1, ROWS);
             }
         }
         case 'K': {
             var c2: int = cx;
-            while (c2 < COLS) { *cell(cy, c2) = ' '; c2 += 1; }
+            while (c2 < COLS) { set_cell(cy, c2, ' '); c2 += 1; }
         }
     }
     if (cy < 0) { cy = 0; }
@@ -91,6 +104,21 @@ fn csi(f: char) {
 }
 
 fn put(c: char) {
+    if (big_n > 0) {
+        // the trailing trytes of a 3-tryte character
+        if (c < -32) {
+            big[big_n] = c;
+            big_n += 1;
+            if (big_n < 3) { return; }
+            big_n = 0;
+            var cp: int;
+            put_cp(tstr_next(&big[0], &cp) == 3 ? cp : 65533);
+            return;
+        }
+        big_n = 0;
+        put_cp(65533);                                   // a broken one; then this tryte
+    }
+    if (esc == 0 && (c == BIG_CHAR || c == BIG_CHAR_OVERLINED)) { big[0] = c; big_n = 1; return; }
     if (esc == 1) {
         esc = c == '[' ? 2 : 0;
         npar = 1;
@@ -110,10 +138,17 @@ fn put(c: char) {
     if (c == 8) { if (cx > 0) { cx -= 1; } row_dirty[cy] = 1; return; }
     if (c == '\t') { cx = (cx / 8 + 1) * 8; if (cx >= COLS) { cx = COLS - 1; } return; }
     if (c == 7 || (c < 32 && c > -33)) { return; }    // control; below -32 an overlined character
-    if (cx >= COLS) { cx = 0; newline(); }
-    *cell(cy, cx) = c;
+    put_cp(c);
+}
+
+// A character into the grid at the cursor: one cell, or two for a wide one.
+fn put_cp(cp: int) {
+    var w: int = tchar_width(cp);
+    if (cx + w > COLS) { cx = 0; newline(); }
+    set_cell(cy, cx, cp);
+    if (w == 2) { set_cell(cy, cx + 1, WIDE_RIGHT); }
     row_dirty[cy] = 1;
-    cx += 1;
+    cx += w;
 }
 
 // Send the rows that changed (and the cursor), then show them.
@@ -122,12 +157,21 @@ fn redraw() {
     var any: int = 0;
     while (r < ROWS) {
         if (row_dirty[r]) {
-            var line: [77]char;
+            var line: [229]char;                 // 3 trytes a cell at most
+            var n: int = 0;
             var c: int = 0;
-            while (c < COLS) { line[c] = *cell(r, c); c += 1; }
-            line[COLS] = 0;
+            while (c < COLS) {
+                var cp: int = *cell(r, c);
+                if (cp != WIDE_RIGHT) {
+                    var k: int = tchar_put(cp, &line[n]);
+                    if (k == 0) { line[n] = '?'; k = 1; }
+                    n += k;
+                }
+                c += 1;
+            }
+            line[n] = 0;
             trw_fill(0, r * CH, COLS * CW, CH, BG);
-            trw_text(0, r * CH, FG, BG, 1, &line[0]);
+            trw_text16(0, r * CH, FG, BG, &line[0]);
             row_dirty[r] = 0;
             any = 1;
         }

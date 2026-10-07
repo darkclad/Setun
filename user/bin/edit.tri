@@ -6,11 +6,14 @@
 //
 // The screen: the text, a status line (file, position, messages) and a line
 // of shortcuts. Tabs show as spaces to the next multiple of 8. Lines can be
-// any length; the view scrolls sideways to follow the cursor.
+// any length; the view scrolls sideways to follow the cursor. A character
+// above U+2671 (3 trytes) is moved over and deleted whole, and an East
+// Asian wide one takes two columns.
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
 import "../lib/stdlib.tri";
+import "../lib/wcwidth.tri";
 
 const MAX_LINES: int = 6561;
 
@@ -128,14 +131,33 @@ fn line_room(l: int, n: int) {
     lcap[l] = cap;
 }
 
+// The trytes of the character at s[k] (3 for a lead and two trailing
+// trytes, else 1), and of the one that ends at s[k].
+fn ch_len(s: *char, k: int) -> int {
+    if ((s[k] == BIG_CHAR || s[k] == BIG_CHAR_OVERLINED) && s[k + 1] < -32 && s[k + 2] < -32) { return 3; }
+    return 1;
+}
+fn ch_back(s: *char, k: int) -> int {
+    if (k >= 3 && (s[k - 3] == BIG_CHAR || s[k - 3] == BIG_CHAR_OVERLINED) && s[k - 2] < -32 && s[k - 1] < -32) { return 3; }
+    return 1;
+}
+
+// The columns the character at s[k] takes, starting at column col.
+fn ch_cols(s: *char, k: int, col: int) -> int {
+    if (s[k] == '\t') { return (col / 8 + 1) * 8 - col; }
+    var cp: int = s[k];
+    if (ch_len(s, k) == 3 && tstr_next(&s[k], &cp) != 3) { cp = '?'; }
+    return tchar_width(cp);
+}
+
 // The screen column of index i in line l (tabs to the next multiple of 8).
 fn render_col(l: int, i: int) -> int {
     var col: int = 0;
     var k: int = 0;
     var s: *char = lines[l];
     while (k < i && s[k] != 0) {
-        if (s[k] == '\t') { col = (col / 8 + 1) * 8; } else { col += 1; }
-        k += 1;
+        col += ch_cols(s, k, col);
+        k += ch_len(s, k);
     }
     return col;
 }
@@ -155,17 +177,21 @@ fn draw_line(r: int) {
         var col: int = 0;
         var k: int = 0;
         while (s[k] != 0 && col < hoff + cols) {
-            if (s[k] == '\t') {
-                var next: int = (col / 8 + 1) * 8;
-                while (col < next) {
-                    if (col >= hoff && col < hoff + cols) { oputc(' '); }
-                    col += 1;
+            var w: int = ch_cols(s, k, col);
+            var n: int = ch_len(s, k);
+            if (s[k] == '\t' || col < hoff || col + w > hoff + cols) {
+                // a tab, or a wide character cut by an edge: spaces
+                var c2: int = col;
+                while (c2 < col + w) {
+                    if (c2 >= hoff && c2 < hoff + cols) { oputc(' '); }
+                    c2 += 1;
                 }
             } else {
-                if (col >= hoff) { oputc(s[k]); }
-                col += 1;
+                var j: int = 0;
+                while (j < n) { oputc(s[k + j]); j += 1; }
             }
-            k += 1;
+            col += w;
+            k += n;
         }
     } else {
         oputc('~');
@@ -218,17 +244,18 @@ fn refresh(line_only: int) {
 
 // ---- keys ----
 
-const K_UP: int = 100000;
-const K_DOWN: int = 100001;
-const K_RIGHT: int = 100002;
-const K_LEFT: int = 100003;
-const K_HOME: int = 100004;
-const K_END: int = 100005;
-const K_DEL: int = 100006;
-const K_PGUP: int = 100007;
-const K_PGDN: int = 100008;
-const K_NONE: int = 100009;
-const K_EOF: int = -2;
+// Keys beyond every code point (key() returns a character's code point).
+const K_UP: int = 2000000;
+const K_DOWN: int = 2000001;
+const K_RIGHT: int = 2000002;
+const K_LEFT: int = 2000003;
+const K_HOME: int = 2000004;
+const K_END: int = 2000005;
+const K_DEL: int = 2000006;
+const K_PGUP: int = 2000007;
+const K_PGDN: int = 2000008;
+const K_NONE: int = 2000009;
+const K_EOF: int = 2000010;
 
 fn getch() -> int {
     var c: [1]char;
@@ -242,6 +269,20 @@ fn getch() -> int {
 
 fn key() -> int {
     var c: int = getch();
+    if (c == BIG_CHAR || c == BIG_CHAR_OVERLINED) {
+        // a character above U+2671: its code point (negative: overlined)
+        var t: [4]char;
+        t[0] = c as char;
+        var hi: int = getch();
+        if (hi == K_EOF) { return K_EOF; }
+        var lo: int = getch();
+        if (lo == K_EOF) { return K_EOF; }
+        t[1] = hi as char;
+        t[2] = lo as char;
+        t[3] = 0;
+        var cp: int;
+        return tstr_next(&t[0], &cp) == 3 ? cp : K_NONE;
+    }
     if (c != 27) { return c; }
     c = getch();
     if (c != '[' && c != 'O') { return c == K_EOF ? K_EOF : K_NONE; }
@@ -284,8 +325,16 @@ fn prompt(q: *char, out: *char, max: int) -> int {
         var c: int = key();
         if (c == '\n' || c == '\r') { out[n] = 0; return 1; }
         if (c == 3 || c == 27 || c == K_EOF) { out[n] = 0; return 0; }
-        if ((c == 127 || c == 8) && n > 0) { n -= 1; }
-        else if (((c >= 32 && c < K_UP) || c <= -33) && n < max - 1) { out[n] = c as char; n += 1; }
+        if ((c == 127 || c == 8) && n > 0) { n -= ch_back(out, n); }
+        else if ((c >= 32 && c < K_UP) || c <= -33) {
+            var t: [3]char;
+            var k: int = tchar_put(c, &t[0]);
+            if (k > 0 && n + k < max) {                 // room for it and the NUL
+                var j: int = 0;
+                while (j < k) { out[n + j] = t[j]; j += 1; }
+                n += k;
+            }
+        }
         out[n] = 0;
     }
 }
@@ -375,14 +424,19 @@ fn save() -> int {
 
 // ---- editing ----
 
+// Insert the character c (a code point; negative: overlined) at the cursor.
 fn insert_char(c: int) {
-    line_room(cy, 1);
+    var t: [3]char;
+    var n: int = tchar_put(c, &t[0]);
+    if (n == 0) { return; }
+    line_room(cy, n);
     var s: *char = lines[cy];
     var len: int = strlen(s);
     var k: int = len;
-    while (k >= cx) { s[k + 1] = s[k]; k -= 1; }
-    s[cx] = c as char;
-    cx += 1;
+    while (k >= cx) { s[k + n] = s[k]; k -= 1; }
+    k = 0;
+    while (k < n) { s[cx + k] = t[k]; k += 1; }
+    cx += n;
     modified = 1;
 }
 
@@ -399,9 +453,10 @@ fn split_line() {
 fn backspace() {
     if (cx > 0) {
         var s: *char = lines[cy];
-        var k: int = cx - 1;
-        while (s[k] != 0) { s[k] = s[k + 1]; k += 1; }
-        cx -= 1;
+        var b: int = ch_back(s, cx);
+        var k: int = cx - b;
+        while (s[k + b - 1] != 0) { s[k] = s[k + b]; k += 1; }
+        cx -= b;
         modified = 1;
         return;
     }
@@ -420,8 +475,9 @@ fn backspace() {
 fn delete_char() {
     var s: *char = lines[cy];
     if (s[cx] != 0) {
+        var f: int = ch_len(s, cx);
         var k: int = cx;
-        while (s[k] != 0) { s[k] = s[k + 1]; k += 1; }
+        while (s[k + f - 1] != 0) { s[k] = s[k + f]; k += 1; }
         modified = 1;
         return;
     }
@@ -501,9 +557,12 @@ fn goto_line() {
     full_redraw = 1;
 }
 
+// Keep the cursor inside the line, on a character's first tryte.
 fn clamp_cx() {
-    var len: int = strlen(lines[cy]);
-    if (cx > len) { cx = len; }
+    var s: *char = lines[cy];
+    var k: int = 0;
+    while (s[k] != 0 && k + ch_len(s, k) <= cx) { k += ch_len(s, k); }
+    cx = k;
 }
 
 fn main(argc: int, argv: **char) -> int {
@@ -559,10 +618,10 @@ fn main(argc: int, argv: **char) -> int {
         else if (c == K_UP) { if (cy > 0) { cy -= 1; clamp_cx(); } }
         else if (c == K_DOWN) { if (cy + 1 < nlines) { cy += 1; clamp_cx(); } }
         else if (c == K_LEFT) {
-            if (cx > 0) { cx -= 1; }
+            if (cx > 0) { cx -= ch_back(lines[cy], cx); }
             else if (cy > 0) { cy -= 1; cx = strlen(lines[cy]); }
         } else if (c == K_RIGHT) {
-            if (lines[cy][cx] != 0) { cx += 1; }
+            if (lines[cy][cx] != 0) { cx += ch_len(lines[cy], cx); }
             else if (cy + 1 < nlines) { cy += 1; cx = 0; }
         } else if (c == K_HOME || c == 1) { cx = 0; }
         else if (c == K_END || c == 5) { cx = strlen(lines[cy]); }

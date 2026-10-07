@@ -6,6 +6,7 @@
 // a pixel instead of the ~30 of a compiled loop.
 
 import "tlibc.tri";
+import "wcwidth.tri";
 
 const TRANSPARENT: int = 19683;       // a text background that leaves pixels alone
 
@@ -165,14 +166,35 @@ fn glyph_row(g: int, over: int, r: int) -> int {
 }
 
 // One character with its top-left at (x, y), each font pixel scale x scale.
+// c is a code point (negative: overlined). A character the 8x8 font lacks
+// is Unifont's glyph shrunk to 8x8, when the font file is there.
 fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) {
     var over: int = c < -32;
-    c = font_glyph(over ? -c : c);
+    var cp: int = over ? -c : c;
+    var rows: [8]int;
+    var g: int = font_glyph(cp);
+    if (g == '?' && cp != '?' && uf_small(cp, &rows[0])) {
+        draw_rows8(s, x, y, &rows[0], over, fg, bg, scale);
+        return;
+    }
+    var r0: int = 0;
+    while (r0 < 8) { rows[r0] = glyph_row(g, over, r0); r0 += 1; }
+    draw_rows8(s, x, y, &rows[0], 0, fg, bg, scale);
+}
+
+// Eight rows of eight pixels (bit 0 = leftmost); over: a bar above, the
+// rest one row lower.
+fn draw_rows8(s: *Surface, x: int, y: int, rows: *int, over: int, fg: int, bg: int, scale: int) {
+    if (over) {
+        var k0: int = 7;
+        while (k0 > 0) { rows[k0] = rows[k0 - 1]; k0 -= 1; }
+        rows[0] = 127;
+    }
     if (scale == 1 && x >= 0 && y >= 0 && x + 8 <= s.w && y + 8 <= s.h) {
         // the common case: whole and unscaled, so no clipping per pixel
         var r: int = 0;
         while (r < 8) {
-            var b: int = glyph_row(c, over, r);
+            var b: int = rows[r];
             var p: *tryte = &s.data[(y + r) * s.w + x];
             var k: int = 0;
             while (k < 8) {
@@ -187,7 +209,7 @@ fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) 
     }
     var row: int = 0;
     while (row < 8) {
-        var bits: int = glyph_row(c, over, row);
+        var bits: int = rows[row];
         var col: int = 0;
         while (col < 8) {
             var on: int = bits % 2;
@@ -200,12 +222,207 @@ fn draw_char(s: *Surface, x: int, y: int, c: int, fg: int, bg: int, scale: int) 
     }
 }
 
+// Text in the 8x8 font, one cell per character (a 3-tryte one too; a
+// malformed one is '?').
 fn draw_text(s: *Surface, x: int, y: int, text: *char, fg: int, bg: int, scale: int) {
+    var cp: int;
     var k: int = 0;
-    while (text[k] != 0) {
-        draw_char(s, x + 8 * scale * k, y, text[k], fg, bg, scale);
+    loop {
+        var n: int = tstr_next(text, &cp);
+        if (n == 0) { break; }
+        if (n < 0) { cp = '?'; n = 1; }
+        draw_char(s, x + 8 * scale * k, y, cp, fg, bg, scale);
+        text = text + n;
         k += 1;
     }
 }
 
-fn text_width(text: *char, scale: int) -> int { return 8 * scale * strlen(text); }
+fn text_width(text: *char, scale: int) -> int {
+    var n: int = tstr_chars(text);
+    return 8 * scale * (n < 0 ? strlen(text) : n);
+}
+
+// ---- Unifont: 8x16 and 16x16 glyphs for everything (/usr/share/unifont) -----------------
+//
+// The file (crates/trinux/src/unifont.rs) is read a glyph at a time: its
+// directory once, then one page's widths and one glyph per miss, with the
+// last 243 glyphs kept.
+
+const UF_CACHE: int = 243;
+var uf_fd: int = -1;
+var uf_tried: int;
+var uf_dir: [1539]tryte;              // the header and 512 page offsets
+var uf_page: int = -1;                // the page whose widths are in uf_widths
+var uf_widths: [256]tryte;
+var uf_ccp: [243]int;                 // cache: the code point (-1 empty)
+var uf_cw: [243]int;                  //        its width in pixels (0: no glyph)
+var uf_crows: [3888]int;              //        16 rows each, bit 0 = leftmost
+
+// Open the font (once); 1 if it is there.
+fn uf_open() -> int {
+    if (uf_tried) { return uf_fd >= 0; }
+    uf_tried = 1;
+    var fd: int = open("/usr/share/unifont", O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    if (read(fd, &uf_dir[0] as *char, 1539) != 1539 || uf_dir[0] != 'U' || uf_dir[1] != 'F' || uf_dir[2] != 1) {
+        close(fd);
+        return 0;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    var k: int = 0;
+    while (k < UF_CACHE) { uf_ccp[k] = -1; k += 1; }
+    uf_fd = fd;
+    return 1;
+}
+
+fn uf_read(at: int, buf: *tryte, n: int) -> int {
+    if (lseek(uf_fd, at, SEEK_SET) != at) { return 0; }
+    return read(uf_fd, buf as *char, n) == n;
+}
+
+// Character cp's glyph: its width in pixels (8 or 16; 0 if the font has
+// none) and, in rows[0..16], its rows with bit 0 the leftmost pixel.
+fn uf_glyph(cp: int, rows: *int) -> int {
+    if (cp < 0 || cp >= 131072 || !uf_open()) { return 0; }
+    var slot: int = cp % UF_CACHE;
+    var k: int = 0;
+    if (uf_ccp[slot] != cp) {
+        uf_ccp[slot] = cp;
+        uf_cw[slot] = uf_fetch(cp, &uf_crows[slot * 16]);
+    }
+    while (k < 16) { rows[k] = uf_crows[slot * 16 + k]; k += 1; }
+    return uf_cw[slot];
+}
+
+fn uf_fetch(cp: int, rows: *int) -> int {
+    var page: int = cp / 256;
+    var d: int = 3 + 3 * page;
+    var at: int = (uf_dir[d] * 19683 + uf_dir[d + 1]) * 19683 + uf_dir[d + 2];
+    if (at == 0) { return 0; }
+    if (page != uf_page) {
+        if (!uf_read(at, &uf_widths[0], 256)) { uf_page = -1; return 0; }
+        uf_page = page;
+    }
+    var lo: int = cp % 256;
+    var w: int = uf_widths[lo];
+    if (w == 0) { return 0; }
+    var off: int = at + 256;
+    var j: int = 0;
+    while (j < lo) { off += uf_widths[j] == 1 ? 10 : uf_widths[j] == 2 ? 19 : 0; j += 1; }
+    var data: [19]tryte;
+    var n: int = w == 2 ? 19 : 10;
+    if (!uf_read(off, &data[0], n)) { return 0; }
+    var px: int = w == 2 ? 16 : 8;
+    // 14 bits a tryte, first bit first; rows top first, leftmost pixel first
+    var t: int = 0;
+    var left: int = 0;                // bits still unread in v
+    var v: int = 0;
+    var r: int = 0;
+    while (r < 16) {
+        var row: int = 0;
+        var c: int = 0;
+        while (c < px) {
+            if (left == 0) { v = data[t] + 8192; t += 1; left = 14; }
+            left -= 1;
+            var bit: int = v / pow2(left) % 2;
+            if (bit) { row += pow2(c); }
+            c += 1;
+        }
+        rows[r] = row;
+        r += 1;
+    }
+    return px;
+}
+
+var pow2_t: [17]int = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
+fn pow2(k: int) -> int { return pow2_t[k]; }
+
+// Unifont's glyph for cp shrunk to 8x8 (each output pixel: any of its 2x2,
+// or 1x2 for an 8-pixel glyph); 0 if there is none.
+fn uf_small(cp: int, out: *int) -> int {
+    var rows: [16]int;
+    var w: int = uf_glyph(cp, &rows[0]);
+    if (w == 0) { return 0; }
+    var r: int = 0;
+    while (r < 8) {
+        var a: int = rows[2 * r];
+        var b: int = rows[2 * r + 1];
+        var m: int = 0;
+        var c: int = 0;
+        while (c < 8) {
+            var on: int;
+            if (w == 16) { on = (a / pow2(2 * c) % 4) != 0 || (b / pow2(2 * c) % 4) != 0; }
+            else { on = (a / pow2(c) % 2) != 0 || (b / pow2(c) % 2) != 0; }
+            if (on) { m += pow2(c); }
+            c += 1;
+        }
+        out[r] = m;
+        r += 1;
+    }
+    return 1;
+}
+
+// One character in Unifont at (x, y), 16 rows high, in tchar_width(c)
+// cells of 8 pixels; returns the cells. A glyph wider than its cells is
+// squeezed (pairs of columns), a narrower one centred; a character the
+// font lacks is U+FFFD (or the 8x8 font's glyph, without the file).
+// Overlined (negative c): a bar on the top row.
+fn draw_char16(s: *Surface, x: int, y: int, c: int, fg: int, bg: int) -> int {
+    var cp: int = c < 0 ? -c : c;
+    var over: int = c < -32 || (c < 0 && cp > 9841);
+    var cells: int = tchar_width(cp);
+    var rows: [16]int;
+    var w: int = uf_glyph(cp, &rows[0]);
+    if (w == 0) { w = uf_glyph(65533, &rows[0]); }
+    if (w == 0) {
+        // no Unifont: the 8x8 glyph, centred
+        if (bg != TRANSPARENT) { fill_rect(s, x, y, 8 * cells, 16, bg); }
+        draw_char(s, x + 4 * (cells - 1), y + 4, c, fg, TRANSPARENT, 1);
+        return cells;
+    }
+    var cw: int = 8 * cells;
+    var r: int = 0;
+    while (r < 16) {
+        var bits: int = rows[r];
+        if (w == 16 && cells == 1) {
+            var m: int = 0;
+            var k: int = 0;
+            while (k < 8) { if (bits / pow2(2 * k) % 4 != 0) { m += pow2(k); } k += 1; }
+            bits = m;
+        } else if (w == 8 && cells == 2) {
+            bits = bits * 16;                          // centred: 4 pixels in
+        }
+        if (over && r == 0) { bits = pow2(cw - 1) - 1; }
+        var yy: int = y + r;
+        if (yy >= 0 && yy < s.h) {
+            var col: int = 0;
+            while (col < cw) {
+                var xx: int = x + col;
+                if (xx >= 0 && xx < s.w) {
+                    if (bits % 2 != 0) { s.data[yy * s.w + xx] = fg as tryte; }
+                    else if (bg != TRANSPARENT) { s.data[yy * s.w + xx] = bg as tryte; }
+                }
+                bits = bits / 2;
+                col += 1;
+            }
+        }
+        r += 1;
+    }
+    return cells;
+}
+
+// Text in Unifont, 16 rows high; returns its width in pixels.
+fn draw_text16(s: *Surface, x: int, y: int, text: *char, fg: int, bg: int) -> int {
+    var cp: int;
+    var x0: int = x;
+    loop {
+        var n: int = tstr_next(text, &cp);
+        if (n == 0) { break; }
+        if (n < 0) { cp = 65533; n = 1; }
+        x += 8 * draw_char16(s, x, y, cp, fg, bg);
+        text = text + n;
+    }
+    return x - x0;
+}
+
+fn text_width16(text: *char) -> int { return 8 * tstr_width(text); }

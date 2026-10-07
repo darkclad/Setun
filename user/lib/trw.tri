@@ -9,6 +9,7 @@
 //           TEXT x y fg bg scale text...         PIXELS x y w h pixels...
 //           SCROLL x y w h dy fill               FLUSH (show the changes)
 //           TITLE text...                        SPAWN path...
+//           TEXT16 x y fg bg text...  (Unifont, 16 rows high, 8 pixels a cell)
 // Events:   KEY char   BUTTON x y buttons   MOTION x y buttons   CLOSE
 //           FOCUS in
 
@@ -22,6 +23,7 @@ const TRW_SCROLL: int = 5;
 const TRW_FLUSH: int = 6;
 const TRW_TITLE: int = 7;
 const TRW_SPAWN: int = 8;
+const TRW_TEXT16: int = 9;            // text in Unifont, 16 rows high (8 pixels a cell)
 
 const TRW_KEY: int = 101;
 const TRW_BUTTON: int = 102;
@@ -89,6 +91,11 @@ fn trw_fill(x: int, y: int, w: int, h: int, colour: int) {
 fn trw_text(x: int, y: int, fg: int, bg: int, scale: int, text: *char) {
     var a: [5]int = { x, y, fg, bg, scale };
     trw_msg(TRW_TEXT, &a[0], 5, text);
+}
+
+fn trw_text16(x: int, y: int, fg: int, bg: int, text: *char) {
+    var a: [4]int = { x, y, fg, bg };
+    trw_msg(TRW_TEXT16, &a[0], 4, text);
 }
 
 // A block of pixels (w * h at most 2181), written straight into the queue.

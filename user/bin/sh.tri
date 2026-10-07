@@ -28,6 +28,7 @@ import "../lib/ctype.tri";
 import "../lib/stdlib.tri";
 import "../lib/testexpr.tri";
 import "../lib/fnmatch.tri";
+import "../lib/wcwidth.tri";
 
 // ---- tokens ---------------------------------------------------------------------------
 
@@ -3155,17 +3156,28 @@ fn ed_left(n: int) {
 }
 
 // Characters above U+2671 are 3 trytes (a lead, two trailing trytes):
-// the editor inserts, deletes and steps over them whole, one column each.
+// the editor inserts, deletes and steps over them whole; an East Asian
+// wide character takes two columns.
 fn ed_lead(c: int) -> int { return c == BIG_CHAR || c == BIG_CHAR_OVERLINED; }
 
 // The trytes of the character that starts at i, and of the one that ends at i.
 fn ed_fwd(i: int) -> int { return i + 3 <= ed_len && ed_lead(ed_buf[i]) ? 3 : 1; }
 fn ed_back(i: int) -> int { return i >= 3 && ed_lead(ed_buf[i - 3]) && ed_buf[i - 2] < -32 && ed_buf[i - 1] < -32 ? 3 : 1; }
 
+// The code point of the character at i (negative: overlined).
+fn ed_cp(i: int) -> int {
+    var cp: int = ed_buf[i];
+    if (ed_fwd(i) == 3) {
+        var t: [4]char = { ed_buf[i], ed_buf[i + 1], ed_buf[i + 2], 0 };
+        if (tstr_next(&t[0], &cp) != 3) { cp = '?'; }
+    }
+    return cp;
+}
+
 // Screen columns of ed_buf[a..b).
 fn ed_cols(a: int, b: int) -> int {
     var n: int = 0;
-    while (a < b) { a += ed_fwd(a); n += 1; }
+    while (a < b) { n += tchar_width(ed_cp(a)); a += ed_fwd(a); }
     return n;
 }
 
@@ -3455,8 +3467,16 @@ fn edit_line_into_src(p: *char) -> int {
             ed_delete(ed_pos, ed_fwd(ed_pos));
         } else if (c == 127 || c == 8) { var b: int = ed_back(ed_pos); ed_delete(ed_pos - b, b); }
         else if (c == K_DEL) { ed_delete(ed_pos, ed_fwd(ed_pos)); }
-        else if (c == K_LEFT) { if (ed_pos > 0) { ed_pos -= ed_back(ed_pos); ed_left(1); } }
-        else if (c == K_RIGHT) { if (ed_pos < ed_len) { ed_pos += ed_fwd(ed_pos); ed_puts("\e[C"); } }
+        else if (c == K_LEFT) {
+            if (ed_pos > 0) { var lb: int = ed_back(ed_pos); ed_pos -= lb; ed_left(ed_cols(ed_pos, ed_pos + lb)); }
+        }
+        else if (c == K_RIGHT) {
+            if (ed_pos < ed_len) {
+                var rf: int = ed_fwd(ed_pos);
+                if (ed_cols(ed_pos, ed_pos + rf) == 2) { ed_puts("\e[2C"); } else { ed_puts("\e[C"); }
+                ed_pos += rf;
+            }
+        }
         else if (c == K_HOME || c == 1) { ed_pos = 0; ed_redraw(); }
         else if (c == K_END || c == 5) { ed_pos = ed_len; ed_redraw(); }
         else if (c == K_UP) { ed_history(-1); }

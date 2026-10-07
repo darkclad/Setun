@@ -14,6 +14,7 @@ path = "src/main.rs"
 setun-core = { path = "../core" }
 trine = { path = "../trine" }
 ternary = { path = "../ternary" }
+flate2 = "1"
 
 [dev-dependencies]
 setun-net = { path = "../net" }

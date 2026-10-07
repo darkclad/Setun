@@ -131,46 +131,128 @@ impl Session {
         }
     }
 
-    /// The terminal window's text, recognised from the screen (`rows` rows).
-    /// Letters drawn alike (Latin A, Cyrillic А) read as the first in
-    /// `glyph_order`; compare with `canonical`.
+    /// The terminal window's text, recognised from the screen (`rows` rows
+    /// of 8 x 16 Unifont cells; a wide character spans two). Characters
+    /// drawn alike (Latin A, Cyrillic А) read as the first in `glyph_order`;
+    /// compare with `canonical`.
     fn term_text(&self, rows: usize) -> Vec<String> {
-        let font = trinux::font8x8_table();
+        let (narrow, wide) = glyph_maps();
         (0..rows)
             .map(|r| {
-                (0..76)
-                    .map(|c| {
-                        let (x0, y0) = (TERM_X + 8 * c as i64, TERM_Y + 9 * r as i64);
-                        let cell: Vec<i16> = (0..8)
-                            .map(|y| (0..8).map(|x| (self.pixel(x0 + x, y0 + y) == WHITE) as i16 * (1 << x)).sum())
-                            .collect();
-                        glyph_order().find(|&i| font[i * 8..i * 8 + 8] == cell[..]).map(trinux::font_char).unwrap_or('?')
-                    })
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
+                let y0 = TERM_Y + 16 * r as i64;
+                let cell = |c: i64, w: i64| -> (u8, [u16; 16]) {
+                    let mut g = [0u16; 16];
+                    for (y, row) in g.iter_mut().enumerate() {
+                        for x in 0..w {
+                            if self.pixel(TERM_X + 8 * c + x, y0 + y as i64) == WHITE {
+                                *row |= 0x8000 >> x;
+                            }
+                        }
+                    }
+                    (w as u8, g)
+                };
+                let mut line = String::new();
+                let mut c = 0;
+                while c < 76 {
+                    let n = cell(c, 8);
+                    if let Some(&ch) = narrow.get(&n) {
+                        line.push(ch);
+                        c += 1;
+                    } else if let Some(&ch) = (c < 75).then(|| wide.get(&cell(c, 16))).flatten() {
+                        line.push(ch);
+                        c += 2;
+                    } else {
+                        line.push('?');
+                        c += 1;
+                    }
+                }
+                line.trim_end().to_string()
             })
             .collect()
     }
 }
 
-/// Font glyphs in the order the screen reader tries them: ASCII, Latin-1,
-/// then Cyrillic.
-fn glyph_order() -> impl Iterator<Item = usize> {
-    (32..127).chain(161..256).chain(256..trinux::FONT_GLYPHS)
+type Glyph = (u8, [u16; 16]);
+
+/// Unifont's glyphs back to characters: narrow ones (8 x 16) and wide ones
+/// (16 x 16, a narrow glyph centred in two cells included), each look the
+/// first character in `glyph_order` that has it.
+fn glyph_maps() -> &'static (std::collections::HashMap<Glyph, char>, std::collections::HashMap<Glyph, char>) {
+    static MAPS: std::sync::OnceLock<(std::collections::HashMap<Glyph, char>, std::collections::HashMap<Glyph, char>)> =
+        std::sync::OnceLock::new();
+    MAPS.get_or_init(|| {
+        let glyphs = font();
+        let (mut narrow, mut wide) = (std::collections::HashMap::new(), std::collections::HashMap::new());
+        for cp in glyph_order() {
+            let Some(&g) = glyphs.get(&cp) else { continue };
+            let ch = char::from_u32(cp).unwrap();
+            let (w, rows) = shown(cp, g);
+            if w == 8 {
+                narrow.entry((8, rows)).or_insert(ch);
+            } else {
+                wide.entry((16, rows)).or_insert(ch);
+            }
+        }
+        (narrow, wide)
+    })
 }
 
-/// How `term_text` reads `s` back: each character as the first glyph that
-/// looks the same, and characters past the font as '?'.
-fn canonical(s: &str) -> String {
-    let font = trinux::font8x8_table();
-    s.chars()
-        .map(|c| match trinux::font_index(c as u32) {
-            Some(i) => {
-                let g = &font[i * 8..i * 8 + 8];
-                glyph_order().find(|&j| &font[j * 8..j * 8 + 8] == g).map(trinux::font_char).unwrap_or('?')
+fn font() -> &'static std::collections::BTreeMap<u32, Glyph> {
+    static F: std::sync::OnceLock<std::collections::BTreeMap<u32, Glyph>> = std::sync::OnceLock::new();
+    F.get_or_init(|| trinux::unifont::load(&trinux::unifont::sources()).unwrap())
+}
+
+/// How gfx.tri draws cp's glyph g in its cells: squeezed to 8 columns when
+/// the character takes one cell, centred when a narrow glyph takes two.
+fn shown(cp: u32, (w, rows): Glyph) -> Glyph {
+    let cells = if wide_char(cp) { 2 } else { 1 };
+    match (w, cells) {
+        (16, 1) => {
+            let mut out = [0u16; 16];
+            for (o, r) in out.iter_mut().zip(rows) {
+                for k in 0..8 {
+                    if r & (0xC000 >> (2 * k)) != 0 {
+                        *o |= 0x8000 >> k;
+                    }
+                }
             }
-            None => '?',
+            (8, out)
+        }
+        (8, 2) => (16, rows.map(|r| r >> 4)),
+        _ => (w, rows),
+    }
+}
+
+/// East Asian wide (W or F), as user/lib/wcwidth.tri has it.
+fn wide_char(cp: u32) -> bool {
+    let src = std::fs::read_to_string(trinux::user_dir().join("lib/wcwidth.tri")).unwrap();
+    let list = |name: &str| -> Vec<u32> {
+        let a = src.find(&format!("var {name}:")).unwrap();
+        let body = &src[a..];
+        let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
+        body.split(',').map(|x| x.trim().parse().unwrap()).collect()
+    };
+    static R: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    let r = R.get_or_init(|| list("wide_first").into_iter().zip(list("wide_last")).collect());
+    r.iter().any(|&(a, b)| (a..=b).contains(&cp))
+}
+
+/// The order the screen reader tries characters in: ASCII, Latin-1,
+/// Cyrillic, then everything else.
+fn glyph_order() -> impl Iterator<Item = u32> {
+    (32..127).chain(161..256).chain(0x400..0x460).chain((256..0x20000).filter(|c| !(0x400..0x460).contains(c)))
+}
+
+/// How `term_text` reads `s` back: each character as the first in
+/// `glyph_order` drawn the same, and one Unifont lacks as U+FFFD would read.
+fn canonical(s: &str) -> String {
+    let (narrow, wide) = glyph_maps();
+    let glyphs = font();
+    s.chars()
+        .map(|c| {
+            let cp = if glyphs.contains_key(&(c as u32)) { c as u32 } else { 0xFFFD };
+            let g = shown(cp, glyphs[&cp]);
+            *if g.0 == 8 { narrow.get(&g) } else { wide.get(&g) }.unwrap_or(&'?')
         })
         .collect()
 }
@@ -452,8 +534,91 @@ fn the_terminal_window_shows_cyrillic() {
     // the letters only Cyrillic has really are read back as Cyrillic
     assert!(text.iter().any(|l| l.contains("Съешь") || l.contains("Cъeшь")), "{text:#?}");
     assert!(text.iter().any(|l| l.contains('Ж') && l.contains('Щ') && l.contains('Ю') && l.contains('Я')), "{text:#?}");
-    // characters past the font are drawn as '?'
-    assert!(text.iter().any(|l| l.starts_with("? ? are past the font.")), "{text:#?}");
+    // and letters the 8x8 font never had (Unifont has them)
+    assert!(text.iter().any(|l| l.starts_with("Ѡ Ѣ were past the 8x8 font.")), "{text:#?}");
+}
+
+#[test]
+fn the_terminal_window_shows_wide_characters() {
+    // A6: 3-tryte characters in Unifont, East Asian wide ones in two cells,
+    // the columns after them still lined up
+    let mut s = Session::boot();
+    s.console("echo '日本語 😀 Ж|' > /tmp/wide; echo 'abcdefghijk|' >> /tmp/wide; echo -n 日本語 > /tmp/nonl");
+    s.console("trwm term &");
+    s.wait_for("trwm: window 0 'Terminal'", 200);
+    s.run(40);
+    s.click(TERM_X + 500, TERM_Y - 8);
+    s.type_text("cat /tmp/wide\n");
+    s.run(120);
+    let text = s.term_text(6);
+    let want = canonical("日本語 😀 Ж|");
+    assert!(text.contains(&want), "missing {want:?}: {text:#?}");
+    // read cell by cell, so 日本語 took six columns and 😀 two: the bar is
+    // in column 11 on both lines
+    let row = text.iter().position(|l| *l == want).unwrap();
+    assert_eq!(text[row + 1], "abcdefghijk|", "{text:#?}");
+    let cols: usize = want.chars().map(|c| if wide_char(c as u32) { 2 } else { 1 }).sum();
+    assert_eq!(cols, 12);
+    // the grid agrees: after 日本語 and the prompt the cursor (a yellow
+    // underline under its cell) is in column 8
+    s.type_text("cat /tmp/nonl\n");
+    s.run(60);
+    let text = s.term_text(8);
+    let row = text.iter().position(|l| l.starts_with(&canonical("日本語$"))).unwrap_or_else(|| panic!("{text:#?}"));
+    let y = TERM_Y + 16 * row as i64 + 14;
+    let cursor: Vec<i64> = (0..76).filter(|&c| s.pixel(TERM_X + 8 * c + 3, y) == rgb(13, 13, 0)).collect();
+    assert_eq!(cursor, [8], "{text:#?}");
+    if let Ok(path) = std::env::var("SETUN_SCREENSHOT") {
+        s.screenshot(&path);
+    }
+}
+
+impl Session {
+    /// The screen as a PNG (for looking at, not for tests).
+    fn screenshot(&self, path: &str) {
+        use std::io::Write;
+        let fb = self.m.mem.framebuffer();
+        let h = (fb.len() / W).min(480);
+        let level = |v: i64| ((v + 13) * 255 / 26) as u8;
+        let mut raw = Vec::new();
+        for y in 0..h {
+            raw.push(0u8);
+            for x in 0..W {
+                let p = fb[y * W + x] as i64;
+                let (r, g, b) = ((p + 9841).div_euclid(729) - 13, ((p + 9841) / 27 % 27) - 13, (p + 9841) % 27 - 13);
+                raw.extend([level(r), level(g), level(b)]);
+            }
+        }
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&raw).unwrap();
+        let idat = z.finish().unwrap();
+        let crc = |data: &[u8]| -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        };
+        let mut png = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10];
+        let mut chunk = |kind: &[u8], data: &[u8]| {
+            png.extend((data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend(data);
+            png.extend(&body);
+            png.extend(crc(&body).to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend((W as u32).to_be_bytes());
+        ihdr.extend((h as u32).to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &idat);
+        chunk(b"IEND", &[]);
+        std::fs::write(path, png).unwrap();
+    }
 }
 
 /// The pid trwm logged for the window titled `title`.

@@ -517,6 +517,26 @@ fn the_editor() {
 }
 
 #[test]
+fn the_editors_with_wide_characters() {
+    // A6: 3-tryte characters moved over and deleted whole; a wide one takes
+    // two columns (the shell moves the cursor by two, edit counts them)
+    let out = session(
+        &[
+            "echo 日本\u{1b}[D語",                            // Left over 本 (two columns back)
+            "echo 日本\u{7f}x",                               // Backspace takes 本 whole
+            "edit /tmp/w.txt",
+            "~日本語\u{1b}[D\u{1b}[D\u{7f}X",                 // Left twice (before 本), Backspace (日), insert
+            "~\u{1b}[F\u{7f}😀\u{1b}[H\u{1b}[3~",            // End, Backspace (語), 😀, Home, Delete (X)
+            "~\u{13}\u{18}",
+            "cat /tmp/w.txt",
+            "exit",
+        ],
+        500_000_000,
+    );
+    assert_has(&out, &["\u{1b}[2D", "\n日語本\n", "\n日x\n", "line 1/1, col 7", "line 1/1, col 3", "Wrote 1 line", "$ cat /tmp/w.txt\n本😀\n"]);
+}
+
+#[test]
 fn the_editor_errors() {
     let out = session(
         &[
@@ -1045,7 +1065,10 @@ fn text_beyond_one_tryte() {
     // TERNARY_WORLD A6: /bin/chartest (3-tryte characters, tstr_next,
     // tstr_chars, tchar_put, UTF-8 both ways, the malformed forms), and the
     // console carrying them both ways: typed in, echoed back
-    let out = session(&["chartest", "echo st=$?", "echo 日本̅ 😀", "exit"], 3_000_000_000);
+    // (head reads through the kernel's line discipline: Backspace there
+    // takes 本 whole)
+    let out = session(&["chartest", "echo st=$?", "echo 日本̅ 😀", "head -n 1 > /tmp/h", "~日本\u{7f}x\n", "cat /tmp/h; echo end", "exit"], 3_000_000_000);
+    assert_has(&out, &["\n日x\nend\n"]);
     assert!(!out.contains("FAILED"), "{out}");
     assert_has(&out, &["chartest: all passed", "st=0", "chartest: 日本語 Ω̅ 😀 ok", "日本̅ 😀"]);
     let n = out.matches(" ok\n").count();

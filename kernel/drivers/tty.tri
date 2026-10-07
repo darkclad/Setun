@@ -275,7 +275,13 @@ fn tty_echo(t: int, c: char) {
 fn erase_one(t: int) {
     var y: *Tty = &ttys[t];
     if (y.line_len == 0) { return; }
-    y.line_len -= 1;
+    var n: int = y.line_len;
+    // a character above U+2671 (a lead -2 or -3, two trailing trytes) goes whole
+    if (n >= 3 && (y.line[n - 3] == -2 || y.line[n - 3] == -3) && y.line[n - 2] < -32 && y.line[n - 1] < -32) {
+        y.line_len -= 3;
+    } else {
+        y.line_len -= 1;
+    }
     if (lflag(t, ECHO) && lflag(t, ECHOE)) {
         tty_output(t, 8 as char);
         tty_output(t, ' ');
