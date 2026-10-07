@@ -9,6 +9,11 @@ fn opts(optimize: bool) -> Options {
     Options { optimize, ..Options::rom() }
 }
 
+/// Optimization levels 1-3 (Options::level): each must run the same too.
+fn at_level(l: u8) -> Options {
+    Options { level: Some(l), ..Options::rom() }
+}
+
 /// (outcome, serial, debug log, framebuffer hash, steps)
 fn run(image: &[i16], steps: u64) -> (Outcome, String, Vec<i64>, u64, u64) {
     let r = run_rom(image, steps, "");
@@ -25,6 +30,11 @@ fn same_both_ways_src(name: &str, src: &str, steps: u64) -> Outcome {
     let (ra, rb) = (run(&a.image, steps), run(&b.image, steps));
     assert_eq!((&ra.0, &ra.1, &ra.2, ra.3), (&rb.0, &rb.1, &rb.2, rb.3), "{name}: optimized run differs");
     assert!(rb.4 <= ra.4, "{name}: the optimized program took more steps ({} vs {})", rb.4, ra.4);
+    for l in 1..=3 {
+        let c = build_source(name, src, None, &at_level(l)).unwrap_or_else(|e| panic!("{name} at -O{l}: {e}"));
+        let rc = run(&c.image, steps);
+        assert_eq!((&ra.0, &ra.1, &ra.2, ra.3), (&rc.0, &rc.1, &rc.2, rc.3), "{name}: the run at -O{l} differs");
+    }
     rb.0
 }
 
@@ -33,6 +43,11 @@ fn same_both_ways_file(path: &Path, steps: u64) {
     let b = build_file(path, &opts(true)).unwrap_or_else(|e| panic!("{e}"));
     let (ra, rb) = (run(&a.image, steps), run(&b.image, steps));
     assert_eq!((&ra.0, &ra.1, &ra.2, ra.3), (&rb.0, &rb.1, &rb.2, rb.3), "{}: optimized run differs", path.display());
+    for l in 1..=3 {
+        let c = build_file(path, &at_level(l)).unwrap_or_else(|e| panic!("{e}"));
+        let rc = run(&c.image, steps);
+        assert_eq!((&ra.0, &ra.1, &ra.2, ra.3), (&rc.0, &rc.1, &rc.2, rc.3), "{}: the run at -O{l} differs", path.display());
+    }
 }
 
 #[test]

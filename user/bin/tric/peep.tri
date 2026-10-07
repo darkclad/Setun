@@ -1,0 +1,818 @@
+// tric/peep.tri: the peephole pass over one function's assembly, after the
+// host's crates/trine/src/peephole.rs (optimization level 1 and up). Same
+// rules, same order, so the output matches the host's character for
+// character:
+//
+// - forward a copy: `mov r1, X` then an instruction reading r1 reads X;
+// - retarget a result: an instruction computing r1, then `mov Y, r1`,
+//   computes Y directly;
+// - drop dead code, self-moves and jumps to the next line;
+// - last, local value numbering drops an instruction that recomputes a
+//   value its destination already holds.
+//
+// Liveness is over registers as bits 0..26 (r-13..r13) and the flags as bit
+// 27. A line it does not understand leaves the function alone.
+
+const PP_FLAGS: int = 134217728;          // 2^27
+const PP_WHOLE: int = 3000;
+const PP_PIECE: int = 250;
+
+struct pline {
+    txt: *char;                          // the line, without its newline
+    kind: int;                           // 0 a label, 1 an instruction, 2 anything else
+    op: *char;                           // the mnemonic, or the label's name
+    na: int;
+    av: [9]*char;                        // the operands
+    iok: int;                            // info: known?
+    uses: int;
+    defs: int;
+    pure: int;
+    dst0: int;
+    ctl: int;                            // 0 next, 1 jump, 2 branch, 3 exit
+}
+
+var pp_l: *int;                          // the lines (pointers to plines)
+var pp_n: int;
+var pp_cap: int;
+var pp_live: *int;                       // live after each line
+var pp_in: *int;
+var pp_s0: *int;                         // successors (-1: none)
+var pp_s1: *int;
+var pp_s2: *int;
+
+fn ppl(k: int) -> *pline { return pp_l[k] as *pline; }
+
+var pp_p2: [28]int;
+var pp_p2_ok: int;
+
+fn pp_pow2(k: int) -> int {
+    if (!pp_p2_ok) {
+        var v: int = 1;
+        var i: int = 0;
+        while (i < 28) { pp_p2[i] = v; v = v * 2; i += 1; }
+        pp_p2_ok = 1;
+    }
+    return pp_p2[k];
+}
+
+fn pp_bit(r: int) -> int { return pp_pow2(r + 13); }
+fn pp_frame() -> int { return pp_bit(13) + pp_bit(11); }
+
+fn pp_space(c: int) -> int { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+// "r-5", "sp", ...: the register number, or -100.
+fn pp_reg(s: *char) -> int {
+    if (streq(s, "sp")) { return 13; }
+    if (streq(s, "fp")) { return 11; }
+    if (streq(s, "lr")) { return 12; }
+    if (streq(s, "zero")) { return 0; }
+    if (s[0] != 'r') { return -100; }
+    // as Rust's i64 parse: an optional sign, then one or more digits
+    var k: int = 1;
+    var neg: int = 0;
+    if (s[k] == '+' || s[k] == '-') { neg = s[k] == '-'; k += 1; }
+    if (s[k] < '0' || s[k] > '9') { return -100; }
+    var v: int = 0;
+    while (s[k] >= '0' && s[k] <= '9') {
+        v = v * 10 + s[k] - '0';
+        if (v > 100) { return -100; }
+        k += 1;
+    }
+    if (s[k] != 0) { return -100; }
+    if (neg) { v = -v; }
+    return v >= -13 && v <= 13 ? v : -100;
+}
+
+// The base register of a memory operand ("[r-3+6]"), or -100.
+fn pp_mem_base(op: *char, rest: *int) -> int {
+    var n: int = strlen(op);
+    *rest = -1;
+    if (n < 2 || op[0] != '[' || op[n - 1] != ']') { return -100; }
+    var b: [27]char;
+    var k: int = 1;
+    var j: int = 0;
+    // "[r-": the base runs to the next + or - after the "r-"
+    if (n >= 4 && op[1] == 'r' && op[2] == '-') {
+        b[0] = 'r'; b[1] = '-';
+        j = 2;
+        k = 3;
+    }
+    while (k < n - 1 && op[k] != '+' && op[k] != '-' && j < 26) { b[j] = op[k]; j += 1; k += 1; }
+    b[j] = 0;
+    *rest = k;
+    return pp_reg(&b[0]);
+}
+
+fn pp_regs_of(op: *char) -> int {
+    var r: int = pp_reg(op);
+    if (r != -100) { return pp_bit(r); }
+    var rest: int;
+    var b: int = pp_mem_base(op, &rest);
+    return b == -100 ? 0 : pp_bit(b);
+}
+
+fn pp_has(list: *char, s: *char) -> int {
+    var n: int = strlen(s);
+    var k: int = 0;
+    while (list[k] != 0) {
+        var e: int = k;
+        while (list[e] != ' ' && list[e] != 0) { e += 1; }
+        if (e - k == n && strncmp(list + k, s, n) == 0) { return 1; }
+        k = e;
+        if (list[k] == ' ') { k += 1; }
+    }
+    return 0;
+}
+
+var PP_ALU3: *char = "add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit band bor bxor bandn bsh";
+var PP_ALU2: *char = "neg sgn abs tlz";
+var PP_BRANCHES: *char = "blt beq bgt ble bge bne bov bnov bnever";
+
+fn pp_args() -> int { return pp_bit(1) + pp_bit(2) + pp_bit(3) + pp_bit(4) + pp_bit(5) + pp_bit(6); }
+
+fn pp_clobbered() -> int {
+    var m: int = bor(PP_FLAGS, pp_bit(12));
+    var r: int = 1;
+    while (r <= 10) { m = bor(m, pp_bit(r)); r += 1; }
+    r = -13;
+    while (r <= -10) { m = bor(m, pp_bit(r)); r += 1; }
+    return m;
+}
+
+fn pp_src(p: *pline, from: int) -> int {
+    var m: int = 0;
+    var k: int = from;
+    while (k < p.na) { m = bor(m, pp_regs_of(p.av[k])); k += 1; }
+    return m;
+}
+
+fn pp_set(p: *pline, uses: int, defs: int, pure: int, dst0: int, ctl: int) {
+    p.iok = 1;
+    p.uses = uses;
+    p.defs = defs;
+    p.pure = pure;
+    p.dst0 = dst0;
+    p.ctl = ctl;
+}
+
+// How the instruction behaves (crates/trine/src/peephole.rs: info).
+fn pp_info(p: *pline) {
+    p.iok = 0;
+    if (p.kind != 1) { return; }
+    var o: *char = p.op;
+    var n: int = p.na;
+    var reg0: int = 0;
+    if (n > 0) { var r0: int = pp_reg(p.av[0]); if (r0 != -100) { reg0 = pp_bit(r0); } }
+    var fl: int = PP_FLAGS;
+    if (pp_has(PP_ALU3, o) && n == 3) {
+        var carry: int = streq(o, "adc") || streq(o, "sbc") ? fl : 0;
+        var faults: int = streq(o, "div") || streq(o, "mod") || streq(o, "divr") || streq(o, "modr");
+        pp_set(p, bor(pp_src(p, 1), carry), bor(reg0, fl), !faults, 1, 0);
+        return;
+    }
+    if (pp_has(PP_ALU2, o) && n == 2) { pp_set(p, pp_src(p, 1), bor(reg0, fl), 1, 1, 0); return; }
+    if (streq(o, "mov") && n == 2) {
+        if (pp_reg(p.av[1]) != -100) { pp_set(p, pp_src(p, 1), bor(reg0, fl), 1, 1, 0); }
+        else { pp_set(p, 0, reg0, 1, 1, 0); }
+        return;
+    }
+    if ((streq(o, "li") || streq(o, "la") || streq(o, "lea")) && n == 2) { pp_set(p, 0, reg0, 1, 1, 0); return; }
+    if (streq(o, "cmp") && n == 2) { pp_set(p, pp_src(p, 0), fl, 1, 0, 0); return; }
+    if ((streq(o, "ldw") || streq(o, "ldt")) && n == 2) { pp_set(p, pp_src(p, 1), reg0, 0, 1, 0); return; }
+    if ((streq(o, "stw") || streq(o, "stt")) && n == 2) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
+    if (streq(o, "push") && n == 1) { pp_set(p, bor(pp_src(p, 0), pp_bit(13)), bor(pp_bit(13), fl), 0, 0, 0); return; }
+    if (streq(o, "pop") && n == 1) { pp_set(p, pp_bit(13), bor(bor(reg0, pp_bit(13)), fl), 0, 0, 0); return; }
+    if ((streq(o, "ext") || streq(o, "bext") || streq(o, "brot")) && n == 4) { pp_set(p, pp_src(p, 1), bor(reg0, fl), 1, 1, 0); return; }
+    if (streq(o, "ins") && n == 4) { pp_set(p, pp_src(p, 0), bor(reg0, fl), 1, 0, 0); return; }
+    if (streq(o, "mrg") && n == 3) { pp_set(p, pp_src(p, 0), bor(reg0, fl), 1, 0, 0); return; }
+    if ((streq(o, "tcp") || streq(o, "tcn") || streq(o, "trev")) && n == 3) { pp_set(p, pp_src(p, 1), bor(reg0, fl), 0, 1, 0); return; }
+    if (streq(o, "stwm") && n == 3) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
+    if (streq(o, "cas3") && n == 3) { pp_set(p, pp_src(p, 0), bor(reg0, fl), 0, 0, 0); return; }
+    if (streq(o, "swap") && n == 2) { pp_set(p, pp_src(p, 0), reg0, 0, 0, 0); return; }
+    if ((streq(o, "vld") || streq(o, "vst") || streq(o, "vbcst") || streq(o, "vbcstw")) && n == 2) { pp_set(p, pp_src(p, 1), 0, 0, 0, 0); return; }
+    if ((streq(o, "vsum") || streq(o, "vdotw")) && n >= 2) { pp_set(p, 0, reg0, 0, 0, 0); return; }
+    if (o[0] == 'v') {
+        var allv: int = 1;
+        var j: int = 0;
+        while (j < n) { if (p.av[j][0] != 'v') { allv = 0; } j += 1; }
+        if (allv) { pp_set(p, 0, 0, 0, 0, 0); return; }
+    }
+    if (streq(o, "in") && n == 2) { pp_set(p, pp_src(p, 1), reg0, 0, 0, 0); return; }
+    if (streq(o, "out") && n == 2) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
+    if (streq(o, "mfc") && n == 2) { pp_set(p, 0, reg0, 0, 0, 0); return; }
+    if (streq(o, "mtc") && n == 2) { pp_set(p, pp_src(p, 1), 0, 0, 0, 0); return; }
+    if (streq(o, "nop")) { pp_set(p, 0, 0, 0, 0, 0); return; }
+    if (streq(o, "hlt") || streq(o, "fence") || streq(o, "tlbflush")) { pp_set(p, 0, 0, 0, 0, 0); return; }
+    if (streq(o, "tlbinv")) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
+    if (streq(o, "sys")) { pp_set(p, bor(pp_args(), pp_bit(13)), bor(pp_bit(1), fl), 0, 0, 0); return; }
+    if (streq(o, "call") && n == 1) { pp_set(p, bor(pp_args(), pp_bit(13)), pp_clobbered(), 0, 0, 0); return; }
+    if (streq(o, "jal") && n == 2) { pp_set(p, bor(pp_args(), pp_bit(13)), bor(pp_clobbered(), reg0), 0, 0, 0); return; }
+    if (streq(o, "jalr") && n >= 2 && reg0 != pp_bit(0)) {
+        pp_set(p, bor(bor(pp_src(p, 1), pp_args()), pp_bit(13)), bor(pp_clobbered(), reg0), 0, 0, 0);
+        return;
+    }
+    if (streq(o, "ret") && n == 0) {
+        var u: int = pp_bit(1) + pp_bit(11) + pp_bit(12) + pp_bit(13);
+        var r: int = -9;
+        while (r <= -1) { u = bor(u, pp_bit(r)); r += 1; }
+        pp_set(p, u, 0, 0, 0, 3);
+        return;
+    }
+    if (streq(o, "b") && n == 1) { pp_set(p, 0, 0, 0, 0, 1); return; }
+    if (pp_has(PP_BRANCHES, o) && n == 1) { pp_set(p, fl, 0, 0, 0, 2); return; }
+    if (streq(o, "br3") && n == 2) { pp_set(p, fl, 0, 0, 0, 2); return; }
+    if ((streq(o, "fldd") || streq(o, "flds") || streq(o, "fstd") || streq(o, "fsts")) && n == 2) { pp_set(p, pp_src(p, 1), 0, 0, 0, 0); return; }
+    if ((streq(o, "fcvtif") || streq(o, "ffrw")) && n == 2) { pp_set(p, pp_src(p, 1), 0, 0, 0, 0); return; }
+    if ((streq(o, "fcvtfi") || streq(o, "ftow") || streq(o, "fexp") || streq(o, "fclass") || streq(o, "fmfs")) && n > 0) {
+        pp_set(p, 0, reg0, 0, 0, 0);
+        return;
+    }
+    if (streq(o, "fmts") && n == 1) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
+    if (streq(o, "fscl") && n == 3) { pp_set(p, pp_src(p, 2), 0, 0, 0, 0); return; }
+    if (streq(o, "fcmp")) { pp_set(p, 0, fl, 0, 0, 0); return; }
+    if (o[0] == 'f') { pp_set(p, 0, 0, 0, 0, 0); return; }
+}
+
+// ---- lines -----------------------------------------------------------------------------------
+
+fn pp_free_line(p: *pline) {
+    free(p.txt as *tryte);
+    if (p.op != null) { free(p.op as *tryte); }
+    var k: int = 0;
+    while (k < p.na) { free(p.av[k] as *tryte); k += 1; }
+    free(p as *tryte);
+}
+
+fn pp_sub(s: *char, a: int, b: int) -> *char {
+    // s[a..b) trimmed
+    while (a < b && pp_space(s[a])) { a += 1; }
+    while (b > a && pp_space(s[b - 1])) { b -= 1; }
+    var r: *char = malloc(b - a + 1) as *char;
+    if (r == null) { oom(); }
+    var k: int = 0;
+    while (a + k < b) { r[k] = s[a + k]; k += 1; }
+    r[k] = 0;
+    return r;
+}
+
+// A pline for text t (taken over).
+fn pp_parse(t: *char) -> *pline {
+    var p: *pline = malloc(sizeof(pline)) as *pline;
+    if (p == null) { oom(); }
+    p.txt = t;
+    p.op = null;
+    p.na = 0;
+    p.kind = 2;
+    var n: int = strlen(t);
+    if (n > 0 && pp_space(t[0])) {
+        var a: int = 0;
+        while (a < n && pp_space(t[a])) { a += 1; }
+        var b: int = n;
+        while (b > a && pp_space(t[b - 1])) { b -= 1; }
+        if (a < b) {
+            p.kind = 1;
+            var e: int = a;
+            while (e < b && !pp_space(t[e])) { e += 1; }
+            p.op = pp_sub(t, a, e);
+            // the operands: the rest split on commas, each trimmed
+            var r: int = e;
+            while (r < b && pp_space(t[r])) { r += 1; }
+            if (r < b) {
+                var s: int = e;
+                var k: int = e;
+                while (k <= b) {
+                    if (k == b || t[k] == ',') {
+                        if (p.na < 9) { p.av[p.na] = pp_sub(t, s, k); p.na += 1; }
+                        s = k + 1;
+                    }
+                    k += 1;
+                }
+            }
+        }
+    } else {
+        var b2: int = n;
+        while (b2 > 0 && pp_space(t[b2 - 1])) { b2 -= 1; }
+        var a2: int = 0;
+        while (a2 < b2 && pp_space(t[a2])) { a2 += 1; }
+        if (b2 > a2 && t[b2 - 1] == ':') {
+            p.kind = 0;
+            p.op = pp_sub(t, a2, b2 - 1);
+        }
+    }
+    pp_info(p);
+    return p;
+}
+
+// The text of an instruction: "        op a, b".
+fn pp_text(p: *pline) -> *char {
+    var c: cvec;
+    c.p = null;
+    c.n = 0;
+    c.cap = 0;
+    cv_str(&c, "        ");
+    cv_str(&c, p.op);
+    var k: int = 0;
+    while (k < p.na) {
+        cv_str(&c, k == 0 ? " " : ", ");
+        cv_str(&c, p.av[k]);
+        k += 1;
+    }
+    cv_push(&c, 0);
+    return c.p;
+}
+
+// Replace line k's text (re-parsed).
+fn pp_replace(k: int, t: *char) {
+    pp_free_line(ppl(k));
+    pp_l[k] = pp_parse(t) as int;
+}
+
+fn pp_remove(k: int) {
+    pp_free_line(ppl(k));
+    while (k + 1 < pp_n) { pp_l[k] = pp_l[k + 1]; k += 1; }
+    pp_n -= 1;
+}
+
+// ---- liveness --------------------------------------------------------------------------------
+
+var pp_ht: *int;                         // label name hash -> line + 1
+var pp_hn: int;
+
+fn pp_hash(s: *char, m: int) -> int {
+    var h: int = 0;
+    var k: int = 0;
+    while (s[k] != 0) { h = (h * 31 + s[k]) % 1000003; k += 1; }
+    if (h < 0) { h += 1000003; }
+    return h % m;
+}
+
+fn pp_label_at(name: *char) -> int {
+    var h: int = pp_hash(name, pp_hn);
+    while (pp_ht[h] != 0) {
+        var p: *pline = ppl(pp_ht[h] - 1);
+        if (streq(p.op, name)) { return pp_ht[h] - 1; }
+        h = (h + 1) % pp_hn;
+    }
+    return -1;
+}
+
+fn pp_alloc(n: int) -> *int {
+    var p: *int = malloc((n + 1) * 3) as *int;
+    if (p == null) { oom(); }
+    return p;
+}
+
+// Liveness after each line into pp_live; 0 if the function cannot be
+// analysed. tail: what is live after the last line when it falls off.
+fn pp_liveness(tail: int) -> int {
+    var n: int = pp_n;
+    var k: int = 0;
+    while (k < n) {
+        var p: *pline = ppl(k);
+        if (p.kind == 2) { return 0; }
+        if (p.kind == 1 && !p.iok) { return 0; }
+        k += 1;
+    }
+    // the labels
+    pp_hn = 2 * n + 27;
+    pp_ht = pp_alloc(pp_hn);
+    k = 0;
+    while (k < pp_hn) { pp_ht[k] = 0; k += 1; }
+    k = 0;
+    while (k < n) {
+        var q: *pline = ppl(k);
+        if (q.kind == 0) {
+            // the first definition wins? the host's map keeps the last: overwrite
+            var h: int = pp_hash(q.op, pp_hn);
+            while (pp_ht[h] != 0 && !streq(ppl(pp_ht[h] - 1).op, q.op)) { h = (h + 1) % pp_hn; }
+            pp_ht[h] = k + 1;
+        }
+        k += 1;
+    }
+    // successors
+    var ok: int = 1;
+    k = 0;
+    while (k < n) {
+        var p2: *pline = ppl(k);
+        var next: int = k + 1 < n ? k + 1 : -1;
+        pp_s0[k] = next;
+        pp_s1[k] = -1;
+        pp_s2[k] = -1;
+        if (p2.kind == 1) {
+            if (p2.ctl == 3) { pp_s0[k] = -1; }
+            else if (p2.ctl == 1) {
+                pp_s0[k] = pp_label_at(p2.av[0]);
+                if (pp_s0[k] < 0) { ok = 0; }
+            } else if (p2.ctl == 2) {
+                pp_s1[k] = pp_label_at(p2.av[0]);
+                if (pp_s1[k] < 0) { ok = 0; }
+                if (p2.na == 2) {
+                    pp_s2[k] = pp_label_at(p2.av[1]);
+                    if (pp_s2[k] < 0) { ok = 0; }
+                }
+            }
+        }
+        k += 1;
+    }
+    free(pp_ht as *tryte);
+    if (!ok) { return 0; }
+    k = 0;
+    while (k < n) { pp_in[k] = 0; pp_live[k] = 0; k += 1; }
+    loop {
+        var changed: int = 0;
+        k = n - 1;
+        while (k >= 0) {
+            var p3: *pline = ppl(k);
+            var falls: int = k + 1 == n && !(p3.kind == 1 && (p3.ctl == 3 || p3.ctl == 1));
+            var out: int = falls ? tail : 0;
+            if (pp_s0[k] >= 0) { out = bor(out, pp_in[pp_s0[k]]); }
+            if (pp_s1[k] >= 0) { out = bor(out, pp_in[pp_s1[k]]); }
+            if (pp_s2[k] >= 0) { out = bor(out, pp_in[pp_s2[k]]); }
+            var inn: int = p3.kind == 1 ? bor(p3.uses, bandn(out, p3.defs)) : out;
+            if (out != pp_live[k] || inn != pp_in[k]) {
+                pp_live[k] = out;
+                pp_in[k] = inn;
+                changed = 1;
+            }
+            k -= 1;
+        }
+        if (!changed) { break; }
+    }
+    return 1;
+}
+
+// ---- rewrites --------------------------------------------------------------------------------
+
+fn pp_is_simple(o: *char) -> int {
+    return pp_has(PP_ALU3, o) || pp_has(PP_ALU2, o) || pp_has("mov cmp stw stt ldw ldt out", o);
+}
+
+// Replace register `from` by `to` in the source operands of p (from first).
+fn pp_substitute(p: *pline, first: int, from: *char, to: *char) {
+    var fl: int = strlen(from);
+    var k: int = first;
+    while (k < p.na) {
+        var a: *char = p.av[k];
+        var n: int = strlen(a);
+        if (streq(a, from)) {
+            free(a as *tryte);
+            p.av[k] = strdup(to);
+        } else if (n >= 2 && a[0] == '[' && a[n - 1] == ']' && n - 2 >= fl && strncmp(a + 1, from, fl) == 0
+                   && (n - 2 == fl || a[1 + fl] == '+' || a[1 + fl] == '-')) {
+            var c: cvec;
+            c.p = null;
+            c.n = 0;
+            c.cap = 0;
+            cv_push(&c, '[');
+            cv_str(&c, to);
+            var j: int = 1 + fl;
+            while (j < n) { cv_push(&c, a[j]); j += 1; }
+            cv_push(&c, 0);
+            free(a as *tryte);
+            p.av[k] = c.p;
+        }
+        k += 1;
+    }
+}
+
+// ---- value numbering -------------------------------------------------------------------------
+
+var vn_val: [27]int;                     // register -> value number (0: none)
+var vn_next: int;
+var vn_keys: cvec;                       // key texts, NUL-terminated
+var vn_tab: *int;                        // hash -> key offset + 1
+var vn_num: *int;                        // and its value number
+var vn_size: int;
+var vn_used: int;
+
+fn vn_fresh() -> int { vn_next += 1; return vn_next; }
+
+fn vn_clear() {
+    var r: int = 0;
+    while (r < 27) { vn_val[r] = 0; r += 1; }
+}
+
+// The value number of key k (a fresh one the first time).
+fn vn_lookup(k: *char) -> int {
+    var h: int = pp_hash(k, vn_size);
+    while (vn_tab[h] != 0) {
+        if (streq(&vn_keys.p[vn_tab[h] - 1], k)) { return vn_num[h]; }
+        h = (h + 1) % vn_size;
+    }
+    vn_tab[h] = vn_keys.n + 1;
+    cv_str(&vn_keys, k);
+    cv_push(&vn_keys, 0);
+    vn_num[h] = vn_fresh();
+    vn_used += 1;
+    return vn_num[h];
+}
+
+// A source operand's part of a key: "#0", "v7", "#text".
+fn vn_operand(c: *cvec, s: *char) {
+    var r: int = pp_reg(s);
+    if (r == 0) { cv_str(c, "#0"); return; }
+    if (r != -100) {
+        if (vn_val[r + 13] == 0) { vn_val[r + 13] = vn_fresh(); }
+        cv_push(c, 'v');
+        cv_int(c, vn_val[r + 13]);
+        return;
+    }
+    cv_push(c, '#');
+    cv_str(c, s);
+}
+
+// The first line that puts into its destination the value already there
+// (flags unneeded), or -1 (crates/trine/src/peephole.rs: redundant).
+fn pp_redundant() -> int {
+    vn_clear();
+    vn_next = 1;
+    vn_keys.n = 0;
+    vn_size = 4 * pp_n + 27;
+    vn_tab = pp_alloc(vn_size);
+    vn_num = pp_alloc(vn_size);
+    var i0: int = 0;
+    while (i0 < vn_size) { vn_tab[i0] = 0; i0 += 1; }
+    var epoch: int = 0;
+    var found: int = -1;
+    var key: cvec;
+    key.p = null;
+    key.n = 0;
+    key.cap = 0;
+    var k: int = 0;
+    while (k < pp_n && found < 0) {
+        var p: *pline = ppl(k);
+        if (p.kind != 1) {
+            vn_clear();
+            epoch += 1;
+            k += 1;
+            continue;
+        }
+        var o: *char = p.op;
+        var a: int = p.na;
+        var flags_dead: int = band(pp_live[k], PP_FLAGS) == 0;
+        var d: int = -100;
+        var sets: int = 0;
+        var computed: int = 1;
+        key.n = 0;
+        if (pp_has(PP_ALU3, o) && a == 3 && !streq(o, "adc") && !streq(o, "sbc")) {
+            cv_str(&key, o);
+            cv_push(&key, '(');
+            vn_operand(&key, p.av[1]);
+            cv_push(&key, ',');
+            vn_operand(&key, p.av[2]);
+            cv_push(&key, ')');
+            d = pp_reg(p.av[0]);
+            sets = 1;
+        } else if (pp_has(PP_ALU2, o) && a == 2) {
+            cv_str(&key, o);
+            cv_push(&key, '(');
+            vn_operand(&key, p.av[1]);
+            cv_push(&key, ')');
+            d = pp_reg(p.av[0]);
+            sets = 1;
+        } else if (streq(o, "mov") && a == 2) {
+            sets = pp_reg(p.av[1]) != -100;
+            cv_push(&key, '=');
+            vn_operand(&key, p.av[1]);
+            d = pp_reg(p.av[0]);
+        } else if ((streq(o, "li") || streq(o, "la") || streq(o, "lea")) && a == 2) {
+            cv_str(&key, o);
+            cv_push(&key, '#');
+            cv_str(&key, p.av[1]);
+            d = pp_reg(p.av[0]);
+        } else if ((streq(o, "ldw") || streq(o, "ldt")) && a == 2) {
+            var rest: int;
+            var base: int = pp_mem_base(p.av[1], &rest);
+            var m: *char = p.av[1];
+            var mn: int = strlen(m);
+            d = pp_reg(p.av[0]);
+            if (rest < 0) { d = -100; }
+            else {
+                cv_str(&key, o);
+                cv_push(&key, '[');
+                if (base == -100) {
+                    // no register: the whole inside is "the rest"
+                    cv_str(&key, "abs");
+                    var j: int = 1;
+                    while (j < mn - 1) { cv_push(&key, m[j]); j += 1; }
+                } else {
+                    var rb: [9]char;
+                    rb[0] = 'r';
+                    var t: cvec;
+                    t.p = null;
+                    t.n = 0;
+                    t.cap = 0;
+                    cv_push(&t, 'r');
+                    cv_int(&t, base);
+                    cv_push(&t, 0);
+                    vn_operand(&key, t.p);
+                    free(t.p as *tryte);
+                    var j2: int = rest;
+                    while (j2 < mn - 1) { cv_push(&key, m[j2]); j2 += 1; }
+                }
+                cv_str(&key, "]@");
+                cv_int(&key, epoch);
+            }
+        } else if (streq(o, "cmp")) {
+            k += 1;
+            continue;                    // flags only
+        } else {
+            computed = 0;
+        }
+        if (computed && d != -100) {
+            cv_push(&key, 0);
+            var v: int;
+            if (key.p[0] == '=' && key.p[1] == 'v') {
+                v = 0;
+                var j3: int = 2;
+                while (key.p[j3] != 0) { v = v * 10 + key.p[j3] - '0'; j3 += 1; }
+            } else {
+                v = vn_lookup(key.p);
+            }
+            if (d != 0 && band(pp_bit(d), pp_frame()) == 0 && vn_val[d + 13] == v && (flags_dead || !sets)) {
+                found = k;
+            } else if (d != 0) {
+                vn_val[d + 13] = v;
+            }
+        } else if (!computed || d == -100) {
+            // not a value: a conditional branch keeps them on its fall-through
+            if (p.iok && p.ctl == 2) { k += 1; continue; }
+            if (pp_has("stw stt fstd fsts out", o)) { epoch += 1; }
+            else { vn_clear(); epoch += 1; }
+        }
+        k += 1;
+    }
+    free(vn_tab as *tryte);
+    free(vn_num as *tryte);
+    if (key.p != null) { free(key.p as *tryte); }
+    return found;
+}
+
+// ---- the pass --------------------------------------------------------------------------------
+
+fn pp_label_run_lands(k: int, target: *char) -> int {
+    var j: int = k + 1;
+    var lands: int = 0;
+    while (j < pp_n && ppl(j).kind == 0) {
+        if (streq(ppl(j).op, target)) { lands = 1; }
+        j += 1;
+    }
+    return lands;
+}
+
+fn pp_run_piece(tail: int) {
+    loop {
+        if (!pp_liveness(tail)) { return; }
+        var changed: int = 0;
+        var k: int = 0;
+        while (k < pp_n) {
+            var a: *pline = ppl(k);
+            if (a.kind != 1) { k += 1; continue; }
+            if (!a.iok) { return; }
+            if (a.pure && band(a.defs, pp_live[k]) == 0 && band(a.defs, pp_frame()) == 0) {
+                pp_remove(k);
+                changed = 1;
+                break;
+            }
+            if (streq(a.op, "mov") && a.na == 2 && streq(a.av[0], a.av[1]) && band(pp_live[k], PP_FLAGS) == 0) {
+                pp_remove(k);
+                changed = 1;
+                break;
+            }
+            if (streq(a.op, "b") && a.na == 1 && pp_label_run_lands(k, a.av[0])) {
+                pp_remove(k);
+                changed = 1;
+                break;
+            }
+            var next: int = k + 1;
+            if (next < pp_n && ppl(next).kind == 1) {
+                var b: *pline = ppl(next);
+                if (!b.iok) { return; }
+                // forward a copy: mov t, x ; I(t) -> I(x)
+                if (streq(a.op, "mov") && a.na == 2 && pp_reg(a.av[1]) != -100 && !streq(a.av[0], a.av[1]) && pp_reg(a.av[0]) != -100) {
+                    var tb: int = pp_bit(pp_reg(a.av[0]));
+                    var first: int = b.dst0 ? 1 : 0;
+                    var reads: int = 0;
+                    var j: int = first;
+                    while (j < b.na) { if (band(pp_regs_of(b.av[j]), tb) != 0) { reads = 1; } j += 1; }
+                    var dead_after: int = band(pp_live[next], tb) == 0
+                        || (band(b.defs, tb) != 0 && b.dst0 && b.na > 0 && streq(b.av[0], a.av[0]));
+                    var only_src: int = !b.dst0 || b.na == 0 || !streq(b.av[0], a.av[0]) || band(b.defs, tb) != 0;
+                    if (reads && dead_after && only_src && pp_is_simple(b.op) && band(pp_live[k], PP_FLAGS) == 0) {
+                        pp_substitute(b, first, a.av[0], a.av[1]);
+                        pp_replace(next, pp_text(b));
+                        pp_remove(k);
+                        changed = 1;
+                        break;
+                    }
+                }
+                // retarget a result: I -> t ; mov y, t -> I -> y
+                if (a.dst0 && a.na > 0
+                    && (a.pure || pp_has("ldw ldt div mod divr modr", a.op))
+                    && streq(b.op, "mov") && b.na == 2 && streq(b.av[1], a.av[0])
+                    && pp_reg(b.av[0]) != -100 && !streq(b.av[0], b.av[1]) && pp_reg(a.av[0]) != -100) {
+                    var t: int = pp_bit(pp_reg(a.av[0]));
+                    if (band(pp_live[next], bor(t, PP_FLAGS)) == 0) {
+                        free(a.av[0] as *tryte);
+                        a.av[0] = strdup(b.av[0]);
+                        pp_replace(k, pp_text(a));
+                        pp_remove(next);
+                        changed = 1;
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if (!changed) {
+            // last, once the local rewrites are done
+            var r: int = pp_redundant();
+            if (r < 0) { return; }
+            pp_remove(r);
+        }
+    }
+}
+
+// Load lines first..last of the code buffer text [from, to) into pp_l.
+fn pp_load(text: *char, from: int, to: int) {
+    var lines: int = 0;
+    var k: int = from;
+    while (k < to) { if (text[k] == '\n') { lines += 1; } k += 1; }
+    if (lines + 1 > pp_cap) {
+        if (pp_l != null) {
+            free(pp_l as *tryte);
+            free(pp_live as *tryte);
+            free(pp_in as *tryte);
+            free(pp_s0 as *tryte);
+            free(pp_s1 as *tryte);
+            free(pp_s2 as *tryte);
+        }
+        pp_cap = lines + 27;
+        pp_l = pp_alloc(pp_cap);
+        pp_live = pp_alloc(pp_cap);
+        pp_in = pp_alloc(pp_cap);
+        pp_s0 = pp_alloc(pp_cap);
+        pp_s1 = pp_alloc(pp_cap);
+        pp_s2 = pp_alloc(pp_cap);
+    }
+    pp_n = 0;
+    var s: int = from;
+    k = from;
+    while (k < to) {
+        if (text[k] == '\n') {
+            var t: *char = malloc(k - s + 1) as *char;
+            if (t == null) { oom(); }
+            var j: int = 0;
+            while (s + j < k) { t[j] = text[s + j]; j += 1; }
+            t[j] = 0;
+            pp_l[pp_n] = pp_parse(t) as int;
+            pp_n += 1;
+            s = k + 1;
+        }
+        k += 1;
+    }
+}
+
+// Optimize the function in code[from..] in place (crates/trine/src/peephole.rs: run).
+fn peephole(from: int) {
+    pp_load(code.p, from, code.n);
+    var all: int = pp_n;
+    if (all <= PP_WHOLE) {
+        pp_run_piece(0);
+    } else {
+        // in pieces of PP_PIECE lines, each taking everything as live after it
+        var keep: *int = pp_alloc(all);
+        var kn: int = 0;
+        var k: int = 0;
+        while (k < all) { keep[k] = pp_l[k]; k += 1; }
+        var at: int = 0;
+        var outs: *int = pp_alloc(all);
+        var on: int = 0;
+        while (at < all) {
+            var take: int = all - at < PP_PIECE ? all - at : PP_PIECE;
+            k = 0;
+            while (k < take) { pp_l[k] = keep[at + k]; k += 1; }
+            pp_n = take;
+            at += take;
+            pp_run_piece(at >= all ? 0 : -1);
+            k = 0;
+            while (k < pp_n) { outs[on] = pp_l[k]; on += 1; k += 1; }
+        }
+        k = 0;
+        while (k < on) { pp_l[k] = outs[k]; k += 1; }
+        pp_n = on;
+        free(keep as *tryte);
+        free(outs as *tryte);
+        kn = 0;
+    }
+    // back into the buffer
+    code.n = from;
+    var k2: int = 0;
+    while (k2 < pp_n) {
+        o(ppl(k2).txt);
+        nl();
+        pp_free_line(ppl(k2));
+        k2 += 1;
+    }
+    pp_n = 0;
+}

@@ -26,7 +26,7 @@ pub const LOADER_KERNEL_SECTORS: i64 = 29_520;
 pub const LOADER_KERNEL_ENTRY: i64 = 29_517;
 
 pub fn kernel_options() -> Options {
-    Options { org: KERNEL_ORG, data: KERNEL_DATA, stack: KERNEL_STACK, kind: Kind::Flat, optimize: true }
+    Options { org: KERNEL_ORG, data: KERNEL_DATA, stack: KERNEL_STACK, kind: Kind::Flat, optimize: true, level: None }
 }
 
 /// The repository's `kernel/` directory.

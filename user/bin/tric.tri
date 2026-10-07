@@ -14,6 +14,7 @@ import "../lib/getopt.tri";
 import "tric/front.tri";
 import "tric/gen.tri";
 import "tric/real.tri";
+import "tric/peep.tri";
 
 const USER_BASE: int = -847288609443;
 const USER_DATA: int = -847288078002;   // USER_BASE + 27 pages
@@ -22,7 +23,7 @@ var stdlib_dir: *char = "/usr/lib/trine/";
 var stdlib_names: *char = "ports.tri rt.tri console.tri keymap.tri real.tri math.tri ";
 
 fn usage() -> int {
-    fputs(STDERR_FILENO, "usage: tric [-S] [-o out] file.tri\n");
+    fputs(STDERR_FILENO, "usage: tric [-S] [-O level] [-o out] file.tri\n");
     return 2;
 }
 
@@ -339,13 +340,14 @@ fn stat_line(what: *char, n: int) {
 fn main(argc: int, argv: **char) -> int {
     var asm_only: int = 0;
     var outpath: *char = null;
-    var c: int = getopt(argc, argv, "So:v");
+    var c: int = getopt(argc, argv, "So:vO:");
     while (c != -1) {
         if (c == 'S') { asm_only = 1; }
         else if (c == 'o') { outpath = optarg; }
         else if (c == 'v') { verbose = 1; }
+        else if (c == 'O' && optarg[0] >= '0' && optarg[0] <= '1' && optarg[1] == 0) { opt_level = optarg[0] - '0'; }
         else { return usage(); }
-        c = getopt(argc, argv, "So:v");
+        c = getopt(argc, argv, "So:vO:");
     }
     if (optind != argc - 1) { return usage(); }
     var path: *char = argv[optind];

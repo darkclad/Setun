@@ -101,9 +101,15 @@ of RAM.
 
 ## Not yet
 
-- The optimizer: `tric` is the host compiler with `--no-opt`, so its
-  programs run slower than the ones the host builds. Porting the optimizer
-  (register locals, inlining, the peephole pass) would be the next step.
+- Most of the optimizer. The host's optimizer comes in four cumulative
+  levels (`trine -O1`..`-O4`, `-O4` being everything), and `tric` has level 1
+  so far: `tric -O1` writes exactly the host's level-1 assembly (the
+  peephole pass, `&&`/`||`/`!` jumping straight to their targets, `if (c)
+  break;` as one jump, loops on constant tests rotated), checked on eleven
+  programs including `sh` and `tric` itself. Level 1 cuts 10–16% of the
+  lines; the big gain (5x fewer instructions run) is in levels 2–4:
+  register locals and direct operands, calls with arguments in registers,
+  inlining.
 - `tric` has its own lexer limits where the host is looser: a number that
   does not fit in a word is refused when it is read, where the host reads
   it and refuses it later.

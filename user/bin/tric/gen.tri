@@ -1,13 +1,20 @@
 // tric/gen.tri: type checking and code generation, after the host's
-// crates/trine/src/compile.rs with `optimize` off. The output must be the
-// host's, character for character: the same instructions, the same label
-// numbers (the labels a look-ahead takes stay taken), the same pools.
+// crates/trine/src/compile.rs. The output must be the host's at the same
+// optimization level (`opt_level`, Options::level there), character for
+// character: the same instructions, the same label numbers (the labels a
+// look-ahead takes stay taken), the same pools.
 
 const W_MAX: int = 3812798742493;
 
 // ---- output ----------------------------------------------------------------------------------
 
 var code: cvec;
+
+// The optimization level (-O): 0 none, 1 the peephole pass and jumps
+// straight to where a condition leads. The host's levels 2..4 are not
+// ported yet.
+var opt_level: int;
+var fn_has_asm: int;                     // the function being compiled has an asm block
 
 fn o(s: *char) { cv_str(&code, s); }
 fn oc(c: int) { cv_push(&code, c); }
@@ -836,6 +843,8 @@ fn function(it: int) {
     var pos: int = it_pos.p[it];
     var intr: int = it_d.p[it];
     begin_fn(ty_a.p[fty]);
+    var fn_start: int = code.n;
+    fn_has_asm = 0;
     o(name_str(name));
     o(":\n");
     if (intr) { interrupt_regs(0); }
@@ -881,6 +890,7 @@ fn function(it: int) {
     } else {
         em("ret");
     }
+    if (opt_level >= 1 && !fn_has_asm) { peephole(fn_start); }
 }
 
 // ---- statements ------------------------------------------------------------------------------
@@ -945,6 +955,13 @@ fn stmt(s: int) {
     if (k == S_EXPR) { expr(st_a.p[s]); return; }
     if (k == S_BLOCK) { block(st_l.p[s], st_n.p[s]); return; }
     if (k == S_IF) {
+        // `if (c) break;` / `continue;`: one jump when c holds
+        var jt: int = jump_of(st_b.p[s]);
+        if (jt > 0) {
+            cond_jump_true(st_a.p[s], jt);
+            if (st_c.p[s] >= 0) { block1(st_c.p[s]); }
+            return;
+        }
         var lelse: int = new_label();
         var lend: int = new_label();
         cond_jump_false(st_a.p[s], lelse);
@@ -957,6 +974,23 @@ fn stmt(s: int) {
         } else {
             lab(lelse);
         }
+        return;
+    }
+    if (k == S_WHILE && cheap_test(st_a.p[s])) {
+        // rotated: the test at the bottom, entered once from the top
+        var rtop: int = new_label();
+        var rtest: int = new_label();
+        var rend: int = new_label();
+        e_l("b ", rtest);
+        lab(rtop);
+        iv_push(&lp_cont, rtest);
+        iv_push(&lp_brk, rend);
+        block1(st_b.p[s]);
+        lp_cont.n -= 1;
+        lp_brk.n -= 1;
+        lab(rtest);
+        cond_jump_true(st_a.p[s], rtop);
+        lab(rend);
         return;
     }
     if (k == S_WHILE || k == S_LOOP) {
@@ -980,9 +1014,11 @@ fn stmt(s: int) {
         var ftop: int = new_label();
         var cont: int = new_label();
         var fend: int = new_label();
-        new_label();                     // the rotated loop's test (unused here)
+        var rotated: int = st_b.p[s] >= 0 && cheap_test(st_b.p[s]);
+        var ftest: int = new_label();
+        if (rotated) { e_l("b ", ftest); }   // as for `while`: the test at the bottom
         lab(ftop);
-        if (st_b.p[s] >= 0) { cond_jump_false(st_b.p[s], fend); }
+        if (st_b.p[s] >= 0 && !rotated) { cond_jump_false(st_b.p[s], fend); }
         iv_push(&lp_cont, cont);
         iv_push(&lp_brk, fend);
         block1(st_d.p[s]);
@@ -990,7 +1026,12 @@ fn stmt(s: int) {
         lp_brk.n -= 1;
         lab(cont);
         if (st_c.p[s] >= 0) { expr(st_c.p[s]); }
-        e_l("b ", ftop);
+        if (rotated) {
+            lab(ftest);
+            cond_jump_true(st_b.p[s], ftop);
+        } else {
+            e_l("b ", ftop);
+        }
         lab(fend);
         scope_close();
         next_slot = fsaved;
@@ -1063,6 +1104,7 @@ fn stmt(s: int) {
         return;
     }
     // asm: the lines as they are
+    fn_has_asm = 1;
     var a: int = 0;
     while (a < st_n.p[s]) {
         var sid: int = lists.p[st_l.p[s] + a];
@@ -1132,8 +1174,58 @@ fn switch_stmt(s: int) {
 
 fn is_comparison(op: int) -> int { return op >= B_LT && op <= B_NE; }
 
+// A loop test worth moving to the bottom of its loop (level 1 and up): a
+// comparison of register locals and constants, or one alone (no register
+// locals yet below level 2: constants).
+fn cheap_plain(x: int) -> int {
+    const_eval(x);
+    return ce_ok;
+}
+
+fn cheap_test(c: int) -> int {
+    if (opt_level < 1) { return 0; }
+    if (ex_kind.p[c] == E_BINARY && is_comparison(ex_op.p[c])) {
+        return cheap_plain(ex_a.p[c]) && cheap_plain(ex_b.p[c]);
+    }
+    return cheap_plain(c);
+}
+
+// The label a statement that is only `break` or `continue` (alone or in a
+// block of its own) jumps to, at level 1 and up; 0 if none.
+fn jump_of(s: int) -> int {
+    if (opt_level < 1) { return 0; }
+    var k: int = st_kind.p[s];
+    if (k == S_BLOCK && st_n.p[s] == 1) { return jump_of(lists.p[st_l.p[s]]); }
+    if (k == S_BREAK) { return lp_brk.n > 0 ? lp_brk.p[lp_brk.n - 1] : 0; }
+    if (k == S_CONTINUE) {
+        var c: int = lp_cont.n - 1;
+        while (c >= 0 && lp_cont.p[c] == 0) { c -= 1; }
+        return c >= 0 ? lp_cont.p[c] : 0;
+    }
+    return 0;
+}
+
 // Jump to `target` when `c` is false (zero).
 fn cond_jump_false(c: int, target: int) {
+    // && || ! jump straight to where they lead (no 0/1 is built)
+    if (opt_level >= 1) {
+        if (ex_kind.p[c] == E_BINARY && ex_op.p[c] == B_AND) {
+            cond_jump_false(ex_a.p[c], target);
+            cond_jump_false(ex_b.p[c], target);
+            return;
+        }
+        if (ex_kind.p[c] == E_BINARY && ex_op.p[c] == B_OR) {
+            var ok: int = new_label();
+            cond_jump_true(ex_a.p[c], ok);
+            cond_jump_false(ex_b.p[c], target);
+            lab(ok);
+            return;
+        }
+        if (ex_kind.p[c] == E_UNARY && ex_op.p[c] == U_NOT) {
+            cond_jump_true(ex_a.p[c], target);
+            return;
+        }
+    }
     if (ex_kind.p[c] == E_BINARY && is_comparison(ex_op.p[c])) {
         var op: int = ex_op.p[c];
         var is_r: int = compare(ex_a.p[c], ex_b.p[c]);
@@ -1153,6 +1245,49 @@ fn cond_jump_false(c: int, target: int) {
     condition_value(c);
     em("cmp r1, 0");
     e_l("beq ", target);
+}
+
+// Jump to `target` if `c` holds (the mirror of cond_jump_false; only the
+// optimized paths use it).
+fn cond_jump_true(c: int, target: int) {
+    var k: int = ex_kind.p[c];
+    if (k == E_BINARY && ex_op.p[c] == B_AND) {
+        var skip: int = new_label();
+        cond_jump_false(ex_a.p[c], skip);
+        cond_jump_true(ex_b.p[c], target);
+        lab(skip);
+        return;
+    }
+    if (k == E_BINARY && ex_op.p[c] == B_OR) {
+        cond_jump_true(ex_a.p[c], target);
+        cond_jump_true(ex_b.p[c], target);
+        return;
+    }
+    if (k == E_UNARY && ex_op.p[c] == U_NOT) {
+        cond_jump_false(ex_a.p[c], target);
+        return;
+    }
+    if (k == E_BINARY && is_comparison(ex_op.p[c])) {
+        var op: int = ex_op.p[c];
+        var is_r: int = compare(ex_a.p[c], ex_b.p[c]);
+        var br: *char = op == B_LT ? "blt " : op == B_LE ? "ble " : op == B_GT ? "bgt " : op == B_GE ? "bge " : op == B_EQ ? "beq " : "bne ";
+        if (is_r && op == B_NE) {
+            e_l("bov ", target);         // unordered: != holds
+            e_l(br, target);
+        } else if (is_r) {
+            // unordered: the comparison is false, so do not jump
+            var skip2: int = new_label();
+            e_l("bov ", skip2);
+            e_l(br, target);
+            lab(skip2);
+        } else {
+            e_l(br, target);
+        }
+        return;
+    }
+    condition_value(c);
+    em("cmp r1, 0");
+    e_l("bne ", target);
 }
 
 // After a real is in f1: r1 := 1 if it is non-zero (a NaN counts), else 0.

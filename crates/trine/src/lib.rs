@@ -64,6 +64,20 @@ pub struct Options {
     pub kind: Kind,
     /// Optimize the generated code (on by default; off for comparisons).
     pub optimize: bool,
+    /// Optimize only up to this level (None: 4 if `optimize`, else 0). The
+    /// levels add up: 1 the peephole pass and jumps straight to where a
+    /// condition leads; 2 locals in registers and direct operands; 3 calls
+    /// with arguments in registers and temporaries held in registers; 4
+    /// inlining and dropping functions nothing calls (everything). `tric`
+    /// ports them in this order and must match each level exactly.
+    pub level: Option<u8>,
+}
+
+impl Options {
+    /// The optimization level in effect (see `level`).
+    pub fn opt_level(&self) -> u8 {
+        self.level.unwrap_or(if self.optimize { 4 } else { 0 })
+    }
 }
 
 /// Boot protocol (docs/BOOT.md): sector 0 of disk 0 is loaded into frame 1.
@@ -79,25 +93,25 @@ impl Options {
     /// A ROM program: code at the reset vector −3^10, globals from the start
     /// of RAM frame 1 upward, stack below them in frame 0.
     pub fn rom() -> Self {
-        Options { org: -59_049, data: 9_843, stack: 9_840, kind: Kind::Rom, optimize: true }
+        Options { org: -59_049, data: 9_843, stack: 9_840, kind: Kind::Rom, optimize: true, level: None }
     }
 
     /// The BIOS: like `rom()`, but frame 1 stays free for the boot sector;
     /// the stack is in frame 2 and globals start in frame 3.
     pub fn bios() -> Self {
-        Options { org: -59_049, data: 49_209, stack: 49_206, kind: Kind::Rom, optimize: true }
+        Options { org: -59_049, data: 49_209, stack: 49_206, kind: Kind::Rom, optimize: true, level: None }
     }
 
     /// A boot sector program: code from the centre of frame 1, stack in
     /// frame 2, globals from frame 3.
     pub fn boot() -> Self {
-        Options { org: BOOT_ENTRY, data: 49_209, stack: 49_206, kind: Kind::Boot, optimize: true }
+        Options { org: BOOT_ENTRY, data: 49_209, stack: 49_206, kind: Kind::Boot, optimize: true, level: None }
     }
 
     /// A Trinux user program: code at `USER_BASE`, globals 27 pages higher,
     /// stack just below −3^18.
     pub fn user() -> Self {
-        Options { org: USER_BASE, data: USER_DATA, stack: USER_STACK, kind: Kind::User, optimize: true }
+        Options { org: USER_BASE, data: USER_DATA, stack: USER_STACK, kind: Kind::User, optimize: true, level: None }
     }
 }
 
@@ -256,7 +270,7 @@ _trine_vectors:
 
 fn finish(loader: Loader, opts: &Options) -> Result<Build, String> {
     let mut c = compile::Compiler::new();
-    c.optimize = opts.optimize;
+    c.level = opts.opt_level();
     let out = c
         .compile(&loader.items, &compile::Layout { data_org: opts.data })
         .map_err(|e| if e.pos == lexer::Pos::default() { e.msg.clone() } else { loader.fmt(&e) })?;

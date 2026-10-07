@@ -640,8 +640,9 @@ pub struct Compiler {
     no_regs: bool,
     free_regs: Vec<&'static str>,
     used_regs: Vec<&'static str>,
-    /// Optimize the generated code.
-    pub optimize: bool,
+    /// How far to optimize the generated code (Options::level): 0 not at
+    /// all, 4 everything.
+    pub level: u8,
     /// Function bodies, for inlining; the ones being inlined now; and the
     /// first local an inlined body may see (the caller's are hidden).
     fns: HashMap<String, Rc<FnDecl>>,
@@ -676,6 +677,11 @@ fn err<T>(pos: Pos, msg: impl Into<String>) -> R<T> {
 }
 
 impl Compiler {
+    /// Is optimization level `l` on?
+    fn o(&self, l: u8) -> bool {
+        self.level >= l
+    }
+
     pub fn new() -> Self {
         Compiler {
             structs: Vec::new(),
@@ -692,7 +698,7 @@ impl Compiler {
             no_regs: true,
             free_regs: Vec::new(),
             used_regs: Vec::new(),
-            optimize: true,
+            level: 4,
             fns: HashMap::new(),
             inline_cost: HashMap::new(),
             inlining: Vec::new(),
@@ -773,7 +779,7 @@ impl Compiler {
     /// when `rest` has no call, which could change f registers): the
     /// register, or None (then use the stack). Release with `release_f`.
     fn hold_f1(&mut self, rest: &[&Expr]) -> Option<String> {
-        if !self.optimize || self.fheld >= 7 || rest.iter().any(|e| self.real_calls(e)) {
+        if !self.o(3) || self.fheld >= 7 || rest.iter().any(|e| self.real_calls(e)) {
             return None;
         }
         let r = format!("f{}", 3 + self.fheld);
@@ -790,7 +796,7 @@ impl Compiler {
     /// carry arguments only for calls and system calls, which `rest`
     /// then does not have).
     fn hold_r1(&mut self, rest: &[&Expr]) -> Option<String> {
-        if !self.optimize || self.iheld >= 3 || rest.iter().any(|e| self.real_calls(e)) {
+        if !self.o(3) || self.iheld >= 3 || rest.iter().any(|e| self.real_calls(e)) {
             return None;
         }
         let r = format!("r{}", 4 + self.iheld);
@@ -839,7 +845,7 @@ impl Compiler {
 
     /// The memory operand of a named real variable (not in a register).
     fn real_var_operand(&self, e: &Expr) -> Option<String> {
-        if !self.optimize {
+        if !self.o(2) {
             return None;
         }
         let ExprKind::Name(n) = &e.kind else { return None };
@@ -1284,7 +1290,7 @@ impl Compiler {
                     // an unreached one is still checked, then dropped
                     let mark = self.code.len();
                     self.function(f)?;
-                    if self.optimize && !keep.contains(&f.name) {
+                    if self.o(4) && !keep.contains(&f.name) {
                         self.code.truncate(mark);
                     }
                 }
@@ -1390,7 +1396,7 @@ impl Compiler {
         self.addr_taken.clear();
         let mut has_asm = false;
         scan_body(f.body.as_ref().unwrap(), &mut self.addr_taken, &mut has_asm);
-        self.no_regs = !self.optimize || has_asm;
+        self.no_regs = !self.o(2) || has_asm;
         // a leaf: every call is a builtin or inlinable (and then inlined)
         if !self.no_regs {
             let mut callees = Vec::new();
@@ -1418,7 +1424,7 @@ impl Compiler {
         }
         // the frame: lr and the caller's fp below sp, fp pointing at the
         // saved fp (optimized: one sp adjustment instead of two pushes)
-        let fast_frame = self.optimize && !has_asm && !f.interrupt;
+        let fast_frame = self.o(2) && !has_asm && !f.interrupt;
         if fast_frame {
             self.emit("stw lr, [sp-3]");
             self.emit("stw fp, [sp-6]");
@@ -1514,7 +1520,7 @@ impl Compiler {
         } else {
             self.emit("ret");
         }
-        if self.optimize && !has_asm {
+        if self.o(1) && !has_asm {
             let mut lines = self.code.split_off(fn_start);
             crate::peephole::run(&mut lines);
             self.code.extend(lines);
@@ -1783,7 +1789,7 @@ impl Compiler {
     /// leaves values the body reuses, and inverted it costs a branch more.
     fn cheap_test(&self, c: &Expr) -> bool {
         let plain = |e: &Expr| self.reg_local(e).is_some() || self.const_eval(e).is_some();
-        self.optimize
+        self.o(1)
             && match &c.kind {
                 ExprKind::Binary(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne, a, b) => plain(a) && plain(b),
                 _ => plain(c),
@@ -1793,7 +1799,7 @@ impl Compiler {
     /// The label a statement that is only `break` or `continue` (alone or
     /// in a block of its own) jumps to, when optimizing.
     fn jump_of(&self, s: &Stmt) -> Option<String> {
-        if !self.optimize {
+        if !self.o(1) {
             return None;
         }
         match &s.kind {
@@ -1806,7 +1812,7 @@ impl Compiler {
 
     fn cond_jump_false(&mut self, c: &Expr, target: &str) -> R<()> {
         // && || ! jump straight to where they lead (no 0/1 is built)
-        if self.optimize {
+        if self.o(1) {
             match &c.kind {
                 ExprKind::Binary(BinOp::And, a, b) => {
                     self.cond_jump_false(a, target)?;
@@ -2123,7 +2129,7 @@ impl Compiler {
     }
 
     fn simple_addr_ex(&mut self, e: &Expr, tmp: &str, any_index: bool) -> R<Option<(String, Ty)>> {
-        if !self.optimize {
+        if !self.o(2) {
             return Ok(None);
         }
         // where the object starts: a register (+ offset), or an absolute address
@@ -2716,7 +2722,7 @@ impl Compiler {
     /// A right operand that needs no evaluation in r1: a register local,
     /// or a scalar variable in memory (loaded into r2). None otherwise.
     fn simple_operand(&mut self, e: &Expr) -> Option<(&'static str, Ty)> {
-        if !self.optimize {
+        if !self.o(2) {
             return None;
         }
         if let Some(rt) = self.reg_local(e) {
@@ -2740,8 +2746,8 @@ impl Compiler {
 
     /// Could `simple_operand` take `e`? (No code emitted.)
     fn is_simple_operand(&self, e: &Expr) -> bool {
-        if !self.optimize || self.reg_local(e).is_some() {
-            return self.optimize;
+        if !self.o(2) || self.reg_local(e).is_some() {
+            return self.o(2);
         }
         let ExprKind::Name(n) = &e.kind else { return false };
         let ty = match self.lookup_local(n) {
@@ -2757,7 +2763,7 @@ impl Compiler {
     /// Evaluate `a` for use as a left operand: a register local stays where
     /// it is; anything else goes into r1. Returns the register and type.
     fn left_operand(&mut self, a: &Expr) -> R<(&'static str, Ty)> {
-        if self.optimize {
+        if self.o(2) {
             if let Some((r, t)) = self.reg_local(a) {
                 return Ok((r, t.decay()));
             }
@@ -2845,7 +2851,7 @@ impl Compiler {
                 }
                 // a constant on the left of a commutative operator: on the
                 // right, it is an immediate (256 * x is x * 256)
-                if self.optimize
+                if self.o(2)
                     && matches!(op, BinOp::Add | BinOp::Mul | BinOp::Min | BinOp::Max)
                     && self.const_eval(a).is_some()
                     && self.const_eval(b).is_none()
@@ -2868,7 +2874,7 @@ impl Compiler {
                 // the left is a constant, or a simple variable the right side
                 // cannot change (no calls, no assignments in it)
                 let left_after = self.const_eval(a).is_some() || (self.is_simple_operand(a) && !has_effects(b));
-                if self.optimize && left_after {
+                if self.o(2) && left_after {
                     let rt = self.expr(b)?.decay();
                     self.emit("mov r2, r1");
                     let lt = match self.const_eval(a) {
@@ -3160,7 +3166,7 @@ impl Compiler {
             self.emit(format!("add sp, sp, {cleanup}"));
             return Ok(*ret);
         }
-        if self.optimize && direct.is_some() && args.len() <= 6 {
+        if self.o(3) && direct.is_some() && args.len() <= 6 {
             return self.call_in_registers(&direct.as_ref().unwrap().0, args, &params, *ret);
         }
         for (a, p) in args.iter().zip(&params) {
@@ -3201,7 +3207,7 @@ impl Compiler {
     /// constant or a simple operand: the address first (in r3), then rhs
     /// (r2), as the general path orders them. None: not that case.
     fn compound_in_place(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> R<Option<Ty>> {
-        if !self.optimize || !(self.const_eval(rhs).is_some() || self.is_simple_operand(rhs)) {
+        if !self.o(2) || !(self.const_eval(rhs).is_some() || self.is_simple_operand(rhs)) {
             return Ok(None);
         }
         let named = match &lhs.kind {
@@ -3333,7 +3339,9 @@ impl Compiler {
     /// Can calls to `name` be inlined at all (small, no real calls, plain
     /// parameter and result types, and the same for what it inlines)?
     fn inlinable(&self, name: &str) -> bool {
-        if self.inline_cost.get(name).copied().flatten().is_none() {
+        // (inlining is level 4: below it a call stays a call, so a caller
+        // with one is no leaf)
+        if !self.o(4) || self.inline_cost.get(name).copied().flatten().is_none() {
             return false;
         }
         let plain = match self.globals.get(name) {
@@ -3350,7 +3358,7 @@ impl Compiler {
 
     /// The body of `name` if a call to it may be inlined here.
     fn inline_candidate(&self, name: &str, params: &[Ty], ret: &Ty) -> Option<Rc<FnDecl>> {
-        if !self.optimize || self.no_regs || self.inlining.iter().any(|n| n == name) {
+        if !self.o(4) || self.no_regs || self.inlining.iter().any(|n| n == name) {
             return None;
         }
         // a leaf function inlines all its calls (it has registers to spare,
@@ -3402,7 +3410,7 @@ impl Compiler {
         for (k, ((a, p), t)) in args.iter().zip(&f.params).zip(params).enumerate() {
             // a register local that neither the body nor a later argument
             // can change: the parameter shares its register
-            if self.optimize
+            if self.o(4)
                 && !asm
                 && self.reg_eligible(&p.name, t)
                 && !self.addr_taken.contains(&format!("={}", p.name))

@@ -1,7 +1,7 @@
 //! `trine`: compile and run Trine programs.
 //!
 //! ```text
-//! trine build FILE.tri [-o OUT.t1b2] [-S OUT.s] [--boot | --bios | --user] [--no-opt] [--data N] [--stack N]
+//! trine build FILE.tri [-o OUT.t1b2] [-S OUT.s] [--boot | --bios | --user] [--no-opt | -O0..-O4] [--data N] [--stack N]
 //! trine run   FILE.tri [--boot] [--steps N] [--input TEXT]
 //! ```
 
@@ -11,12 +11,12 @@ use trine::{bios_rom, build_file, run_machine, Kind, Options, Outcome};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  trine build FILE.tri [-o OUT.t1b2] [-S OUT.s] [--boot | --bios | --user] [--no-opt] [--data N] [--stack N]\n  trine run   FILE.tri [--boot] [--steps N] [--input TEXT]\n\n\
+        "usage:\n  trine build FILE.tri [-o OUT.t1b2] [-S OUT.s] [--boot | --bios | --user] [--no-opt | -O0..-O4] [--data N] [--stack N]\n  trine run   FILE.tri [--boot] [--steps N] [--input TEXT]\n\n\
          build    compile to a ROM image (run it with `setun --rom OUT.t1b2`)\n\
          \x20        --boot: a bootable one-sector disk image instead (`setun --disk OUT.t1b2`)\n\
          \x20        --bios: the BIOS memory layout (frame 1 left free for the boot sector)\n\
          \x20        --user: a Trinux program's layout (its flat image; mkdisk makes the TEF)\n\
-         \x20        --no-opt: without the optimizer\n\
+         \x20        --no-opt: without the optimizer (= -O0); -O1..-O3: part of it (cumulative levels)\n\
          run      compile and run on an emulated machine without a window; prints the\n\
          \x20        serial output and how the program ended. --boot boots it through the BIOS\n\
          -S F     also write the generated assembly to F"
@@ -49,8 +49,9 @@ fn main() {
             "--input" => text = val().replace("\\n", "\n"),
             "--boot" => opts = Options::boot(),
             "--bios" => opts = Options::bios(),
-            "--user" => opts = Options { optimize: opts.optimize, ..Options::user() },
+            "--user" => opts = Options { optimize: opts.optimize, level: opts.level, ..Options::user() },
             "--no-opt" => opts.optimize = false,
+            "-O0" | "-O1" | "-O2" | "-O3" | "-O4" => opts.level = Some(a.as_bytes()[2] - b'0'),
             "--data" => data = Some(val().parse().unwrap_or_else(|_| usage())),
             "--stack" => stack = Some(val().parse().unwrap_or_else(|_| usage())),
             _ if input.is_none() && !a.starts_with('-') => input = Some(PathBuf::from(a)),
