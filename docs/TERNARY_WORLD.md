@@ -63,7 +63,7 @@ The arithmetic is done: Setun-11̅ has balanced integers, tritwise logic and nat
 | Logic primitives | `MIN` (and), `MAX` (or), `NEG` (not), `TMUL`, `TSAT`, `CONS` (consensus) | Kleene logic in one instruction; consensus has no binary equivalent | Done |
 | Truth type in languages | Trine already has `trit`, `&` (min), `\|` (max), `~` (= `-x`), `<=>` and `sign`. Missing: `true`/`unknown`/`false` as +1/0/−1, `b_true`/`b_false` for binary logic, and refusing `if` on a trit (§A1) | NULL, `Option` and "not known yet" without a separate flag | Partial |
 | Logic algebra and minimization | Canonical forms and minimizers (ternary Karnaugh maps, Quine–McCluskey) for 3-valued functions | Compilers and chip design need them; the binary versions don't apply | Research |
-| Packing two-state data | A tlibc flag-set module first: 3 flags in 2 trits, 19 flags in 12 trits (99.9% efficient) | Recovers the 0.415 bit lost per flag stored alone | Planned |
+| Packing two-state data | `lib/flags.tri`: 42 two-state flags per word (a 42-bit two's complement number, 98% of the word's information), and Kleene vectors of 27 truth values per word, where `&`, `\|`, `~` act on all 27 lanes at once and `TCP`/`TCN` count the true and false ones | Recovers the 0.415 bit lost per flag stored alone | Done |
 
 Decided 2026-10-06:
 
@@ -192,8 +192,8 @@ The system software exists and builds itself: Trinux, tlibc, Trine and the `tas`
 | Operating system | Trinux: POSIX interfaces, a tryte is the "byte" (`CHAR_BIT` = 9), text in code points | Unix programs port with few changes | Done |
 | Language and compiler | Trine; `tric` compiles itself to a fixed point | The ecosystem grows from inside the machine | Done |
 | Three-way control flow | `sign (a <=> b) { neg: … zero: … pos: … }`, compiled to one `CMP` and one `BR3` | The C convention (<0, 0, >0) becomes a first-class branch | Done |
-| Trit operations in place of bit tricks | `TLZ` (leading zero trits) exists; add counts of + and − trits, trit reversal (§A3) and packed flag sets | Replaces popcount, clz and bitmask idioms | Partial |
-| Data structures | 3-ary heaps; B-trees with 27 or 81 keys per node; hash tables of 3^k buckets indexed by trits; ternary search tries | Wider fan-out means shallower trees | Planned |
+| Trit operations in place of bit tricks | `TLZ` (leading zero trits), `TCP`/`TCN` counts, `TREV` reversal (§A3), packed flag sets and Kleene vectors (`lib/flags.tri`) | Replaces popcount, clz and bitmask idioms | Done |
+| Data structures | 3-ary heaps (`lib/heap3.tri`) and B-trees with 27 keys per node (`lib/btree.tri`, 3000 keys in 3 levels) are done, both with three-way compares (`sign`); hash tables of 3^k buckets indexed by trits and ternary search tries are next | Wider fan-out means shallower trees | Partial |
 | Algorithms | Radix sort in base 27; radix-3 FFT and number-theoretic transforms | Natural digit size, no conversions | Planned |
 | Optimizer in `tric` | Port the host optimizer (register locals, peephole) into the self-hosted compiler | Optimized builds made on the machine itself | Planned |
 

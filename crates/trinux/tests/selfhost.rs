@@ -259,7 +259,7 @@ fn tric_reports_errors_as_the_host_does() {
 
 #[test]
 fn tas_matches_the_host_assembler() {
-    let progs = ["echo", "cat", "edit", "calc", "tas", "mtxtest", "vectest", "chartest"];
+    let progs = ["echo", "cat", "edit", "calc", "tas", "mtxtest", "vectest", "chartest", "dstest"];
     let disk = disk_with_sources(&progs, &[]);
     let mut s = Session::boot_disk(&disk, false);
     for p in progs {
@@ -362,10 +362,11 @@ fn tric_compiles_truth_values_as_the_host_does() {
     let opts = trine::Options { optimize: false, ..trine::Options::user() };
     let want = trine::build_source("/usr/src/kleene.tri", KLEENE, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
     let want2 = trine::build_source("/usr/src/idioms.tri", IDIOMS, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
-    let disk = disk_with_trine(&["vectest", "chartest"], &[("kleene.tri", KLEENE), ("kleene.s", &want), ("idioms.tri", IDIOMS), ("idioms.s", &want2)]);
+    let disk = disk_with_trine(&["vectest", "chartest", "dstest"], &[("kleene.tri", KLEENE), ("kleene.s", &want), ("idioms.tri", IDIOMS), ("idioms.s", &want2)]);
     let mut s = Session::boot_disk(&disk, false);
     tric_compare(&mut s, "kleene", "/usr/src/kleene.tri");
     tric_compare(&mut s, "idioms", "/usr/src/idioms.tri");
     tric_same_as_host(&mut s, "vectest"); // the vector builtins (A5)
     tric_same_as_host(&mut s, "chartest"); // 3-tryte characters in literals (A6)
+    tric_same_as_host(&mut s, "dstest"); // flags, 3-ary heap, B-tree (phase A)
 }

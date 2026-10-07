@@ -144,7 +144,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     let mut v: Vec<(String, PathBuf)> = vec![("/sbin/init".into(), u.join("init.tri"))];
     for prog in [
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
-        "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest", "mtxtest", "vectest", "chartest",
+        "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest", "mtxtest", "vectest", "chartest", "dstest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
         "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
     ] {

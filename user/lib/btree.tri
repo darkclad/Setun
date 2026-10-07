@@ -1,0 +1,315 @@
+// btree: an int -> int map as a B-tree with up to 27 keys a node
+// (docs/TERNARY_WORLD.md §8; minimum degree 14: every node but the root
+// holds 13 to 27 keys and has one more child than keys). A million keys
+// fit in five levels.
+//
+// Inside a node the search is binary, with a three-way compare (`<=>` and
+// `sign`) at each step: split by 3 would cost about 1.26x the compares, so
+// the ternary fan-out is in the node width, not in the search.
+
+import "tlibc.tri";
+import "stdlib.tri";
+
+const BT_T: int = 14;                 // minimum degree
+const BT_MAX: int = 27;               // 2 * BT_T - 1 keys
+
+struct bnode {
+    n: int;
+    leaf: int;
+    keys: [27]int;
+    vals: [27]int;
+    kids: [28]*bnode;
+}
+
+struct btree {
+    root: *bnode;
+    count: int;
+}
+
+fn bn_new(leaf: int) -> *bnode {
+    var x: *bnode = malloc(sizeof(bnode)) as *bnode;
+    if (x == null) { return null; }
+    x.n = 0;
+    x.leaf = leaf;
+    return x;
+}
+
+fn bt_init(t: *btree) {
+    t.root = null;
+    t.count = 0;
+}
+
+fn bt_count(t: *btree) -> int { return t.count; }
+
+// The index of key in x (and *found = 1), or of the first key above it.
+fn bn_find(x: *bnode, key: int, found: *int) -> int {
+    var lo: int = 0;
+    var hi: int = x.n;
+    *found = 0;
+    while (lo < hi) {
+        var mid: int = (lo + hi) / 2;
+        var hit: int = 0;
+        sign (key <=> x.keys[mid]) {
+            neg: { hi = mid; }
+            zero: { hit = 1; }
+            pos: { lo = mid + 1; }
+        }
+        if (hit) { *found = 1; return mid; }
+    }
+    return lo;
+}
+
+// The value for key in *val; 0 if it is not there.
+fn bt_get(t: *btree, key: int, val: *int) -> int {
+    var x: *bnode = t.root;
+    var found: int;
+    while (x != null) {
+        var i: int = bn_find(x, key, &found);
+        if (found) { *val = x.vals[i]; return 1; }
+        if (x.leaf) { return 0; }
+        x = x.kids[i];
+    }
+    return 0;
+}
+
+// Split x's full child i: its middle key moves up into x.
+fn bn_split(x: *bnode, i: int) -> int {
+    var y: *bnode = x.kids[i];
+    var z: *bnode = bn_new(y.leaf);
+    if (z == null) { return 0; }
+    z.n = BT_T - 1;
+    var j: int = 0;
+    while (j < BT_T - 1) { z.keys[j] = y.keys[j + BT_T]; z.vals[j] = y.vals[j + BT_T]; j += 1; }
+    if (!y.leaf) {
+        j = 0;
+        while (j < BT_T) { z.kids[j] = y.kids[j + BT_T]; j += 1; }
+    }
+    y.n = BT_T - 1;
+    j = x.n;
+    while (j > i) { x.kids[j + 1] = x.kids[j]; x.keys[j] = x.keys[j - 1]; x.vals[j] = x.vals[j - 1]; j -= 1; }
+    x.kids[i + 1] = z;
+    x.keys[i] = y.keys[BT_T - 1];
+    x.vals[i] = y.vals[BT_T - 1];
+    x.n += 1;
+    return 1;
+}
+
+// Insert into a node that is not full: 1 new, 0 replaced, -1 out of memory.
+fn bn_insert(x: *bnode, key: int, val: int) -> int {
+    loop {
+        var found: int;
+        var i: int = bn_find(x, key, &found);
+        if (found) { x.vals[i] = val; return 0; }
+        if (x.leaf) {
+            var j: int = x.n;
+            while (j > i) { x.keys[j] = x.keys[j - 1]; x.vals[j] = x.vals[j - 1]; j -= 1; }
+            x.keys[i] = key;
+            x.vals[i] = val;
+            x.n += 1;
+            return 1;
+        }
+        if (x.kids[i].n == BT_MAX) {
+            if (!bn_split(x, i)) { return -1; }
+            sign (key <=> x.keys[i]) {
+                neg: { }
+                zero: { x.vals[i] = val; return 0; }
+                pos: { i += 1; }
+            }
+        }
+        x = x.kids[i];
+    }
+    return -1;
+}
+
+// Set key to val: 1 if the key is new, 0 if it was there (value replaced),
+// -1 if out of memory.
+fn bt_put(t: *btree, key: int, val: int) -> int {
+    if (t.root == null) {
+        t.root = bn_new(1);
+        if (t.root == null) { return -1; }
+    }
+    if (t.root.n == BT_MAX) {
+        var s: *bnode = bn_new(0);
+        if (s == null) { return -1; }
+        s.kids[0] = t.root;
+        if (!bn_split(s, 0)) { free(s as *tryte); return -1; }
+        t.root = s;
+    }
+    var r: int = bn_insert(t.root, key, val);
+    if (r == 1) { t.count += 1; }
+    return r;
+}
+
+// Merge x's child i+1 and key i into child i (both children have BT_T - 1 keys).
+fn bn_merge(x: *bnode, i: int) {
+    var y: *bnode = x.kids[i];
+    var z: *bnode = x.kids[i + 1];
+    y.keys[BT_T - 1] = x.keys[i];
+    y.vals[BT_T - 1] = x.vals[i];
+    var j: int = 0;
+    while (j < z.n) { y.keys[BT_T + j] = z.keys[j]; y.vals[BT_T + j] = z.vals[j]; j += 1; }
+    if (!y.leaf) {
+        j = 0;
+        while (j <= z.n) { y.kids[BT_T + j] = z.kids[j]; j += 1; }
+    }
+    y.n = BT_MAX;
+    j = i;
+    while (j < x.n - 1) { x.keys[j] = x.keys[j + 1]; x.vals[j] = x.vals[j + 1]; x.kids[j + 1] = x.kids[j + 2]; j += 1; }
+    x.n -= 1;
+    free(z as *tryte);
+}
+
+// Make sure x's child i has at least BT_T keys before descending into it:
+// borrow from a sibling or merge with one. The child's index afterwards.
+fn bn_fill(x: *bnode, i: int) -> int {
+    var c: *bnode = x.kids[i];
+    if (c.n >= BT_T) { return i; }
+    if (i > 0 && x.kids[i - 1].n >= BT_T) {
+        // rotate right: x's key i-1 down into c, the left sibling's last key up
+        var l: *bnode = x.kids[i - 1];
+        var j: int = c.n;
+        while (j > 0) { c.keys[j] = c.keys[j - 1]; c.vals[j] = c.vals[j - 1]; j -= 1; }
+        if (!c.leaf) {
+            j = c.n + 1;
+            while (j > 0) { c.kids[j] = c.kids[j - 1]; j -= 1; }
+            c.kids[0] = l.kids[l.n];
+        }
+        c.keys[0] = x.keys[i - 1];
+        c.vals[0] = x.vals[i - 1];
+        c.n += 1;
+        x.keys[i - 1] = l.keys[l.n - 1];
+        x.vals[i - 1] = l.vals[l.n - 1];
+        l.n -= 1;
+        return i;
+    }
+    if (i < x.n && x.kids[i + 1].n >= BT_T) {
+        // rotate left: x's key i down to c's end, the right sibling's first key up
+        var r: *bnode = x.kids[i + 1];
+        c.keys[c.n] = x.keys[i];
+        c.vals[c.n] = x.vals[i];
+        if (!c.leaf) { c.kids[c.n + 1] = r.kids[0]; }
+        c.n += 1;
+        x.keys[i] = r.keys[0];
+        x.vals[i] = r.vals[0];
+        var k: int = 0;
+        while (k < r.n - 1) { r.keys[k] = r.keys[k + 1]; r.vals[k] = r.vals[k + 1]; k += 1; }
+        if (!r.leaf) {
+            k = 0;
+            while (k < r.n) { r.kids[k] = r.kids[k + 1]; k += 1; }
+        }
+        r.n -= 1;
+        return i;
+    }
+    if (i < x.n) { bn_merge(x, i); return i; }
+    bn_merge(x, i - 1);
+    return i - 1;
+}
+
+// Delete key from the subtree at x (x has at least BT_T keys, or is the root).
+fn bn_delete(x: *bnode, key: int) -> int {
+    loop {
+        var found: int;
+        var i: int = bn_find(x, key, &found);
+        if (found && x.leaf) {
+            var j: int = i;
+            while (j < x.n - 1) { x.keys[j] = x.keys[j + 1]; x.vals[j] = x.vals[j + 1]; j += 1; }
+            x.n -= 1;
+            return 1;
+        }
+        if (found) {
+            var y: *bnode = x.kids[i];
+            var z: *bnode = x.kids[i + 1];
+            if (y.n >= BT_T) {
+                // replace with the predecessor, then delete that from y
+                var p: *bnode = y;
+                while (!p.leaf) { p = p.kids[p.n]; }
+                key = p.keys[p.n - 1];
+                x.keys[i] = key;
+                x.vals[i] = p.vals[p.n - 1];
+                x = y;
+            } else if (z.n >= BT_T) {
+                var s: *bnode = z;
+                while (!s.leaf) { s = s.kids[0]; }
+                key = s.keys[0];
+                x.keys[i] = key;
+                x.vals[i] = s.vals[0];
+                x = z;
+            } else {
+                bn_merge(x, i);
+                x = y;
+            }
+            continue;
+        }
+        if (x.leaf) { return 0; }
+        x = x.kids[bn_fill(x, i)];
+    }
+    return 0;
+}
+
+// Remove key: 1 if it was there.
+fn bt_del(t: *btree, key: int) -> int {
+    if (t.root == null) { return 0; }
+    var r: int = bn_delete(t.root, key);
+    if (t.root.n == 0) {
+        var old: *bnode = t.root;
+        t.root = old.leaf ? null : old.kids[0];
+        free(old as *tryte);
+    }
+    t.count -= r;
+    return r;
+}
+
+fn bn_walk(x: *bnode, f: fn(int, int)) {
+    var i: int = 0;
+    while (i < x.n) {
+        if (!x.leaf) { bn_walk(x.kids[i], f); }
+        f(x.keys[i], x.vals[i]);
+        i += 1;
+    }
+    if (!x.leaf) { bn_walk(x.kids[x.n], f); }
+}
+
+// Call f(key, value) for every pair, in key order.
+fn bt_walk(t: *btree, f: fn(int, int)) {
+    if (t.root != null) { bn_walk(t.root, f); }
+}
+
+fn bn_free(x: *bnode) {
+    if (!x.leaf) {
+        var i: int = 0;
+        while (i <= x.n) { bn_free(x.kids[i]); i += 1; }
+    }
+    free(x as *tryte);
+}
+
+fn bt_free(t: *btree) {
+    if (t.root != null) { bn_free(t.root); }
+    bt_init(t);
+}
+
+// The checks behind the tests: keys in order and inside (lo, hi), node
+// sizes in bounds, every leaf at the same depth. The height, or -1.
+fn bn_check(x: *bnode, root: int, lo: int, has_lo: int, hi: int, has_hi: int) -> int {
+    if (x.n > BT_MAX || (!root && x.n < BT_T - 1) || (root && x.n < 1)) { return -1; }
+    var i: int = 0;
+    while (i < x.n) {
+        if ((has_lo && x.keys[i] <= lo) || (has_hi && x.keys[i] >= hi)) { return -1; }
+        if (i > 0 && x.keys[i] <= x.keys[i - 1]) { return -1; }
+        i += 1;
+    }
+    if (x.leaf) { return 1; }
+    var h: int = -2;
+    i = 0;
+    while (i <= x.n) {
+        var c: int = bn_check(x.kids[i], 0, i > 0 ? x.keys[i - 1] : lo, i > 0 || has_lo, i < x.n ? x.keys[i] : hi, i < x.n || has_hi);
+        if (c < 0 || (h != -2 && c != h)) { return -1; }
+        h = c;
+        i += 1;
+    }
+    return h + 1;
+}
+
+fn bt_height(t: *btree) -> int {
+    if (t.root == null) { return 0; }
+    return bn_check(t.root, 1, 0, 0, 0, 0);
+}

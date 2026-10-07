@@ -1,0 +1,257 @@
+// /bin/dstest: the ternary data structures (docs/TERNARY_WORLD.md §1, §8):
+// packed flags and Kleene vectors (lib/flags.tri), the 3-ary heap
+// (lib/heap3.tri) and the 27-key B-tree (lib/btree.tri), each against a
+// plain model, with the refusals. One line per check.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/flags.tri";
+import "../lib/heap3.tri";
+import "../lib/btree.tri";
+
+var failures: int;
+
+fn ok(what: *char, cond: int) {
+    puts("dstest: ");
+    puts(what);
+    puts(cond ? " ok\n" : " FAILED\n");
+    if (!cond) { failures += 1; }
+}
+
+// A small LCG whose products fit a word: 0 <= rnd(n) < n.
+var seed: int = 12345;
+fn rnd(n: int) -> int {
+    seed = (seed * 214013 + 2531011) % 16777216;          // 2^24 * 214013 < 3^27 / 2
+    return seed / 256 % n;
+}
+
+// ---- flags ----
+
+fn kleene() {
+    var w: int = 0;
+    ok("a zero word is all unknown", tv_unknowns(w, 27) == 27 && tv_get(w, 5) == unknown);
+    var lanes: [27]int;
+    var k: int = 0;
+    var good: int = 1;
+    while (k < 27) {
+        lanes[k] = rnd(3) - 1;
+        w = tv_set(w, k, lanes[k] as trit);
+        k += 1;
+    }
+    k = 0;
+    var t: int = 0;
+    var f: int = 0;
+    while (k < 27) {
+        if ((tv_get(w, k) as int) != lanes[k]) { good = 0; }
+        if (lanes[k] == 1) { t += 1; }
+        if (lanes[k] == -1) { f += 1; }
+        k += 1;
+    }
+    ok("27 lanes set and read back", good);
+    ok("TCP and TCN count the true and false lanes", tv_trues(w, 27) == t && tv_falses(w, 27) == f && tv_unknowns(w, 27) == 27 - t - f);
+    // lane-wise Kleene logic is one ALU instruction a word
+    var v: int = 0;
+    k = 0;
+    while (k < 27) { v = tv_set(v, k, (rnd(3) - 1) as trit); k += 1; }
+    var and3: int = w & v;
+    var or3: int = w | v;
+    var not3: int = ~w;
+    good = 1;
+    k = 0;
+    while (k < 27) {
+        if (tv_get(and3, k) != (tv_get(w, k) & tv_get(v, k))) { good = 0; }
+        if (tv_get(or3, k) != (tv_get(w, k) | tv_get(v, k))) { good = 0; }
+        if (tv_get(not3, k) != ~tv_get(w, k)) { good = 0; }
+        k += 1;
+    }
+    ok("& | ~ on words are Kleene AND, OR, NOT in every lane", good);
+    var all9: int = tv_fill(9, true);
+    ok("all/any: 9 true lanes", tv_all(all9, 9) == true && tv_any(all9, 9) == true && tv_all(all9, 10) == unknown);
+    var some: int = tv_set(all9, 4, false);
+    ok("all/any: one false lane", tv_all(some, 9) == false && tv_any(some, 9) == true);
+    ok("all/any: all false", tv_any(tv_fill(5, false), 5) == false && tv_all(tv_fill(27, false), 27) == false);
+    ok("27 lanes filled", tv_trues(tv_fill(27, true), 27) == 27 && tv_falses(tv_fill(27, false), 0) == 0);
+    ok("refused: lanes outside 0..26", tv_get(all9, 27) == unknown && tv_get(all9, -1) == unknown
+        && tv_set(all9, 27, false) == all9 && tv_set(all9, -1, false) == all9);
+}
+
+fn packed() {
+    var w: int = 0;
+    var model: [42]int;
+    var k: int = 0;
+    while (k < 42) { model[k] = 0; k += 1; }
+    var good: int = 1;
+    var r: int = 0;
+    while (r < 500) {
+        k = rnd(42);
+        var on: int = rnd(2);
+        w = pf_set(w, k, on);
+        model[k] = on;
+        r += 1;
+    }
+    var n: int = 0;
+    k = 0;
+    while (k < 42) {
+        if (pf_get(w, k) != model[k]) { good = 0; }
+        n += model[k];
+        k += 1;
+    }
+    ok("42 flags in a word, set and cleared at random", good && pf_count(w) == n);
+    var all: int = 0;
+    k = 0;
+    while (k < 42) { all = pf_set(all, k, 1); k += 1; }
+    ok("all 42 set: the word holds it", pf_count(all) == 42 && pf_get(all, 41) == 1 && pf_get(all, 0) == 1);
+    all = pf_set(all, 41, 0);
+    ok("clearing the top flag", pf_count(all) == 41 && pf_get(all, 41) == 0);
+    ok("pf_next finds the next set flag", pf_next(pf_set(pf_set(0, 7, 1), 30, 1), 8) == 30 && pf_next(0, 0) == -1);
+    ok("refused: flags outside 0..41", pf_get(all, 42) == 0 && pf_set(all, 42, 1) == all && pf_set(all, -1, 1) == all);
+    // an array of 1000 flags
+    var nf: int = 1000;
+    var a: *int = calloc(pfa_words(nf), sizeof(int)) as *int;
+    var m: *tryte = calloc(nf, 1);
+    r = 0;
+    while (r < 3000) {
+        var i: int = rnd(nf);
+        var on2: int = rnd(2);
+        pfa_set(a, nf, i, on2);
+        m[i] = on2 as tryte;
+        r += 1;
+    }
+    good = 1;
+    var cnt: int = 0;
+    var i2: int = 0;
+    while (i2 < nf) { if (pfa_get(a, nf, i2) != m[i2]) { good = 0; } cnt += m[i2]; i2 += 1; }
+    ok("1000 flags in 24 words", good && pfa_words(nf) == 24 && pfa_count(a, nf) == cnt);
+    ok("refused: array index out of range", pfa_set(a, nf, nf, 1) == 0 && pfa_set(a, nf, -1, 1) == 0 && pfa_get(a, nf, nf) == 0);
+}
+
+// ---- heap3 ----
+
+fn heaps() {
+    var h: heap3;
+    h3_init(&h);
+    var k: int;
+    var v: int;
+    ok("refused: pop and peek on an empty heap", h3_pop(&h, &k, &v) == 0 && h3_peek(&h, &k, &v) == 0);
+    var n: int = 2000;
+    var good: int = 1;
+    var sum: int = 0;
+    var i: int = 0;
+    while (i < n) {
+        var key: int = rnd(1000) - 500;
+        h3_push(&h, key, key * 7 + 1);
+        sum += key;
+        if (!h3_valid(&h)) { good = 0; }
+        i += 1;
+    }
+    ok("2000 pushes keep the heap property", good && h3_size(&h) == n);
+    var last: int = -100000;
+    var sorted: int = 1;
+    var got: int = 0;
+    while (h3_pop(&h, &k, &v)) {
+        if (k < last || v != k * 7 + 1) { sorted = 0; }
+        if (!h3_valid(&h)) { good = 0; }
+        last = k;
+        sum -= k;
+        got += 1;
+    }
+    ok("pops come out in order, each with its value", sorted && good && got == n && sum == 0);
+    // interleaved, against a sorted array model
+    var model: [300]int;
+    var mn: int = 0;
+    good = 1;
+    var r: int = 0;
+    while (r < 1500) {
+        if (rnd(3) != 0 && mn < 300) {
+            var key2: int = rnd(100);
+            h3_push(&h, key2, 0);
+            var j: int = mn;
+            while (j > 0 && model[j - 1] > key2) { model[j] = model[j - 1]; j -= 1; }
+            model[j] = key2;
+            mn += 1;
+        } else if (mn > 0) {
+            if (!h3_pop(&h, &k, &v) || k != model[0]) { good = 0; }
+            var j2: int = 0;
+            while (j2 < mn - 1) { model[j2] = model[j2 + 1]; j2 += 1; }
+            mn -= 1;
+        }
+        r += 1;
+    }
+    ok("pushes and pops interleaved match a sorted model", good && h3_size(&h) == mn);
+    h3_free(&h);
+}
+
+// ---- btree ----
+
+var walk_last: int;
+var walk_n: int;
+var walk_bad: int;
+
+fn walk_check(key: int, val: int) {
+    if (walk_n > 0 && key <= walk_last) { walk_bad = 1; }
+    if (val != key * 3 - 1) { walk_bad = 1; }
+    walk_last = key;
+    walk_n += 1;
+}
+
+fn trees() {
+    var t: btree;
+    bt_init(&t);
+    var v: int;
+    ok("refused: get and delete in an empty tree", bt_get(&t, 5, &v) == 0 && bt_del(&t, 5) == 0 && bt_height(&t) == 0);
+    // a model: which of 0..9999 are in the tree
+    var range: int = 10000;
+    var has: *tryte = calloc(range, 1);
+    var count: int = 0;
+    var good: int = 1;
+    var r: int = 0;
+    while (r < 20000) {
+        var key: int = rnd(range) - 5000;
+        if (rnd(3) != 0) {
+            var put: int = bt_put(&t, key, key * 3 - 1);
+            if (put != (has[key + 5000] ? 0 : 1)) { good = 0; }
+            if (!has[key + 5000]) { has[key + 5000] = 1; count += 1; }
+        } else {
+            var del: int = bt_del(&t, key);
+            if (del != has[key + 5000]) { good = 0; }
+            if (has[key + 5000]) { has[key + 5000] = 0; count -= 1; }
+        }
+        if (r % 997 == 0 && bt_height(&t) < 0) { good = 0; }
+        r += 1;
+    }
+    ok("20000 random puts and deletes agree with the model", good && bt_count(&t) == count);
+    var h: int = bt_height(&t);
+    ok("the tree is a B-tree (order, node sizes, leaf depth)", h > 0);
+    good = 1;
+    var k: int = 0;
+    while (k < range) {
+        var found: int = bt_get(&t, k - 5000, &v);
+        if (found != has[k] || (found && v != (k - 5000) * 3 - 1)) { good = 0; }
+        k += 1;
+    }
+    ok("every key found or not found as the model says", good);
+    walk_n = 0;
+    walk_bad = 0;
+    bt_walk(&t, &walk_check);
+    ok("an in-order walk visits every key once, in order", !walk_bad && walk_n == count);
+    ok("replacing a value keeps the count", bt_put(&t, 123456, 1) == 1 && bt_put(&t, 123456, 2) == 0 && bt_get(&t, 123456, &v) == 1 && v == 2 && bt_count(&t) == count + 1);
+    bt_del(&t, 123456);
+    // shallow: 3000 keys in sequence take 3 levels (a binary tree would take 12)
+    bt_free(&t);
+    k = 0;
+    while (k < 3000) { bt_put(&t, k, k * 3 - 1); k += 1; }
+    ok("3000 keys in order: 3 levels", bt_height(&t) == 3 && bt_count(&t) == 3000);
+    k = 0;
+    while (k < 3000) { if (bt_del(&t, k) != 1) { good = 0; } k += 1; }
+    ok("deleting them all empties the tree", good && bt_count(&t) == 0 && t.root == null && bt_get(&t, 5, &v) == 0);
+    bt_free(&t);
+}
+
+fn main() -> int {
+    kleene();
+    packed();
+    heaps();
+    trees();
+    puts(failures == 0 ? "dstest: all passed\n" : "dstest: FAILED\n");
+    return failures != 0;
+}

@@ -1,0 +1,144 @@
+// flags: sets of truth values packed into words (docs/TERNARY_WORLD.md §1).
+//
+// Two kinds:
+//
+// - Kleene vectors (tv_*): 27 truth values per word, one trit each: true
+//   (+1), unknown (0), false (-1). The ALU works on all 27 at once: `a & b`
+//   is Kleene AND lane by lane, `a | b` OR, `~a` NOT; TCP and TCN count
+//   the true and false ones. A zero word is all unknown.
+// - Packed flags (pf_*): two-state flags, 42 per word. The word is read as
+//   a 42-bit two's complement number (2^42 < 3^27, so 98% of the word's
+//   information is used; one flag per trit would use 63%). A zero word has every flag
+//   clear. pfa_* work on arrays of them.
+//
+// Every function checks its index: out of range, a getter returns 0 (or
+// unknown) and a setter returns the word unchanged.
+
+import "tlibc.tri";
+
+var p3_t: [27]int = {
+    1, 3, 9, 27, 81, 243, 729, 2187, 6561,
+    19683, 59049, 177147, 531441, 1594323, 4782969, 14348907, 43046721, 129140163,
+    387420489, 1162261467, 3486784401, 10460353203, 31381059609, 94143178827, 282429536481, 847288609443, 2541865828329
+};
+
+// ---- Kleene vectors -----------------------------------------------------------------------
+
+const TV_LANES: int = 27;
+
+// Lane k (0 = the lowest trit).
+fn tv_get(w: int, k: int) -> trit {
+    if (k < 0 || k >= TV_LANES) { return unknown; }
+    var t: int = divr(w, p3_t[k]);                // the trits from k up (exact: balanced digits round)
+    return (t - 3 * divr(t, 3)) as trit;
+}
+
+// w with lane k set to t.
+fn tv_set(w: int, k: int, t: trit) -> int {
+    if (k < 0 || k >= TV_LANES) { return w; }
+    return mrg(w, p3_t[k], (t as int) * p3_t[k]); // the mask's +1 at k takes the source's trit
+}
+
+// n lanes (from 0) all set to t, the rest unknown.
+fn tv_fill(n: int, t: trit) -> int {
+    if (n < 0) { n = 0; }
+    if (n >= TV_LANES) { return (t as int) * 3812798742493; }   // every trit +1: (3^27 - 1) / 2
+    return (t as int) * ((p3_t[n] - 1) / 2);
+}
+
+// How many of the low n lanes are true, false, unknown.
+fn tv_trues(w: int, n: int) -> int { return n <= 0 ? 0 : tcp(w, n >= TV_LANES ? 0 : n); }
+fn tv_falses(w: int, n: int) -> int { return n <= 0 ? 0 : tcn(w, n >= TV_LANES ? 0 : n); }
+fn tv_unknowns(w: int, n: int) -> int {
+    if (n > TV_LANES) { n = TV_LANES; }
+    return n <= 0 ? 0 : n - tv_trues(w, n) - tv_falses(w, n);
+}
+
+// Kleene AND and OR over the low n lanes (all of none is true, any of none false).
+fn tv_all(w: int, n: int) -> trit {
+    if (tv_falses(w, n) > 0) { return false; }
+    return tv_unknowns(w, n) > 0 ? unknown : true;
+}
+fn tv_any(w: int, n: int) -> trit {
+    if (tv_trues(w, n) > 0) { return true; }
+    return tv_unknowns(w, n) > 0 ? unknown : false;
+}
+
+// ---- packed two-state flags ---------------------------------------------------------------
+
+const PF_FLAGS: int = 42;
+const PF_TOP: int = 2199023255552;                // 2^41: the top flag weighs -2^41 (two's complement)
+
+var p2_t: [42]int;
+var p2_ready: int;
+
+fn pf_pow2(k: int) -> int {
+    if (!p2_ready) {
+        var v: int = 1;
+        var i: int = 0;
+        while (i < PF_FLAGS) { p2_t[i] = v; v = v * 2; i += 1; }
+        p2_ready = 1;
+    }
+    return p2_t[k];
+}
+
+// The word holds a 42-bit two's complement number, -2^41 .. 2^41 - 1.
+fn pf_get(w: int, k: int) -> int {
+    if (k < 0 || k >= PF_FLAGS) { return 0; }
+    if (k == PF_FLAGS - 1) { return w < 0; }
+    var m: int = pf_pow2(k + 1);
+    var r: int = w % m;
+    if (r < 0) { r += m; }                        // (w % m + m) would overflow at m = 2^41
+    return r / pf_pow2(k);
+}
+
+fn pf_set(w: int, k: int, on: int) -> int {
+    if (k < 0 || k >= PF_FLAGS) { return w; }
+    var weight: int = k == PF_FLAGS - 1 ? -PF_TOP : pf_pow2(k);
+    var was: int = pf_get(w, k);
+    if (on && !was) { return w + weight; }
+    if (!on && was) { return w - weight; }
+    return w;
+}
+
+// Flags set in the word.
+fn pf_count(w: int) -> int {
+    var n: int = 0;
+    var k: int = 0;
+    while (k < PF_FLAGS) { n += pf_get(w, k); k += 1; }
+    return n;
+}
+
+// The lowest set flag at or after k, or -1.
+fn pf_next(w: int, k: int) -> int {
+    if (k < 0) { k = 0; }
+    while (k < PF_FLAGS) {
+        if (pf_get(w, k)) { return k; }
+        k += 1;
+    }
+    return -1;
+}
+
+// ---- arrays of packed flags ---------------------------------------------------------------
+
+// Words for n flags (zeroed words are all clear).
+fn pfa_words(n: int) -> int { return n <= 0 ? 0 : (n + PF_FLAGS - 1) / PF_FLAGS; }
+
+fn pfa_get(a: *int, n: int, i: int) -> int {
+    if (i < 0 || i >= n) { return 0; }
+    return pf_get(a[i / PF_FLAGS], i % PF_FLAGS);
+}
+
+// Set flag i (on 1) or clear it (on 0); 0 if i is out of range.
+fn pfa_set(a: *int, n: int, i: int, on: int) -> int {
+    if (i < 0 || i >= n) { return 0; }
+    a[i / PF_FLAGS] = pf_set(a[i / PF_FLAGS], i % PF_FLAGS, on);
+    return 1;
+}
+
+fn pfa_count(a: *int, n: int) -> int {
+    var c: int = 0;
+    var k: int = 0;
+    while (k < pfa_words(n)) { c += pf_count(a[k]); k += 1; }
+    return c;
+}

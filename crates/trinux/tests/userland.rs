@@ -1074,3 +1074,14 @@ fn text_beyond_one_tryte() {
     let n = out.matches(" ok\n").count();
     assert!(n >= 18, "only {n} checks:\n{out}");
 }
+
+#[test]
+fn ternary_data_structures() {
+    // TERNARY_WORLD phase A: /bin/dstest (Kleene vectors and packed flags,
+    // the 3-ary heap, the 27-key B-tree, each against a plain model)
+    let out = session(&["dstest", "echo st=$?", "exit"], 6_000_000_000);
+    assert!(!out.contains("FAILED"), "{out}");
+    assert_has(&out, &["dstest: all passed", "st=0", "3000 keys in order: 3 levels ok"]);
+    let n = out.matches(" ok\n").count();
+    assert!(n >= 25, "only {n} checks:\n{out}");
+}
