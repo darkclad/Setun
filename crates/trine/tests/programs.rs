@@ -799,3 +799,14 @@ fn vector_builtins() {
         assert!(e.contains(want), "{src}: {e}");
     }
 }
+
+#[test]
+fn characters_above_one_tryte() {
+    // A6: a character above U+2671 is 3 trytes in a string; a character
+    // literal cannot hold one
+    let src = "fn main() -> int { var s: *char = \"a日😀\"; var n: int = 0; while (s[n] != 0) { n += 1; } return n * 10 + (s[1] == -2) + (s[4] == -2); }";
+    assert_eq!(exit(src), 72);
+    assert!(compile_err("fn main() -> int { return '日'; }").contains("takes three trytes"));
+    assert!(compile_err("fn main() -> int { return '日\u{305}'; }").contains("takes three trytes"));
+    assert!(compile_err("fn main() -> int { return 'ab'; }").contains("exactly one character"));
+}

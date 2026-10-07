@@ -197,6 +197,9 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
             if q == '\'' {
                 match cps[..] {
                     [ch] => out.push(Token { tok: Tok::Char(ch), pos }),
+                    [lead, _, _] if lead == ternary::BIG_CHAR || lead == ternary::BIG_CHAR_OVERLINED => {
+                        return Err(err("a character above U+2671 takes three trytes: use a string".into()))
+                    }
                     _ => return Err(err("a character literal holds exactly one character".into())),
                 }
             } else {

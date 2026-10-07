@@ -466,6 +466,7 @@ fn lex(src: *char, n: int, file: int) {
                 cv_push(&sb, ch);
             }
             if (qt == '\'') {
+                if (sb.n == 3 && (sb.p[0] == -2 || sb.p[0] == -3)) { fail_at(pos, "a character above U+2671 takes three trytes: use a string", null); }
                 if (sb.n != 1) { fail_at(pos, "a character literal holds exactly one character", null); }
                 add_tok(T_CHAR, sb.p[0], pos);
             } else {

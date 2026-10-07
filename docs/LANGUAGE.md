@@ -33,7 +33,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - A malformed literal is an error that says what is wrong (a bar on `0`, two bars, `E` as a digit, the old `+`/`-` base-3 digits…), and a constant must fit its type.
 - **Real literals:** `2.5`, `1e10`, `6.02e-23`, `1_000.5`: digits with a point and digits, an exponent, or both (`1.` and `.5` are not reals). A letter right after a number is an error. The value is rounded to the nearest `real`.
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
-- **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte. Its type is `*tryte`, pointing at the first character.
+- **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte, except that a character above U+2671 takes three (ISA §8.4: `"日本"` is 6 trytes). Its type is `*tryte`, pointing at the first character. A character literal cannot hold such a character ("takes three trytes: use a string"); tlibc's `tstr_next`, `tstr_chars` and `tchar_put` read and write them.
 - **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false unknown b_true b_false null void trit tryte int char real`
 - `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.
 

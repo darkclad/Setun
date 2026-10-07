@@ -61,8 +61,9 @@ fn as_octets(p: *tryte, n: int, len: *int) -> *tryte {
 }
 
 // Strict UTF-8 with at least one multi-octet character: decode into the
-// same buffer (code points never take more trytes than octets); the new
-// length, or -1 to leave the file as it is.
+// same buffer (no character takes more trytes than octets: one above
+// U+2671 is 3 trytes from 3 or 4 octets); the new length, or -1 to leave
+// the file as it is.
 fn utf8_in_place(p: *tryte, n: int) -> int {
     var multi: int = 0;
     var m: int = 0;
@@ -74,7 +75,8 @@ fn utf8_in_place(p: *tryte, n: int) -> int {
         if (b < 128) { need = 0; cp = b; }
         else if (b >= 194 && b < 224) { need = 1; cp = b % 32; }
         else if (b >= 224 && b < 240) { need = 2; cp = b % 16; }
-        else { return -1; }                     // 4-octet characters do not fit a tryte
+        else if (b >= 240 && b < 245) { need = 3; cp = b % 8; }
+        else { return -1; }
         if (need > 0 && k + need >= n) { return -1; }   // cut short
         var j: int = 1;
         while (j <= need) {
@@ -83,15 +85,16 @@ fn utf8_in_place(p: *tryte, n: int) -> int {
             cp = cp * 64 + c % 64;
             j += 1;
         }
-        if (need == 2 && cp < 2048) { return -1; }      // overlong
-        if (cp > 9841) { return -1; }
+        if ((need == 2 && cp < 2048) || (need == 3 && cp < 65536)) { return -1; }   // overlong
+        if (cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return -1; }
         if (need > 0) { multi = 1; }
-        // a combining overline makes the character before it negative
-        if (cp == 773 && m > 0 && p[m - 1] > 32) {
+        // a combining overline makes the character before it overlined
+        if (cp == 773 && m >= 3 && p[m - 3] == BIG_CHAR && p[m - 2] < -32 && p[m - 1] < -32) {
+            p[m - 3] = BIG_CHAR_OVERLINED as tryte;
+        } else if (cp == 773 && m > 0 && p[m - 1] > 32) {
             p[m - 1] = (-p[m - 1]) as tryte;
         } else {
-            p[m] = cp as tryte;
-            m += 1;
+            m += tchar_put(cp, (p + m) as *char);
         }
         k += 1 + need;
     }

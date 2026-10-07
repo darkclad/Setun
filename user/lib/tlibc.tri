@@ -353,6 +353,75 @@ fn mtx_unlock(m: *int) {
     if (swap(m, 0) == -1) { futex_wake(m, 1); }
 }
 
+// ---- characters beyond U+2671 (ISA §1.1, TERNARY_WORLD A6) --------------------------------
+//
+// A character is one tryte (a code point up to 9841, negated when
+// overlined) or three: the lead -2 (-3 overlined) and two trailing trytes
+// in -9841..-33, which spell n = cp - 9842 as -(33 + n / 9809),
+// -(33 + n % 9809). A trailing tryte is never NUL, a newline or any ASCII
+// character, so strlen, strchr and line splitting keep working on trytes.
+
+const BIG_CHAR: int = -2;              // not -1: that is EOF from fgetc
+const BIG_CHAR_OVERLINED: int = -3;
+const TRAIL_VALUES: int = 9809;
+
+// Whether cp is a character that takes three trytes: above 9841, at most
+// U+10FFFF and not a surrogate.
+fn big_char_ok(cp: int) -> int {
+    return cp > 9841 && cp <= 1114111 && !(cp >= 55296 && cp <= 57343);
+}
+
+// The character at s: its code point (negated when overlined) in *cp, and
+// its length in trytes, 1 or 3; 0 at the terminating NUL; -1 if it is
+// malformed (a lead -1 or -4..-32, a lead cut off by the end, a trailing tryte
+// outside -9841..-33, or a code point big_char_ok refuses).
+fn tstr_next(s: *char, cp: *int) -> int {
+    var t: int = s[0];
+    if (t == 0) { *cp = 0; return 0; }
+    if (t > 0 || t < -32) { *cp = t; return 1; }
+    if (t != BIG_CHAR && t != BIG_CHAR_OVERLINED) { return -1; }
+    var hi: int = s[1];
+    if (hi > -33) { return -1; }                   // also the end of the string
+    var lo: int = s[2];
+    if (lo > -33) { return -1; }
+    var c: int = 9842 + (-hi - 33) * TRAIL_VALUES + (-lo - 33);
+    if (!big_char_ok(c)) { return -1; }
+    *cp = t == BIG_CHAR ? c : -c;
+    return 3;
+}
+
+// The number of characters in s, or -1 if any is malformed.
+fn tstr_chars(s: *char) -> int {
+    var n: int = 0;
+    var cp: int;
+    loop {
+        var k: int = tstr_next(s, &cp);
+        if (k == 0) { return n; }
+        if (k < 0) { return -1; }
+        s = s + k;
+        n += 1;
+    }
+    return n;
+}
+
+// Write the character cp (negative: overlined) at out; its length in
+// trytes (1 or 3), or 0 if no character has that code point.
+fn tchar_put(cp: int, out: *char) -> int {
+    var over: int = cp < 0;
+    var c: int = over ? -cp : cp;
+    if (c <= 9841) {
+        if (over && c <= 32) { return 0; }         // control characters are not overlined
+        out[0] = cp as char;
+        return 1;
+    }
+    if (!big_char_ok(c)) { return 0; }
+    var n: int = c - 9842;
+    out[0] = (over ? BIG_CHAR_OVERLINED : BIG_CHAR) as char;
+    out[1] = (-(33 + n / TRAIL_VALUES)) as char;
+    out[2] = (-(33 + n % TRAIL_VALUES)) as char;
+    return 3;
+}
+
 // ---- pseudo-terminals (stdlib.h) ------------------------------------------------------
 
 const TIOCGPTN: int = 2147767344;

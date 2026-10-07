@@ -642,6 +642,35 @@ fn serial_input_folds_overlines() {
 }
 
 #[test]
+fn serial_carries_characters_above_one_tryte() {
+    // A6: typed in as 3 trytes (an overline after one turns its lead to the
+    // overlined lead); written out, they come back whole even when a drain
+    // cuts one; malformed ones are U+FFFD
+    let mut m = machine();
+    m.dev.serial_input("日\u{305}😀x\u{305}");
+    let mut got = Vec::new();
+    while inp(&mut m, block::SERIAL, 1) > 0 {
+        got.push(inp(&mut m, block::SERIAL, 0));
+    }
+    let mut want = ternary::char_trytes(0x65E5, true);
+    want.extend(ternary::char_trytes(0x1F600, false));
+    want.push(-('x' as i64));
+    assert_eq!(got, want);
+    for &t in &want[..4] {
+        out(&mut m, block::SERIAL, 0, t);
+    }
+    assert_eq!(m.dev.serial.take_output(), "日\u{305}", "the second character is cut off");
+    for &t in &want[4..] {
+        out(&mut m, block::SERIAL, 0, t);
+    }
+    assert_eq!(m.dev.serial.take_output(), "😀x\u{305}");
+    for t in [-1, 65, -2, 66, -4, -2, -9841, -9841] {
+        out(&mut m, block::SERIAL, 0, t);
+    }
+    assert_eq!(m.dev.serial.take_output(), "\u{FFFD}A\u{FFFD}B\u{FFFD}\u{FFFD}");
+}
+
+#[test]
 fn disk_error_paths() {
     let mut m = machine();
     let run_cmd = |m: &mut Machine, cmd: i64| {

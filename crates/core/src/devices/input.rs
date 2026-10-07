@@ -124,12 +124,17 @@ impl Mouse {
     }
 }
 
-/// Serial debug console. Characters are trytes holding Unicode code points.
+/// Serial debug console. Characters are trytes holding Unicode code points
+/// (a character above U+2671 is 3 trytes: ternary::char_trytes).
 #[derive(Default)]
 pub struct Serial {
     rx: VecDeque<i64>,
+    /// The last character received took 3 trytes.
+    rx_big: bool,
     /// Characters the machine has written, for the host to drain.
     pub tx: Vec<i64>,
+    /// A 3-tryte character split across drains.
+    tx_text: ternary::TextDecoder,
     irq_on: bool,
 }
 
@@ -141,31 +146,30 @@ impl Serial {
     /// dropped).
     pub fn receive(&mut self, c: i64) -> bool {
         if c == OVERLINE {
-            if let Some(last) = self.rx.back_mut() {
+            let n = self.rx.len();
+            if self.rx_big && n >= 3 {
+                self.rx[n - 3] = ternary::BIG_CHAR_OVERLINED;
+            } else if let Some(last) = self.rx.back_mut() {
                 if *last >= 33 {
                     *last = -*last;
                 }
             }
+            self.rx_big = false;
             return false;
         }
-        self.rx.push_back(c);
+        self.rx.extend(ternary::char_trytes(c, false));
+        self.rx_big = c > ternary::TRYTE_CHAR_MAX;
         self.irq_on
     }
 
     /// Drain transmitted output as a host string: a negative code point
-    /// (an overlined character) becomes the character and U+0305.
+    /// (an overlined character) becomes the character and U+0305, a 3-tryte
+    /// character the character (ternary::TextDecoder; one cut off by the
+    /// drain finishes in the next).
     pub fn take_output(&mut self) -> String {
         let mut s = String::new();
         for c in self.tx.drain(..) {
-            let ch = |v: i64| u32::try_from(v).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
-            if c < -32 {
-                s.push(ch(-c));
-                s.push('\u{305}');
-            } else if c < 0 {
-                s.push('\u{FFFD}'); // an overlined control character means nothing
-            } else {
-                s.push(ch(c));
-            }
+            self.tx_text.push(c, &mut s);
         }
         s
     }

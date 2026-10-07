@@ -88,7 +88,7 @@ A negative digit is the positive one with a bar over it, as on the Setun. Negati
 
 **Writing the bar:**
 - **In host source files** (Trine, assembler, Rust tests): the digit followed by U+0305 COMBINING OVERLINE, in UTF-8. `_` and spaces may separate digits.
-- **In the machine:** an overlined character is the **negated code point**: overlined `1` is −49, overlined `D` is −68. So an overlined digit is still one tryte, one glyph and one screen cell, and "overline" is the same negation as on the number itself. Only code points below −32 are overlined characters; −1…−32 mean nothing.
+- **In the machine:** an overlined character is the **negated code point**: overlined `1` is −49, overlined `D` is −68. So an overlined digit is still one tryte, one glyph and one screen cell, and "overline" is the same negation as on the number itself. Only code points below −32 are overlined characters. −2 and −3 lead a character above U+2671 (§8.4); −1 and −4…−32 mean nothing (−1 is also what C-style readers return for end of file).
   - **Screen:** the glyph moved down one row, under a bar.
   - **Serial port:** the character followed by U+0305, both ways.
   - **Keyboard:** Right Alt (AltGr) held with the character.
@@ -682,8 +682,12 @@ Control values are ternary wherever that is natural.
 
 - A 9-trit tryte covers ±9841.
 - **A positive tryte is a Unicode code point, U+0000..U+2671.** That covers ASCII, Latin-1, Latin Extended, Greek, **Cyrillic**, Hebrew, Arabic, Devanagari, general punctuation, arrows, box drawing, blocks and geometric shapes.
-- **A negative tryte is a lead unit** for "UTF-T": a code point above 9841 is written as a negative lead tryte followed by one more tryte.
-- For nearly all text, one character is one tryte, and the serial console, keyboard, text mode and the compiler's `char` all use this encoding.
+- **A negative tryte below −32 is an overlined character** (§1.1).
+- **A character above U+2671 is three trytes:** the lead −2 (−3 when overlined), then two trailing trytes, both in −9841…−33: with n = code point − 9842, they are −(33 + n div 9809) and −(33 + n mod 9809). Every Unicode scalar value fits (9809² is far beyond U+10FFFF).
+  - A trailing tryte is never 0, a newline, any ASCII character or a lead, so NUL-terminated strings, `strlen` (which counts trytes), `strchr` for ASCII and line splitting all keep working. A tool that reads trytes one at a time sees two overlined characters.
+  - Malformed, refused by every decoder (or shown as U+FFFD): a lead −1 or −4…−32, a lead not followed by two trailing trytes, a code point above U+10FFFF, a surrogate (U+D800…U+DFFF). There is no overlong form: the encoding starts at U+2672.
+  - The form is not self-synchronizing; text is decoded forward from a known start.
+- For nearly all text, one character is one tryte, and the serial console, keyboard, text mode and the compiler's `char` all use this encoding. The serial port carries a 3-tryte character as the one Unicode character, both ways.
 
 ### 8.5 Host file format for tryte data (T1B2)
 

@@ -359,14 +359,43 @@ struct ifreq {
 
 // ---- UTF-8 ---------------------------------------------------------------------------------
 
-// Encode the code point c as UTF-8 octets into out; returns how many (1..4).
-// A negative tryte (an overlined character) is sent as its digit followed
-// by U+0305, the way the serial console shows it.
+// Encode one tryte of text as UTF-8 octets into out; returns how many (0..8).
+// A negative tryte (an overlined character) is sent as its character
+// followed by U+0305, the way the serial console shows it. A character
+// above U+2671 is three trytes (ISA §1.1): the lead and the first trailing
+// tryte return 0 and the last one the whole character, so callers may go
+// tryte by tryte; a malformed one is sent as U+FFFD.
+var utf8_lead: int;                    // a pending lead tryte, or 0
+var utf8_hi: int;
+
 fn utf8_encode(c: int, out: *tryte) -> int {
-    if (c < 0) {
-        var n: int = utf8_encode(-c, out);
-        return n + utf8_encode(773, out + n);
+    if (utf8_lead != 0) {
+        if (c > -33) {
+            // not a trailing tryte: U+FFFD for the broken character, then this one
+            utf8_lead = 0;
+            var n0: int = utf8_cp(65533, out);
+            return n0 + utf8_encode(c, out + n0);
+        }
+        if (utf8_hi == 0) { utf8_hi = c; return 0; }
+        var t: [3]char = { utf8_lead as char, utf8_hi as char, c as char };
+        utf8_lead = 0;
+        utf8_hi = 0;
+        var cp: int = 0;
+        var n1: int = tstr_next(&t[0], &cp) == 3 ? utf8_cp(cp < 0 ? -cp : cp, out) : utf8_cp(65533, out);
+        if (cp < 0 && n1 > 0 && t[0] == BIG_CHAR_OVERLINED) { n1 += utf8_cp(773, out + n1); }
+        return n1;
     }
+    if (c == BIG_CHAR || c == BIG_CHAR_OVERLINED) { utf8_lead = c; utf8_hi = 0; return 0; }
+    if (c < 0 && c >= -32) { return utf8_cp(65533, out); }
+    if (c < 0) {
+        var n: int = utf8_cp(-c, out);
+        return n + utf8_cp(773, out + n);
+    }
+    return utf8_cp(c, out);
+}
+
+// The code point c (0..U+10FFFF) as UTF-8 octets; how many.
+fn utf8_cp(c: int, out: *tryte) -> int {
     if (c < 128) { out[0] = c as tryte; return 1; }
     if (c < 2048) {
         out[0] = (192 + c / 64) as tryte;
@@ -388,10 +417,12 @@ fn utf8_encode(c: int, out: *tryte) -> int {
 
 // An incremental UTF-8 decoder: feed octets one at a time. Returns the code
 // point when one is complete, -1 while more octets are needed, and '?' for
-// a malformed sequence or a code point a tryte cannot hold.
+// a malformed sequence (a bad continuation, an overlong form, a surrogate,
+// or above U+10FFFF).
 struct utf8_state {
     need: int;
     cp: int;
+    min: int;                          // the smallest code point of this length
 }
 
 fn utf8_decode(st: *utf8_state, b: int) -> int {
@@ -400,18 +431,20 @@ fn utf8_decode(st: *utf8_state, b: int) -> int {
         st.cp = st.cp * 64 + b % 64;
         st.need -= 1;
         if (st.need > 0) { return -1; }
-        return st.cp > 9841 ? '?' : st.cp;
+        if (st.cp < st.min || st.cp > 1114111 || (st.cp >= 55296 && st.cp <= 57343)) { return '?'; }
+        return st.cp;
     }
     if (b < 128) { return b; }
-    if (b >= 194 && b < 224) { st.need = 1; st.cp = b % 32; return -1; }
-    if (b >= 224 && b < 240) { st.need = 2; st.cp = b % 16; return -1; }
-    if (b >= 240 && b < 245) { st.need = 3; st.cp = b % 8; return -1; }
+    if (b >= 194 && b < 224) { st.need = 1; st.cp = b % 32; st.min = 128; return -1; }
+    if (b >= 224 && b < 240) { st.need = 2; st.cp = b % 16; st.min = 2048; return -1; }
+    if (b >= 240 && b < 245) { st.need = 3; st.cp = b % 8; st.min = 65536; return -1; }
     return '?';
 }
 
 // Decode n octets into characters; a character followed by U+0305
-// (combining overline) becomes the negative tryte, as on the serial
-// console. Returns how many characters were written to out (at most n).
+// (combining overline) becomes overlined, as on the serial console.
+// Returns how many trytes were written to out (at most n: a character
+// above U+2671 takes 3 trytes and at least 3 octets).
 fn utf8_to_text(st: *utf8_state, in: *tryte, n: int, out: *char) -> int {
     var m: int = 0;
     var k: int = 0;
@@ -419,17 +452,22 @@ fn utf8_to_text(st: *utf8_state, in: *tryte, n: int, out: *char) -> int {
         var c: int = utf8_decode(st, in[k]);
         k += 1;
         if (c < 0) { continue; }
-        if (c == 773 && m > 0 && out[m - 1] > 32) {
-            out[m - 1] = (-out[m - 1]) as char;
-            continue;
+        if (c == 773 && m > 0) {
+            if (m >= 3 && out[m - 3] == BIG_CHAR && out[m - 2] < -32 && out[m - 1] < -32) {
+                out[m - 3] = BIG_CHAR_OVERLINED as char;
+                continue;
+            }
+            if (out[m - 1] > 32) {
+                out[m - 1] = (-out[m - 1]) as char;
+                continue;
+            }
         }
-        out[m] = c as char;
-        m += 1;
+        m += tchar_put(c, out + m);
     }
     return m;
 }
 
-// Encode n characters as UTF-8 into out (room for 8 octets per character);
+// Encode n trytes of text as UTF-8 into out (room for 8 octets per tryte);
 // returns the number of octets.
 fn text_to_utf8(in: *char, n: int, out: *tryte) -> int {
     var m: int = 0;

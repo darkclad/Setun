@@ -464,32 +464,137 @@ impl<const N: usize> Tern<N> {
 /// U+0305 COMBINING OVERLINE: the mark of a negative digit.
 pub const OVERLINE: char = '\u{305}';
 
-/// Host text as the machine's code points, one per tryte: a character
-/// followed by U+0305 is the character overlined, written as its negated
-/// code point (`1` + U+0305 is −`'1'` = −49; docs/NOTATION.md). An overline
-/// with nothing before it, two overlines, an overline on a control
-/// character or a space, and a character above 9841 are errors.
+/// The lead tryte of a character above U+2671 (9841). Two trailing trytes
+/// follow, both in -9841..=-33 (what a tryte reader takes for overlined
+/// characters), so a trailing tryte is never NUL, a newline, any ASCII
+/// character or a lead: n = cp - 9842 is written as -(33 + n / 9809),
+/// -(33 + n % 9809). Not -1, which C-style readers return for end of
+/// file (fgetc).
+pub const BIG_CHAR: i64 = -2;
+/// The same character overlined.
+pub const BIG_CHAR_OVERLINED: i64 = -3;
+/// The largest code point a tryte holds directly.
+pub const TRYTE_CHAR_MAX: i64 = 9841;
+
+/// How many values one trailing tryte takes: -9841..=-33.
+const TRAIL_VALUES: i64 = 9809;
+
+/// Whether `cp` is a character that takes three trytes: above 9841 and a
+/// Unicode scalar value (at most U+10FFFF, not a surrogate).
+pub fn big_char_ok(cp: i64) -> bool {
+    cp > TRYTE_CHAR_MAX && cp <= 0x10FFFF && !(0xD800..=0xDFFF).contains(&cp)
+}
+
+/// The code point two trailing trytes spell, or None if either is outside
+/// -9841..=-33 or the result is not `big_char_ok`.
+pub fn big_char_of(hi: i64, lo: i64) -> Option<i64> {
+    let digit = |t: i64| (-9841..=-33).contains(&t).then_some(-t - 33);
+    let cp = TRYTE_CHAR_MAX + 1 + digit(hi)? * TRAIL_VALUES + digit(lo)?;
+    big_char_ok(cp).then_some(cp)
+}
+
+/// The trytes of one character: 1 for code points up to 9841 (negated when
+/// overlined), 3 above.
+pub fn char_trytes(cp: i64, over: bool) -> Vec<i64> {
+    if cp <= TRYTE_CHAR_MAX {
+        return vec![if over { -cp } else { cp }];
+    }
+    let n = cp - TRYTE_CHAR_MAX - 1;
+    vec![if over { BIG_CHAR_OVERLINED } else { BIG_CHAR }, -(33 + n / TRAIL_VALUES), -(33 + n % TRAIL_VALUES)]
+}
+
+/// Host text as the machine's trytes: a character followed by U+0305 is the
+/// character overlined, written as its negated code point (`1` + U+0305 is
+/// −`'1'` = −49; docs/NOTATION.md); a character above 9841 takes three
+/// trytes (`char_trytes`). An overline with nothing before it, two
+/// overlines, and an overline on a control character or a space are errors.
 pub fn code_points(s: &str) -> Result<Vec<i64>, String> {
     let mut out: Vec<i64> = Vec::new();
     let mut barred = false;
+    let mut last_big = false;
     for c in s.chars() {
         if c == OVERLINE {
+            let n = out.len();
             match out.last_mut() {
                 None => return Err("an overline with no character before it".into()),
                 Some(_) if barred => return Err("two overlines on one character".into()),
+                Some(_) if last_big => out[n - 3] = BIG_CHAR_OVERLINED,
                 Some(&mut p) if p <= 32 => return Err(format!("U+{p:04X} cannot be overlined")),
                 Some(p) => *p = -*p,
             }
             barred = true;
         } else {
-            if c as i64 > 9841 {
-                return Err(format!("character U+{:X} does not fit in one tryte", c as i64));
-            }
-            out.push(c as i64);
+            out.extend(char_trytes(c as i64, false));
+            last_big = c as i64 > TRYTE_CHAR_MAX;
             barred = false;
         }
     }
     Ok(out)
+}
+
+/// Machine text back to host text, a tryte at a time (it may arrive in
+/// pieces): an overlined character becomes the character and U+0305, and
+/// anything malformed (−3 … −32, a bad escape) becomes U+FFFD.
+#[derive(Default, Clone)]
+pub struct TextDecoder {
+    lead: i64,
+    got: Vec<i64>,
+}
+
+impl TextDecoder {
+    pub fn push(&mut self, t: i64, out: &mut String) {
+        let ch = |v: i64| u32::try_from(v).ok().and_then(char::from_u32).unwrap_or('\u{FFFD}');
+        if self.lead != 0 && t > -33 {
+            // not a trailing tryte: the broken character, then this one
+            out.push('\u{FFFD}');
+            self.lead = 0;
+            self.got.clear();
+        }
+        if self.lead != 0 {
+            self.got.push(t);
+            if self.got.len() < 2 {
+                return;
+            }
+            if let Some(cp) = big_char_of(self.got[0], self.got[1]) {
+                out.push(ch(cp));
+                if self.lead == BIG_CHAR_OVERLINED {
+                    out.push(OVERLINE);
+                }
+            } else {
+                out.push('\u{FFFD}');
+            }
+            self.lead = 0;
+            self.got.clear();
+        } else if t == BIG_CHAR || t == BIG_CHAR_OVERLINED {
+            self.lead = t;
+        } else if t < -32 {
+            out.push(ch(-t));
+            out.push(OVERLINE);
+        } else if t < 0 {
+            out.push('\u{FFFD}'); // an overlined control character means nothing
+        } else {
+            out.push(ch(t));
+        }
+    }
+
+    /// Whether a character is half received.
+    pub fn pending(&self) -> bool {
+        self.lead != 0
+    }
+}
+
+/// Machine text as host text (`TextDecoder`); a character cut off at the
+/// end becomes U+FFFD.
+pub fn text_of(trytes: &[i64]) -> String {
+    let mut d = TextDecoder::default();
+    let mut s = String::new();
+    for &t in trytes {
+        d.push(t, &mut s);
+    }
+    if d.pending() {
+        s.push('\u{FFFD}');
+    }
+    s
 }
 
 /// The value of a prefixed literal's digits, as the assembler and the Trine
@@ -674,7 +779,50 @@ mod tests {
         assert!(code_points("\u{305}1").unwrap_err().contains("no character before"));
         assert!(code_points("1\u{305}\u{305}").unwrap_err().contains("two overlines"));
         assert!(code_points(" \u{305}").unwrap_err().contains("cannot be overlined"));
-        assert!(code_points("\u{1F600}").unwrap_err().contains("does not fit"));
+    }
+
+    #[test]
+    fn characters_beyond_one_tryte() {
+        // three trytes above 9841, the trailing ones never NUL, ASCII or a lead
+        assert_eq!(code_points("\u{2671}").unwrap(), [9841]);
+        let t = code_points("\u{2672}").unwrap();
+        assert_eq!(t, [BIG_CHAR, -33, -33]);
+        for cp in [9842, 19683, 0xD7FF, 0xE000, 0xFFFF, 0x10000, 0x10FFFF, 9842 + 9809, 9842 + 9808] {
+            let t = char_trytes(cp, false);
+            assert_eq!(t.len(), 3, "{cp}");
+            assert!(t[1..].iter().all(|&x| (-9841..=-33).contains(&x)), "{cp}: {t:?}");
+            assert_eq!(big_char_of(t[1], t[2]), Some(cp), "{cp}");
+            let s = char::from_u32(cp as u32).unwrap().to_string();
+            assert_eq!(code_points(&s).unwrap(), t);
+            assert_eq!(text_of(&t), s);
+            let over = format!("{s}\u{305}");
+            assert_eq!(code_points(&over).unwrap(), char_trytes(cp, true));
+            assert_eq!(text_of(&char_trytes(cp, true)), over);
+        }
+        assert_eq!(code_points("日\u{305}本").unwrap()[0], BIG_CHAR_OVERLINED);
+        assert!(code_points("日\u{305}\u{305}").unwrap_err().contains("two overlines"));
+        // malformed machine text is U+FFFD
+        assert_eq!(text_of(&[BIG_CHAR]), "\u{FFFD}");
+        assert_eq!(text_of(&[BIG_CHAR, -40]), "\u{FFFD}");
+        assert_eq!(text_of(&[BIG_CHAR, 65, 66]), "\u{FFFD}AB", "text after a lead is still text");
+        assert_eq!(text_of(&[-1, 65]), "\u{FFFD}A"); // -1 is EOF's, never a lead
+        assert_eq!(text_of(&[-4, 65]), "\u{FFFD}A");
+        assert_eq!(text_of(&[BIG_CHAR, -9841, -9841]), "\u{FFFD}", "above U+10FFFF");
+        assert_eq!(big_char_of(-33, -33), Some(9842));
+        assert_eq!(big_char_of(5, -40), None, "a trailing tryte that is text");
+        assert_eq!(big_char_of(-40, -32), None);
+        assert_eq!(big_char_of(-34, 0), None);
+        let s = char_trytes(0xD7FF, false);
+        assert_eq!(text_of(&[BIG_CHAR, s[1], s[2] - 1]), "\u{FFFD}", "U+D800");
+        // a character split across pieces
+        let mut d = TextDecoder::default();
+        let mut out = String::new();
+        let t = char_trytes(0x1F600, false);
+        d.push(t[0], &mut out);
+        d.push(t[1], &mut out);
+        assert!(out.is_empty() && d.pending());
+        d.push(t[2], &mut out);
+        assert_eq!(out, "\u{1F600}");
     }
 
     #[test]

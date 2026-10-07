@@ -3154,6 +3154,21 @@ fn ed_left(n: int) {
     ed_puts("D");
 }
 
+// Characters above U+2671 are 3 trytes (a lead, two trailing trytes):
+// the editor inserts, deletes and steps over them whole, one column each.
+fn ed_lead(c: int) -> int { return c == BIG_CHAR || c == BIG_CHAR_OVERLINED; }
+
+// The trytes of the character that starts at i, and of the one that ends at i.
+fn ed_fwd(i: int) -> int { return i + 3 <= ed_len && ed_lead(ed_buf[i]) ? 3 : 1; }
+fn ed_back(i: int) -> int { return i >= 3 && ed_lead(ed_buf[i - 3]) && ed_buf[i - 2] < -32 && ed_buf[i - 1] < -32 ? 3 : 1; }
+
+// Screen columns of ed_buf[a..b).
+fn ed_cols(a: int, b: int) -> int {
+    var n: int = 0;
+    while (a < b) { a += ed_fwd(a); n += 1; }
+    return n;
+}
+
 fn ed_redraw() {
     ed_puts("\r");
     var k: int = 0;
@@ -3162,7 +3177,7 @@ fn ed_redraw() {
     ed_puts(&ed_prompt[line]);
     ed_write(&ed_buf[0], ed_len);
     ed_puts("\e[K");
-    ed_left(ed_len - ed_pos);
+    ed_left(ed_cols(ed_pos, ed_len));
 }
 
 // Insert n characters at the cursor.
@@ -3185,11 +3200,12 @@ fn ed_delete(i: int, n: int) {
     if (i + n > ed_len) { n = ed_len - i; }
     if (n <= 0) { return; }
     var at_end: int = i + n == ed_len && ed_pos == ed_len;
+    var one: int = ed_cols(i, i + n) == 1;
     var k: int = i;
     while (k + n < ed_len) { ed_buf[k] = ed_buf[k + n]; k += 1; }
     ed_len -= n;
     if (ed_pos > i + n) { ed_pos -= n; } else if (ed_pos > i) { ed_pos = i; }
-    if (at_end && n == 1) { ed_putc(8); ed_putc(' '); ed_putc(8); } else { ed_redraw(); }   // as ECHOE does
+    if (at_end && one) { ed_putc(8); ed_putc(' '); ed_putc(8); } else { ed_redraw(); }   // as ECHOE does
 }
 
 fn ed_load(s: *char) {
@@ -3356,8 +3372,9 @@ fn ed_complete() {
     ed_redraw();
 }
 
-// One key from the terminal: a character, or one of these for an escape
-// sequence. -1 = interrupted, -2 = end of input.
+// One key from the terminal: a character (a lead tryte comes alone; the
+// caller reads the rest), or one of these for an escape sequence, an
+// interruption or the end of input.
 const K_UP: int = 100000;
 const K_DOWN: int = 100001;
 const K_RIGHT: int = 100002;
@@ -3366,12 +3383,14 @@ const K_HOME: int = 100004;
 const K_END: int = 100005;
 const K_DEL: int = 100006;
 const K_NONE: int = 100007;
+const K_INTR: int = 100008;
+const K_EOF: int = 100009;
 
 fn ed_getc() -> int {
     var c: [1]char;
     var r: int = read(STDIN_FILENO, &c[0], 1);
-    if (r < 0) { return errno == EINTR ? -1 : -2; }
-    if (r == 0) { return -2; }
+    if (r < 0) { return errno == EINTR ? K_INTR : K_EOF; }
+    if (r == 0) { return K_EOF; }
     return c[0];
 }
 
@@ -3379,12 +3398,12 @@ fn ed_key() -> int {
     var c: int = ed_getc();
     if (c != 27) { return c; }
     c = ed_getc();
-    if (c < 0) { return c; }
+    if (c == K_INTR || c == K_EOF) { return c; }
     if (c != '[' && c != 'O') { return K_NONE; }
     var num: int = 0;
     loop {
         c = ed_getc();
-        if (c < 0) { return c; }
+        if (c == K_INTR || c == K_EOF) { return c; }
         if (c >= '0' && c <= '9') { num = num * 10 + c - '0'; continue; }
         if (c == ';') { continue; }
         break;
@@ -3428,16 +3447,16 @@ fn edit_line_into_src(p: *char) -> int {
     loop {
         var c: int = ed_key();
         if (c != '\t') { ed_tabs = 0; }
-        if (c == -1) { ed_puts("^C"); result = -1; break; }
-        if (c == -2) { result = ed_len > 0 ? 1 : 0; if (ed_len > 0) { ed_puts("\n"); } break; }
+        if (c == K_INTR) { ed_puts("^C"); result = -1; break; }
+        if (c == K_EOF) { result = ed_len > 0 ? 1 : 0; if (ed_len > 0) { ed_puts("\n"); } break; }
         if (c == '\n' || c == '\r') { ed_puts("\n"); break; }
         if (c == 4) {                                   // ^D
             if (ed_len == 0) { result = 0; break; }
-            ed_delete(ed_pos, 1);
-        } else if (c == 127 || c == 8) { ed_delete(ed_pos - 1, 1); }
-        else if (c == K_DEL) { ed_delete(ed_pos, 1); }
-        else if (c == K_LEFT) { if (ed_pos > 0) { ed_pos -= 1; ed_left(1); } }
-        else if (c == K_RIGHT) { if (ed_pos < ed_len) { ed_pos += 1; ed_puts("\e[C"); } }
+            ed_delete(ed_pos, ed_fwd(ed_pos));
+        } else if (c == 127 || c == 8) { var b: int = ed_back(ed_pos); ed_delete(ed_pos - b, b); }
+        else if (c == K_DEL) { ed_delete(ed_pos, ed_fwd(ed_pos)); }
+        else if (c == K_LEFT) { if (ed_pos > 0) { ed_pos -= ed_back(ed_pos); ed_left(1); } }
+        else if (c == K_RIGHT) { if (ed_pos < ed_len) { ed_pos += ed_fwd(ed_pos); ed_puts("\e[C"); } }
         else if (c == K_HOME || c == 1) { ed_pos = 0; ed_redraw(); }
         else if (c == K_END || c == 5) { ed_pos = ed_len; ed_redraw(); }
         else if (c == K_UP) { ed_history(-1); }
@@ -3450,6 +3469,14 @@ fn edit_line_into_src(p: *char) -> int {
             while (w > 0 && ed_buf[w - 1] != ' ') { w -= 1; }
             ed_delete(w, ed_pos - w);
         } else if (c == '\t') { ed_tabs += 1; ed_complete(); }
+        else if (ed_lead(c)) {
+            // a character above U+2671: its two trailing trytes follow
+            var big: [3]char;
+            big[0] = c as char;
+            big[1] = ed_getc() as char;
+            big[2] = ed_getc() as char;
+            if (big[1] < -32 && big[2] < -32) { ed_insert(&big[0], 3); }
+        }
         else if ((c >= 32 && c < K_UP) || c <= -33) {       // negative: an overlined character
             var ch: [1]char;
             ch[0] = c as char;

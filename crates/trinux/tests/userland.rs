@@ -1039,3 +1039,15 @@ fn vector_unit_from_user_mode() {
     }
     assert_has(&out, &["vectest: all passed", "st=0\n", "Vector:\tunused\n"]);
 }
+
+#[test]
+fn text_beyond_one_tryte() {
+    // TERNARY_WORLD A6: /bin/chartest (3-tryte characters, tstr_next,
+    // tstr_chars, tchar_put, UTF-8 both ways, the malformed forms), and the
+    // console carrying them both ways: typed in, echoed back
+    let out = session(&["chartest", "echo st=$?", "echo 日本̅ 😀", "exit"], 3_000_000_000);
+    assert!(!out.contains("FAILED"), "{out}");
+    assert_has(&out, &["chartest: all passed", "st=0", "chartest: 日本語 Ω̅ 😀 ok", "日本̅ 😀"]);
+    let n = out.matches(" ok\n").count();
+    assert!(n >= 18, "only {n} checks:\n{out}");
+}

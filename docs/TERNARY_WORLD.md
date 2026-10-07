@@ -388,7 +388,16 @@ Trine gets these as builtins on a `[9]tryte` value first; a vector type can come
 
 Negative tests: any vector instruction with `VE` = 0 raises −13 and changes nothing; unaligned `VLD`; a non-lane-wise function under `VALU`; lane index out of range in `VMOV`; a context switch between two tasks that both use vectors.
 
-### A6. Text beyond U+2671
+### A6. Text beyond U+2671 ✅
+
+**Done (2026-10-06),** with two changes to the table below, both found while building it (ISA §8.4 has the final form):
+
+- **The leads are −2 and −3, not −1 and −2.** `fgetc` returns −1 for end of file, and every character-at-a-time reader would have taken the lead for it (the shell did).
+- **The trailing trytes are both in −9841…−33,** not the code point as an 18-trit number. As a plain number, the low tryte is 0 for 56 code points (U+4CE3 = 19683 is one), which would end a C string. The high tryte is 1…56, so for some characters it would equal a newline (10) or a space (32) and line or word splitting would cut the character in half. Now a trailing tryte is never NUL, ASCII or a lead, and an overlong form cannot be written at all.
+
+Built: the `ternary` crate (`char_trytes`, `code_points`, `TextDecoder`, used by the assembler, both compilers' literals, the disk builder and the serial port, which carries them both ways); tlibc `tstr_next`, `tstr_chars`, `tchar_put`; UTF-8 at the border (`utf8_encode` takes a 3-tryte character tryte by tryte, `utf8_decode` refuses overlong forms, surrogates and anything above U+10FFFF, and `utf8_in_place` takes 4-octet characters); the shell's line editor inserts, deletes and steps over such a character whole. Tests: `/bin/chartest` (every edge value both ways, every malformed form), typing and echoing `日本̅ 😀` on the console, `tric` and `tas` matching the host on it, the serial device, and the `ternary` unit tests. Mutations in the library's checks, the decoder's overlong check, the editor, the serial port and the trailing-tryte range each fail a test.
+
+Not yet: the graphical side. `gfx.tri` still draws tryte by tryte (a 3-tryte character shows as `?` and two overlined glyphs), `edit` and `term` count it as three cells, and the 16×16 CJK font is not in the image.
 
 A character is 1 or 3 trytes:
 

@@ -1,0 +1,118 @@
+// /bin/chartest: text beyond U+2671 (ISA §1.1, TERNARY_WORLD A6): the
+// 3-tryte characters, tstr_next/tstr_chars/tchar_put, and UTF-8 at the
+// border, one line per check, failure paths included.
+
+import "../lib/tlibc.tri";
+import "../lib/socket.tri";
+
+var failures: int;
+
+fn ok(what: *char, cond: int) {
+    puts("chartest: ");
+    puts(what);
+    puts(cond ? " ok\n" : " FAILED\n");
+    if (!cond) { failures += 1; }
+}
+
+// cp through tchar_put and tstr_next, and through UTF-8 and back.
+fn round_trip(cp: int) -> int {
+    var t: [8]char;
+    var n: int = tchar_put(cp, &t[0]);
+    if (n == 0) { return 0; }
+    t[n] = 0;
+    var back: int = 7;
+    if (tstr_next(&t[0], &back) != n || back != cp) { return 0; }
+    var k: int = 1;
+    while (k < n) { if (t[k] == 0 || t[k] > -33) { return 0; } k += 1; }   // never NUL, ASCII or a lead
+    var wire: [24]tryte;
+    var m: int = text_to_utf8(&t[0], n, &wire[0]);
+    var st: utf8_state;
+    st.need = 0;
+    var u: [24]char;
+    var got: int = utf8_to_text(&st, &wire[0], m, &u[0]);
+    if (got != n) { return 0; }
+    k = 0;
+    while (k < n) { if (u[k] != t[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+// Feed octets to a fresh decoder: what utf8_to_text makes of them.
+fn decode(o: *tryte, n: int, out: *char) -> int {
+    var st: utf8_state;
+    st.need = 0;
+    var m: int = utf8_to_text(&st, o, n, out);
+    out[m] = 0;
+    return m;
+}
+
+fn main() -> int {
+    // edge values, plain and overlined
+    var edges: [10]int = { 33, 9841, 9842, 19683, 55295, 57344, 65535, 65536, 1114111, 27700 };
+    var all: int = 1;
+    var k: int = 0;
+    while (k < 10) {
+        if (!round_trip(edges[k]) || !round_trip(-edges[k])) { all = 0; var nb: [27]char; puts("chartest: edge "); puts(itoa(edges[k], &nb[0])); puts("\n"); }
+        k += 1;
+    }
+    ok("edge code points round-trip (tchar_put, tstr_next, UTF-8), plain and overlined", all);
+    var t: [4]char;
+    ok("one tryte up to U+2671, three above", tchar_put(9841, &t[0]) == 1 && tchar_put(9842, &t[0]) == 3);
+    ok("no character for a surrogate", tchar_put(55296, &t[0]) == 0 && tchar_put(57343, &t[0]) == 0);
+    ok("no character above U+10FFFF", tchar_put(1114112, &t[0]) == 0);
+    ok("no overlined control character", tchar_put(-10, &t[0]) == 0);
+
+    // a literal from the source: three characters of 3 trytes and one of 1
+    var s: *char = "日本語!";
+    ok("a literal above U+2671: 10 trytes, 4 characters", strlen(s) == 10 && tstr_chars(s) == 4);
+    var cp: int;
+    ok("tstr_next reads 日 (U+65E5)", tstr_next(s, &cp) == 3 && cp == 26085);
+
+    // malformed: each must be refused
+    var bad: [6]char;
+    var r: int = 0;
+    bad[0] = BIG_CHAR as char; bad[1] = 0;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 1; }                 // a lead at the end
+    bad[0] = BIG_CHAR as char; bad[1] = -40 as char; bad[2] = 0;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 10; }                // cut after the first trailing tryte
+    bad[0] = -1 as char; bad[1] = 0;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 100; }               // a reserved lead
+    bad[0] = -4 as char;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 1000000; }
+    bad[0] = -32 as char;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 1000; }
+    bad[0] = BIG_CHAR as char; bad[1] = 'A'; bad[2] = 'B'; bad[3] = 0;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 10000; }             // trailing trytes that are text
+    bad[0] = BIG_CHAR as char; bad[1] = -9841 as char; bad[2] = -9841 as char;
+    if (tstr_next(&bad[0], &cp) != -1) { r += 100000; }            // far above U+10FFFF
+    ok("malformed characters are refused", r == 0);
+    var sur: [4]char;
+    var n0: int = tchar_put(55295, &sur[0]);                        // U+D7FF, then step to U+D800
+    sur[2] = (sur[2] - 1) as char;
+    sur[3] = 0;
+    ok("a surrogate spelled out is refused", n0 == 3 && tstr_next(&sur[0], &cp) == -1);
+    ok("tstr_chars reports a malformed string", tstr_chars(&bad[0]) == -1);
+
+    // UTF-8 in: malformed sequences become '?'
+    var u: [16]char;
+    var o1: [4]tryte = { 240, 128, 128, 128 };                      // overlong (U+0000 in 4 octets)
+    var o2: [3]tryte = { 237, 160, 128 };                           // U+D800
+    var o3: [4]tryte = { 244, 144, 128, 128 };                      // U+110000
+    var o4: [3]tryte = { 224, 129, 129 };                           // overlong in 3 octets
+    ok("UTF-8: overlong 4-octet form refused", decode(&o1[0], 4, &u[0]) == 1 && u[0] == '?');
+    ok("UTF-8: surrogate refused", decode(&o2[0], 3, &u[0]) == 1 && u[0] == '?');
+    ok("UTF-8: above U+10FFFF refused", decode(&o3[0], 4, &u[0]) == 1 && u[0] == '?');
+    ok("UTF-8: overlong 3-octet form refused", decode(&o4[0], 3, &u[0]) == 1 && u[0] == '?');
+    var o5: [5]tryte = { 230, 151, 165, 204, 133 };                 // 日 then U+0305
+    ok("UTF-8: an overline after a 3-tryte character overlines it",
+        decode(&o5[0], 5, &u[0]) == 3 && u[0] == BIG_CHAR_OVERLINED && tstr_next(&u[0], &cp) == 3 && cp == -26085);
+    // UTF-8 out: a broken character is U+FFFD, and the tryte after it still goes out
+    var w: [24]tryte;
+    var broken: [2]char = { BIG_CHAR as char, 'A' };
+    var m: int = text_to_utf8(&broken[0], 2, &w[0]);
+    ok("UTF-8 out: a lead before plain text is U+FFFD, then the text", m == 4 && w[0] == 239 && w[1] == 191 && w[2] == 189 && w[3] == 'A');
+
+    // and to the console as is: the host sees the characters
+    puts("chartest: 日本語 Ω̅ 😀 ok\n");
+    puts(failures == 0 ? "chartest: all passed\n" : "chartest: FAILED\n");
+    return failures != 0;
+}
