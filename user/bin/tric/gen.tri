@@ -1818,7 +1818,7 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
 
 // ---- calls ----
 
-var builtin_names: *char = "sgn abs divr modr tmul tsat cons mulh trit ext ins tlz band bor bxor bandn bsh bext brot tcp tcn trev mrg stwm cas3 swap bytes in out mfc mtc hlt brk tlbflush tlbinv fence syscall sqrt trunc round rem scale3 exponent3 fconst fsr set_fsr fclass real27 ";
+var builtin_names: *char = "sgn abs divr modr tmul tsat cons mulh trit ext ins tlz band bor bxor bandn bsh bext brot tcp tcn trev mrg stwm cas3 swap bytes in out mfc mtc hlt brk tlbflush tlbinv fence syscall sqrt trunc round rem scale3 exponent3 fconst fsr set_fsr fclass real27 vadd vsub vmin vmax vtmul vtsat vcons vneg vabs vsgn vaddw vsubw vminw vmaxw vtmulw vtsatw vconsw vnegw vabsw vsgnw vmrg vbcst vbcstw vsum vdotw ";
 
 fn is_builtin(s: *char) -> int {
     var k: int = 0;
@@ -1956,6 +1956,117 @@ fn two(a: int, b: int) {
 var two_a: int;
 var two_b: int;
 
+// ---- the vector unit ----
+
+const VB_BINARY: int = 1;
+const VB_UNARY: int = 2;
+const VB_MERGE: int = 3;
+const VB_FILL: int = 4;
+const VB_REDUCE: int = 5;
+
+fn is_one_of(s: *char, words: *char) -> int {
+    var k: int = 0;
+    while (words[k] != 0) {
+        var j: int = 0;
+        while (s[j] != 0 && words[k + j] == s[j]) { j += 1; }
+        if (s[j] == 0 && words[k + j] == ' ') { return 1; }
+        while (words[k] != ' ') { k += 1; }
+        k += 1;
+    }
+    return 0;
+}
+
+// A vector builtin: kind * 10 + how many vectors (or values) it reads; 0 if not one.
+fn vector_kind(n: *char) -> int {
+    if (is_one_of(n, "vadd vsub vmin vmax vtmul vtsat vcons vaddw vsubw vminw vmaxw vtmulw vtsatw vconsw ")) { return VB_BINARY * 10 + 2; }
+    if (is_one_of(n, "vneg vabs vsgn vnegw vabsw vsgnw ")) { return VB_UNARY * 10 + 1; }
+    if (streq(n, "vmrg")) { return VB_MERGE * 10 + 2; }
+    if (streq(n, "vbcst") || streq(n, "vbcstw")) { return VB_FILL * 10 + 1; }
+    if (streq(n, "vsum")) { return VB_REDUCE * 10 + 1; }
+    if (streq(n, "vdotw")) { return VB_REDUCE * 10 + 2; }
+    return 0;
+}
+
+// A pointer to a vector: 0 for *int, 1 for *tryte (the vector address is one past it).
+fn vec_ptr(n: *char, t: int, pos: int) -> int {
+    var d: int = decay(t);
+    if (d == mk_ptr(t_int)) { return 0; }
+    if (d == mk_ptr(t_tryte)) { return 1; }
+    m0(); ms("`"); ms(n); ms("` needs a pointer to a vector ([3]int or [9]tryte)"); fail(pos);
+    return 0;
+}
+
+fn vec_fix(tr: int, r: *char) {
+    if (tr) { ln(); o("add "); o(r); o(", "); o(r); o(", 1"); nl(); }
+}
+
+// Memory to memory: each vector is 9 trytes at a multiple of 9.
+fn vector_builtin(n: *char, k: int, sources: int, args: int, na: int, pos: int) -> int {
+    want(n, na, sources + (k != VB_REDUCE ? 1 : 0), pos);
+    if (k == VB_BINARY || k == VB_MERGE) {
+        // d in r3, a in r1, b in r2
+        var td: int = vec_ptr(n, expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        em("push r1");
+        two(arg(args, 1), arg(args, 2));
+        var ta: int = vec_ptr(n, two_a, ex_pos.p[arg(args, 1)]);
+        var tb: int = vec_ptr(n, two_b, ex_pos.p[arg(args, 2)]);
+        em("pop r3");
+        vec_fix(ta, "r1");
+        vec_fix(tb, "r2");
+        vec_fix(td, "r3");
+        if (k == VB_MERGE) {
+            em("vld v1, [r3]");
+            em("vld v2, [r1]");
+            em("vld v3, [r2]");
+            em("vmrg v1, v2, v3");
+        } else {
+            em("vld v1, [r1]");
+            em("vld v2, [r2]");
+            ln(); o(n); o(" v1, v1, v2"); nl();
+        }
+        em("vst v1, [r3]");
+        return t_void;
+    }
+    if (k == VB_UNARY) {
+        two(arg(args, 0), arg(args, 1));
+        var ud: int = vec_ptr(n, two_a, ex_pos.p[arg(args, 0)]);
+        var ua: int = vec_ptr(n, two_b, ex_pos.p[arg(args, 1)]);
+        vec_fix(ud, "r1");
+        vec_fix(ua, "r2");
+        em("vld v1, [r2]");
+        ln(); o(n); o(" v1, v1"); nl();
+        em("vst v1, [r1]");
+        return t_void;
+    }
+    if (k == VB_FILL) {
+        two(arg(args, 0), arg(args, 1));
+        var fd: int = vec_ptr(n, two_a, ex_pos.p[arg(args, 0)]);
+        need_integer(two_b, ex_pos.p[arg(args, 1)]);
+        vec_fix(fd, "r1");
+        ln(); o(n); o(" v1, r2"); nl();
+        em("vst v1, [r1]");
+        return t_void;
+    }
+    if (sources == 1) {
+        // vsum(a)
+        var sa: int = vec_ptr(n, expr(arg(args, 0)), ex_pos.p[arg(args, 0)]);
+        vec_fix(sa, "r1");
+        em("vld v1, [r1]");
+        em("vsum r1, v1");
+        return t_int;
+    }
+    // vdotw(a, w)
+    two(arg(args, 0), arg(args, 1));
+    var da: int = vec_ptr(n, two_a, ex_pos.p[arg(args, 0)]);
+    var dw: int = vec_ptr(n, two_b, ex_pos.p[arg(args, 1)]);
+    vec_fix(da, "r1");
+    vec_fix(dw, "r2");
+    em("vld v1, [r1]");
+    em("vld v2, [r2]");
+    em("vdotw r1, v1, v2");
+    return t_int;
+}
+
 fn arg(args: int, k: int) -> int { return lists.p[args + k]; }
 
 fn want(n: *char, na: int, k: int, pos: int) {
@@ -2042,6 +2153,8 @@ fn builtin(n: *char, args: int, na: int, pos: int) -> int {
         ln(); o(n); o(" r1, r1, r2"); nl();
         return t_int;
     }
+    var vk: int = vector_kind(n);
+    if (vk != 0) { return vector_builtin(n, vk / 10, vk % 10, args, na, pos); }
     if (streq(n, "cas3")) {
         // cas3(p, expected, new): the old *p; *p := new if it was expected
         want(n, na, 3, pos);

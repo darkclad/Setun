@@ -23,7 +23,7 @@
 //! from binary systems); `'c'` (a Unicode character). `$` is the current address.
 //! Registers: `r-13`..`r13`, `zero` = r0, `fp` = r11, `lr` = r12, `sp` = r13.
 
-use setun_core::isa::{self, alu, cond, cr, falu, fcvt, fld, fmem, mem, memr, op, sys};
+use setun_core::isa::{self, alu, cond, cr, falu, fcvt, fld, fmem, mem, memr, op, sys, valu, vmem, vmov};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use ternary::Word;
@@ -297,6 +297,8 @@ enum Operand {
     Reg(i64),
     /// An FPU register, f−13..f13.
     FReg(i64),
+    /// A vector register, v−13..v13.
+    VReg(i64),
     Mem(i64, Expr),
     Expr(Expr),
     /// A real literal (decimal with a point or an exponent).
@@ -306,6 +308,12 @@ enum Operand {
 /// An FPU register name: `f-13` … `f13`.
 pub fn fregister(s: &str) -> Option<i64> {
     let n: i64 = s.trim().strip_prefix('f')?.parse().ok()?;
+    (-13..=13).contains(&n).then_some(n)
+}
+
+/// A vector register name: `v-13` … `v13`.
+pub fn vregister(s: &str) -> Option<i64> {
+    let n: i64 = s.trim().strip_prefix('v')?.parse().ok()?;
     (-13..=13).contains(&n).then_some(n)
 }
 
@@ -348,6 +356,9 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     }
     if let Some(f) = fregister(s) {
         return Ok(Operand::FReg(f));
+    }
+    if let Some(v) = vregister(s) {
+        return Ok(Operand::VReg(v));
     }
     match parse_expr(s) {
         Ok(e) => Ok(Operand::Expr(e)),
@@ -571,6 +582,30 @@ fn alu_binary(m: &str) -> Option<i64> {
     })
 }
 
+/// A lane-wise vector operation: `vadd` (9 tryte lanes), `vaddw` (3 word
+/// lanes), …; the VALU function and whether it takes two sources.
+pub fn valu_lanes(m: &str) -> Option<(i64, bool)> {
+    let s = m.strip_prefix('v')?;
+    let (s, words) = match s.strip_suffix('w') {
+        Some(t) => (t, true),
+        None => (s, false),
+    };
+    let (f, binary) = match s {
+        "add" => (alu::ADD, true),
+        "sub" => (alu::SUB, true),
+        "min" => (alu::MIN, true),
+        "max" => (alu::MAX, true),
+        "tmul" => (alu::TMUL, true),
+        "tsat" => (alu::TSAT, true),
+        "cons" => (alu::CONS, true),
+        "neg" => (alu::NEG, false),
+        "abs" => (alu::ABS, false),
+        "sgn" => (alu::SGN, false),
+        _ => return None,
+    };
+    Some((if words { f + valu::WORD_LANES } else { f }, binary))
+}
+
 fn alu_unary(m: &str) -> Option<i64> {
     Some(match m {
         "neg" | "not" => alu::NEG,
@@ -757,6 +792,10 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
         Operand::FReg(f) => Ok(*f),
         _ => err(line, format!("FPU register expected for `{m}`")),
     };
+    let vreg = |o: &Operand| match o {
+        Operand::VReg(v) => Ok(*v),
+        _ => err(line, format!("vector register expected for `{m}`")),
+    };
     let rel = |target: i64| -> Result<i64, Error> {
         let d = target - env.here;
         if d % 3 != 0 {
@@ -816,6 +855,45 @@ fn encode(m: &str, ops: &[Operand], size: usize, env: &Env) -> Result<Option<Vec
         } else {
             two(isa::wide(op::FMEMD, f, freg(d)?, *base, off))
         };
+    }
+    if let Some((f, binary)) = valu_lanes(m) {
+        return match (binary, ops) {
+            (true, [d, a, b]) => one(isa::rrr(op::VALU, f, vreg(d)?, vreg(a)?, vreg(b)?)),
+            (false, [d, a]) => one(isa::rrr(op::VALU, f, vreg(d)?, vreg(a)?, 0)),
+            _ => bad(),
+        };
+    }
+    let vm = |b: i64, x: i64, y: i64, z: i64| one(isa::rrr(op::VMOV, b, x, y, z));
+    let lane = |o: &Operand, n: i64| -> Result<i64, Error> {
+        let k = exp(o)?;
+        if !(0..n).contains(&k) {
+            return err(line, format!("lane {k} out of range for `{m}` (0..{})", n - 1));
+        }
+        Ok(k)
+    };
+    match (m, ops) {
+        ("vmrg", [d, k, s]) => return one(isa::rrr(op::VALU, valu::VMRG, vreg(d)?, vreg(k)?, vreg(s)?)),
+        ("vsum", [d, a]) => return one(isa::rrr(op::VALU, valu::VSUM, reg(d)?, vreg(a)?, 0)),
+        ("vdotw", [d, a, b]) => return one(isa::rrr(op::VALU, valu::VDOTW, reg(d)?, vreg(a)?, vreg(b)?)),
+        ("vld" | "vst", [d, Operand::Mem(base, off)]) => {
+            // 9 trytes; the offset counts in vectors
+            let off = env.val(off)?;
+            if off % 9 != 0 {
+                return err(line, format!("`{m}` offset {off} is not a multiple of 9"));
+            }
+            let f = if m == "vld" { vmem::VLD } else { vmem::VST };
+            return one(isa::rrr(op::VMEM, f, vreg(d)?, *base, env.range("offset/9", off / 9, 13)?));
+        }
+        ("vget", [d, a, k]) => return vm(vmov::VGET, reg(d)?, vreg(a)?, lane(k, 9)?),
+        ("vput", [d, a, k]) => return vm(vmov::VPUT, vreg(d)?, reg(a)?, lane(k, 9)?),
+        ("vgetw", [d, a, k]) => return vm(vmov::VGETW, reg(d)?, vreg(a)?, lane(k, 3)?),
+        ("vputw", [d, a, k]) => return vm(vmov::VPUTW, vreg(d)?, reg(a)?, lane(k, 3)?),
+        ("vbcst", [d, a]) => return vm(vmov::VBCST, vreg(d)?, reg(a)?, 0),
+        ("vbcstw", [d, a]) => return vm(vmov::VBCSTW, vreg(d)?, reg(a)?, 0),
+        _ if matches!(m, "vmrg" | "vsum" | "vdotw" | "vld" | "vst" | "vget" | "vput" | "vgetw" | "vputw" | "vbcst" | "vbcstw") => {
+            return bad()
+        }
+        _ => {}
     }
     let fcv = |b: i64, x: i64, y: i64, z: i64| one(isa::rrr(op::FCVT, b, x, y, z));
     match (m, ops) {

@@ -519,11 +519,12 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
   | handler | any caught signal | a signal frame is pushed (below) |
 
   `SIGKILL` and `SIGSTOP` can be neither caught nor blocked.
-- **Signal frame:** 113 words, pushed below an 81-tryte red zone under the user `sp`:
+- **Signal frame:** 192 words, pushed below an 81-tryte red zone under the user `sp`:
   - the whole 28-word trap frame;
   - the old blocked mask;
   - a magic word;
-  - a flag and the 82-word FPU state (§23), when the process has used the FPU.
+  - a flag and the 82-word FPU state (§23), when the process has used the FPU;
+  - a flag and the 78-word vector state (§26), when it has used the vector unit.
 
   The handler starts with `r1` = the signal number and `lr` = `sa_restorer` (tlibc's `__restore_rt`: `sys 139`). While it runs, the signal itself and `sa_mask` are blocked.
 - **`rt_sigreturn`** restores the frame. It checks the magic word, and that the saved `MODE` trits 23–27 (IOPL, PG, IE, ring) match user mode, so a forged frame cannot raise privileges. `FE` (trit 24) is left out of the check: the kernel sets it on every return.
@@ -963,3 +964,14 @@ TERNARY_WORLD A4 needs a lock shared between processes, and Trinux has no thread
 - **`futex(uaddr, op, val)`** (system call 98, as Linux numbers it): `FUTEX_WAIT` sleeps while the word at `uaddr` still holds `val` (`EAGAIN` if it does not), `FUTEX_WAKE` wakes up to `val` tasks sleeping on it and returns how many. The wait channel is the word's physical address, so processes sharing the page meet there; the kernel does not preempt itself, so looking at the word and going to sleep happen at once. `EINVAL` for a misaligned address or an unknown operation, `EFAULT` outside user space.
 - **tlibc** has `futex_wait`, `futex_wake`, and the mutex of ISA §3.4.1: `mtx_lock` (`CAS3` 0 → +1, else `SWAP` in −1 and wait until the swap finds 0) and `mtx_unlock` (`SWAP` in 0, waking one waiter if the old value was −1).
 - **`/bin/mtxtest`** checks all of this: sharing across fork and freeing with the last sharer (free memory before and after), the futex errors and a cross-process wait and wake, and four processes adding 1 to a shared counter 300 times each, yielding inside the critical section: exactly 1200 with the mutex, fewer without it.
+
+## 26. The vector unit
+
+[`kernel/vec.tri`](../kernel/vec.tri) switches the vector registers (ISA §15) lazily, exactly as §23 does the FPU's:
+
+- **One owner,** `vec_owner`; every other task's 26 registers (`v0` is always zero) are 78 words in its `Task.vec`. `VLD` and `VST` need a multiple of 9, so `Task.vec` has two words of slack and the save area starts at whichever of its first three words is aligned (`vec_area`). Two tasks' areas need not start at the same index, so fork and the signal code copy area to area.
+- **Trapping the first use:** `trap_return` calls `vec_fixup` after `fpu_fixup`; it sets `MODE.VE` (trit 19) in the frame of every return to user mode, +1 for the owner and 0 for everyone else. Vector −13 from user mode saves the owner's registers, loads the current task's (zeroes on first use) and retries the instruction. The kernel turns its own `MODE.VE` on before it touches the registers.
+- **fork** copies the parent's registers; **execve** and **exit** drop them; a **signal handler** starts with zeroes and `rt_sigreturn` brings the interrupted registers back from the frame. The signal frame grows to 192 words for this (§18).
+- **Faults:** a misaligned `VLD`/`VST` is `SIGBUS`, a store into read-only memory `SIGSEGV`, an invalid vector function `SIGILL`.
+- **`/proc/<pid>/status`** has a `Vector:` line: `unused`, `live` or `saved`.
+- **Tests:** `/bin/vectest` (`tests/userland.rs`) runs every Trine vector builtin against the same work done lane by lane, keeps values in `v12` and `v−12` (which compiled code never uses) across yields in two processes, and checks fork, execve, a signal handler and the three faults, each in its own child. Turning switching off fails five of its checks; not copying on fork, not restoring after a handler, and not dropping on execve each fail one.

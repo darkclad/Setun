@@ -147,6 +147,11 @@ fn info(i: &Ins) -> Option<Info> {
         "stwm" if a.len() == 3 => inf(src(0), 0, false, false),
         "cas3" if a.len() == 3 => inf(src(0), reg0() | FLAGS, false, false),
         "swap" if a.len() == 2 => inf(src(0), reg0(), false, false),
+        // the vector unit: v registers are not tracked, so nothing is pure;
+        // integer registers by position
+        "vld" | "vst" | "vbcst" | "vbcstw" if a.len() == 2 => inf(src(1), 0, false, false),
+        "vsum" | "vdotw" if a.len() >= 2 => inf(0, reg0(), false, false),
+        _ if op.starts_with('v') && a.iter().all(|x| x.starts_with('v')) => inf(0, 0, false, false),
         "in" if a.len() == 2 => inf(src(1), reg0(), false, false),
         "out" if a.len() == 2 => inf(src(0), 0, false, false),
         "mfc" if a.len() == 2 => inf(0, reg0(), false, false),

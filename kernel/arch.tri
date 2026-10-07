@@ -6,6 +6,7 @@ import "mm.tri";
 import "sched.tri";
 import "vm.tri";
 import "fpu.tri";
+import "vec.tri";
 import "drivers/tty.tri";
 import "drivers/input.tri";
 import "drivers/tnic.tri";
@@ -72,6 +73,8 @@ fn _arch_asm() {
         "trap_return:"
         "        mov   r1, sp"
         "        call  fpu_fixup"
+        "        mov   r1, sp"
+        "        call  vec_fixup"
         "        ldw   r1, [sp+81]"
         "        mtc   ksp, r1"
         "        ldw   r1, [sp+78]"
@@ -163,6 +166,7 @@ fn fault_name(v: int) -> *char {
         case -10: return "bus error";
         case -11: return "floating-point exception";
         case -12: return "FPU not available";
+        case -13: return "vector unit not available";
     }
     return "unknown trap";
 }
@@ -213,6 +217,11 @@ fn trap_handler(f: *int) {
     var from_user: int = trit(f[F_EMODE], 27) == -1;
     if (v == -12 && from_user) {
         fpu_unavailable();
+        do_signal(f);
+        return;
+    }
+    if (v == -13 && from_user) {
+        vec_unavailable();
         do_signal(f);
         return;
     }

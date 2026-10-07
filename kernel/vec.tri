@@ -1,0 +1,156 @@
+// vec: lazy switching of the vector registers (ISA §15, docs/KERNEL.md).
+//
+// The same scheme as fpu.tri: only vec_owner's registers live in the
+// hardware. Every return to user mode sets MODE.VE (trit 19) in the frame to
+// 1 for the owner and 0 for everyone else, so another task traps (vector
+// -13) on its first vector instruction; the trap saves the owner's registers
+// into its Task, loads the current task's and retries the instruction.
+//
+// A save area is v-13..v13 without v0, 3 words each: 78 words. VLD and VST
+// need a multiple of 9, so Task.vec has two words of slack and the area
+// starts at whichever of its first three words is aligned (vec_area); two
+// tasks' areas need not start at the same index, so copies go area to area.
+// A task that has not used the vector unit (vec_used = 0) starts zeroed.
+
+import "params.tri";
+import "sched.tri";
+
+const VEC_WORDS: int = 78;
+const MODE_VE_TRIT: int = 19;
+
+var vec_owner: int;                   // the task whose registers are live; 0 = nobody
+var vec_switches: int;                // -13 traps that loaded a task's state
+
+extern fn vec_save(area: *int);
+extern fn vec_load(area: *int);
+
+fn _vec_asm() {
+    asm {
+        "        b     _vec_asm_end"
+        "vec_save:"
+        "        vst   v-13, [r1]"
+        "        vst   v-12, [r1+9]"
+        "        vst   v-11, [r1+18]"
+        "        vst   v-10, [r1+27]"
+        "        vst   v-9, [r1+36]"
+        "        vst   v-8, [r1+45]"
+        "        vst   v-7, [r1+54]"
+        "        vst   v-6, [r1+63]"
+        "        vst   v-5, [r1+72]"
+        "        vst   v-4, [r1+81]"
+        "        vst   v-3, [r1+90]"
+        "        vst   v-2, [r1+99]"
+        "        vst   v-1, [r1+108]"
+        "        vst   v1, [r1+117]"
+        "        add   r1, r1, 117"
+        "        vst   v2, [r1+9]"
+        "        vst   v3, [r1+18]"
+        "        vst   v4, [r1+27]"
+        "        vst   v5, [r1+36]"
+        "        vst   v6, [r1+45]"
+        "        vst   v7, [r1+54]"
+        "        vst   v8, [r1+63]"
+        "        vst   v9, [r1+72]"
+        "        vst   v10, [r1+81]"
+        "        vst   v11, [r1+90]"
+        "        vst   v12, [r1+99]"
+        "        vst   v13, [r1+108]"
+        "        ret"
+        "vec_load:"
+        "        vld   v-13, [r1]"
+        "        vld   v-12, [r1+9]"
+        "        vld   v-11, [r1+18]"
+        "        vld   v-10, [r1+27]"
+        "        vld   v-9, [r1+36]"
+        "        vld   v-8, [r1+45]"
+        "        vld   v-7, [r1+54]"
+        "        vld   v-6, [r1+63]"
+        "        vld   v-5, [r1+72]"
+        "        vld   v-4, [r1+81]"
+        "        vld   v-3, [r1+90]"
+        "        vld   v-2, [r1+99]"
+        "        vld   v-1, [r1+108]"
+        "        vld   v1, [r1+117]"
+        "        add   r1, r1, 117"
+        "        vld   v2, [r1+9]"
+        "        vld   v3, [r1+18]"
+        "        vld   v4, [r1+27]"
+        "        vld   v5, [r1+36]"
+        "        vld   v6, [r1+45]"
+        "        vld   v7, [r1+54]"
+        "        vld   v8, [r1+63]"
+        "        vld   v9, [r1+72]"
+        "        vld   v10, [r1+81]"
+        "        vld   v11, [r1+90]"
+        "        vld   v12, [r1+99]"
+        "        vld   v13, [r1+108]"
+        "        ret"
+        "_vec_asm_end:"
+    }
+}
+
+// The kernel's own MODE.VE is whatever the interrupted task had; turn it on
+// before the kernel itself touches the registers.
+fn vec_kernel_enable() {
+    var m: int = mfc(MODE);
+    if (trit(m, MODE_VE_TRIT) != 1) { mtc(MODE, ins(m, 1, MODE_VE_TRIT, 1)); }
+}
+
+// The aligned 78 words inside t.vec.
+fn vec_area(t: *Task) -> *int {
+    var p: *int = &t.vec[0];
+    while ((p as int) % 9 != 0) { p = p + 1; }
+    return p;
+}
+
+// The live registers go back into the owner's Task; nobody owns them after.
+fn vec_flush() {
+    if (vec_owner == 0) { return; }
+    vec_kernel_enable();
+    vec_save(vec_area(&tasks[vec_owner]));
+    vec_owner = 0;
+}
+
+// Make `t`'s saved state current (a fork or signal frame about to copy it).
+fn vec_sync(t: *Task) {
+    if (vec_owner != 0 && &tasks[vec_owner] == t) { vec_flush(); }
+}
+
+// Vector -13 from user mode: give the vector unit to the current task.
+fn vec_unavailable() {
+    var t: *Task = current_task();
+    if (vec_owner == current) { return; }           // stale VE; trap_return fixes it
+    vec_flush();
+    var a: *int = vec_area(t);
+    if (!t.vec_used) {
+        var i: int = 0;
+        while (i < VEC_WORDS) { a[i] = 0; i += 1; }
+        t.vec_used = 1;
+    }
+    vec_kernel_enable();
+    vec_load(a);
+    vec_owner = current;
+    vec_switches += 1;
+}
+
+// Called by trap_return with the frame about to be restored.
+fn vec_fixup(f: *int) {
+    if (trit(f[F_EMODE], 27) != -1) { return; }
+    f[F_EMODE] = ins(f[F_EMODE], vec_owner != 0 && vec_owner == current, MODE_VE_TRIT, 1);
+}
+
+// fork: the child starts with a copy of the parent's registers.
+fn vec_fork(parent: *Task, child: *Task) {
+    vec_sync(parent);
+    child.vec_used = parent.vec_used;
+    var from: *int = vec_area(parent);
+    var to: *int = vec_area(child);
+    var i: int = 0;
+    while (i < VEC_WORDS) { to[i] = from[i]; i += 1; }
+}
+
+// execve and exit: the old program's registers are gone.
+fn vec_drop(t: *Task) {
+    if (vec_owner != 0 && &tasks[vec_owner] == t) { vec_owner = 0; }
+    t.vec_used = 0;
+}

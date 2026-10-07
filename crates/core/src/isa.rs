@@ -17,6 +17,9 @@ pub mod op {
     pub const LIQ: i64 = 6;
     pub const BRQ: i64 = 7;
     pub const MEMR: i64 = 8;
+    pub const VALU: i64 = 9;
+    pub const VMEM: i64 = 10;
+    pub const VMOV: i64 = 11;
     // 2-word (A[1] = +)
     pub const ALUI: i64 = 6561;
     pub const MEMD: i64 = 6562;
@@ -143,6 +146,29 @@ pub mod memr {
     pub const CAS3: i64 = 2;
 }
 
+/// The vector unit (ISA §15): VALU functions beyond the lane-wise ALU ones
+/// (1..27 tryte lanes, 28..54 word lanes), VMEM and VMOV functions.
+pub mod valu {
+    pub const WORD_LANES: i64 = 27;
+    pub const VMRG: i64 = 55;
+    pub const VSUM: i64 = 56;
+    pub const VDOTW: i64 = 57;
+}
+
+pub mod vmem {
+    pub const VLD: i64 = 1;
+    pub const VST: i64 = 2;
+}
+
+pub mod vmov {
+    pub const VGET: i64 = 1;
+    pub const VPUT: i64 = 2;
+    pub const VGETW: i64 = 3;
+    pub const VPUTW: i64 = 4;
+    pub const VBCST: i64 = 5;
+    pub const VBCSTW: i64 = 6;
+}
+
 /// Memory functions (tryte B).
 pub mod mem {
     pub const LDT: i64 = 1;
@@ -208,6 +234,7 @@ pub mod mode {
     pub const S: usize = 21;
     pub const C: usize = 20;
     pub const FE: usize = 24;
+    pub const VE: usize = 19;
 }
 
 /// Vector numbers (ISA §7.1).
@@ -225,6 +252,7 @@ pub mod vector {
     pub const BUS_ERROR: i64 = -10;
     pub const FP_EXCEPTION: i64 = -11;
     pub const FPU_UNAVAILABLE: i64 = -12;
+    pub const VECTOR_UNAVAILABLE: i64 = -13;
 }
 
 fn head(a: i64, b: i64) -> Word {

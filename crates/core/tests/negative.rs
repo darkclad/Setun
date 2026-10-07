@@ -78,7 +78,7 @@ fn cat<const N: usize>(parts: [&[Word]; N]) -> Vec<Word> {
 
 #[test]
 fn reserved_alu_functions_are_illegal() {
-    for b in [0, -1, -22, -23, 28, 100, 9841] {
+    for b in [0, -1, -22, -23, 32, 100, 9841] {
         assert_eq!(fault(&[rrr(op::ALU, b, 1, 2, 3)]), vector::ILLEGAL, "ALU B={b}");
         assert_eq!(fault(&[rrr(op::ALUQ, b, 1, 2, 3)]), vector::ILLEGAL, "ALUQ B={b}");
         assert_eq!(fault(&isa::wide(op::ALUI, b, 1, 2, 3)), vector::ILLEGAL, "ALUI B={b}");
@@ -133,7 +133,7 @@ fn bad_bit_fields_are_illegal() {
 
 #[test]
 fn unassigned_major_opcodes_are_illegal() {
-    for a in [8, 100, 3280, -1, -3280] {
+    for a in [12, 100, 3280, -1, -3280] {
         assert_eq!(fault(&[rrr(a, 1, 0, 0, 0)]), vector::ILLEGAL, "1-word A={a}");
     }
     for a in [6570, 6560 + 3281, 3281, 9841] {

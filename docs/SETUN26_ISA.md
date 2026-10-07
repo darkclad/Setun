@@ -36,7 +36,7 @@ Version history:
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
-- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), and the three-way compare-and-swap `CAS3` (§3.4.1).
+- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), the three-way compare-and-swap `CAS3` (§3.4.1), and the vector unit (majors 9–11, `MODE.VE`, vector −13; §15).
 
 ---
 
@@ -133,7 +133,8 @@ There are 27 general registers of 27 trits, `r-13 … r0 … r13`. A register in
 | 22 | `TF` | +1 single-step trap after each instruction |
 | 21 | `S` | **sign of the last result**: −1, 0, +1 |
 | 20 | `C` | **carry trit** of the last add/subtract/multiply |
-| 1–19 | – | reserved, read as 0 |
+| 19 | `VE` | +1 the vector unit is enabled; 0: vector instructions raise vector −13 (§15.1) |
+| 1–18 | – | reserved, read as 0 |
 
 - **S** replaces the binary sign and zero flags.
 - **C** is non-zero exactly when a result overflowed. It also feeds `ADC`/`SBC` for multi-word arithmetic.
@@ -206,6 +207,9 @@ word 2:                                                           [ imm27 ]
 | 6 | `LIQ` | S | `rd := imm6` |
 | 7 | `BRQ` | S | the `rd` field holds `cond`: if it holds, `PC += 3·imm6` (§3.5) |
 | 8 | MEMR | R | read-modify-write memory operations at the address in `ra` (§3.4.1) |
+| 9 | VALU | R | vector arithmetic on v registers (§15) |
+| 10 | VMEM | R | vector load and store at `ra + 9·q3` (§15) |
+| 11 | VMOV | R | vector lane moves and broadcasts (§15) |
 | **2-word** | | | |
 | 6561 | ALUI | I | `rd := ra ⊕ imm27` |
 | 6562 | MEMD | I | load or store at `ra + imm27` (trytes) |
@@ -477,7 +481,8 @@ There are **243 = 3^5 vectors, numbered balanced −121..121**. Each entry is on
 | −10 | bus error (no device at the physical address) | the instruction |
 | −11 | floating-point exception (an unmasked FPU exception, §14.4) | the instruction |
 | −12 | FPU not available (`MODE.FE` = 0) | the instruction |
-| −13 … −26 | reserved CPU exceptions | |
+| −13 | vector unit not available (`MODE.VE` = 0) | the instruction |
+| −14 … −26 | reserved CPU exceptions | |
 | −27 … −121 | free for OS use | |
 | **+1 … +81** | **hardware IRQ 0–80** (81 = 3^4 lines; vector = IRQ + 1) | the next instruction |
 | +82 … +121 | free for OS use | |
@@ -884,3 +889,51 @@ FPU majors have `A[1] = −`. Then `A[2]` sets the length: 0 means 1 word, + mea
 **Assembler forms:** the mnemonic with operands in field order, e.g. `FADD f1, f2, f3`, `FLDD f4, 0(r13)` (a `q3` offset in units of the access size), `FLDD f4, 12(r2)` (2-word, tryte offset), `FLI f1, 2.5`, `FCONST f2, pi`. Directives: `.real27 x` emits a word, and `.real81 x` emits three, with x written as a decimal or base-27 number.
 
 **Trine:** the type `real` is a real81 (§ LANGUAGE.md).
+
+## 15. The vector unit
+
+A SIMD unit on 81-trit registers: one register is **9 tryte lanes or 3 word lanes**, so the same instruction adds nine trytes (text, pixels, ternary weights) or three words.
+
+### 15.1 Registers and enable
+
+- `v−13 … v13`, 3 words each; `v0` reads as zero and ignores writes. Word lane k is word k; tryte lane j is tryte `j mod 3` of word `j div 3`, the most significant first. In memory that is simply the 9 trytes in address order.
+- `MODE.VE` (trit 19): with `VE` = 0, every vector instruction raises vector **−13** (vector unit not available) and changes nothing. Reset sets `VE` = 1 and zeroes the registers. An OS switches the registers lazily, as for the FPU (Trinux: docs/KERNEL.md).
+
+### 15.2 Encoding
+
+All three majors are 1-word R-format instructions (§3.1).
+
+| A | Mnemonic | Operation |
+|---|---|---|
+| 9 | VALU | lane-wise arithmetic and reductions (functions below) |
+| 10 | VMEM | B = 1 `VLD vd, [ra + 9·q3]`, B = 2 `VST vd, [ra + 9·q3]`: 9 trytes at an address that must be a **multiple of 9** (vector −5 otherwise). `VST` checks all three words before writing any, so a store straddling into a read-only page changes nothing. |
+| 11 | VMOV | lane moves (below) |
+
+**VALU functions (B):**
+
+| B | Mnemonic | Operation |
+|---|---|---|
+| 1–27 | `VADD vd, va, vb`, … | the ALU function B (§3.3) on 9 tryte lanes, wrapping within each lane |
+| 28–54 | `VADDW vd, va, vb`, … | the ALU function B − 27 on 3 word lanes |
+| 55 | `VMRG vd, vm, vs` | `vd := MRG(vd, vm, vs)` on the 81 trits: per trit, the mask's 0 keeps `vd`, +1 takes `vs`, −1 clears |
+| 56 | `VSUM rd, va` | `rd` (a general register) := the sum of `va`'s 9 tryte lanes (exact) |
+| 57 | `VDOTW rd, va, vb` | `rd` := Σ `va.lane[j]` × the lowest trit of `vb.lane[j]`: one weight trit per lane, so each product is a pass, a negation or a zero (the inner loop of a ternary-weight network) |
+| other | – | `ILL` |
+
+Only the lane-wise ALU functions are valid in either range: `ADD`, `SUB`, `MIN`, `MAX`, `TMUL`, `TSAT`, `CONS` (`vd, va, vb`) and `NEG`, `ABS`, `SGN` (`vd, va`). Any other function (`MUL`, `DIV`, shifts, carries, `CMP`, the binary operations) raises `ILL`. Vector instructions do not touch `MODE.S` or `C`.
+
+**VMOV functions (B):**
+
+| B | Mnemonic | Operation |
+|---|---|---|
+| 1 | `VGET rd, va, j` | `rd` := tryte lane j (0..8) of `va` |
+| 2 | `VPUT vd, ra, j` | tryte lane j of `vd` := the low tryte of `ra` |
+| 3 | `VGETW rd, va, k` | `rd` := word lane k (0..2) |
+| 4 | `VPUTW vd, ra, k` | word lane k of `vd` := `ra` |
+| 5 | `VBCST vd, ra` | every tryte lane := the low tryte of `ra` |
+| 6 | `VBCSTW vd, ra` | every word lane := `ra` |
+| other | – | `ILL`; so is a lane number out of range |
+
+**Assembler forms:** `vadd v1, v2, v3`, `vnegw v4, v5`, `vld v1, [r2+18]` (the offset in trytes, a multiple of 9 within ±117), `vget r1, v2, 8`. The disassembler prints the same.
+
+**Trine:** memory-to-memory builtins (LANGUAGE.md §8): `vadd(d, a, b)` and the rest, on `@align(9)` arrays.

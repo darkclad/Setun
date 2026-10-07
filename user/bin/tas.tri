@@ -376,6 +376,7 @@ const O_REG: int = 1;
 const O_FREG: int = 2;
 const O_MEM: int = 3;
 const O_EXPR: int = 4;
+const O_VREG: int = 5;
 
 var o_kind: *tryte;
 var o_reg: *tryte;
@@ -427,6 +428,12 @@ fn fregister(s: *char, n: int) -> int {
     return small_num(s + 1, n - 1);
 }
 
+fn vregister(s: *char, n: int) -> int {
+    s = trim(s, &n);
+    if (n < 2 || s[0] != 'v') { return -100; }
+    return small_num(s + 1, n - 1);
+}
+
 fn add_operand(kind: int, reg: int, e: int) {
     if (o_used >= o_cap) { die("too many operands", null); }
     o_kind[o_used] = kind as tryte;
@@ -474,6 +481,8 @@ fn parse_operand(s: *char, n: int) {
     if (r2 != -100) { add_operand(O_REG, r2, 0); return; }
     var f: int = fregister(s, n);
     if (f != -100) { add_operand(O_FREG, f, 0); return; }
+    var v: int = vregister(s, n);
+    if (v != -100) { add_operand(O_VREG, v, 0); return; }
     var e3: int = parse_expr(s, n);
     if (e3 < 0) {
         var k2: int = 0;
@@ -490,7 +499,8 @@ fn parse_operand(s: *char, n: int) {
 //
 // Codes: 1..26 the ALU functions (see alu_b), 30 cmp, 40.. unary ALU,
 // 50.. branches, 60.. memory (65, 66: MEMR), 70.. FPU memory, 80.. FALU binary,
-// 90.. FALU unary, 100.. the other FPU ones, 120.. SYS, 140.. the rest.
+// 90.. FALU unary, 100.. the other FPU ones, 120.. SYS, 140.. the rest,
+// 170.. vector lanes (tryte, then word: 180..), 190.. the other vector ones.
 
 const M_CMP: int = 30;
 const M_NEG: int = 40;
@@ -506,6 +516,9 @@ const M_FSQRT: int = 90;                 // fsqrt fneg fabs frnd ftrunc
 const M_FCMP: int = 100;                 // fcmp fmov fcvtif fcvtfi ftow ffrw fexp fscl fmfs fmts fclass fconst fli
 const M_NOP: int = 120;                  // nop hlt brk iret tlbflush fence ill
 const M_MOV: int = 140;                  // mov li la lea jal call jalr ret br3 in out push pop ext ins bext brot tlbinv sys mfc mtc
+const M_VADD: int = 170;                 // vadd vsub vmin vmax vtmul vtsat vcons vneg vabs vsgn (binary first)
+const M_VADDW: int = 180;                // the same on word lanes
+const M_VMRG: int = 190;                 // vmrg vsum vdotw vld vst vget vput vgetw vputw vbcst vbcstw
 
 var mn_name: [243]*char;
 var mn_code: [243]int;
@@ -519,8 +532,8 @@ fn mn_add(name: *char, code: int) {
 
 fn mn_init() {
     var alu: *char = "add sub adc sbc mul mulh div mod divr modr min max tmul tsat cons sh trit band bor bxor bandn bsh mrg tcp tcn trev ";
-    var groups: [12]*char;
-    var firsts: [12]int;
+    var groups: [15]*char;
+    var firsts: [15]int;
     groups[0] = "cmp "; firsts[0] = M_CMP;
     groups[1] = "neg sgn abs tlz "; firsts[1] = M_NEG;
     groups[2] = "b blt beq bgt ble bge bne bov bnov bnever "; firsts[2] = M_B;
@@ -533,8 +546,11 @@ fn mn_init() {
     groups[8] = "nop hlt brk iret tlbflush fence ill "; firsts[8] = M_NOP;
     groups[9] = "mov li la lea jal call jalr ret br3 in out push pop ext ins bext brot tlbinv sys mfc mtc "; firsts[9] = M_MOV;
     groups[10] = alu; firsts[10] = 1;
+    groups[12] = "vadd vsub vmin vmax vtmul vtsat vcons vneg vabs vsgn "; firsts[12] = M_VADD;
+    groups[13] = "vaddw vsubw vminw vmaxw vtmulw vtsatw vconsw vnegw vabsw vsgnw "; firsts[13] = M_VADDW;
+    groups[14] = "vmrg vsum vdotw vld vst vget vput vgetw vputw vbcst vbcstw "; firsts[14] = M_VMRG;
     var g: int = 0;
-    while (g < 12) {
+    while (g < 15) {
         var s: *char = groups[g];
         var code: int = firsts[g];
         var k: int = 0;
@@ -863,6 +879,16 @@ fn freg_of(o: int) -> int {
     if (o_kind[o] != O_FREG) { die("FPU register expected", null); }
     return o_reg[o];
 }
+fn vreg_of(o: int) -> int {
+    if (o_kind[o] != O_VREG) { die("vector register expected", null); }
+    return o_reg[o];
+}
+// A lane number 0..n-1.
+fn lane_of(o: int, n: int) -> int {
+    var k: int = exp_of(o);
+    if (k < 0 || k >= n) { die_num("lane out of range:", k); }
+    return k;
+}
 fn exp_of(o: int) -> int {
     if (o_kind[o] != O_EXPR) { die("value expected", null); }
     return value(o_e[o], here);
@@ -908,6 +934,36 @@ fn encode(i: int, size: int) -> int {
         // stwm / cas3 rd, [ra], rb: no offset
         if (n != 3 || o_kind[o + 1] != O_MEM || value(o_e[o + 1], here) != 0) { bad(m); }
         emit(rrr(8, m - M_STWM + 1, reg_of(o), o_reg[o + 1], reg_of(o + 2)));
+        return 0;
+    }
+    if (m >= M_VADD && m <= M_VADDW + 9) {
+        // lane-wise: VALU, the ALU function (+27 on word lanes)
+        var lf: [10]int = { 1, 2, 11, 12, 13, 14, 15, 19, 21, 20 };
+        var lk: int = (m - M_VADD) % 10;
+        var lb: int = lf[lk] + (m >= M_VADDW ? 27 : 0);
+        if (lk < 7) { if (n != 3) { bad(m); } emit(rrr(9, lb, vreg_of(o), vreg_of(o + 1), vreg_of(o + 2))); }
+        else { if (n != 2) { bad(m); } emit(rrr(9, lb, vreg_of(o), vreg_of(o + 1), 0)); }
+        return 0;
+    }
+    if (m >= M_VMRG && m <= M_VMRG + 10) {
+        var vk: int = m - M_VMRG;
+        if (vk == 0) { if (n != 3) { bad(m); } emit(rrr(9, 55, vreg_of(o), vreg_of(o + 1), vreg_of(o + 2))); return 0; }
+        if (vk == 1) { if (n != 2) { bad(m); } emit(rrr(9, 56, reg_of(o), vreg_of(o + 1), 0)); return 0; }
+        if (vk == 2) { if (n != 3) { bad(m); } emit(rrr(9, 57, reg_of(o), vreg_of(o + 1), vreg_of(o + 2))); return 0; }
+        if (vk <= 4) {
+            // vld / vst vd, [ra+off]: off a multiple of 9, counted in vectors
+            if (n != 2 || o_kind[o + 1] != O_MEM) { bad(m); }
+            var voff: int = value(o_e[o + 1], here);
+            if (voff % 9 != 0) { die_num("offset is not a multiple of 9:", voff); }
+            emit(rrr(10, vk - 2, vreg_of(o), o_reg[o + 1], range("offset/9 out of range:", voff / 9, 13)));
+            return 0;
+        }
+        if (vk == 5) { if (n != 3) { bad(m); } emit(rrr(11, 1, reg_of(o), vreg_of(o + 1), lane_of(o + 2, 9))); return 0; }
+        if (vk == 6) { if (n != 3) { bad(m); } emit(rrr(11, 2, vreg_of(o), reg_of(o + 1), lane_of(o + 2, 9))); return 0; }
+        if (vk == 7) { if (n != 3) { bad(m); } emit(rrr(11, 3, reg_of(o), vreg_of(o + 1), lane_of(o + 2, 3))); return 0; }
+        if (vk == 8) { if (n != 3) { bad(m); } emit(rrr(11, 4, vreg_of(o), reg_of(o + 1), lane_of(o + 2, 3))); return 0; }
+        if (n != 2) { bad(m); }
+        emit(rrr(11, vk - 4, vreg_of(o), reg_of(o + 1), 0));      // vbcst 5, vbcstw 6
         return 0;
     }
     if (m >= M_LDT && m <= M_LDT + 4) {

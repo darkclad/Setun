@@ -699,3 +699,103 @@ fn cas3_and_swap_builtins() {
     assert!(compile_err("fn main() -> int { var x: int = 1; return cas3(x, 0, 1); }").contains("`cas3` needs a pointer to an int"));
     assert!(compile_err("fn main() -> int { var x: tryte = 1; return swap(&x, 0); }").contains("`swap` needs a pointer to an int"));
 }
+
+/// Vectors (ISA §15) from Trine: every builtin on tryte and word lanes,
+/// checked against the same thing done lane by lane.
+const VECTORS: &str = "@align(9) var a: [9]tryte = { 1, -2, 3, 9841, -9841, 0, 100, -100, 13 };
+@align(9) var b: [9]tryte = { 5, 5, -5, 1, -1, 7, -300, 4, 0t1T1 };
+@align(9) var d: [9]tryte;
+@align(9) var wa: [3]int = { 123456789, -5, 3812798742000 };
+@align(9) var wb: [3]int = { -1, 99999, 3 };
+@align(9) var wd: [3]int;
+
+fn lane(f: int, x: int, y: int) -> int {
+    if (f == 0) { return (x + y) as tryte; }
+    if (f == 1) { return (x - y) as tryte; }
+    if (f == 2) { return x & y; }
+    if (f == 3) { return x | y; }
+    if (f == 4) { return tmul(x, y); }
+    if (f == 5) { return tsat(x, y); }
+    if (f == 6) { return cons(x, y); }
+    if (f == 7) { return -x; }
+    if (f == 8) { return abs(x); }
+    return sgn(x);
+}
+
+fn run(f: int) {
+    if (f == 0) { vadd(d, a, b); vaddw(wd, wa, wb); }
+    if (f == 1) { vsub(d, a, b); vsubw(wd, wa, wb); }
+    if (f == 2) { vmin(d, a, b); vminw(wd, wa, wb); }
+    if (f == 3) { vmax(d, a, b); vmaxw(wd, wa, wb); }
+    if (f == 4) { vtmul(d, a, b); vtmulw(wd, wa, wb); }
+    if (f == 5) { vtsat(d, a, b); vtsatw(wd, wa, wb); }
+    if (f == 6) { vcons(d, a, b); vconsw(wd, wa, wb); }
+    if (f == 7) { vneg(d, a); vnegw(wd, wa); }
+    if (f == 8) { vabs(d, a); vabsw(wd, wa); }
+    if (f == 9) { vsgn(d, a); vsgnw(wd, wa); }
+}
+
+fn main() -> int {
+    var r: int = 0;
+    var f: int = 0;
+    while (f < 10) {
+        {
+            run(f);
+            var i: int = 0;
+            while (i < 9) { if (d[i] != lane(f, a[i], b[i])) { r += 1; } i += 1; }
+            i = 0;
+            while (i < 3) {
+                var want: int = f == 0 ? wa[i] + wb[i] : f == 1 ? wa[i] - wb[i] : f == 7 ? -wa[i] : f == 8 ? abs(wa[i]) : f == 9 ? sgn(wa[i])
+                    : f == 2 ? wa[i] & wb[i] : f == 3 ? wa[i] | wb[i] : f == 4 ? tmul(wa[i], wb[i]) : f == 5 ? tsat(wa[i], wb[i]) : cons(wa[i], wb[i]);
+                if (wd[i] != want) { r += 10; }
+                i += 1;
+            }
+        }
+        f += 1;
+    }
+    // reductions: the lanes' sum, and the dot product with one weight trit per lane
+    var s: int = 0;
+    var dot: int = 0;
+    var j: int = 0;
+    while (j < 9) { s += a[j]; dot += a[j] * trit(b[j], 27); j += 1; }
+    if (vsum(a) != s) { r += 100; }
+    if (vdotw(a, b) != dot) { r += 1000; }
+    // fills, and a merge: the mask's +1 lanes take the source, -1 clear, 0 keep
+    vbcst(d, -77);
+    j = 0;
+    while (j < 9) { if (d[j] != -77) { r += 10000; } j += 1; }
+    vbcstw(wd, 5);
+    if (wd[0] != 5 || wd[1] != 5 || wd[2] != 5) { r += 100000; }
+    vbcst(wd, 0t1T0);
+    vmrg(d, wd, a);
+    j = 0;
+    while (j < 9) { if (d[j] != mrg(-77, 0t1T0, a[j])) { r += 1000000; } j += 1; }
+    return r;
+}
+";
+
+#[test]
+fn vector_builtins() {
+    assert_eq!(exit(VECTORS), 0);
+    let o = |src: &str| {
+        let b = build_source("test.tri", src, None, &Options { optimize: false, ..Options::rom() }).unwrap();
+        run_rom(&b.image, 20_000_000, "").outcome
+    };
+    assert!(matches!(o(VECTORS), Outcome::Exit(0)), "unoptimized");
+    // a vector off a multiple of 9 traps -5 at its address
+    let src = "@align(9) var pad: [3]int; var v: [3]int; fn main() -> int { vbcstw(&v[0], 1); return 0; }";
+    let src2 = "@align(9) var pad: [4]int; var v: [3]int; fn main() -> int { vbcstw(&v[0], 1); return 0; }";
+    assert!(matches!(o(src), Outcome::Exit(0)), "pad of 3 words lands v on a multiple of 9: {:?}", o(src));
+    assert!(matches!(o(src2), Outcome::Fault { vector: -5, .. }), "{:?}", o(src2));
+    for (src, want) in [
+        ("fn main() -> int { var x: int; vadd(x, x, x); return 0; }", "`vadd` needs a pointer to a vector"),
+        ("fn main() -> int { var x: [3]int; vneg(x, 5); return 0; }", "`vneg` needs a pointer to a vector"),
+        ("fn main() -> int { var x: [3]int; return vsum(x, x); }", "argument"),
+        ("fn main() -> int { var x: [3]int; vadd(x, x); return 0; }", "argument"),
+        ("fn main() -> int { var x: [3]int; var p: *[3]int = &x; vbcst(x, p); return 0; }", "integer"),
+        ("fn main() -> int { var x: [3]trit; vabs(x, x); return 0; }", "`vabs` needs a pointer to a vector"),
+    ] {
+        let e = compile_err(src);
+        assert!(e.contains(want), "{src}: {e}");
+    }
+}

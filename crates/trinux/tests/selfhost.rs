@@ -232,6 +232,11 @@ fn tric_reports_errors_as_the_host_does() {
         ("mrgargs.tri", "fn main() -> int { return mrg(1, 2); }\n"),
         ("cas3ptr.tri", "fn main() -> int { var x: int = 1; return cas3(x, 0, 1); }\n"),
         ("swapptr.tri", "fn main() -> int { var x: tryte = 1; return swap(&x, 0); }\n"),
+        // vector builtins (A5)
+        ("vecptr.tri", "fn main() -> int { var x: int; vadd(x, x, x); return 0; }\n"),
+        ("vectrit.tri", "fn main() -> int { var x: [3]trit; vabsw(x, x); return 0; }\n"),
+        ("vecargs.tri", "fn main() -> int { var x: [3]int; return vsum(x, x); }\n"),
+        ("vecfill.tri", "fn main() -> int { var x: [3]int; vbcst(x, x); return 0; }\n"),
     ];
     let disk = disk_with_trine(&[], bad);
     let mut s = Session::boot_disk(&disk, false);
@@ -251,7 +256,7 @@ fn tric_reports_errors_as_the_host_does() {
 
 #[test]
 fn tas_matches_the_host_assembler() {
-    let progs = ["echo", "cat", "edit", "calc", "tas", "mtxtest"];
+    let progs = ["echo", "cat", "edit", "calc", "tas", "mtxtest", "vectest"];
     let disk = disk_with_sources(&progs, &[]);
     let mut s = Session::boot_disk(&disk, false);
     for p in progs {
@@ -291,6 +296,14 @@ fn tas_reports_errors_with_their_lines() {
         // error is the missing data symbols at the end
         ("tryte.s", "        .org -847288609443\n        .tryte 'A'\n        .tryte '\\''\n        .word '\\n', -'1'\n", "tas: line 0: no _trine_data_start/_trine_data_end"),
         ("mfc.s", "        .org -847288609443\n        mfc r1, nosuch\n", "tas: line 2: unknown control register `nosuch`"),
+        ("vlane.s", "        .org -847288609443\n        vget r1, v2, 9\n", "tas: line 2: lane out of range: `9`"),
+        ("vwlane.s", "        .org -847288609443\n        vputw v1, r2, 3\n", "tas: line 2: lane out of range: `3`"),
+        ("valign.s", "        .org -847288609443\n        vld v1, [r2+3]\n", "tas: line 2: offset is not a multiple of 9: `3`"),
+        ("voff.s", "        .org -847288609443\n        vst v1, [r2+126]\n", "tas: line 2: offset/9 out of range: `14`"),
+        ("vreg.s", "        .org -847288609443\n        vadd v1, v2, r3\n", "tas: line 2: vector register expected"),
+        ("vsum.s", "        .org -847288609443\n        vsum v1, v2\n", "tas: line 2: register expected"),
+        ("vmul.s", "        .org -847288609443\n        vmul v1, v2, v3\n", "tas: line 2: unknown instruction `vmul`"),
+        ("vneg.s", "        .org -847288609443\n        vnegw v1, v2, v3\n", "tas: line 2: bad operands"),
     ];
     let extra: Vec<(&str, &str)> = bad.iter().map(|(n, t, _)| (*n, *t)).collect();
     let disk = disk_with_sources(&[], &extra);
@@ -346,8 +359,9 @@ fn tric_compiles_truth_values_as_the_host_does() {
     let opts = trine::Options { optimize: false, ..trine::Options::user() };
     let want = trine::build_source("/usr/src/kleene.tri", KLEENE, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
     let want2 = trine::build_source("/usr/src/idioms.tri", IDIOMS, None, &opts).unwrap_or_else(|e| panic!("{e}")).asm;
-    let disk = disk_with_trine(&[], &[("kleene.tri", KLEENE), ("kleene.s", &want), ("idioms.tri", IDIOMS), ("idioms.s", &want2)]);
+    let disk = disk_with_trine(&["vectest"], &[("kleene.tri", KLEENE), ("kleene.s", &want), ("idioms.tri", IDIOMS), ("idioms.s", &want2)]);
     let mut s = Session::boot_disk(&disk, false);
     tric_compare(&mut s, "kleene", "/usr/src/kleene.tri");
     tric_compare(&mut s, "idioms", "/usr/src/idioms.tri");
+    tric_same_as_host(&mut s, "vectest"); // the vector builtins (A5)
 }

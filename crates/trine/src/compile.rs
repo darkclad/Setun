@@ -578,7 +578,31 @@ const BUILTINS: &[&str] = &[
     "mfc", "mtc", "hlt", "brk", "tlbflush", "tlbinv", "fence", "syscall",
     // the FPU
     "sqrt", "trunc", "round", "rem", "scale3", "exponent3", "fconst", "fsr", "set_fsr", "fclass", "real27",
+    // the vector unit
+    "vadd", "vsub", "vmin", "vmax", "vtmul", "vtsat", "vcons", "vneg", "vabs", "vsgn",
+    "vaddw", "vsubw", "vminw", "vmaxw", "vtmulw", "vtsatw", "vconsw", "vnegw", "vabsw", "vsgnw",
+    "vmrg", "vbcst", "vbcstw", "vsum", "vdotw",
 ];
+
+const VB_BINARY: u8 = 1;
+const VB_UNARY: u8 = 2;
+const VB_MERGE: u8 = 3;
+const VB_FILL: u8 = 4;
+const VB_REDUCE: u8 = 5;
+
+/// A vector builtin's kind and how many vectors (or values) it reads.
+fn vector_builtin(n: &str) -> Option<(u8, usize)> {
+    let base = n.strip_suffix('w').filter(|_| n != "vdotw").unwrap_or(n);
+    Some(match base {
+        "vadd" | "vsub" | "vmin" | "vmax" | "vtmul" | "vtsat" | "vcons" => (VB_BINARY, 2),
+        "vneg" | "vabs" | "vsgn" => (VB_UNARY, 1),
+        "vmrg" if n == "vmrg" => (VB_MERGE, 2),
+        "vbcst" => (VB_FILL, 1),
+        "vsum" if n == "vsum" => (VB_REDUCE, 1),
+        "vdotw" => (VB_REDUCE, 2),
+        _ => return None,
+    })
+}
 
 // ---- compiler -------------------------------------------------------------------
 
@@ -3552,6 +3576,94 @@ impl Compiler {
                 self.emit("mrg r3, r1, r2");
                 self.emit("mov r1, r3");
                 Ok(Ty::Int)
+            }
+            _ if vector_builtin(n).is_some() => {
+                // the vector unit, memory to memory: each vector is 9 trytes
+                // at a multiple of 9 (an @align(9) [3]int, or [9]tryte, whose
+                // vector address is one past its first tryte)
+                let (k, sources) = vector_builtin(n).unwrap();
+                want(sources + (k != VB_REDUCE) as usize)?;
+                let vec = |c: &mut Self, t: &Ty, e: &Expr| -> R<bool> {
+                    match t.clone().decay() {
+                        Ty::Ptr(p) if *p == Ty::Int => Ok(false),
+                        Ty::Ptr(p) if *p == Ty::Tryte => Ok(true),
+                        _ => {
+                            let _ = c;
+                            err(e.pos, format!("`{n}` needs a pointer to a vector ([3]int or [9]tryte)"))
+                        }
+                    }
+                };
+                // trytes: the vector address is the second tryte's
+                let fix = |c: &mut Self, tryte: bool, r: &str| {
+                    if tryte {
+                        c.emit(format!("add {r}, {r}, 1"));
+                    }
+                };
+                match k {
+                    VB_BINARY | VB_MERGE => {
+                        // d in r3, a in r1, b in r2
+                        let t = self.expr(&args[0])?;
+                        let td = vec(self, &t, &args[0])?;
+                        self.emit("push r1");
+                        let (ta, tb) = self.two(&args[1], &args[2])?;
+                        let (ta, tb) = (vec(self, &ta, &args[1])?, vec(self, &tb, &args[2])?);
+                        self.emit("pop r3");
+                        fix(self, ta, "r1");
+                        fix(self, tb, "r2");
+                        fix(self, td, "r3");
+                        if k == VB_MERGE {
+                            self.emit("vld v1, [r3]");
+                            self.emit("vld v2, [r1]");
+                            self.emit("vld v3, [r2]");
+                            self.emit("vmrg v1, v2, v3");
+                        } else {
+                            self.emit("vld v1, [r1]");
+                            self.emit("vld v2, [r2]");
+                            self.emit(format!("{n} v1, v1, v2"));
+                        }
+                        self.emit("vst v1, [r3]");
+                        Ok(Ty::Void)
+                    }
+                    VB_UNARY => {
+                        let (td, ta) = self.two(&args[0], &args[1])?;
+                        let (td, ta) = (vec(self, &td, &args[0])?, vec(self, &ta, &args[1])?);
+                        fix(self, td, "r1");
+                        fix(self, ta, "r2");
+                        self.emit("vld v1, [r2]");
+                        self.emit(format!("{n} v1, v1"));
+                        self.emit("vst v1, [r1]");
+                        Ok(Ty::Void)
+                    }
+                    VB_FILL => {
+                        let (td, tx) = self.two(&args[0], &args[1])?;
+                        let td = vec(self, &td, &args[0])?;
+                        self.need_integer(&tx, args[1].pos)?;
+                        fix(self, td, "r1");
+                        self.emit(format!("{n} v1, r2"));
+                        self.emit("vst v1, [r1]");
+                        Ok(Ty::Void)
+                    }
+                    _ if sources == 1 => {
+                        // vsum(a)
+                        let t = self.expr(&args[0])?;
+                        let ta = vec(self, &t, &args[0])?;
+                        fix(self, ta, "r1");
+                        self.emit("vld v1, [r1]");
+                        self.emit("vsum r1, v1");
+                        Ok(Ty::Int)
+                    }
+                    _ => {
+                        // vdotw(a, w)
+                        let (ta, tb) = self.two(&args[0], &args[1])?;
+                        let (ta, tb) = (vec(self, &ta, &args[0])?, vec(self, &tb, &args[1])?);
+                        fix(self, ta, "r1");
+                        fix(self, tb, "r2");
+                        self.emit("vld v1, [r1]");
+                        self.emit("vld v2, [r2]");
+                        self.emit("vdotw r1, v1, v2");
+                        Ok(Ty::Int)
+                    }
+                }
             }
             "cas3" => {
                 // cas3(p, expected, new): the old *p; *p := new if it was expected

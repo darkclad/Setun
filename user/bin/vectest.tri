@@ -1,0 +1,222 @@
+// /bin/vectest: the vector unit from user mode (ISA §15, TERNARY_WORLD A5)
+// and the kernel's lazy switching of its registers (docs/KERNEL.md), one
+// line per check, failure paths included. `vectest fresh` is the program
+// exec'd by the exec check: it exits 0 if it starts with clean registers.
+//
+// The switching checks keep values in v12 and v-12, which compiled Trine
+// code never uses (the builtins use v1..v3), so only the kernel can
+// preserve (or break) them.
+
+import "../lib/tlibc.tri";
+
+extern fn put12(p: *int);             // v12 := the vector at p
+extern fn get12(p: *int);             // the vector at p := v12
+extern fn putm12(p: *int);            // v-12 := ...
+extern fn getm12(p: *int);
+extern fn vec_ill();                  // a VMOV function that does not exist
+
+fn _vectest_asm() {
+    asm {
+        "        b     _vectest_asm_end"
+        "put12:  vld   v12, [r1]"
+        "        ret"
+        "get12:  vst   v12, [r1]"
+        "        ret"
+        "putm12: vld   v-12, [r1]"
+        "        ret"
+        "getm12: vst   v-12, [r1]"
+        "        ret"
+        "vec_ill:"
+        "        .word 4261764024"      // VMOV function 7 (rrr(11, 7, 1, 5, 0))
+        "        ret"
+        "_vectest_asm_end:"
+    }
+}
+
+var failures: int;
+
+fn ok(what: *char, cond: int) {
+    puts("vectest: ");
+    puts(what);
+    puts(cond ? " ok\n" : " FAILED\n");
+    if (!cond) { failures += 1; }
+}
+
+fn status_of(pid: int) -> int {
+    var st: int = 0;
+    waitpid(pid, &st, 0);
+    return st;
+}
+
+@align(9) var a: [9]tryte = { 1, -2, 3, 9841, -9841, 0, 100, -100, 13 };
+@align(9) var b: [9]tryte = { 5, 5, -5, 1, -1, 7, -300, 4, 0t1T1 };
+@align(9) var d: [9]tryte;
+@align(9) var wa: [3]int = { 123456789, -5, 3812798742000 };
+@align(9) var wb: [3]int = { -1, 99999, 3 };
+@align(9) var wd: [3]int;
+@align(9) var tmp: [3]int;
+
+// v12 and v-12 as one value each (word lanes equal)
+fn set12(x: int) { tmp[0] = x; tmp[1] = -x; tmp[2] = x; put12(&tmp[0]); }
+fn is12(x: int) -> int { get12(&tmp[0]); return tmp[0] == x && tmp[1] == -x && tmp[2] == x; }
+fn setm12(x: int) { tmp[0] = x; tmp[1] = x; tmp[2] = -x; putm12(&tmp[0]); }
+fn ism12(x: int) -> int { getm12(&tmp[0]); return tmp[0] == x && tmp[1] == x && tmp[2] == -x; }
+
+fn lanes() -> int {
+    var bad: int = 0;
+    vadd(d, a, b);
+    var i: int = 0;
+    while (i < 9) { if (d[i] != ((a[i] + b[i]) as tryte)) { bad += 1; } i += 1; }
+    vtmulw(wd, wa, wb);
+    i = 0;
+    while (i < 3) { if (wd[i] != tmul(wa[i], wb[i])) { bad += 1; } i += 1; }
+    vmin(d, a, b);
+    i = 0;
+    while (i < 9) { if (d[i] != (a[i] & b[i])) { bad += 1; } i += 1; }
+    vnegw(wd, wa);
+    if (wd[0] != -wa[0] || wd[1] != -wa[1] || wd[2] != -wa[2]) { bad += 1; }
+    var s: int = 0;
+    var dot: int = 0;
+    i = 0;
+    while (i < 9) { s += a[i]; dot += a[i] * trit(b[i], 27); i += 1; }
+    if (vsum(a) != s || vdotw(a, b) != dot) { bad += 1; }
+    return bad;
+}
+
+// Every builtin once (so tric's code for each is compared with the host's):
+// filling d and wd with known values, x - x = 0, -(-x) = x and so on.
+fn every_builtin() -> int {
+    var bad: int = 0;
+    vbcst(d, 5);
+    vsub(d, d, d);
+    vbcstw(wd, -3);
+    vsubw(wd, wd, wd);
+    if (vsum(d) != 0 || wd[0] != 0 || wd[2] != 0) { bad += 1; }
+    vaddw(wd, wa, wb);
+    vmaxw(wd, wd, wa);
+    vminw(wd, wd, wa);                             // max then min with wa: wa
+    if (wd[0] != wa[0] || wd[1] != wa[1] || wd[2] != wa[2]) { bad += 1; }
+    vneg(d, a);
+    vneg(d, d);
+    vabs(wd, a);                                   // a [9]tryte as three words
+    vabsw(wd, wd);
+    vsgnw(wd, wd);
+    vsgn(d, d);
+    vmax(d, d, b);
+    vtsat(d, d, b);
+    vtsatw(wd, wd, wb);
+    vcons(d, d, a);
+    vconsw(wd, wd, wa);
+    vtmul(d, d, b);
+    vbcst(wd, 0t1T0);                              // mask: take, clear, keep
+    vbcst(d, -77);
+    vmrg(d, wd, a);
+    var j: int = 0;
+    while (j < 9) { if (d[j] != mrg(-77, 0t1T0, a[j])) { bad += 1; } j += 1; }
+    return bad;
+}
+
+// Vector work in v1..v3 between yields, with v12 and v-12 held throughout.
+fn hold(x: int, y: int, rounds: int) -> int {
+    set12(x);
+    setm12(y);
+    var good: int = 1;
+    var r: int = 0;
+    while (r < rounds) {
+        if (lanes() != 0) { good = 0; }
+        sched_yield();
+        if (!is12(x) || !ism12(y)) { good = 0; }
+        r += 1;
+    }
+    return good;
+}
+
+var in_handler_clean: int;
+
+fn on_usr1(sig: int) {
+    in_handler_clean = is12(0) && ism12(0);
+    set12(99);                                     // clobbered, and thrown away
+}
+
+fn main(argc: int, argv: **char) -> int {
+    if (argc > 1 && strcmp(argv[1], "fresh") == 0) {
+        return is12(0) && ism12(0) ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "misaligned") == 0) {
+        put12(&tmp[1]);                            // 3 trytes past a multiple of 9
+        return 3;
+    }
+    if (argc > 1 && strcmp(argv[1], "readonly") == 0) {
+        var code: int = &put12 as int;
+        get12((code - (code % 9 + 9) % 9) as *int);    // a VST into the program's code
+        return 3;
+    }
+    if (argc > 1 && strcmp(argv[1], "ill") == 0) {
+        vec_ill();
+        return 3;
+    }
+
+    // a first vector instruction just works (vector -13 is invisible)
+    ok("first use: the registers start zeroed", is12(0) && ism12(0));
+    ok("lane-wise operations, reductions", lanes() == 0);
+    ok("every builtin, tryte and word lanes, fills and a merge", every_builtin() == 0);
+
+    // two processes keep their registers across switches
+    var pid: int = fork();
+    if (pid == 0) { _exit(hold(-777777, 3812798742493, 40) ? 0 : 1); }
+    var mine: int = hold(31415926, -5, 40);
+    var st: int = status_of(pid);
+    ok("registers survive switching (parent)", mine);
+    ok("registers survive switching (child)", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    // fork copies the registers
+    set12(4242);
+    pid = fork();
+    if (pid == 0) { _exit(is12(4242) ? 0 : 1); }
+    ok("fork copies the vector registers", status_of(pid) == 0);
+
+    // execve starts the new program clean
+    set12(5);
+    setm12(6);
+    pid = fork();
+    if (pid == 0) {
+        var args: [3]*char;
+        args[0] = "vectest";
+        args[1] = "fresh";
+        args[2] = null;
+        execv("/bin/vectest", &args[0]);
+        _exit(2);
+    }
+    ok("execve resets the vector registers", status_of(pid) == 0);
+
+    // a signal handler starts clean, and the interrupted state comes back
+    set12(725);
+    signal(SIGUSR1, &on_usr1 as int);
+    raise(SIGUSR1);
+    ok("handler starts with clean vector registers", in_handler_clean);
+    ok("interrupted vector state restored", is12(725));
+
+    // negative: the faults reach the process that made them, as signals
+    var cases: [3]*char = { "misaligned", "readonly", "ill" };
+    var sigs: [3]int = { SIGBUS, SIGSEGV, SIGILL };
+    var names: [3]*char = { "a misaligned VLD is SIGBUS", "a VST into read-only memory is SIGSEGV", "an unknown vector function is SIGILL" };
+    var k: int = 0;
+    while (k < 3) {
+        pid = fork();
+        if (pid == 0) {
+            var args2: [3]*char;
+            args2[0] = "vectest";
+            args2[1] = cases[k];
+            args2[2] = null;
+            execv("/bin/vectest", &args2[0]);
+            _exit(2);
+        }
+        st = status_of(pid);
+        ok(names[k], WIFSIGNALED(st) && WTERMSIG(st) % 128 == sigs[k]);
+        k += 1;
+    }
+    ok("parent unaffected", is12(725) && lanes() == 0);
+
+    puts(failures == 0 ? "vectest: all passed\n" : "vectest: FAILED\n");
+    return failures != 0;
+}

@@ -56,8 +56,9 @@ const SYS_INSN_TRYTES: int = 3;
 const EINTR: int = 4;
 const ESRCH: int = 3;
 
-const SIGFRAME_WORDS: int = 113;      // trap frame (28), old mask, magic, FPU flag + state (82)
+const SIGFRAME_WORDS: int = 192;      // trap frame (28), old mask, magic, FPU flag + state (82), vector flag + state (78)
 const SF_FPU: int = 30;               // 1 if the FPU state follows
+const SF_VEC: int = 113;              // 1 if the vector state follows
 
 const SIGFRAME_MAGIC: int = 0zB007AB17;
 const RED_ZONE: int = 81;             // trytes left untouched below the user sp
@@ -315,6 +316,13 @@ fn setup_frame(f: *int, sig: int, t: *Task) -> int {
     i = 0;
     while (i < FPU_WORDS) { w[SF_FPU + 1 + i] = t.fpu_used ? t.fpu[i] : 0; i += 1; }
     fpu_drop(t);
+    // and the vector state likewise
+    vec_sync(t);
+    w[SF_VEC] = t.vec_used;
+    var va: *int = vec_area(t);
+    i = 0;
+    while (i < VEC_WORDS) { w[SF_VEC + 1 + i] = t.vec_used ? va[i] : 0; i += 1; }
+    vec_drop(t);
     t.has_saved_mask = 0;
     // Block the signal itself and sa_mask while the handler runs.
     var m: int = t.sig_blocked;
@@ -348,6 +356,13 @@ fn sys_rt_sigreturn(f: *int) -> int {
         i = 0;
         while (i < FPU_WORDS) { t.fpu[i] = w[SF_FPU + 1 + i]; i += 1; }
         t.fpu_used = 1;
+    }
+    vec_drop(t);
+    if (w[SF_VEC] != 0) {
+        var va: *int = vec_area(t);
+        i = 0;
+        while (i < VEC_WORDS) { va[i] = w[SF_VEC + 1 + i]; i += 1; }
+        t.vec_used = 1;
     }
     return f[F_R1];                                 // the interrupted r1 goes back unchanged
 }

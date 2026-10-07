@@ -6,7 +6,7 @@
 //! So disassembly output always reassembles byte-for-byte.
 
 use crate::text;
-use setun_core::isa::{alu, cond, cr, falu, fcvt, fld, fmem, io, mem, memr, op, sys};
+use setun_core::isa::{alu, cond, cr, falu, fcvt, fld, fmem, io, mem, memr, op, sys, valu, vmem, vmov};
 use ternary::Word;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +184,37 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
             memr::CAS3 => format!("cas3 {}, [{}], {}", r(f.x), r(f.y), r(f.z)),
             _ => return None,
         },
+        op::VALU => match f.b {
+            valu::VMRG => format!("vmrg {}, {}, {}", vr(f.x), vr(f.y), vr(f.z)),
+            valu::VSUM => format!("vsum {}, {}", r(f.x), vr(f.y)),
+            valu::VDOTW => format!("vdotw {}, {}, {}", r(f.x), vr(f.y), vr(f.z)),
+            1..=54 => {
+                let (g, w) = if f.b > valu::WORD_LANES { (f.b - valu::WORD_LANES, "w") } else { (f.b, "") };
+                let name = format!("v{}{w}", alu_name(g)?);
+                match text::valu_lanes(&name)? {
+                    (_, true) => format!("{name} {}, {}, {}", vr(f.x), vr(f.y), vr(f.z)),
+                    (_, false) => format!("{name} {}, {}", vr(f.x), vr(f.y)),
+                }
+            }
+            _ => return None,
+        },
+        op::VMEM => {
+            let name = match f.b {
+                vmem::VLD => "vld",
+                vmem::VST => "vst",
+                _ => return None,
+            };
+            format!("{name} {}, {}", vr(f.x), addr(f.y, 9 * f.z))
+        }
+        op::VMOV => match f.b {
+            vmov::VGET => format!("vget {}, {}, {}", r(f.x), vr(f.y), f.z),
+            vmov::VPUT => format!("vput {}, {}, {}", vr(f.x), r(f.y), f.z),
+            vmov::VGETW => format!("vgetw {}, {}, {}", r(f.x), vr(f.y), f.z),
+            vmov::VPUTW => format!("vputw {}, {}, {}", vr(f.x), r(f.y), f.z),
+            vmov::VBCST => format!("vbcst {}, {}", vr(f.x), r(f.y)),
+            vmov::VBCSTW => format!("vbcstw {}, {}", vr(f.x), r(f.y)),
+            _ => return None,
+        },
         op::IO | op::IOI => {
             let name = match f.b {
                 io::IN => "in",
@@ -239,6 +270,10 @@ fn decode(w1: Word, w2: Option<Word>, pc: i64) -> Option<(String, usize)> {
         _ => return None,
     };
     Some((s, n))
+}
+
+fn vr(n: i64) -> String {
+    format!("v{n}")
 }
 
 fn fr(n: i64) -> String {

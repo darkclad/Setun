@@ -1012,3 +1012,30 @@ fn mutex_futex_and_shared_memory() {
     let n = out.matches(" ok\n").count();
     assert!(n >= 18, "only {n} checks:\n{out}");
 }
+
+#[test]
+fn vector_unit_from_user_mode() {
+    // TERNARY_WORLD A5: /bin/vectest (the Trine vector builtins; lazy
+    // switching keeps each process's v registers across switches, fork,
+    // execve and signal handlers; the faults arrive as signals)
+    let out = session(&["vectest", "echo st=$?", "grep Vector /proc/1/status", "exit"], 3_000_000_000);
+    assert!(!out.contains("FAILED") && !out.contains("Kernel panic"), "{out}");
+    for check in [
+        "first use: the registers start zeroed",
+        "lane-wise operations, reductions",
+        "every builtin, tryte and word lanes, fills and a merge",
+        "registers survive switching (parent)",
+        "registers survive switching (child)",
+        "fork copies the vector registers",
+        "execve resets the vector registers",
+        "handler starts with clean vector registers",
+        "interrupted vector state restored",
+        "a misaligned VLD is SIGBUS",
+        "a VST into read-only memory is SIGSEGV",
+        "an unknown vector function is SIGILL",
+        "parent unaffected",
+    ] {
+        assert!(out.contains(&format!("vectest: {check} ok\n")), "missing {check:?} in:\n{out}");
+    }
+    assert_has(&out, &["vectest: all passed", "st=0\n", "Vector:\tunused\n"]);
+}

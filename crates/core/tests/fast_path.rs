@@ -38,6 +38,7 @@ fn insn(r: &mut Rng) -> i64 {
     let majors = [
         op::SYS, op::ALU, op::ALUQ, op::MEM, op::IO, op::JALR, op::LIQ, op::BRQ, op::ALUI, op::MEMD, op::LI, op::LEA,
         op::JAL, op::BR, op::BR3, op::IOI, op::FLD, op::FALU, op::FCVT, op::FMEM, op::FMEMD, op::FLI,
+        op::MEMR, op::VALU, op::VMEM, op::VMOV,
     ];
     let a = if r.range(0, 20) == 0 { r.range(-9841, 9841) } else { r.pick(&majors) };
     let b = if r.range(0, 10) == 0 { r.range(-9841, 9841) } else { r.range(-3, 30) };
@@ -137,6 +138,10 @@ fn digest(m: &mut Machine) -> Vec<i64> {
             d.push(m.mem.read_word(a).unwrap().value());
             a += 3;
         }
+    }
+    // (after memory, so the offsets above do not move)
+    for v in -13..=13 {
+        d.extend(m.cpu.vreg(v).map(|w| w.value()));
     }
     d.extend(m.dev.serial.take_output().chars().map(|c| c as i64));
     d
@@ -1166,4 +1171,195 @@ fn cas3_refused() {
         assert_eq!(reg_in(&st, 1), 4, "{addr}: rd changed");
         assert_eq!(st[27 * 5 + 5 + 6561 + ((at - PAGE + 9840) / 3) as usize], 5, "{addr}: memory changed");
     }
+}
+
+// ---- the vector unit (ISA v0.7 §15) ----------------------------------------
+
+/// A vector's 9 tryte lanes (lane j: tryte j % 3 of word j / 3, high first).
+fn lanes(w: [i64; 3]) -> [i64; 9] {
+    let mut t = [0i64; 9];
+    for k in 0..3 {
+        let v = Word::new(w[k]).unwrap();
+        t[3 * k] = v.field(1..=9);
+        t[3 * k + 1] = v.field(10..=18);
+        t[3 * k + 2] = v.field(19..=27);
+    }
+    t
+}
+
+/// v register `v` in a digest (after the memory frames).
+fn vreg_in(st: &[i64], v: i64) -> [i64; 3] {
+    let base = 27 * 5 + 5 + FRAMES as usize * 6561 + 3 * (v + 13) as usize;
+    [st[base], st[base + 1], st[base + 2]]
+}
+
+#[test]
+fn vector_lanes_loads_stores_and_moves() {
+    // two vectors loaded from memory; every lane-wise operation on tryte
+    // and word lanes; VMRG; VSUM and VDOTW; lane moves and broadcasts; VST;
+    // in a compiled loop
+    use setun_core::isa::{valu, vmem, vmov};
+    let base = PAGE + 297; // a multiple of 9
+    assert_eq!(base % 9, 0);
+    let a_words = [3_141_592_653_589i64, -2_718_281_828_459, 1_234_567];
+    let b_words = [-1_000_000_007i64, 2_222_333_444_555, -9_876_543_210];
+    let ops = [alu::ADD, alu::SUB, alu::MIN, alu::MAX, alu::TMUL, alu::TSAT, alu::CONS, alu::NEG, alu::ABS, alu::SGN];
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, base));
+    prog.push(isa::s6(op::LIQ, 0, 9, 4));
+    let top = prog.len() as i64;
+    prog.push(isa::rrr(op::VMEM, vmem::VLD, 1, 2, 0)); // v1 = a
+    prog.push(isa::rrr(op::VMEM, vmem::VLD, 2, 2, 1)); // v2 = b (9 trytes up)
+    for (k, &f) in ops.iter().enumerate() {
+        // results stored from base + 18 up; q3 reaches 13 at most, so the
+        // base moves on after every pair
+        prog.push(isa::rrr(op::VALU, f, 3, 1, 2)); // tryte lanes
+        prog.push(isa::rrr(op::VMEM, vmem::VST, 3, 11, 0));
+        prog.push(isa::rrr(op::VALU, f + valu::WORD_LANES, 3, 1, 2)); // word lanes
+        prog.push(isa::rrr(op::VMEM, vmem::VST, 3, 11, 1));
+        prog.extend(isa::wide(op::ALUI, alu::ADD, 11, 11, 18));
+        let _ = k;
+    }
+    prog.push(isa::rrr(op::VALU, valu::VMRG, 4, 1, 2)); // v4 = merge(v4, mask v1, src v2)
+    prog.push(isa::rrr(op::VALU, valu::VSUM, 5, 1, 0)); // r5 = sum of a's lanes
+    prog.push(isa::rrr(op::VALU, valu::VDOTW, 6, 1, 2)); // r6 = a . low trits of b
+    prog.push(isa::rrr(op::VMOV, vmov::VGET, 7, 2, 5)); // r7 = b lane 5
+    prog.push(isa::rrr(op::VMOV, vmov::VGETW, 8, 1, 2)); // r8 = a word lane 2
+    prog.push(isa::s6(op::LIQ, 0, 10, -300));
+    prog.push(isa::rrr(op::VMOV, vmov::VPUT, 5, 10, 8)); // v5 lane 8 = -300
+    prog.push(isa::rrr(op::VMOV, vmov::VBCST, 6, 10, 0)); // v6 = -300 in every lane
+    prog.push(isa::rrr(op::VMOV, vmov::VBCSTW, 7, 2, 0)); // v7 = base in every word lane
+    prog.push(isa::rrr(op::VMOV, vmov::VPUTW, 7, 9, 1)); // v7 word lane 1 = r9
+    prog.push(isa::rrr(op::VALU, alu::ADD, 0, 1, 2)); // v0 stays 0
+    prog.extend(isa::wide(op::LI, 0, 11, 0, base + 18));
+    prog.push(isa::rrr(op::ALUQ, alu::SUB, 9, 9, 1));
+    let here = prog.len() as i64;
+    prog.push(isa::s6(op::BRQ, 0, cond::NE, top - here));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        m.mem.load_words(base, &a_words.map(w));
+        m.mem.load_words(base + 9, &b_words.map(w));
+        m.cpu.set_vreg(4, [w(77), w(-77), w(5)]);
+        m.cpu.set_reg(11, w(base + 18));
+    };
+    let (st, fast) = both_ways_jit(1, setup, &prog, 3000);
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(fast.cpu.jit_stats()[2] > 100, "the loop ran compiled: {:?}", fast.cpu.jit_stats());
+    let _ = fast;
+    // the model
+    let (ta, tb) = (lanes(a_words), lanes(b_words));
+    let t9 = |v: i64| ternary::Tryte::wrap(v as i128);
+    let lane = |f: i64, x: ternary::Tryte, y: ternary::Tryte| -> i64 {
+        match f {
+            alu::ADD => t9(x.value() + y.value()).value(),
+            alu::SUB => t9(x.value() - y.value()).value(),
+            alu::MIN => x.tritwise_min(y).value(),
+            alu::MAX => x.tritwise_max(y).value(),
+            alu::TMUL => x.tritwise_mul(y).value(),
+            alu::TSAT => x.tritwise_sat(y).value(),
+            alu::CONS => x.tritwise_cons(y).value(),
+            alu::NEG => -x.value(),
+            alu::ABS => x.value().abs(),
+            _ => x.value().signum(),
+        }
+    };
+    let word_lane = |f: i64, x: i64, y: i64| -> i64 {
+        let (p, q) = (w(x), w(y));
+        match f {
+            alu::ADD => Word::wrap(x as i128 + y as i128).value(),
+            alu::SUB => Word::wrap(x as i128 - y as i128).value(),
+            alu::MIN => p.tritwise_min(q).value(),
+            alu::MAX => p.tritwise_max(q).value(),
+            alu::TMUL => p.tritwise_mul(q).value(),
+            alu::TSAT => p.tritwise_sat(q).value(),
+            alu::CONS => p.tritwise_cons(q).value(),
+            alu::NEG => -x,
+            alu::ABS => x.abs(),
+            _ => x.signum(),
+        }
+    };
+    let mem = |addr: i64| st[27 * 5 + 5 + 6561 + ((addr - PAGE + 9840) / 3) as usize];
+    for (k, &f) in ops.iter().enumerate() {
+        let at = base + 18 + 18 * k as i64;
+        let got = lanes([mem(at), mem(at + 3), mem(at + 6)]);
+        let want: Vec<i64> = (0..9).map(|j| lane(f, t9(ta[j]), t9(tb[j]))).collect();
+        assert_eq!(got.to_vec(), want, "tryte lanes, ALU function {f}");
+        let at = at + 9;
+        let want: Vec<i64> = (0..3).map(|q| word_lane(f, a_words[q], b_words[q])).collect();
+        assert_eq!(vec![mem(at), mem(at + 3), mem(at + 6)], want, "word lanes, ALU function {f}");
+    }
+    // VMRG ran 4 times: merging again changes nothing
+    let merged: Vec<i64> = (0..3).map(|q| [77, -77, 5].map(w)[q].tritwise_merge(w(a_words[q]), w(b_words[q])).value()).collect();
+    assert_eq!(vreg_in(&st, 4).to_vec(), merged);
+    assert_eq!(reg_in(&st, 5), ta.iter().sum::<i64>());
+    let dot: i64 = (0..9).map(|j| ta[j] * t9(tb[j]).trit(9) as i64).sum();
+    assert_eq!(reg_in(&st, 6), dot);
+    assert_eq!(reg_in(&st, 7), tb[5]);
+    assert_eq!(reg_in(&st, 8), a_words[2]);
+    assert_eq!(lanes(vreg_in(&st, 5))[8], -300);
+    assert_eq!(lanes(vreg_in(&st, 6)), [-300; 9]);
+    assert_eq!(vreg_in(&st, 7), [base, 1, base], "VBCSTW then VPUTW (r9 = 1 in the last round)");
+    assert_eq!(vreg_in(&st, 0), [0; 3], "v0 reads 0");
+}
+
+#[test]
+fn vector_unit_refused() {
+    use setun_core::isa::{valu, vector, vmem, vmov};
+    let base = PAGE + 297;
+    // (instruction, the vector it must trap with, the address r2 holds)
+    let cases: Vec<(Word, i64, i64)> = vec![
+        (isa::rrr(op::VMEM, vmem::VLD, 1, 2, 0), vector::MISALIGNED, base + 3),
+        (isa::rrr(op::VMEM, vmem::VST, 1, 2, 0), vector::MISALIGNED, base - 3),
+        (isa::rrr(op::VALU, alu::MUL, 1, 1, 1), vector::ILLEGAL, base), // not lane-wise
+        (isa::rrr(op::VALU, alu::DIV + valu::WORD_LANES, 1, 1, 1), vector::ILLEGAL, base),
+        (isa::rrr(op::VALU, 58, 1, 1, 1), vector::ILLEGAL, base),
+        (isa::rrr(op::VMOV, vmov::VGET, 5, 1, 9), vector::ILLEGAL, base), // tryte lane 9
+        (isa::rrr(op::VMOV, vmov::VPUTW, 1, 5, 3), vector::ILLEGAL, base), // word lane 3
+        (isa::rrr(op::VMOV, 7, 1, 5, 0), vector::ILLEGAL, base),
+        (isa::rrr(op::VMEM, 3, 1, 2, 0), vector::ILLEGAL, base),
+    ];
+    for (k, (ins, want, addr)) in cases.into_iter().enumerate() {
+        let mut prog = Vec::new();
+        prog.extend(isa::wide(op::LI, 0, 2, 0, addr));
+        prog.push(ins);
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let st = both_ways(|m: &mut Machine| m.cpu.set_vreg(1, [w(1), w(2), w(3)]), &prog, 20);
+        assert_eq!(vector_in(&st), want, "case {k}");
+        assert_eq!(vreg_in(&st, 1), [1, 2, 3], "case {k}: v1 changed");
+        assert_eq!(reg_in(&st, 5), 0, "case {k}: r5 changed");
+    }
+    // VE off: every vector instruction traps -13 and changes nothing
+    for ins in [isa::rrr(op::VALU, alu::ADD, 1, 1, 1), isa::rrr(op::VMEM, vmem::VLD, 1, 2, 0), isa::rrr(op::VMOV, vmov::VGET, 5, 1, 0)] {
+        let mut prog = Vec::new();
+        prog.extend(isa::wide(op::LI, 0, 2, 0, base));
+        prog.push(ins);
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let st = both_ways(
+            |m: &mut Machine| {
+                m.cpu.set_vreg(1, [w(1), w(2), w(3)]);
+                m.cpu.set_mode(mode::VE, 0);
+            },
+            &prog,
+            20,
+        );
+        assert_eq!(vector_in(&st), vector::VECTOR_UNAVAILABLE);
+        assert_eq!(vreg_in(&st, 1), [1, 2, 3]);
+        assert_eq!(reg_in(&st, 5), 0);
+    }
+    // a VST straddling the end of page 1 into read-only page 2 writes nothing
+    let last = PAGE + 9837; // words at 9837 and 9840 in page 1, 9843 in page 2
+    assert_eq!(last % 9, 0);
+    let mut prog = Vec::new();
+    prog.extend(isa::wide(op::LI, 0, 2, 0, last));
+    prog.push(isa::rrr(op::VMEM, vmem::VST, 1, 2, 0));
+    prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+    let setup = move |m: &mut Machine| {
+        paged(m);
+        m.mem.write_word(4 * PAGE + 6, w(pte(5, -1, 1, -1))).unwrap(); // page 2 -> frame 5, read only
+        m.cpu.set_vreg(1, [w(1), w(2), w(3)]);
+    };
+    let st = both_ways(setup, &prog, 20);
+    assert_eq!(vector_in(&st), vector::PROTECTION);
+    let mem = |addr: i64| st[27 * 5 + 5 + 6561 + ((addr - PAGE + 9840) / 3) as usize];
+    assert_eq!((mem(last), mem(last + 3)), (0, 0), "page 1 untouched");
 }

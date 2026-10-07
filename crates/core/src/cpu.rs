@@ -1,7 +1,7 @@
 //! Setun-26 CPU: registers, decode/execute, traps and the MMU.
 
 use crate::io::Io;
-use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, memr, mode, op, sys, vector};
+use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, memr, mode, op, sys, valu, vector, vmem, vmov};
 use crate::memory::Memory;
 use crate::{HALF_PAGE, PAGE};
 use setun_real::Real;
@@ -80,6 +80,8 @@ pub struct Cpu {
     inst_pc: Word,
     /// The FPU: f−13..f13 (f0 reads as zero) and FSR (ISA §14.2).
     fregs: [Real; 27],
+    /// The vector registers v-13..v13 (v0 reads 0), 3 words each.
+    vregs: [[Word; 3]; 27],
     fsr: Word,
     /// Exception flags (`setun_real` bits) already set in FSR and masked,
     /// so raising them again changes nothing (0 whenever FSR is written).
@@ -216,6 +218,8 @@ enum Op {
     Br3,
     /// An FPU instruction: run by `exec_fpu` without ending the block.
     Fpu,
+    /// A vector instruction (VALU, VMEM, VMOV): `exec_vec`, likewise.
+    Vec,
     /// BEXT / BROT with valid fields: `imm` = pos, `imm2` = len.
     Bfld,
     Generic,
@@ -350,6 +354,7 @@ impl Cpu {
             halted: false,
             inst_pc: Word::ZERO,
             fregs: [Real::ZERO; 27],
+            vregs: [[Word::ZERO; 3]; 27],
             fsr: Word::ZERO,
             fsr_quiet: 0,
             batch: false,
@@ -398,7 +403,9 @@ impl Cpu {
         self.cycle = 0;
         self.set_mode(mode::RING, 1);
         self.set_mode(mode::FE, 1);
+        self.set_mode(mode::VE, 1);
         self.fregs = [Real::ZERO; 27];
+        self.vregs = [[Word::ZERO; 3]; 27];
         self.fsr = Word::new(fsr::RESET).unwrap();
         self.fsr_quiet = 0;
         self.pc = Word::new(RESET_PC).unwrap();
@@ -505,6 +512,18 @@ impl Cpu {
     }
 
     /// FPU register `f` (f0 is always zero).
+    /// Vector register `v` as its three words (word lane 0 first; tryte
+    /// lane j is tryte j % 3 of word j / 3, the high one first).
+    pub fn vreg(&self, v: i64) -> [Word; 3] {
+        self.vregs[idx(v)]
+    }
+
+    pub fn set_vreg(&mut self, v: i64, w: [Word; 3]) {
+        if v != 0 {
+            self.vregs[idx(v)] = w;
+        }
+    }
+
     pub fn freg(&self, f: i64) -> Real {
         self.fregs[idx(f)]
     }
@@ -883,7 +902,7 @@ impl Cpu {
                     Ok(Ctl::Next) => {
                         pc += d.len as i64;
                         k += 1;
-                        if matches!(d.op, Op::Stt | Op::Stw | Op::Swap | Op::Fpu) && (!m.code_dirty.is_empty() || m.pt_dirty) {
+                        if matches!(d.op, Op::Stt | Op::Stw | Op::Swap | Op::Fpu | Op::Vec) && (!m.code_dirty.is_empty() || m.pt_dirty) {
                             break; // it wrote code or a page table: look again
                         }
                     }
@@ -1260,6 +1279,7 @@ impl Cpu {
                     (d.op, d.imm, d.imm2) = (Op::Bfld, pos, len as i32);
                 }
             }
+            op::VALU | op::VMEM | op::VMOV => d.op = Op::Vec,
             op::JALR => (d.op, d.imm) = (Op::Jalr, 3 * z),
             op::LIQ => (d.op, d.imm) = (Op::Li, imm6),
             op::LI => (d.op, d.imm) = (Op::Li, imm),
@@ -1397,6 +1417,7 @@ impl Cpu {
                 }))
             }
             Op::Fpu => self.exec_fpu(m, d.a as i64, d.f as i64, x, y, z, pc, Some(d.imm))?,
+            Op::Vec => self.exec_vec(m, d.a as i64, d.f as i64, x, y, z)?,
             Op::Bfld => {
                 let v = crate::isa::bin_field(d.f as i64, self.reg(y).value(), d.imm, d.imm2 as i64).expect("checked when decoded");
                 let r = Word::new(v).unwrap();
@@ -1492,6 +1513,7 @@ impl Cpu {
                     _ => return Err(ill()),
                 }
             }
+            op::VALU | op::VMEM | op::VMOV => self.exec_vec(m, a, b, x, y, z)?,
             op::MEMR => match b {
                 memr::STWM => {
                     // the word at ra := merge(old, rd, mask rb), all at once
@@ -1595,6 +1617,120 @@ impl Cpu {
             _ => return Err(ill()),
         }
         self.pc = next_w;
+        Ok(())
+    }
+
+    // ---- the vector unit (ISA §15) --------------------------------------------
+
+    /// VALU, VMEM or VMOV (the PC is the caller's business).
+    fn exec_vec(&mut self, m: &mut Memory, a: i64, b: i64, x: i64, y: i64, z: i64) -> Result<(), Fault> {
+        let ill = || Fault::new(vector::ILLEGAL);
+        if self.mode(mode::VE) != 1 {
+            return Err(Fault::new(vector::VECTOR_UNAVAILABLE));
+        }
+        match a {
+            op::VALU => match b {
+                1..=54 => {
+                    // a lane-wise ALU operation on 9 tryte lanes or 3 word lanes
+                    let (f, words) = if b > valu::WORD_LANES { (b - valu::WORD_LANES, true) } else { (b, false) };
+                    if !matches!(f, alu::ADD | alu::SUB | alu::MIN | alu::MAX | alu::TMUL | alu::TSAT | alu::CONS | alu::NEG | alu::ABS | alu::SGN) {
+                        return Err(ill());
+                    }
+                    let (va, vb) = (self.vreg(y), self.vreg(z));
+                    let r = if words {
+                        [0, 1, 2].map(|k| lane_op(f, va[k], vb[k]))
+                    } else {
+                        let (ta, tb) = (vec_trytes(va), vec_trytes(vb));
+                        let mut out = [0i64; 9];
+                        for j in 0..9 {
+                            let (p, q) = (Tryte::new(ta[j]).unwrap(), Tryte::new(tb[j]).unwrap());
+                            out[j] = lane_op(f, p, q).value();
+                        }
+                        vec_from_trytes(out)
+                    };
+                    self.set_vreg(x, r);
+                }
+                valu::VMRG => {
+                    let (d, mk, s) = (self.vreg(x), self.vreg(y), self.vreg(z));
+                    self.set_vreg(x, [0, 1, 2].map(|k| d[k].tritwise_merge(mk[k], s[k])));
+                }
+                valu::VSUM => {
+                    let s: i64 = vec_trytes(self.vreg(y)).iter().sum();
+                    self.set_reg(x, Word::new(s).unwrap());
+                }
+                valu::VDOTW => {
+                    // one weight trit per lane: the low trit of vb's tryte
+                    let (ta, tw) = (vec_trytes(self.vreg(y)), vec_trytes(self.vreg(z)));
+                    let s: i64 = (0..9).map(|j| ta[j] * Tryte::new(tw[j]).unwrap().trit(9) as i64).sum();
+                    self.set_reg(x, Word::new(s).unwrap());
+                }
+                _ => return Err(ill()),
+            },
+            op::VMEM => {
+                // 9 trytes whose first word is at ra + 9·q3, a multiple of 9
+                let va = self.reg(y).value() + 9 * z;
+                if va.rem_euclid(9) != 0 {
+                    return Err(Fault::mem(vector::MISALIGNED, va, if b == vmem::VST { Access::Write } else { Access::Read }));
+                }
+                match b {
+                    vmem::VLD => {
+                        let mut w = [Word::ZERO; 3];
+                        for (k, slot) in w.iter_mut().enumerate() {
+                            *slot = self.load_word_as(m, ww(va + 3 * k as i64).value(), Access::Read)?;
+                        }
+                        self.set_vreg(x, w);
+                    }
+                    vmem::VST => {
+                        // all or nothing: the three words may straddle a page end
+                        for k in 0..3 {
+                            self.data_pa(m, ww(va + 3 * k).value(), Access::Write, true)?;
+                        }
+                        let w = self.vreg(x);
+                        for (k, v) in w.iter().enumerate() {
+                            self.store_word(m, ww(va + 3 * k as i64).value(), *v)?;
+                        }
+                    }
+                    _ => return Err(ill()),
+                }
+            }
+            op::VMOV => {
+                let tryte_lane = |q: i64| if (0..9).contains(&q) { Ok(q as usize) } else { Err(ill()) };
+                let word_lane = |q: i64| if (0..3).contains(&q) { Ok(q as usize) } else { Err(ill()) };
+                match b {
+                    vmov::VGET => {
+                        let j = tryte_lane(z)?;
+                        let t = vec_trytes(self.vreg(y))[j];
+                        self.set_reg(x, Word::new(t).unwrap());
+                    }
+                    vmov::VPUT => {
+                        let j = tryte_lane(z)?;
+                        let mut t = vec_trytes(self.vreg(x));
+                        t[j] = self.reg(y).resize::<9>().value();
+                        self.set_vreg(x, vec_from_trytes(t));
+                    }
+                    vmov::VGETW => {
+                        let k = word_lane(z)?;
+                        self.set_reg(x, self.vreg(y)[k]);
+                    }
+                    vmov::VPUTW => {
+                        let k = word_lane(z)?;
+                        let mut w = self.vreg(x);
+                        w[k] = self.reg(y);
+                        self.set_vreg(x, w);
+                    }
+                    vmov::VBCST => {
+                        let t = self.reg(y).resize::<9>().value();
+                        self.set_vreg(x, vec_from_trytes([t; 9]));
+                    }
+                    vmov::VBCSTW => {
+                        let v = self.reg(y);
+                        self.set_vreg(x, [v; 3]);
+                    }
+                    _ => return Err(ill()),
+                }
+            }
+            _ => return Err(ill()),
+        }
         Ok(())
     }
 
@@ -1958,6 +2094,40 @@ impl Cpu {
         self.set_s(r.sign());
         Ok(Some(r))
     }
+}
+
+/// A lane-wise ALU operation (the VALU set) on two lanes of one width,
+/// wrapping within the lane.
+fn lane_op<const N: usize>(f: i64, a: ternary::Tern<N>, b: ternary::Tern<N>) -> ternary::Tern<N> {
+    let wrap = |v: i128| ternary::Tern::<N>::wrap(v);
+    match f {
+        alu::ADD => wrap(a.value() as i128 + b.value() as i128),
+        alu::SUB => wrap(a.value() as i128 - b.value() as i128),
+        alu::MIN => a.tritwise_min(b),
+        alu::MAX => a.tritwise_max(b),
+        alu::TMUL => a.tritwise_mul(b),
+        alu::TSAT => a.tritwise_sat(b),
+        alu::CONS => a.tritwise_cons(b),
+        alu::NEG => -a,
+        alu::ABS => wrap((a.value() as i128).abs()),
+        _ => wrap(a.value().signum() as i128), // SGN
+    }
+}
+
+/// A vector's 9 tryte lanes (lane j: tryte j % 3 of word j / 3, high first).
+fn vec_trytes(w: [Word; 3]) -> [i64; 9] {
+    let mut t = [0i64; 9];
+    for k in 0..3 {
+        let v = w[k];
+        t[3 * k] = v.field(1..=9);
+        t[3 * k + 1] = v.field(10..=18);
+        t[3 * k + 2] = v.field(19..=27);
+    }
+    t
+}
+
+fn vec_from_trytes(t: [i64; 9]) -> [Word; 3] {
+    [0, 1, 2].map(|k| Word::new((t[3 * k] * 19_683 + t[3 * k + 1]) * 19_683 + t[3 * k + 2]).unwrap())
 }
 
 /// Check one page-table entry against an access (ISA §5.3).

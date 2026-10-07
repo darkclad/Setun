@@ -187,6 +187,11 @@ These are not functions: each compiles to one instruction or a few.
 | `stwm(p, value, mask)` | `*p := mrg(*p, mask, value)` in one store; `p` is an `*int` | `STWM` |
 | `cas3(p, expected, new)` | the old `*p`; `*p := new` if it was `expected`, atomically | `CAS3` |
 | `swap(p, v)` | the old `*p`, and `*p := v`, atomically | `SWAP` |
+| `vadd(d, a, b)` `vsub` `vmin` `vmax` `vtmul` `vtsat` `vcons` | the vector `d` := `a` ⊕ `b`, lane by lane on 9 tryte lanes; with a `w` suffix (`vaddw` …) on 3 word lanes | `VLD`, `VALU`, `VST` |
+| `vneg(d, a)` `vabs` `vsgn` (and `…w`) | `d` := the operation on each lane of `a` | `VALU` |
+| `vmrg(d, mask, src)` | `d` := `mrg(d, mask, src)` over all 81 trits | `VMRG` |
+| `vbcst(d, x)` `vbcstw(d, x)` | every tryte (word) lane of `d` := `x` | `VBCST`, `VBCSTW` |
+| `vsum(a)` `vdotw(a, w)` | the sum of `a`'s tryte lanes; Σ `a[j]` × the lowest trit of `w[j]` | `VSUM`, `VDOTW` |
 | `band(a, b)` `bor(a, b)` `bxor(a, b)` `bandn(a, b)` | binary AND / OR / XOR / a AND NOT b, on two's-complement values (ISA §3.3.1) | `BAND` … `BANDN` |
 | `bsh(x, n)` | x·2^n, or ⌊x / 2^−n⌋ for n < 0 | `BSH` |
 | `bext(x, pos, len)` `brot(x, n, len)` | bits pos..pos+len−1; the low len bits rotated left by n (constant `pos`/`n`, `len`) | `BEXT`, `BROT` |
@@ -204,6 +209,8 @@ These are not functions: each compiles to one instruction or a few.
 | `fclass(x)` | −3 −∞, −2 normal, −1 subnormal, 0 zero, … 3 +∞, 4 NaN | `FCLASS` |
 | `real27(x)` | x rounded to real27 precision (17 trits) | `FTOW` + `FFRW` |
 | `fsr()` `set_fsr(v)` | the FPU status register (flags, masks; ISA §14.4) | `FMFS`, `FMTS` |
+
+The vector builtins work memory to memory. Each vector argument is a `[3]int` or `[9]tryte` array (or an `*int` or `*tryte` to its start) whose 9 trytes start at a multiple of 9: declare it `@align(9)` (for a `[9]tryte` the compiler passes the second tryte's address, which is the vector's). A vector off that alignment traps (misaligned access); locals are only word-aligned, so vectors are globals or heap memory. They use `v1`–`v3` only.
 
 ## 9. Low-level features
 

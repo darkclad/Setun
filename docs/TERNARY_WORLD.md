@@ -366,7 +366,9 @@ This is the classic futex mutex, which binary systems encode as 0/1/2. Here "hel
 
 Negative tests: unaligned `CAS3`; `CAS3` on a read-only page leaves memory unchanged and raises vector −4; the three S outcomes each checked by a `BR3`; a lock stress test with preemption on.
 
-### A5. Vector unit
+### A5. Vector unit ✅
+
+**Done (2026-10-06):** ISA §15 as below, with three changes found while building it. `MRG` is not a lane function (its number 28 is the first word-lane function); it is `VMRG`, VALU function 55, over all 81 trits. All three majors are R format, so `VMEM`'s offset is `q3` vectors (±117 trytes). `VDOTW` takes the lowest trit of each of `vb`'s tryte lanes as the weight. Built in the interpreter, both JITs (through the interpreter's code), the host assembler and disassembler, and `tas`. Trine and `tric` got memory-to-memory builtins (`vadd(d, a, b)` … `vsum`, `vdotw`, `vmrg`, `vbcst`) on `@align(9)` `[3]int` or `[9]tryte` arrays. Trinux switches the registers lazily (KERNEL.md §26). Tests: lane-by-lane models in the fast-path tests (native and wasm), assembler round trips and refusals, `tas` and `tric` matching the host on `/bin/vectest`, and `/bin/vectest` itself in Trinux. A mutation in each part (the enable check, `VDOTW`, `VST`'s all-or-nothing, a lane function, the compilers' address fix-up and merge, `tas`'s function table and `VLD`/`VST`, and the kernel's switching, fork, signal return and execve) fails a test.
 
 - **Registers:** `v−13 … v13`, 81 trits each; `v0` reads as zero. A register is 9 tryte lanes or 3 word lanes.
 - **Enable and lazy switching:** MODE trit 19 becomes `VE`. With `VE` = 0, any vector instruction raises vector −13 (vector unit not available), so Trinux saves and restores the registers only for tasks that use them, as for the FPU. The state is 26 × 9 = 234 trytes per task.

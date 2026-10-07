@@ -181,6 +181,8 @@ struct Task {
     groups: [9]int;
     fpu_used: int;                    // fpu.tri: the task has touched the FPU
     fpu: [82]int;                     // its saved FSR and registers while not the owner
+    vec_used: int;                    // vec.tri: the task has touched the vector unit
+    vec: [80]int;                     // its saved vector registers (78 words, aligned within)
 }
 
 var tasks: [27]Task;
@@ -334,6 +336,7 @@ fn spawn_init(path: *char) -> int {
     t.heap_start = load_heap;
     t.brk = load_brk;
     t.fpu_used = 0;
+    t.vec_used = 0;
     fs_init_task(t);
     set_user_entry(task_frame(t), load_entry, load_sp, exec_argc, load_argv, load_envp);
     prepare_stack(t);
@@ -369,6 +372,7 @@ fn do_fork(f: *int) -> int {
     child.umask = parent.umask;
     creds_fork(parent, child);
     fpu_fork(parent, child);
+    vec_fork(parent, child);
     var c: int = 0;
     while (c < 27) { child.fd_cloexec[c] = parent.fd_cloexec[c]; c += 1; }
     child.pgid = parent.pgid;
@@ -399,6 +403,7 @@ fn do_execve(f: *int) -> int {
     if (old != 0) { free_address_space(old); }
     signals_exec(t);
     fpu_drop(t);
+    vec_drop(t);
     close_on_exec(t);
     set_comm(t);
     set_user_entry(f, load_entry, load_sp, exec_argc, load_argv, load_envp);
@@ -408,6 +413,7 @@ fn do_execve(f: *int) -> int {
 fn do_exit(status: int) {
     var t: *Task = current_task();
     fpu_drop(t);
+    vec_drop(t);
     fs_exit(t);
     if (t.l1 != 0) {
         mtc(PTB, frame_centre(kernel_l1));
