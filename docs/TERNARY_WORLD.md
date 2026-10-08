@@ -254,15 +254,16 @@ flowchart TB
     classDef gate fill:#fff,stroke:#777,color:#111
     classDef research fill:#fff,stroke:#777,color:#111,stroke-dasharray:4 3
     class D done
-    class A next
+    class A done
+    class B next
     class GA,GB,GC gate
     class R research
 ```
 
 | Phase | Work |
 |---|---|
-| **A · Ternary idioms** (next) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
-| B · Formats, reliability | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
+| A · Ternary idioms (done, 2026-10-07) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
+| **B · Formats, reliability** (next) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
 | C · Native networking | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
 | Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 
@@ -418,6 +419,20 @@ This gives meaning to trytes −1 and −2, which ISA §1.1 now reserves ("−1�
 - The font path needs glyphs beyond the current 353 (Latin-1, Cyrillic, №): a 16×16 font for CJK, shipped in the disk image and loaded on demand.
 
 Negative tests: a lead tryte at the end of a string; a code point above U+10FFFF; surrogates U+D800–U+DFFF; leads −3…−32; an escape that encodes a code point ≤ 9841 (an overlong form, refused as in UTF-8); round trips through UTF-8 for every edge value.
+
+### Gate A ✅ (2026-10-07)
+
+*Programs branch with BR3 and write with masks; negative tests pass.*
+
+- **Three-way branches in real code.** `sign` compiles to one `CMP` and one `BR3`. It is used where a decision really is three-way:
+  - the kernel's `fork`, on the page table's software trit (shared, private, already copy-on-write);
+  - the binary searches in `wcwidth` (behind the shell, `term`, `edit` and every column count) and in `lib/btree.tri`, and the 3-ary heap's sift;
+  - `sort -n`'s comparator, the shell's file-name completion (no slash, the root, a directory), `gfx` scrolling up or down, and `tric`'s operand formatting.
+
+  7 of the 76 programs on the disk now contain `BR3` (15 sites), and so does the kernel.
+- **Masked writes in real code.** The kernel marks a page copy-on-write in `fork`, and makes it writable again when its last sharer writes, with `STWM`. Two trits of the entry change (V and the software trit); the frame, the execute trit and the hardware's access trit stay. Before, the fault rebuilt the whole entry, which cleared the access trit. Other masked or trit-wise writes: the mutex (`mtx_lock`: `CAS3` and `SWAP`), and `lib/flags.tri`'s Kleene vectors (27 truth values per word, combined with tritwise min and max).
+- **What stays two-way.** Most decisions in this code are two-way: a test, a bound, an error. Written as three-way branches they would be longer and no faster, so they stay `if`. Phase A's other items are done: packed flags, 3-ary heaps, B-trees, and the `tric` optimizer at all four levels.
+- **Negative tests.** The full suite passes. Mutations in the converted code each fail a test: the copy-on-write mask in `fork` (`k3test`'s "child saw 43, parent still has 100"), the fault's mask, and `sort`'s comparator.
 
 ### Decided for phase A (2026-10-06)
 

@@ -3344,9 +3344,11 @@ fn ed_complete() {
         k = 0;
         while (k < wl) { if (word[k] == '/') { slash = k; } k += 1; }
         var dir2: [243]char;
-        if (slash < 0) { strcpy(&dir2[0], "."); }
-        else if (slash == 0) { strcpy(&dir2[0], "/"); }
-        else { strncpy(&dir2[0], &word[0], slash); dir2[slash] = 0; }
+        sign (slash) {
+            neg: { strcpy(&dir2[0], "."); }          // no slash
+            zero: { strcpy(&dir2[0], "/"); }         // the root
+            pos: { strncpy(&dir2[0], &word[0], slash); dir2[slash] = 0; }
+        }
         stem = slash + 1;
         cand_dir(&dir2[0], &word[stem], wl - stem, 0);
     }

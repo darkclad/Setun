@@ -47,9 +47,14 @@ fn tchar_width(cp: int) -> int {
     var hi: int = WIDE_RANGES - 1;
     while (lo <= hi) {
         var mid: int = (lo + hi) / 2;
-        if (cp < wide_first[mid]) { hi = mid - 1; }
-        else if (cp > wide_last[mid]) { lo = mid + 1; }
-        else { return 2; }
+        sign (cp <=> wide_first[mid]) {
+            neg: { hi = mid - 1; }
+            zero: { return 2; }
+            pos: {
+                if (cp <= wide_last[mid]) { return 2; }
+                lo = mid + 1;
+            }
+        }
     }
     return 1;
 }

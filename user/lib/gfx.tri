@@ -109,20 +109,24 @@ fn scroll_rect(s: *Surface, x: int, y: int, w: int, h: int, dy: int, fill: int) 
     var y0: int = clip_y0;
     var y1: int = clip_y1;
     var n: int = clip_x1 - clip_x0;
-    if (dy > 0) {
-        var row: int = y0;
-        while (row + dy < y1) {
-            gfx_copy(&s.data[row * s.w + x0], &s.data[(row + dy) * s.w + x0], n);
-            row += 1;
+    sign (dy) {
+        pos: {
+            var row: int = y0;
+            while (row + dy < y1) {
+                gfx_copy(&s.data[row * s.w + x0], &s.data[(row + dy) * s.w + x0], n);
+                row += 1;
+            }
+            while (row < y1) { gfx_fill(&s.data[row * s.w + x0], fill, n); row += 1; }
         }
-        while (row < y1) { gfx_fill(&s.data[row * s.w + x0], fill, n); row += 1; }
-    } else if (dy < 0) {
-        var r2: int = y1 - 1;
-        while (r2 + dy >= y0) {
-            gfx_copy(&s.data[r2 * s.w + x0], &s.data[(r2 + dy) * s.w + x0], n);
-            r2 -= 1;
+        neg: {
+            var r2: int = y1 - 1;
+            while (r2 + dy >= y0) {
+                gfx_copy(&s.data[r2 * s.w + x0], &s.data[(r2 + dy) * s.w + x0], n);
+                r2 -= 1;
+            }
+            while (r2 >= y0) { gfx_fill(&s.data[r2 * s.w + x0], fill, n); r2 -= 1; }
         }
-        while (r2 >= y0) { gfx_fill(&s.data[r2 * s.w + x0], fill, n); r2 -= 1; }
+        zero: { }
     }
 }
 

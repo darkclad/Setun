@@ -162,16 +162,26 @@ fn copy_address_space(parent: int) -> int {
             var i2: int = tbl_lo[pl2];
             while (i2 <= tbl_hi[pl2]) {
                 var p: int = *table_entry(pl2, i2);
-                if (p != 0 && trit(p, 24) == -1) {
-                    *table_entry(cl2, i2) = p;                 // shared as it is
-                    if (!is_device_frame(pte_frame(p))) { get_page(pte_frame(p)); }
-                } else if (p != 0) {
-                    if (trit(p, 19) == 1) {                    // writable: share copy-on-write
-                        p = p - 2 * PTE_V + PTE_SW;
-                        *table_entry(pl2, i2) = p;
+                if (p != 0) {
+                    // the software trit says how the page is held: three ways
+                    sign (trit(p, 24)) {
+                        neg: {
+                            // shared memory (or a device): shared as it is
+                            if (!is_device_frame(pte_frame(p))) { get_page(pte_frame(p)); }
+                        }
+                        zero: {
+                            // private: writable ones are shared copy-on-write, by
+                            // a masked store of two trits (V := -1 read only,
+                            // SW := +1), the rest of the entry (AD) kept
+                            if (trit(p, 19) == 1) {
+                                stwm(table_entry(pl2, i2), PTE_SW - PTE_V, PTE_V + PTE_SW);
+                                p = *table_entry(pl2, i2);
+                            }
+                            get_page(pte_frame(p));
+                        }
+                        pos: { get_page(pte_frame(p)); }    // copy-on-write already
                     }
                     *table_entry(cl2, i2) = p;
-                    get_page(pte_frame(p));
                 }
                 i2 += 1;
             }
@@ -207,9 +217,12 @@ fn handle_user_fault(t: *Task, va: int, access: int) -> int {
             copy_frame(nf, f);
             frame_ref[nf] = 1;
             put_page(f);
-            f = nf;
+            *slot = user_pte(nf, 1, trit(p, 20) == 1);
+        } else {
+            // the last sharer keeps the frame: two trits change (V := +1
+            // writable, SW cleared), the access trit with the rest stays
+            stwm(slot, PTE_V, PTE_V - PTE_SW);
         }
-        *slot = user_pte(f, 1, trit(p, 20) == 1);
         tlbinv(va);
         return 1;
     }

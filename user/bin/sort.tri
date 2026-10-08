@@ -18,7 +18,11 @@ fn cmp_lines(a: int, b: int) -> int {
     if (numeric) {
         var x: int = strtol(a as *char, null, 10);
         var y: int = strtol(b as *char, null, 10);
-        r = x < y ? -1 : (x > y ? 1 : strcmp(a as *char, b as *char));
+        sign (x <=> y) {
+            neg: { r = -1; }
+            zero: { r = strcmp(a as *char, b as *char); }
+            pos: { r = 1; }
+        }
     } else {
         r = strcmp(a as *char, b as *char);
     }

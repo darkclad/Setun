@@ -32,8 +32,7 @@ fn e_i(s: *char, v: int) { ln(); o(s); oi(v); nl(); }  // "li r1, 5"
 fn om(base: *char, off: int) {
     oc('[');
     o(base);
-    if (off > 0) { oc('+'); oi(off); }
-    else if (off < 0) { oi(off); }
+    sign (off) { neg: { oi(off); } zero: { } pos: { oc('+'); oi(off); } }
     oc(']');
 }
 
@@ -478,8 +477,7 @@ fn freg_local(x: int) -> *char {
 fn c_mem(c: *cvec, base: *char, off: int) {
     cv_push(c, '[');
     cv_str(c, base);
-    if (off > 0) { cv_push(c, '+'); cv_int(c, off); }
-    else if (off < 0) { cv_int(c, off); }
+    sign (off) { neg: { cv_int(c, off); } zero: { } pos: { cv_push(c, '+'); cv_int(c, off); } }
     cv_push(c, ']');
 }
 
