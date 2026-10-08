@@ -195,7 +195,7 @@ The system software exists and builds itself: Trinux, tlibc, Trine and the `tas`
 | Trit operations in place of bit tricks | `TLZ` (leading zero trits), `TCP`/`TCN` counts, `TREV` reversal (§A3), packed flag sets and Kleene vectors (`lib/flags.tri`) | Replaces popcount, clz and bitmask idioms | Done |
 | Data structures | 3-ary heaps (`lib/heap3.tri`) and B-trees with 27 keys per node (`lib/btree.tri`, 3000 keys in 3 levels) are done, both with three-way compares (`sign`); hash tables of 3^k buckets indexed by trits and ternary search tries are next | Wider fan-out means shallower trees | Partial |
 | Algorithms | Radix sort in base 27; radix-3 FFT and number-theoretic transforms | Natural digit size, no conversions | Planned |
-| Optimizer in `tric` | Port the host optimizer (register locals, peephole) into the self-hosted compiler | Optimized builds made on the machine itself | Planned |
+| Optimizer in `tric` | The host optimizer split into four cumulative levels and ported level by level: `tric -On` writes exactly the host's assembly at each (SELFHOST.md) | Optimized builds made on the machine itself | Done |
 
 Decided 2026-10-06:
 

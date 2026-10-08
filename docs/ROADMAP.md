@@ -55,7 +55,7 @@ Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole t
     - S1 ✅ `tas`, the assembler in Trine: the host assembler's executables, word for word
     - S2 ✅ `tric`, the compiler in Trine: the host compiler's unoptimized assembly, character for character (exact real literals too), and its error messages
     - S3 ✅ the fixed point: `tric` builds itself, and that build builds the same file again
-    - next: the optimizer in `tric`
+    - ✅ the optimizer in `tric`: all four levels of the host's (`-O1`..`-O4`), each matching the host's assembly
 
 ## Next: performance
 

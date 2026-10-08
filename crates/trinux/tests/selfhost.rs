@@ -135,7 +135,7 @@ fn tric_at_level(level: u8, progs: &[&str]) -> Session {
         assert!(o.contains("status 0"), "{p}: {o}");
         let (a, b) = (md5_of(&o, &format!("/usr/obj/{p}.s")), md5_of(&o, &format!("/usr/src/{p}.O{level}.s")));
         if a != b {
-            let d = s.cmd_max(&format!("diff /usr/src/{p}.O{level}.s /usr/obj/{p}.s | head -30"), 20_000_000_000);
+            let d = s.cmd_max(&format!("diff /usr/src/{p}.O{level}.s /usr/obj/{p}.s | head -n 30"), 20_000_000_000);
             panic!("{p}: tric -O{level} and the host differ:\n{d}");
         }
     }
@@ -154,9 +154,15 @@ fn tric_matches_the_host_at_level_2() {
 
 #[test]
 fn tric_matches_the_host_at_level_3() {
-    let mut s = tric_at_level(3, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
-    // level 4 is not there yet
-    has(&s.cmd("tric -O4 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
+    tric_at_level(3, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
+}
+
+/// Level 4 is everything (the host's default build): inlining, and the
+/// functions nothing reaches left out.
+#[test]
+fn tric_matches_the_host_at_level_4() {
+    let mut s = tric_at_level(4, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
+    has(&s.cmd("tric -O5 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
 }
 
 /// Real literals: the decimal is converted exactly and rounded once, ties to
@@ -418,4 +424,26 @@ fn tric_compiles_truth_values_as_the_host_does() {
     tric_same_as_host(&mut s, "vectest"); // the vector builtins (A5)
     tric_same_as_host(&mut s, "chartest"); // 3-tryte characters in literals (A6)
     tric_same_as_host(&mut s, "dstest"); // flags, 3-ary heap, B-tree (phase A)
+}
+
+/// (A debugging aid, not run by default.) `TRIC_DBG=file.tri
+/// [TRIC_LEVEL=n] cargo test -p trinux --test selfhost tric_debug_level --
+/// --ignored`: tric -On and the host's assembly of the file (which may
+/// import ../lib/...), written to dbg_tric.s and dbg_host.s in the temp
+/// directory, for diffing.
+#[test]
+#[ignore]
+fn tric_debug_level() {
+    let Ok(path) = std::env::var("TRIC_DBG") else { return };
+    let level: u8 = std::env::var("TRIC_LEVEL").ok().and_then(|l| l.parse().ok()).unwrap_or(4);
+    let src = std::fs::read_to_string(&path).unwrap();
+    let opts = trine::Options { level: Some(level), ..trine::Options::user() };
+    let want = trine::build_source("/usr/src/bin/dbg.tri", &src, Some(&trinux::user_dir().join("bin")), &opts).unwrap_or_else(|e| panic!("{e}")).asm;
+    let disk = disk_with_trine(&[], &[("dbgsrc", &src), ("dbg.s", &want)]);
+    let mut s = Session::boot_disk(&disk, false);
+    let o = s.cmd_max(&format!("cp /usr/src/dbgsrc /usr/src/bin/dbg.tri; tric -O{level} -S -o /tmp/dbg.s /usr/src/bin/dbg.tri; echo status $?; echo ====; cat /tmp/dbg.s"), 20_000_000_000);
+    let (head, tric_out) = o.split_once("====").unwrap_or((&o, ""));
+    std::fs::write(std::env::temp_dir().join("dbg_tric.s"), tric_out.trim_start()).unwrap();
+    std::fs::write(std::env::temp_dir().join("dbg_host.s"), &want).unwrap();
+    println!("{head}");
 }

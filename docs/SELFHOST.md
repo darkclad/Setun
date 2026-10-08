@@ -6,15 +6,17 @@ take the place of the host's toolchain:
 | Program | Does | Matches |
 |---|---|---|
 | `tas` | assembles `.s` into a Trinux executable (TEF) | `setun-asm`, word for word |
-| `tric` | compiles `.tri` into assembly, then runs `tas` | `trine build --user --no-opt`, character for character |
+| `tric` | compiles `.tri` into assembly, then runs `tas` | `trine build --user -On` at the same optimization level, character for character |
 
 ```text
-tric [-S] [-v] [-o OUT] FILE.tri      compile (and assemble) a program
+tric [-S] [-v] [-O level] [-o OUT] FILE.tri   compile (and assemble) a program
 tas [-r] [-o OUT] FILE.s              assemble
 ```
 
 `tric -o hello hello.tri` writes the executable `hello` (default `a.out`);
-with `-S` it writes the assembly instead (default `a.s`). `-v` reports the
+with `-S` it writes the assembly instead (default `a.s`). `-O0` (the
+default) to `-O4` choose the optimization level, as the host's `trine -On`
+(below). `-v` reports the
 program's size and the memory the compile took. Imports resolve as on the
 host: next to the importing file first, then the standard library, which
 lives in `/usr/lib/trine` (`ports.tri`, `rt.tri`, `console.tri`,
@@ -43,10 +45,12 @@ the tests hold them to its output:
 - `tas` must turn the host compiler's assembly into the same executable
   the host assembler makes (`echo` through `sh` and `wget`, 93k lines,
   and `tas` itself).
-- `tric` must write the same assembly as the host compiler with its
-  optimizer off: the same instructions, label numbers, string and real
-  pools, and global equates. The tests compare `echo`, `cat`, `sh`,
-  `edit`, `tas`, `tric`, `libctest`, `wget`, `calc` and `fputest`.
+- `tric` must write the same assembly as the host compiler at the same
+  optimization level: the same instructions, label numbers, register
+  choices, string and real pools, and global equates. Unoptimized, the
+  tests compare `echo`, `cat`, `sh`, `edit`, `tas`, `tric`, `libctest`,
+  `wget`, `calc` and `fputest`; at each of the four levels, thirteen
+  programs including `sh` and `tric` itself.
 - Its errors are the host's too: for each of 26 bad programs (lexing,
   parsing, types, layout, imports), `tric` gives the host's message at the
   same line and column, exits 1 and leaves no output file behind.
@@ -67,6 +71,30 @@ details that are easy to get wrong in a port:
   72 trits, ties to even, with subnormals at the bottom of the exponent
   range and ∞ at the top. `tric` carries a small bignum (base-3^9 limbs,
   long division a trit at a time) for this.
+- **Inlined bodies are a copy.** The host inlines from a copy of each
+  function, so its type cache (keyed by expression address) misses on a
+  function's first inlining and looks ahead again, taking labels; `tric`
+  keeps a second cache for inlined bodies to match.
+- **A for loop keeps its register.** The host gives a block's register
+  locals back at its end, but not a `for` loop's own variable; `tric`
+  copies that.
+
+## The optimizer
+
+The host's optimizer comes in four cumulative levels (`trine -O1` to
+`-O4`; `-O4`, everything, is its default), and `tric` has all four, each
+writing exactly the host's assembly at that level:
+
+| Level | What it adds | `tric`'s own size |
+|---|---|---|
+| 1 | the peephole pass (copy forwarding, retargeting, dead code, value numbering); `&&`, `\|\|`, `!` jumping straight to their targets; `if (c) break;` as one jump; loops on constant tests rotated | 61.7k lines |
+| 2 | int and pointer locals in registers (r-1..r-9, and caller-saved ones in a leaf), real locals in f registers in a leaf, direct operands, loads and stores through simple addresses, compound assignment in place, the one-adjustment frame | 54.9k |
+| 3 | left operands held in r4..r6 and f3..f9 instead of the stack, calls with their arguments straight in registers | 43.9k |
+| 4 | inlining of small functions with no real calls, and functions nothing reaches left out | (the host's default build) |
+
+Programs built with `tric -O4` are the host's own builds, about 5x fewer
+instructions run than `-O0` on the benchmark mix. `tric -O4 bin/tric.tri`
+rebuilds the compiler itself as the host builds it.
 
 ## The fixed point
 
@@ -101,15 +129,6 @@ of RAM.
 
 ## Not yet
 
-- Most of the optimizer. The host's optimizer comes in four cumulative
-  levels (`trine -O1`..`-O4`, `-O4` being everything), and `tric` has level 1
-  so far: `tric -O1` writes exactly the host's level-1 assembly (the
-  peephole pass, `&&`/`||`/`!` jumping straight to their targets, `if (c)
-  break;` as one jump, loops on constant tests rotated), checked on eleven
-  programs including `sh` and `tric` itself. Level 1 cuts 10–16% of the
-  lines; the big gain (5x fewer instructions run) is in levels 2–4:
-  register locals and direct operands, calls with arguments in registers,
-  inlining.
 - `tric` has its own lexer limits where the host is looser: a number that
   does not fit in a word is refused when it is read, where the host reads
   it and refuses it later.
