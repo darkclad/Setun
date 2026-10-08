@@ -135,7 +135,7 @@ Formats are where a ternary world either stays ternary or quietly turns into bin
 | Format | Ternary-native design | Gain over binary | Status |
 | --- | --- | --- | --- |
 | Text | One Unicode code point per tryte; an overlined character is the negated code point | Fixed width, no UTF-8 decoding, overline for free | Done |
-| Text beyond U+2671 | A lead tryte in the unused −1…−32 range followed by 2 trytes (3^18 values) covers all of Unicode; built now in tlibc, the UTF-8 border and the font path | CJK and emoji without giving up one tryte per common character | Planned |
+| Text beyond U+2671 | A lead tryte (−2 plain, −3 overlined) followed by 2 trytes in −9841…−33 covers all of Unicode; built in tlibc, the UTF-8 border and the font path | CJK and emoji without giving up one tryte per common character | Done |
 | Floating point standard | real27 / real81 written up as a standalone standard: formats, exceptions, text conversion, a test suite | A ternary IEEE 754 that other ternary machines can adopt | Partial |
 | Images | 27 levels per channel, 3^9 colours per tryte; a lossless file format whose prediction residuals are stored balanced | Residuals are signed by nature, so balanced storage needs no offset | Planned |
 | Audio | Balanced samples of one word (3 trytes, about 42.8 bits). A tryte (14.3 bits) falls short of 16-bit audio, and 2 trytes is not a power of 3 | Silence is 0 with no DC offset; the range is symmetric | Planned |
@@ -144,7 +144,7 @@ Formats are where a ternary world either stays ternary or quietly turns into bin
 
 Decided 2026-10-06:
 
-- Code points beyond U+2671 (CJK, emoji) are implemented now: 3 trytes per character, a lead tryte in −1…−32 and 2 trytes of code point.
+- Code points beyond U+2671 (CJK, emoji) are implemented now: 3 trytes per character: a lead tryte (−2, or −3 for an overlined character; −1 is left alone because `fgetc` returns it for end of file) and 2 trytes of code point, each in −9841…−33.
 - A timestamp is one word of seconds around the 1970 epoch (±120,000 years, no 2038 problem). Sub-second time is a `long` (81 trits): seconds in the top word, a base-3 fraction of a second in the lower 54 trits.
 
 ## 6. Interconnect, I/O and networking
@@ -406,13 +406,13 @@ A character is 1 or 3 trytes:
 |---|---|
 | code point c ≤ 9841 | `c` |
 | the same, overlined (c ≥ 33) | `−c` |
-| code point c > 9841 | `−1`, then c as an 18-trit balanced number in 2 trytes (high, low) |
-| the same, overlined | `−2`, then the same 2 trytes |
-| `−3 … −32` | reserved: refused by every decoder |
+| code point c > 9841 | `−2`, then with n = c − 9842 the 2 trytes −(33 + n div 9809), −(33 + n mod 9809) |
+| the same, overlined | `−3`, then the same 2 trytes |
+| `−1`, `−4 … −32` | reserved: refused by every decoder |
 
-This gives meaning to trytes −1 and −2, which ISA §1.1 now reserves ("−1…−32 mean nothing"), so §1.1 changes with it.
+This gives meaning to trytes −2 and −3, which ISA §1.1 now reserves ("−1…−32 mean nothing"), so §1.1 changes with it.
 
-- Two trytes hold 3^18 values, far more than Unicode's 1,114,112, so every code point fits.
+- The two trailing trytes give 9809² ≈ 96 million values, far more than Unicode's 1,114,112, so every code point fits.
 - Every existing file stays valid, because all text today is at or below 9841.
 - The form is not self-synchronizing: a trailing tryte can look like an ordinary character. Text is decoded forward from a known start, as Trinux does now. Backward scanning restarts from the line start.
 - `strlen` keeps counting trytes. tlibc gets `tstr_next`, `tstr_chars` and a decoder that reports errors; `utf8_encode`/`utf8_decode` handle the escape at the border.

@@ -28,11 +28,16 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 
 ## Docs
 
-- [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the ISA (v0.4 accepted; v0.5 draft adds floating-point instructions, §14)
+- [`docs/CPU.md`](docs/CPU.md): **the CPU manual**: registers, every instruction, the MMU, traps, devices and ports, the assembler, the ABI
+- [`docs/TRINUX.md`](docs/TRINUX.md): **the Trinux manual**: the shell, every command, files, processes, signals, the window system, networking, system calls and libraries
+- [`docs/TRINE.md`](docs/TRINE.md): **the Trine manual**: a tutorial and the complete language reference, builtins, the standard library, the compilers and their optimization levels
+- [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the normative ISA specification (v0.7: integer, floating-point and vector instructions)
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
-- [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the systems language (v0.2, implemented)
+- [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the compact language reference
+- [`docs/SELFHOST.md`](docs/SELFHOST.md): self-hosting: `tas` and `tric`, Trinux's own assembler and compiler (`-O0` to `-O4`, the host's output to the character)
+- [`docs/TERNARY_WORLD.md`](docs/TERNARY_WORLD.md): the plan for a more ternary system, phase by phase
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
-- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux, the Linux-modelled POSIX kernel (K1–K8 running: a POSIX-like system with a scripting shell, core utilities and a window system with a terminal)
+- [`docs/KERNEL.md`](docs/KERNEL.md): Trinux's kernel, milestone by milestone (K1–K8, users, the FPU, networking, shared memory, the vector unit)
 - [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet and SSH logins, TLS for `wget`, a web server
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)

@@ -1,6 +1,6 @@
 # Trinux: the Setun-11̅ kernel
 
-**Status: v0.1, accepted. Milestones K1–K3 are implemented** (`kernel/`, built by `mkdisk`).
+**Status: v0.1, accepted; all milestones (K1–K8, users, the FPU, networking, shared memory, the vector unit) are implemented** (`kernel/`, built by `mkdisk`). This file is the design log, milestone by milestone; [`TRINUX.md`](TRINUX.md) is the manual, by topic. Where the two differ (early plans that changed as the code was written), the manual describes the code.
 Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
 
 Trinux is a Unix kernel for Setun-11̅, **modelled on Linux** and providing

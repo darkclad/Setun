@@ -1,6 +1,6 @@
 # Trine: a C-like language for Setun-11̅
 
-**Status: v0.2, implemented by the v1 compiler (`crates/trine`, binary `trine`).**
+**Status: v0.2, implemented by the host compiler (`crates/trine`, binary `trine`) and by Trinux's own `tric`.** This file is the compact reference; [`TRINE.md`](TRINE.md) is the full manual, with a tutorial.
 §14 records the design decisions; §15 lists the changes from v0.1.
 
 Trine is the systems language for Setun-11̅: the language of the BIOS,
@@ -24,7 +24,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 ## 2. Lexical structure
 
 - **Comments:** `// to end of line` and `/* block */`, which do not nest.
-- **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`. Case matters.
+- **Identifiers:** a letter or `_`, then letters, digits and `_`; any Unicode letter or digit counts (`счёт` is a name). Case matters.
 - **Integer literals**, the same forms as the assembler:
   - `42` and `1_000` (decimal)
   - `0t1T0` = `0t11̅0` = 6 (balanced ternary: `1`, `0`, and `T` or an overlined `1` for −1, most significant first)
@@ -44,7 +44,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 | `trit` | 1 | −1, 0, +1 | three-state flags, signs. Stored in a tryte. |
 | `tryte`, alias `char` | 1 | −9 841 … 9 841 | a `char` holds one Unicode code point |
 | `int` | 3 | ±3 812 798 742 493 | the machine word: 27 trits |
-| `real` | 9 | ±3^9840, 71-trit precision, ±∞, NaN | the FPU's real81 (ISA §14): about 34 decimal digits |
+| `real` | 9 | ±3^9840, 72-trit precision, ±∞, NaN | the FPU's real81 (ISA §14): about 34 decimal digits |
 | `*T` | 3 | an address | a pointer is a word |
 | `[N]T` | N·sizeof(T), rounded up (§4) | | fixed-size array |
 | `struct S` | a multiple of 3 | | §4 |
@@ -139,7 +139,7 @@ Precedence, from highest to lowest:
 | 13 | `c ? a : b` | |
 | 14 | `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `\|=` | assignment is an expression, right-associative |
 
-**Evaluation order:** operands left to right, and function arguments left to right.
+**Evaluation order:** operands left to right, and function arguments left to right. A plain assignment evaluates its right side before the address of its left; a compound assignment takes the address first.
 
 There is **no binary `^`**. Ternary has no single "exclusive or", so the tritwise product, threshold add and consensus are builtins (§8).
 
@@ -207,7 +207,7 @@ These are not functions: each compiles to one instruction or a few.
 | `scale3(x, k)` `exponent3(x)` | x·3^k; the exponent E of x | `FSCL`, `FEXP` |
 | `fconst(k)` | 0 zero, 1 one, 2 π, 3 e, 4 ln 3, 5 log₃ e, 6 log₃ 10 (constant `k`) | `FCONST` |
 | `fclass(x)` | −3 −∞, −2 normal, −1 subnormal, 0 zero, … 3 +∞, 4 NaN | `FCLASS` |
-| `real27(x)` | x rounded to real27 precision (17 trits) | `FTOW` + `FFRW` |
+| `real27(x)` | x rounded to real27 precision (18 trits) | `FTOW` + `FFRW` |
 | `fsr()` `set_fsr(v)` | the FPU status register (flags, masks; ISA §14.4) | `FMFS`, `FMTS` |
 
 The vector builtins work memory to memory. Each vector argument is a `[3]int` or `[9]tryte` array (or an `*int` or `*tryte` to its start) whose 9 trytes start at a multiple of 9: declare it `@align(9)` (for a `[9]tryte` the compiler passes the second tryte's address, which is the vector's). A vector off that alignment traps (misaligned access); locals are only word-aligned, so vectors are globals or heap memory. They use `v1`–`v3` only.
@@ -250,7 +250,7 @@ When `main` returns, its value goes to `SYSCTL.DEBUG` and the machine powers off
 import "console.tri";
 ```
 
-`import` includes a file once, textually (a second import of the same file does nothing), and the whole program compiles as one unit. Symbol names are global. A module keeps a name private by prefixing it with `_`, which hides it from other files. **⚠ REVIEW**
+`import` includes a file once, textually (a second import of the same file does nothing), and the whole program compiles as one unit. Symbol names are global: every top-level name is visible in every file, whatever its spelling (a `_` prefix is only a convention).
 
 ## 11. Calling convention (ABI)
 
@@ -340,7 +340,7 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 6. **C division semantics** for `/` and `%`, with rounding division available through builtins.
 7. **One compilation unit** with textual `import`, and `_` for private names.
 8. **No `volatile`:** every access to addressable memory happens as written; the optimizer (§16) never removes or reorders one.
-9. **What v1 leaves out:** floats, `long`, struct values, varargs, generics and macros.
+9. **What v1 leaves out:** `long`, struct values, varargs, generics and macros. (Floats were left out at first; `real` has since been added.)
 
 ## 15. Changes from v0.1
 
@@ -376,7 +376,7 @@ func        = [ "interrupt" ] "fn" IDENT "(" [ param { "," param } ] ")" [ "->" 
 extern      = "extern" ( "fn" IDENT "(" [ param { "," param } ] ")" [ "->" type ]
                        | "var" IDENT ":" type ) ";" ;
 param       = IDENT ":" type ;
-type        = "int" | "tryte" | "char" | "trit" | "void" | IDENT
+type        = "int" | "tryte" | "char" | "trit" | "real" | "void" | IDENT
             | "*" type | "[" expr "]" type | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
 init        = expr | "{" [ init { "," init } ] "}" ;
 block       = "{" { stmt } "}" ;

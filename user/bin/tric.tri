@@ -1,11 +1,11 @@
-// tric [-S] [-o OUT] FILE.tri: the Trine compiler, in Trine.
+// tric [-S] [-v] [-O level] [-o OUT] FILE.tri: the Trine compiler, in Trine.
 //
-// It compiles as the host's `trine build --user --no-opt` does: the same
-// assembly, character for character (docs/SELFHOST.md). With -S that
-// assembly is the output; otherwise tas assembles it into a Trinux
-// executable. Imports resolve as on the host: next to the importing file
-// first, then the standard library (in /usr/lib/trine). Not yet: real
-// literals, and the optimizer.
+// It compiles as the host's `trine build --user -On` does at the same
+// level (0 to 4): the same assembly, character for character
+// (docs/SELFHOST.md). With -S that assembly is the output; otherwise tas
+// assembles it into a Trinux executable. Imports resolve as on the host:
+// next to the importing file first, then the standard library (in
+// /usr/lib/trine).
 
 import "../lib/tlibc.tri";
 import "../lib/stdlib.tri";
@@ -23,7 +23,7 @@ var stdlib_dir: *char = "/usr/lib/trine/";
 var stdlib_names: *char = "ports.tri rt.tri console.tri keymap.tri real.tri math.tri ";
 
 fn usage() -> int {
-    fputs(STDERR_FILENO, "usage: tric [-S] [-O level] [-o out] file.tri\n");
+    fputs(STDERR_FILENO, "usage: tric [-S] [-v] [-O level] [-o out] file.tri\n");
     return 2;
 }
 

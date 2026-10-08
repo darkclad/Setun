@@ -309,7 +309,7 @@ fn tric_reports_errors_as_the_host_does() {
         has(&o, &[want.as_str(), "status 1"]);
         assert!(!o.contains("bad.s"), "{name}: output left behind:\n{o}");
     }
-    has(&s.cmd("tric; echo status $?; tric /nosuch.tri; echo status $?"), &["usage: tric [-S] [-O level] [-o out] file.tri\nstatus 2", "tric: /nosuch.tri: No such file or directory\nstatus 1"]);
+    has(&s.cmd("tric; echo status $?; tric /nosuch.tri; echo status $?"), &["usage: tric [-S] [-v] [-O level] [-o out] file.tri\nstatus 2", "tric: /nosuch.tri: No such file or directory\nstatus 1"]);
 }
 
 #[test]

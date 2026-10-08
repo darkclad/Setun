@@ -2,7 +2,7 @@
 
 Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
-**Status: v0.6 draft (2026-10-05): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14) and binary operations (§3.3.1).** §13 records the decisions.
+**Status: v0.7 (2026-10-07): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14), binary operations (§3.3.1) and the ternary idioms and vector unit (§3.3, §3.4.1, §15), all implemented.** §13 records the decisions. [`CPU.md`](CPU.md) is the programmer's manual built on this specification.
 
 Setun-11̅ is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
@@ -727,22 +727,25 @@ One sector is 39 366 bytes.
 
 ## 11. Example
 
-Print "Hi" on the serial console, then halt:
+Print "Hi" on the serial console, then halt (a ROM at the reset address; `setun-asm build hi.s --rom`, then `setun --rom hi.rom`):
 
 ```
-        LIQ   r1, 'H'          ; 72
-        CALL  putc
-        LIQ   r1, 'i'          ; 105
-        CALL  putc
-        HLT
+        .org -59049
+        li    r1, 'H'          ; 72
+        call  putc
+        li    r1, 'i'          ; 105
+        call  putc
+        hlt
 
-putc:   LIQ   r3, 162          ; serial block base
-wait:   IN    r2, [r3 + 2]     ; TX_READY
-        CMPQ  r2, r2, 0
-        BRQ   BLE, wait        ; wait until TX_READY > 0
-        OUT   r1, [r3 + 0]     ; DATA
-        RET
+putc:   li    r3, 162          ; serial block base
+wait:   in    r2, [r3 + 2]     ; TX_READY
+        cmp   r2, 0
+        ble   wait             ; wait until TX_READY > 0
+        out   r1, [r3 + 0]     ; DATA
+        ret
 ```
+
+[`CPU.md`](CPU.md) §14 has more examples.
 
 ## 12. Setun-11̅ vs i386 at a glance
 

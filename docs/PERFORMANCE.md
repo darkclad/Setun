@@ -153,22 +153,24 @@ stores, JALR, the product's correction) makes one fail.
 
 Against the same code compiled natively for the host (`setun-bench
 --vs-native`, Rust ports that follow the Trine source line by line, results
-checked equal; best of several runs, Ryzen 9 5950X):
+checked equal; best of 3 runs, Ryzen 9 5950X, measured 2026-10-07):
 
 | Program | Native | Setun | Setun instructions | Overhead |
 |---|---:|---:|---:|---:|
-| mandel (fixed-point arithmetic, framebuffer) | 9.4 ms | 72 ms | 65.3M | 7.7× |
-| sieve + insertion sort (tryte array, word array) | 0.2 ms | 7.7 ms | 5.5M | 37× (180–240× before constant index offsets and value numbering) |
+| mandel (fixed-point arithmetic, framebuffer) | 9.6 ms | 74.8 ms | 61.5M | 7.8× |
+| sieve + insertion sort (tryte array, word array) | 0.15 ms | 8.4 ms | 5.45M | 56× (180–240× before constant index offsets and value numbering) |
 
 Mandelbrot is arithmetic in registers, where compiled Setun code runs at
-about 700 MIPS. The sieve and sort are memory loops, where the host compiler
+about 800 MIPS. Across runs Setun's times vary by about 4% (mandel 74.8–77.7 ms,
+the sieve and sort 8.4–8.8 ms). The native side of the sieve and sort is so
+short (0.15 ms) that its ratio moves most: 37× in an earlier run, against a
+native 0.2 ms. The sieve and sort are memory loops, where the host compiler
 still does better than Trine (the sort's inner loop is 9 Setun instructions,
 about half again what the host needs). Both run 95% compiled.
 
 ## Next
 
-- **Trine:** more locals in registers (more than nine), and branch
-  inversion (`if (c) break;` still costs a branch around a branch).
+- **Trine:** more locals in registers (more than nine).
 - **FPU arithmetic:** FALU's arithmetic and FCVTIF/FFRW go to one direct
   helper (no flag or register syncing): FCVTIF 12 -> 5 ns, but FADD, FMUL
   and FDIV stay at 20-30 ns, nearly all of it the arithmetic itself (a
