@@ -595,10 +595,10 @@ fn kleene_truth_values() {
         var t: trit = ~true;
         if (t != false) { r = r + 1000; }
         if ((false as int) != -1 || (unknown as int) != 0 || (true as int) != 1) { r = r + 10000; }
-        // binary truth: b_true and b_false are ints; any non-zero value holds
+        // binary truth: TRUE and FALSE are ints; any non-zero value holds
         var n: int = 0;
-        while (b_true) { n += 1; if (n == 3) { break; } }
-        if (b_false || !b_true || n != 3) { r = r + 100000; }
+        while (TRUE) { n += 1; if (n == 3) { break; } }
+        if (FALSE || !TRUE || n != 3) { r = r + 100000; }
         // a trit tested on purpose: as int, compared, or three ways
         var k: trit = false;
         if (k as int) { r = r + 0; } else { r = r + 1000000; }
@@ -611,7 +611,7 @@ fn kleene_truth_values() {
 
 #[test]
 fn kleene_truth_values_refused() {
-    let cases: [(&str, &str); 11] = [
+    let cases: [(&str, &str); 13] = [
         ("fn main() -> int { if (true) { return 1; } return 0; }", "a trit is not a condition"),
         ("fn main() -> int { while (false) { } return 0; }", "a trit is not a condition"),
         ("fn main() -> int { var t: trit = unknown; if (t) { return 1; } return 0; }", "sign (t)"),
@@ -619,10 +619,13 @@ fn kleene_truth_values_refused() {
         ("fn main() -> int { var t: trit = 1; return t && 1; }", "a trit is not a condition"),
         ("fn main() -> int { var t: trit = 1; return t ? 2 : 3; }", "a trit is not a condition"),
         ("fn main() -> int { var a: int = 1; if (a <=> 2) { return 1; } return 0; }", "use `a != b`"),
-        ("fn main() -> int { var done: int = false; return done; }", "binary truth is `b_true`/`b_false`"),
-        ("fn f() -> int { return true; } fn main() -> int { return f(); }", "binary truth is `b_true`/`b_false`"),
+        ("fn main() -> int { var done: int = false; return done; }", "binary truth is `TRUE`/`FALSE`"),
+        ("fn f() -> int { return true; } fn main() -> int { return f(); }", "binary truth is `TRUE`/`FALSE`"),
         ("fn f(x: int) -> int { return x; } fn main() -> int { return f(unknown); }", "found a truth value"),
         ("fn main() -> int { var unknown: int = 1; return unknown; }", ""),
+        // the binary constants are TRUE and FALSE: keywords, and the old names are gone
+        ("fn main() -> int { return b_true; }", "unknown name `b_true`"),
+        ("fn main() -> int { var TRUE: int = 2; return TRUE; }", "expected a name, found `TRUE`"),
     ];
     for (src, want) in cases {
         let e = compile_err(src);

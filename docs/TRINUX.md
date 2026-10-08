@@ -1453,7 +1453,7 @@ language with balanced integer types (`trit`, `tryte`, `int`), `char`,
   negation, not binary AND, OR and NOT. Flag words therefore use
   arithmetic (`flags / BIT % 2`), or `bin32.tri` for data from binary
   systems.
-- **Truth values.** Comparisons return an `int` (`b_true`/`b_false`). A
+- **Truth values.** Comparisons return an `int` (`TRUE`/`FALSE`). A
   `trit` cannot be used as a condition; use `sign (t) { neg: … zero: …
   pos: … }`.
 - **Structures for the kernel** have one word per field.

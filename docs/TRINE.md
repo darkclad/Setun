@@ -415,7 +415,7 @@ fn main() -> int {
 Conditions stay binary. A `trit` is refused as a condition, because tested
 the binary way `false` (−1) would count as true. Compare it (`t ==
 true`), branch three ways with `sign`, or convert it (`t as int`). For
-binary truth there are `b_true` (the `int` 1) and `b_false` (the `int` 0).
+binary truth there are `TRUE` (the `int` 1) and `FALSE` (the `int` 0).
 The three Kleene names never become an `int` implicitly: `var done: int =
 false;` is an error.
 
@@ -548,7 +548,7 @@ local of the same name hides the builtin.
 ```text
 fn var const struct return if else while for loop break continue sign
 switch case default as sizeof import extern interrupt asm true false
-unknown b_true b_false null void trit tryte int char real
+unknown TRUE FALSE null void trit tryte int char real
 ```
 
 `neg`, `zero` and `pos` are contextual: they are `sign` arm labels when
@@ -727,7 +727,7 @@ here`.
 ### 2.4 Truth types
 
 - **Binary truth** is an `int`: comparisons, `!`, `&&` and `||` give 1 or
-  0, and `b_true` and `b_false` are the `int` constants 1 and 0.
+  0, and `TRUE` and `FALSE` are the `int` constants 1 and 0.
 - **Kleene truth** is a `trit`: `true` +1, `unknown` 0, `false` −1.
 - A condition (`if`, `while`, `for`, `?:`, `!`, `&&`, `||`) takes an
   integer, a pointer, a function pointer or a real, and holds when the
@@ -762,7 +762,7 @@ Everything else is an error:
 A Kleene expression (built only from `true`, `unknown` and `false` with
 `~`, `&`, `|` and parentheses) is refused where an `int` or `tryte` is
 expected: `expected int, found a truth value (a trit): binary truth is
-`b_true`/`b_false`, or convert with `as``. A `trit` variable still
+`TRUE`/`FALSE`, or convert with `as``. A `trit` variable still
 widens to `int` implicitly.
 
 **Explicit conversions** use `as`:
@@ -1874,7 +1874,7 @@ cast        = prefix { "as" type } ;
 prefix      = ( "-" | "~" | "!" | "*" | "&" ) prefix | postfix ;
 postfix     = primary { "(" [ expr { "," expr } ] ")" | "[" expr "]" | "." IDENT } ;
 primary     = INT | REAL | CHAR | STRING
-            | "true" | "unknown" | "false" | "b_true" | "b_false" | "null"
+            | "true" | "unknown" | "false" | "TRUE" | "FALSE" | "null"
             | IDENT
             | "trit"                                  (* only before "(" *)
             | "sizeof" "(" type ")"
@@ -1909,7 +1909,7 @@ Notes:
 | `interrupt` | interrupt function |
 | `asm` | inline assembly |
 | `true`, `unknown`, `false` | the Kleene truth values, `trit` +1, 0, −1 |
-| `b_true`, `b_false` | the binary truth values, `int` 1, 0 |
+| `TRUE`, `FALSE` | the binary truth values, `int` 1, 0 |
 | `null` | the null pointer |
 | `void`, `trit`, `tryte`, `int`, `char`, `real` | types |
 

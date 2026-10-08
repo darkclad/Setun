@@ -2078,7 +2078,7 @@ impl Compiler {
         if matches!(dst, Ty::Int | Ty::Tryte) && is_truth(e) {
             return err(
                 e.pos,
-                format!("expected {}, found a truth value (a trit): binary truth is `b_true`/`b_false`, or convert with `as`", self.tyname(dst)),
+                format!("expected {}, found a truth value (a trit): binary truth is `TRUE`/`FALSE`, or convert with `as`", self.tyname(dst)),
             );
         }
         let src = src.clone().decay();

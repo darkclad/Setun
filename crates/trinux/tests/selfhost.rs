@@ -381,7 +381,7 @@ fn tas_reports_errors_with_their_lines() {
 
 
 /// Kleene truth values (TERNARY_WORLD A1): true, unknown, false as trits,
-/// b_true and b_false, & | ~ on trits, a trit tested on purpose.
+/// TRUE and FALSE, & | ~ on trits, a trit tested on purpose.
 const KLEENE: &str = "fn and3(a: trit, b: trit) -> trit { return a & b; }
 fn or3(a: trit, b: trit) -> trit { return a | b; }
 fn not3(a: trit) -> trit { return ~a; }
@@ -396,7 +396,7 @@ fn main() -> int {
     }
     var t: trit = ~true & unknown;
     var n: int = 0;
-    while (b_true) { n += 1; if (n == 3 || b_false) { break; } }
+    while (TRUE) { n += 1; if (n == 3 || FALSE) { break; } }
     sign (t) { neg: { r += 0; } zero: { r += 100; } pos: { r += 100; } }
     if ((t as int) == -1 && t == false) { return r; }
     return r + 1000;

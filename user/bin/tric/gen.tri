@@ -2726,7 +2726,7 @@ fn zero_object(frame: int, off: int, ty: int) {
 
 fn check_assign(dst: int, src: int, x: int) {
     if ((dst == t_int || dst == t_tryte) && is_truth(x)) {
-        m0(); ms("expected "); mty(dst); ms(", found a truth value (a trit): binary truth is `b_true`/`b_false`, or convert with `as`"); fail(ex_pos.p[x]);
+        m0(); ms("expected "); mty(dst); ms(", found a truth value (a trit): binary truth is `TRUE`/`FALSE`, or convert with `as`"); fail(ex_pos.p[x]);
     }
     src = decay(src);
     var ok: int = 0;

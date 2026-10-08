@@ -61,13 +61,13 @@ The arithmetic is done: Setun-11̅ has balanced integers, tritwise logic and nat
 | Integers | Tryte ±9,841, word ±3.8×10¹²; no unsigned types | Symmetric ranges, no sign extension, one compare instruction | Done |
 | Division | `DIVR` rounds to nearest; `MODR` remainder with \|r\| ≤ \|b\|/2 | Rounding falls out of the arithmetic | Done |
 | Logic primitives | `MIN` (and), `MAX` (or), `NEG` (not), `TMUL`, `TSAT`, `CONS` (consensus) | Kleene logic in one instruction; consensus has no binary equivalent | Done |
-| Truth type in languages | Trine already has `trit`, `&` (min), `\|` (max), `~` (= `-x`), `<=>` and `sign`. Missing: `true`/`unknown`/`false` as +1/0/−1, `b_true`/`b_false` for binary logic, and refusing `if` on a trit (§A1) | NULL, `Option` and "not known yet" without a separate flag | Partial |
+| Truth type in languages | Trine already has `trit`, `&` (min), `\|` (max), `~` (= `-x`), `<=>` and `sign`. Missing: `true`/`unknown`/`false` as +1/0/−1, `TRUE`/`FALSE` for binary logic, and refusing `if` on a trit (§A1) | NULL, `Option` and "not known yet" without a separate flag | Partial |
 | Logic algebra and minimization | Canonical forms and minimizers (ternary Karnaugh maps, Quine–McCluskey) for 3-valued functions | Compilers and chip design need them; the binary versions don't apply | Research |
 | Packing two-state data | `lib/flags.tri`: 42 two-state flags per word (a 42-bit two's complement number, 98% of the word's information), and Kleene vectors of 27 truth values per word, where `&`, `\|`, `~` act on all 27 lanes at once and `TCP`/`TCN` count the true and false ones | Recovers the 0.415 bit lost per flag stored alone | Done |
 
 Decided 2026-10-06:
 
-- Trine's existing `trit` type is the Kleene truth type, with `&`, `|` and `~` as and, or, not, and `true` = +1, `unknown` = 0, `false` = −1. Binary logic uses `b_false` = 0 and `b_true` = `!b_false`. An `if` on a trit does not compile; the program must say what unknown does, with `sign` (§A1).
+- Trine's existing `trit` type is the Kleene truth type, with `&`, `|` and `~` as and, or, not, and `true` = +1, `unknown` = 0, `false` = −1. Binary logic uses `FALSE` = 0 and `TRUE` = `!FALSE`. An `if` on a trit does not compile; the program must say what unknown does, with `sign` (§A1).
 - Packed flags start as a tlibc library. They become a language feature only if they see heavy use.
 
 ## 2. Physical layer and circuits
@@ -288,8 +288,10 @@ Trine already has most of a three-valued logic. `trit` is a type, `&` and `|` ar
 | `true` | `trit` | +1 | Kleene true |
 | `unknown` | `trit` | 0 | Kleene unknown (a new keyword) |
 | `false` | `trit` | −1 | Kleene false |
-| `b_false` | `int` | 0 | binary false, as in C |
-| `b_true` | `int` | `!b_false` = 1 | binary true; any non-zero value tests as true |
+| `FALSE` | `int` | 0 | binary false, as in C |
+| `TRUE` | `int` | `!FALSE` = 1 | binary true; any non-zero value tests as true |
+
+The binary constants were first spelled `b_true` and `b_false`; they became `TRUE` and `FALSE` on 2026-10-08, so that the two kinds of truth differ at a glance (lower case ternary, upper case binary).
 
 Binary logic keeps its usual rule, false is 0 and true is "not false", so +1 and −1 both test as binary true. That rule now lives only in the `b_` names and in conditions on integers.
 
@@ -306,10 +308,10 @@ Rules:
 - A condition (`if`, `while`, `for`, `?:`, `!`, `&&`, `||`) takes an integer, tested the binary way: zero is false, anything else is true.
 - An expression of type `trit` is refused as a condition, because the binary test would make `false` (−1) count as true. The error names the fix: `sign (t) { neg: … zero: … pos: … }`, or an explicit `t == true`.
 - `if (a <=> b)` is refused by the same rule; the message suggests `a != b`.
-- Comparisons (`<`, `==`, …) return `int` `b_true` or `b_false` and stay valid conditions.
+- Comparisons (`<`, `==`, …) return `int` `TRUE` or `FALSE` and stay valid conditions.
 - `true`, `false` and `unknown` do not convert to `int` implicitly. `t as int` is the explicit form.
 
-**Migration.** This changes the value of `false` from 0 to −1, so silent changes of meaning must be impossible. The last rule makes every old use of `true` or `false` as an integer a compile error. `var done: int = false`, `while (true)` and `return true` from an `int` function each stop compiling, and the fix is `b_false`, `loop { }` or `b_true`. The compiler finds every line, and the fixes go in the same change as the rule. Today no Trine code uses `true`, `false` or `unknown` outside strings and comments, so the migration starts close to empty. The bootstrapped `tric` is rebuilt to its fixed point afterwards.
+**Migration.** This changes the value of `false` from 0 to −1, so silent changes of meaning must be impossible. The last rule makes every old use of `true` or `false` as an integer a compile error. `var done: int = false`, `while (true)` and `return true` from an `int` function each stop compiling, and the fix is `FALSE`, `loop { }` or `TRUE`. The compiler finds every line, and the fixes go in the same change as the rule. Today no Trine code uses `true`, `false` or `unknown` outside strings and comments, so the migration starts close to empty. The bootstrapped `tric` is rebuilt to its fixed point afterwards.
 
 Negative tests: each refused form above gives its error and message; `true`, `false` and `unknown` assigned to an `int` without `as`; `unknown` as an identifier now refused; `t as int` accepted as a condition, because the program has said it wants integer truth; the S1–S3 fixed point still reached after the migration.
 
@@ -436,7 +438,7 @@ Negative tests: a lead tryte at the end of a string; a code point above U+10FFFF
 
 ### Decided for phase A (2026-10-06)
 
-- Truth values are ternary first: `true` = +1, `unknown` = 0, `false` = −1; binary logic uses `b_false` = 0 and `b_true` = `!b_false` (§A1).
+- Truth values are ternary first: `true` = +1, `unknown` = 0, `false` = −1; binary logic uses `FALSE` = 0 and `TRUE` = `!FALSE` (§A1).
 - `STWM` stays a 1-word instruction without an offset; the address is computed first.
 - `VDOTW` takes one weight trit per lane, in the low trit of each of the 9 tryte lanes of `vb`.
 - The 16×16 font ships in the disk image, under `/usr/share` next to `font8x8`, and `gfx.tri` loads it on demand (it became all of Unifont's planes 0 and 1, not only CJK).

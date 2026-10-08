@@ -522,8 +522,8 @@ impl Parser {
             Tok::Kw("true") => ExprKind::Truth(1),
             Tok::Kw("unknown") => ExprKind::Truth(0),
             Tok::Kw("false") => ExprKind::Truth(-1),
-            Tok::Kw("b_true") => ExprKind::Int(1),
-            Tok::Kw("b_false") => ExprKind::Int(0),
+            Tok::Kw("TRUE") => ExprKind::Int(1),
+            Tok::Kw("FALSE") => ExprKind::Int(0),
             Tok::Kw("null") => ExprKind::Null,
             // `trit` is a type, but `trit(x, i)` is the builtin.
             Tok::Kw("trit") if self.is("(") => ExprKind::Name("trit".into()),
