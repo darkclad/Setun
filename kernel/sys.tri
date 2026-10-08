@@ -89,8 +89,67 @@ fn sys_fchmodat(dirfd: int, path: int, mode: int) -> int {
     if (inodes[i].fs == FS_PROC) { return -EPERM; }
     if (!is_owner(i)) { return -EPERM; }
     inodes[i].mode = (mode % 4096 + 4096) % 4096;
-    inodes[i].mtime = in(RTC_SECONDS);
-    if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
+    inode_changed(i);
+    return 0;
+}
+
+// utimensat: a file's access and modification times. `times` is two
+// timespecs (access, modification); null, or tv_nsec UTIME_NOW, means now,
+// UTIME_OMIT leaves that time. Times are kept in whole seconds. Setting
+// both to now needs ownership or write permission, any other time
+// ownership. A null path (futimens) means the file open as `dirfd`.
+const UTIME_NOW: int = 1073741823;
+const UTIME_OMIT: int = 1073741822;
+
+fn sys_utimensat(dirfd: int, path: int, times: int, flags: int) -> int {
+    var i: int;
+    if (path == 0) {
+        var f: int = fd_file(dirfd);
+        if (f < 0) { return f; }
+        i = files[f].ino;
+    } else {
+        var r: int = get_path(path);
+        if (r < 0) { return r; }
+        var base: int = dir_base(dirfd);
+        if (base < 0) { return base; }
+        i = path_lookup(&kpath[0], base);
+        if (i < 0) { return i; }
+    }
+    var now: int = in(RTC_SECONDS);
+    var v: [2]int;                        // the new access and modification times
+    var set: [2]int;
+    var all_now: int = 1;
+    var k: int = 0;
+    while (k < 2) {
+        v[k] = now;
+        set[k] = 1;
+        k += 1;
+    }
+    if (times != 0) {
+        if (!user_range_ok(times, 12)) { return -EFAULT; }
+        var t: *int = times as *int;
+        k = 0;
+        while (k < 2) {
+            var ns: int = t[2 * k + 1];
+            if (ns == UTIME_OMIT) { set[k] = 0; }
+            else if (ns != UTIME_NOW) {
+                if (ns < 0 || ns > 999999999) { return -EINVAL; }
+                v[k] = t[2 * k];
+                all_now = 0;
+            }
+            k += 1;
+        }
+    }
+    if (inodes[i].fs != FS_TFS && inodes[i].fs != FS_RAM) { return -EPERM; }
+    if (set[0] == 0 && set[1] == 0) { return 0; }
+    if (!is_owner(i)) {
+        if (!all_now) { return -EPERM; }
+        var w: int = inode_permission(i, MAY_WRITE);
+        if (w < 0) { return w; }
+    }
+    if (set[0]) { inodes[i].atime = v[0]; }
+    if (set[1]) { inodes[i].mtime = v[1]; }
+    inode_changed(i);
     return 0;
 }
 
@@ -120,7 +179,8 @@ fn sys_linkat(olddirfd: int, oldpath: int, newdirfd: int, newpath: int) -> int {
     r = dir_add(dir, &leaf[0], leaf_len, inodes[src].ino_no);
     if (r < 0) { return r; }
     inodes[src].nlink += 1;
-    tfs_isave(src);
+    inode_changed(src);
+    inode_modified(dir);
     return 0;
 }
 

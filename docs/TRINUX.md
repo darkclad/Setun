@@ -435,7 +435,7 @@ links): `misc` (busybox style), `tools`, `useradm`, `reboot`, and
 
 | Command | Synopsis | Description |
 |---|---|---|
-| `ls` | `ls [-al] [path ...]` | list directories, sorted by name. `-a` shows dot files; `-l` the long form with owner and group names, and `s`/`t` (or `S`/`T`) for the set-ID and sticky bits |
+| `ls` | `ls [-acltur] [path ...]` | list directories, sorted by name. `-a` shows dot files; `-l` the long form with owner and group names, `s`/`t` (or `S`/`T`) for the set-ID and sticky bits, and the modification time (`Oct  8 13:30` within six months, `Oct  8  2024` otherwise); `-t` sorts by that time, newest first; `-u` uses the access time, `-c` the change time; `-r` reverses the order |
 | `cat` | `cat [file ...]` | copy files, or standard input (also for `-`), to standard output |
 | `cp` | `cp source target`, `cp source ... dir` | copy files |
 | `mv` | `mv source target` | rename within one file system |
@@ -443,13 +443,15 @@ links): `misc` (busybox style), `tools`, `useradm`, `reboot`, and
 | `rm` | `rm [-d] file ...` | remove files; `-d` also empty directories |
 | `mkdir` | `mkdir [-p] dir ...` | make directories; `-p` makes missing parents |
 | `rmdir` | `rmdir dir ...` | remove empty directories |
-| `touch` | `touch file ...` | create empty files; existing files are left alone |
+| `touch` | `touch [-acm] [-r file \| -d date \| -t [[CC]YY]MMDDhhmm[.SS]] file ...` | set the access and modification times (now, or from the reference file, a date, or a stamp), making missing files (not with `-c`); `-a` or `-m` sets only that time. A date is `@SECONDS[.FRACTION]` or `YYYY-MM-DD[ HH:MM[:SS]]`, UTC |
 | `chmod` | `chmod mode file ...` | octal mode, or `[ugoa][+-=][rwx]` |
 | `chown` | `chown owner[:group] file ...` | change owner (and group); names or numbers |
 | `chgrp` | `chgrp group file ...` | change group |
+| `stat` | `stat [-c format] file ...` | a file's inode: size, blocks, inode, links, mode, owner, and the access, modification and change times; `-c` with `%n %s %b %i %h %u %g %U %G %a %A %F %X %Y %Z %x %y %z %%` |
+| `time` | `time command [args]` | run the command, then `real 1.234` (seconds, the monotonic clock) on stderr; its exit status (127 if it cannot run). No user and sys times: Trinux does not keep them |
 | `basename` | `basename path [suffix]` | |
 | `dirname` | `dirname path` | |
-| `find` | `find [path ...] [expression]` | tests `-name pattern`, `-type c`, `-maxdepth n`, `-mindepth n`, `!`; actions `-print`, `-exec cmd {} ;` |
+| `find` | `find [path ...] [expression]` | tests `-name pattern`, `-type c`, `-newer file`, `-mtime [+-]n` (whole days), `-mmin [+-]n` (minutes), `-maxdepth n`, `-mindepth n`, `!`; actions `-print`, `-exec cmd {} ;` |
 | `df` | `df [path ...]` | free space in blocks of 3^9 trytes; default `/` and `/tmp` |
 | `sync` | `sync` | write every dirty buffer to disk |
 | `mount` | `mount`, `mount -t type source dir` | list mounts (`/proc/mounts`), or mount `ramfs`/`tmpfs` or `proc` (root) |
@@ -503,7 +505,7 @@ quits.
 |---|---|---|
 | `ps` | `ps` | processes from `/proc`: PID, PPID, PGID, state, time, command |
 | `kill` | `kill [-sig] pid ...` | signal by number or name (`-9`, `-KILL`, `-SIGKILL`); default `SIGTERM` (the shell's builtin also takes `%job`) |
-| `sleep` | `sleep seconds` | whole seconds |
+| `sleep` | `sleep seconds` | seconds, with a fraction allowed (`0.25`); the clock ticks every 1/100 s |
 | `env` | `env [-i] [NAME=v ...] [cmd [args]]` | run a command with a changed environment, or print it; `-i` starts from an empty one. Status 127 not found, 126 not runnable |
 | `printenv` | `printenv [NAME]` | |
 | `true`, `false` | | |
@@ -522,7 +524,7 @@ quits.
 | `useradd` | `useradd [-u uid] [-G group,...] [-d home] [-s shell] [-c comment] name` | `/sbin`; a new user with a private group (same name and number, from 1000 up), a home owned by it, and a locked password |
 | `userdel` | `userdel [-r] name` | `/sbin`; removes the user, its group and its memberships; `-r` also the home directory |
 | `uname` | `uname [-asnrvm]` | |
-| `date` | `date [+format]` | UTC; default format `%a %b %e %H:%M:%S UTC %Y`; see `strftime` (§16.2) |
+| `date` | `date [-u] [-d date \| -r file] [+format]` | now, a date (as `touch -d`) or a file's modification time; UTC (`-u` is accepted); default format `%a %b %e %H:%M:%S UTC %Y`; `strftime`'s conversions (§16.2) and `%N`, the nanoseconds |
 | `clear` | `clear` | `ESC[H ESC[2J` |
 | `reboot`, `poweroff`, `halt` | | `/sbin`; §2.5 |
 | `ntpdate` | `ntpdate [-q] [-p port] server` | §4.6 |
@@ -1601,6 +1603,7 @@ descriptor (`EBADF`). Structures have one word per field. Time values are
 | 79 | `newfstatat` | `dirfd, path, buf, flags` | 0 | `flags` ignored (no symbolic links) |
 | 80 | `fstat` | `fd, buf` | 0 | |
 | 81 | `sync` | none | 0 | |
+| 88 | `utimensat` | `dirfd, path, times, flags` | 0 | `times` two timespecs (access, modification) or null (both now); `tv_nsec` `UTIME_NOW` (1073741823) or `UTIME_OMIT` (1073741822); a null path means the file open as `dirfd` (`futimens`); now needs ownership or write permission, other times ownership (`EPERM`); kept in whole seconds; `EINVAL`, `EFAULT`, `EPERM` (procfs, devices) |
 | 82 | `fsync` | `fd` | 0 | `EIO` |
 
 `struct stat` is: dev, ino, mode, nlink, uid, gid, rdev, size, blksize,
@@ -1770,7 +1773,7 @@ The error and signal constants (`EPERM` … `EINPROGRESS`, `SIGHUP` …
 | `ctype.tri` | `isdigit`, `isupper`, `islower`, `isalpha`, `isalnum`, `isspace`, `isxdigit`, `isprint`, `ispunct`, `toupper`, `tolower` (ASCII classes; `isprint` also accepts overlined printable ASCII) |
 | `stdlib.tri` | `malloc`, `free`, `calloc`, `realloc`, `malloc_usable_size`, `strdup`, `strndup`, `strtol(s, end, base)` (bases 2–36; `ERANGE` clamps at ±(3^27−1)/2), `atoi`, `abs`, `setenv`, `unsetenv`, `qsort(a, n, cmp)` |
 | `stdio.tri` | `FILE` streams: `stdin()`, `stdout()`, `stderr()`, `fopen(path, "r"\|"w"\|"a"\|"r+")`, `fdopen`, `fflush`, `fclose`, `fgetc`, `ungetc`, `fgets`, `feof`, `ferror`, `fputc`, `fwrite_chars`, `fputs_f`, `fput_int`, `fput_padded`, `put_padded`; `BUFSIZ` 2187, `EOF` −1 |
-| `time.tri` | `time`, `gmtime_r(t, *tm)`, `is_leap`, `days_in_month`, `strftime(buf, max, fmt, *tm)` with `%Y %m %d %e %H %M %S %a %b %j %%` (UTC only) |
+| `time.tri` | `time`, `gmtime_r(t, *tm)` and `timegm(*tm)` (any year, 400-year eras), `time_days(y, m, d)`, `is_leap`, `days_in_month`, `strftime(buf, max, fmt, *tm)` with `%Y %C %y %m %d %e %j %H %I %M %S %p %a %A %b %h %B %u %w %s %Z %T %R %D %F %n %t %%` (UTC only), `parse_date(s, *timespec)`. Precise time is a `long`: t / 3^54 seconds (the top word the seconds, the lower 54 trits a base-3 fraction): `LTIME_SECOND`, `ltime_from_ts`, `ltime_to_ts`, `ltime_now(clock)`, `ltime_seconds`, `ltime_text(t, digits, out)`, `ltime_parse(s, end)` |
 | `getopt.tri` | `getopt(argc, argv, opts)` with `optarg`, `optind`, `optopt`; clusters, arguments, a leading `:` for missing arguments, `--` |
 
 `malloc` is first fit over a free list in words, grown by `sbrk` 27 pages
@@ -1858,9 +1861,10 @@ and §14.
 4. **No threads.** `clone` exists only in its fork form. Processes share
    memory through `MAP_SHARED|MAP_ANONYMOUS` and synchronize with `futex`.
 5. **No symbolic links**, and hard links only on tfs. `lstat` is `stat`.
-6. **Times.** Inodes keep one time: `stat` reports the modification time as
-   atime, mtime and ctime. `touch` does not update the time of an existing
-   file. There is no `utime`.
+6. **Times** are whole seconds: `utimensat` drops the nanoseconds, and
+   `stat` has no `st_atim`/`st_mtim`/`st_ctim`. The access time follows
+   Linux's `relatime`: a read sets it only when it is older than the
+   modification or change time, or a day old. Only `ITIMER_REAL` exists.
 7. **Missing calls.** `truncate`, `select` (use `poll`), real-time
    signals and every timer but `ITIMER_REAL` do not exist. `vfork` is a
    fork (the parent does not wait for the child's `execve`).

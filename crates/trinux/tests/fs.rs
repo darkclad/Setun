@@ -85,7 +85,7 @@ fn assert_clean(disk: &[i16]) {
 fn k6_files_survive_a_reboot() {
     let (out, mut m) = session(
         &default_disk(),
-        &["echo persist > /home/note", "mkdir /home/docs", "echo deep > /home/docs/d.txt", "mv /home/note /home/docs/note", "poweroff"],
+        &["echo persist > /home/note", "mkdir /home/docs", "echo deep > /home/docs/d.txt", "mv /home/note /home/docs/note", "touch -m -d @1000000000 /home/docs/d.txt", "touch -a -d @1500000000 /home/docs/d.txt", "poweroff"],
         200_000_000,
     );
     assert_has(&out, &["reboot: Power down"]);
@@ -99,9 +99,10 @@ fn k6_files_survive_a_reboot() {
     assert_eq!(fs.sb(tfs::SB_STATE), 1, "cleanly unmounted");
     assert_clean(&disk);
     // A second boot of the same disk sees the files.
-    let (out, _) = session(&disk, &["cat /home/docs/note /home/docs/d.txt", "ls /home/docs", "exit"], 150_000_000);
+    // (the times first: reading d.txt would set its atime)
+    let (out, _) = session(&disk, &["stat -c '%X %Y' /home/docs/d.txt", "cat /home/docs/note /home/docs/d.txt", "ls /home/docs", "exit"], 150_000_000);
     assert!(!out.contains("not cleanly unmounted"), "{out}");
-    assert_has(&out, &["$ cat /home/docs/note /home/docs/d.txt\npersist\ndeep\n", "$ ls /home/docs\nd.txt\nnote\n"]);
+    assert_has(&out, &["1500000000 1000000000\n", "$ cat /home/docs/note /home/docs/d.txt\npersist\ndeep\n", "$ ls /home/docs\nd.txt\nnote\n"]);
 }
 
 #[test]
@@ -190,7 +191,7 @@ fn k6_initramfs_root_still_boots() {
     // is the most that fits beside the kernel in 729 pages of RAM. The
     // test programs and the network and crypto tools no longer fit in
     // that, and are not needed to boot.
-    let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest"];
+    let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest", "/sbin/telnetd", "/bin/nc", "/bin/paint", "/bin/colors"];
     let files: Vec<_> = trinux::default_files().into_iter().filter(|(name, _)| !heavy.iter().any(|h| name.contains(h))).collect();
     let disk = trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Initramfs).unwrap_or_else(|e| panic!("{e}")).trytes;
     let (out, _) = session(&disk, &["echo ramfs root", "ls /proc/1", "exit"], 100_000_000);

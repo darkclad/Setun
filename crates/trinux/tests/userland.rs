@@ -185,6 +185,79 @@ fn scripts_run_their_interpreter() {
 }
 
 #[test]
+fn time_tools() {
+    // touch with dates, stamps and a reference; stat; ls -l times and -t;
+    // date -d / -r and %N; find -newer, -mtime, -mmin; sleep with a
+    // fraction; time. The clock starts at 2026-09-21 14:13:20 UTC.
+    let out = session(
+        &[
+            "touch -d '2024-10-08 15:06:40' /tmp/a; stat -c '%X %Y' /tmp/a",
+            "touch -t 202001021530.45 /tmp/b; stat -c '%X %Y %y' /tmp/b",
+            "touch -m -d @1000000000 /tmp/a; stat -c 'A %X M %Y' /tmp/a",
+            "touch -a -r /tmp/b /tmp/a; stat -c 'A %X M %Y' /tmp/a",
+            "touch /tmp/c",
+            "touch -c /tmp/none; ls /tmp/none",
+            "touch -d bogus /tmp/a; echo status $?",
+            "touch -t 2020013 /tmp/a; echo status $?",
+            "ls -l /tmp/a /tmp/c",
+            "ls -t /tmp; ls -tr /tmp",
+            "ls -lu /tmp/a",
+            "date -d @1728400000 +%F_%T; date -d @1.5 +%s.%N; date -r /tmp/a +%s",
+            "date -d nope; echo status $?",
+            "stat /tmp/b",
+            "find /tmp -type f -newer /tmp/b",
+            "find /tmp -type f -mtime +1000",
+            "find /tmp -type f -mtime -1; find /tmp -type f -mmin -5",
+            "find /tmp -mtime x; echo status $?",
+            "sleep 0.3; echo slept",
+            "sleep -1; echo status $?; sleep 1x; echo status $?",
+            "time sleep 0.5",
+            "time false; echo status $?",
+            "time nosuchcmd; echo status $?",
+            // a non-owner: now needs write permission, other times ownership
+            "touch /tmp/own; chmod 644 /tmp/own; su user -c 'touch /tmp/own'; echo status $?",
+            "su user -c 'touch -d @5 /tmp/own'; echo status $?",
+            "chmod 666 /tmp/own; su user -c 'touch /tmp/own'; echo now-ok $?; su user -c 'touch -d @5 /tmp/own'; echo status $?",
+        ],
+        3_000_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "1728400000 1728400000",
+            "1577979045 1577979045 2020-01-02 15:30:45 UTC",
+            "A 1728400000 M 1000000000",
+            "A 1577979045 M 1000000000",
+            "ls: /tmp/none: No such file or directory",
+            "touch: invalid date: bogus\nstatus 1",
+            "touch: invalid date: 2020013\nstatus 1",
+            "Sep  9  2001 /tmp/a",
+            "Sep 21 14:1",
+            "ls -tr /tmp\nc\nb\na\na\nb\nc\n",
+            "Jan  2  2020 /tmp/a",
+            "2024-10-08_15:06:40\n1.500000000\n1000000000",
+            "date: invalid date: nope\nstatus 1",
+            "  File: /tmp/b",
+            "regular file",
+            "Modify: 2020-01-02 15:30:45 UTC",
+            "-type f -newer /tmp/b\n/tmp/c\n",
+            "-mtime +1000\n/tmp/b\n/tmp/a\n", // (directory order)
+            "-mmin -5\n/tmp/c\n/tmp/c\n",
+            "expected a number after -mtime\nstatus 1",
+            "slept",
+            "sleep: invalid time\nstatus 1\nsleep: invalid time\nstatus 1",
+            "real 0.5",
+            "real 0.",
+            "status 1",
+            "status 127",
+            "touch: /tmp/own: Permission denied\nstatus 1",
+            "touch: /tmp/own: Operation not permitted\nstatus 1",
+            "now-ok 0\ntouch: /tmp/own: Operation not permitted\nstatus 1",
+        ],
+    );
+}
+
+#[test]
 fn k7_shell_errors() {
     let out = session(
         &[
@@ -797,7 +870,7 @@ fn k7_utilities() {
             "2:apple\n4:apple\n1\nCherry\nban",
             "date\nfound\nbanana\n",
             "banana\nf\n",
-            "-rw-r--r-- 2 root     root          31 /home/f\n-rw------- 2 root     root          31 /home/f2\n-rwxr--r-- 2 root     root          31 /home/f\n",
+            "-rw-r--r-- 2 root     root          31 Sep 21 14:13 /home/f\n-rw------- 2 root     root          31 Sep 21 14:13 /home/f2\n-rwxr--r-- 2 root     root          31 Sep 21 14:13 /home/f\n",
             "file\ny\n/usr/lib\n.\n/\n",
             "3\n4\n5\nA=1\nB=2\n/root\nprintenv-status 1\n",
             "is-file\nis-dir\ncompound\n",
@@ -876,7 +949,7 @@ fn k7_utility_errors() {
             "usage: basename path [suffix]\nstatus 1\n",
             "rmdir: /tmp: Device or resource busy\nstatus 1\n",
             "rmdir: /nope: No such file or directory\nstatus 1\n",
-            "usage: date [+format]\nstatus 1\n",
+            "usage: date [-u] [-d date | -r file] [+format]\nstatus 1\n",
         ],
     );
 }

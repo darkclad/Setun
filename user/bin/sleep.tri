@@ -1,13 +1,21 @@
-// sleep seconds: suspend for a whole number of seconds.
+// sleep seconds: suspend for that many seconds, which may have a fraction
+// ("0.25"; the clock ticks every 1/100 s).
 
 import "../lib/tlibc.tri";
+import "../lib/time.tri";
 
 fn main(argc: int, argv: **char) -> int {
     if (argc != 2) { fputs(STDERR_FILENO, "usage: sleep seconds\n"); return 2; }
-    var n: int = 0;
-    var k: int = 0;
-    while (argv[1][k] >= '0' && argv[1][k] <= '9') { n = n * 10 + argv[1][k] - '0'; k += 1; }
-    if (k == 0 || argv[1][k] != 0) { fputs(STDERR_FILENO, "sleep: invalid time\n"); return 1; }
-    sleep(n);
+    var end: *char;
+    var t: long = ltime_parse(argv[1], &end);
+    var s: *char = argv[1];
+    if (end == s || *end != 0 || s[0] == '-' || s[0] == '+' || s[0] == '.') { fputs(STDERR_FILENO, "sleep: invalid time\n"); return 1; }
+    var req: timespec;
+    ltime_to_ts(t, &req);
+    var rem: timespec;
+    while (nanosleep(&req, &rem) < 0 && errno == EINTR) {
+        req.tv_sec = rem.tv_sec;
+        req.tv_nsec = rem.tv_nsec;
+    }
     return 0;
 }

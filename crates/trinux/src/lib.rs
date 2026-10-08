@@ -153,7 +153,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     // One multi-call program under many names (hard links on tfs).
     for applet in [
         "rmdir", "basename", "dirname", "env", "printenv", "uname", "date", "clear", "seq", "tee", "yes", "kill", "test", "[",
-        "id", "whoami", "groups", "chown", "chgrp",
+        "id", "whoami", "groups", "chown", "chgrp", "stat", "time",
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }

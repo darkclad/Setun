@@ -952,20 +952,29 @@ fn do_diff(argc: int, argv: **char) -> int {
 
 // ---- find -------------------------------------------------------------------------------------
 //
-// find [path ...] [-name pat] [-type f|d|c|p] [-maxdepth n] [-mindepth n]
-//      [-print] [-exec cmd ... ;] with ! before a test to negate it; tests
-// are all ANDed, and with no -print or -exec, matches are printed.
+// find [path ...] [-name pat] [-type f|d|c|p] [-newer file] [-mtime [+-]n]
+//      [-mmin [+-]n] [-maxdepth n] [-mindepth n] [-print] [-exec cmd ... ;]
+// with ! before a test to negate it; tests are all ANDed, and with no
+// -print or -exec, matches are printed. -newer: modified after the file
+// was; -mtime n: modified n whole days ago (+n more, -n fewer); -mmin the
+// same in minutes.
 
 const F_NAME: int = 1;
 const F_TYPE: int = 2;
 const F_PRINT: int = 3;
 const F_EXEC: int = 4;
+const F_NEWER: int = 5;
+const F_AGE: int = 6;                 // -mtime / -mmin: ft_num = the unit in seconds
 
 var ft_kind: [27]int;
 var ft_neg: [27]int;
 var ft_arg: [27]*char;
 var ft_exec: [27]int;                 // -exec: index of its command in argv
 var ft_exec_n: [27]int;               // and its word count
+var ft_num: [27]int;                  // -newer: the file's mtime; -mtime/-mmin: the unit
+var ft_cmp: [27]int;                  // -mtime/-mmin: n, and ft_sign -1, 0, +1 for -n, n, +n
+var ft_sign: [27]int;
+var find_now: int;
 var nft: int;
 var find_argv: **char;
 var find_action: int;
@@ -1011,6 +1020,16 @@ fn find_visit(path: *char, depth: int) {
                 var t: char = ft_arg[k][0];
                 hit = (t == 'f' && S_ISREG(st.st_mode)) || (t == 'd' && S_ISDIR(st.st_mode))
                     || (t == 'c' && S_ISCHR(st.st_mode)) || (t == 'p' && S_ISFIFO(st.st_mode));
+            } else if (ft_kind[k] == F_NEWER) { hit = st.st_mtime > ft_num[k]; }
+            else if (ft_kind[k] == F_AGE) {
+                var age: int = find_now - st.st_mtime;
+                var units: int = age / ft_num[k];
+                if (age < 0 && age % ft_num[k] != 0) { units -= 1; }
+                sign (ft_sign[k]) {
+                    neg: { hit = units < ft_cmp[k]; }
+                    zero: { hit = units == ft_cmp[k]; }
+                    pos: { hit = units > ft_cmp[k]; }
+                }
             } else if (ft_kind[k] == F_PRINT) { puts(path); puts("\n"); }
             else if (ft_kind[k] == F_EXEC) { hit = find_run(k, path); }
             if (ft_neg[k]) { hit = !hit; }
@@ -1067,6 +1086,29 @@ fn do_find(argc: int, argv: **char) -> int {
             }
             nft += 1;
             i += 2;
+        } else if (streq(a, "-newer")) {
+            if (i + 1 >= argc) { return fail("missing argument to ", a); }
+            var rs: stat_t;
+            if (stat(argv[i + 1], &rs) < 0) { perror2("find", argv[i + 1]); return 1; }
+            ft_kind[nft] = F_NEWER;
+            ft_num[nft] = rs.st_mtime;
+            nft += 1;
+            i += 2;
+        } else if (streq(a, "-mtime") || streq(a, "-mmin")) {
+            if (i + 1 >= argc) { return fail("missing argument to ", a); }
+            var na: *char = argv[i + 1];
+            var sg: int = 0;
+            if (na[0] == '+') { sg = 1; na = &na[1]; } else if (na[0] == '-') { sg = -1; na = &na[1]; }
+            if (!isdigit(na[0])) { return fail("expected a number after ", a); }
+            var q: int = 0;
+            while (isdigit(na[q])) { q += 1; }
+            if (na[q] != 0) { return fail("expected a number after ", a); }
+            ft_kind[nft] = F_AGE;
+            ft_num[nft] = streq(a, "-mtime") ? 86400 : 60;
+            ft_cmp[nft] = atoi(na);
+            ft_sign[nft] = sg;
+            nft += 1;
+            i += 2;
         } else if (streq(a, "-maxdepth") || streq(a, "-mindepth")) {
             if (i + 1 >= argc || !isdigit(argv[i + 1][0])) { return fail("expected a number after ", a); }
             if (streq(a, "-maxdepth")) { find_maxdepth = atoi(argv[i + 1]); } else { find_mindepth = atoi(argv[i + 1]); }
@@ -1090,6 +1132,9 @@ fn do_find(argc: int, argv: **char) -> int {
             return fail("unknown predicate: ", a);
         }
     }
+    var now: timespec;
+    clock_gettime(CLOCK_REALTIME, &now);
+    find_now = now.tv_sec;
     if (npaths == 0) { find_visit(".", 0); }
     else {
         var p: int = 1;

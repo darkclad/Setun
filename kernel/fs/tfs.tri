@@ -234,7 +234,9 @@ fn tfs_iload(i: int) -> int {
     inodes[i].mode = mode % 4096;
     inodes[i].nlink = p[DI_NLINK];
     inodes[i].size = p[DI_SIZE];
+    inodes[i].atime = p[DI_ATIME];
     inodes[i].mtime = p[DI_MTIME];
+    inodes[i].ctime = p[DI_CTIME];
     inodes[i].uid = p[DI_UID];
     inodes[i].gid = p[DI_GID];
     if (inodes[i].size < 0 || inodes[i].nlink < 0) { return tfs_bad("size", inodes[i].size, ino); }
@@ -247,8 +249,9 @@ fn tfs_isave(i: int) {
     dinode_set(ino, DI_MODE, st_mode(i));
     dinode_set(ino, DI_NLINK, inodes[i].nlink);
     dinode_set(ino, DI_SIZE, inodes[i].size);
+    dinode_set(ino, DI_ATIME, inodes[i].atime);
     dinode_set(ino, DI_MTIME, inodes[i].mtime);
-    dinode_set(ino, DI_CTIME, inodes[i].mtime);
+    dinode_set(ino, DI_CTIME, inodes[i].ctime);
     dinode_set(ino, DI_UID, inodes[i].uid);
     dinode_set(ino, DI_GID, inodes[i].gid);
 }
@@ -351,7 +354,6 @@ fn tfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
         done += chunk;
     }
     if (pos + done > inodes[i].size) { inodes[i].size = pos + done; }
-    inodes[i].mtime = in(RTC_SECONDS);
     tfs_isave(i);
     return done;
 }
@@ -387,7 +389,6 @@ fn tfs_truncate(i: int) -> int {
     if (d != null && *d != 0) { var v2: int = *d; free_indirect(v2, 2); bfree(v2); dinode_set(ino, DI_DOUBLE, 0); }
     dinode_set(ino, DI_BLOCKS, 0);
     inodes[i].size = 0;
-    inodes[i].mtime = in(RTC_SECONDS);
     tfs_isave(i);
     return 0;
 }
@@ -480,7 +481,6 @@ fn dir_add(i: int, s: *char, len: int, ino: int) -> int {
     var r: int = dir_set(i, slots, ino, s, len);
     if (r < 0) { return r; }
     inodes[i].size = (slots + 1) * DIRENT;
-    inodes[i].mtime = in(RTC_SECONDS);
     tfs_isave(i);
     return 0;
 }
@@ -571,7 +571,6 @@ fn tfs_unlink(dir: int, s: *char, len: int, i: int) -> int {
     } else {
         inodes[i].nlink -= 1;
     }
-    inodes[dir].mtime = in(RTC_SECONDS);
     tfs_isave(dir);
     tfs_isave(i);
     return 0;

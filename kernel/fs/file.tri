@@ -379,9 +379,9 @@ fn fill_stat(i: int, buf: int) -> int {
     st.st_size = node.type == I_REG || node.type == I_DIR ? node.size : 0;
     st.st_blksize = PAGE;
     st.st_blocks = (st.st_size + PAGE - 1) / PAGE;
-    st.st_atime = node.mtime;
+    st.st_atime = node.atime;
     st.st_mtime = node.mtime;
-    st.st_ctime = node.mtime;
+    st.st_ctime = node.ctime;
     return 0;
 }
 
@@ -425,6 +425,7 @@ fn sys_getdents64(fd: int, buf: int, n: int) -> int {
     if (inodes[dir].type != I_DIR) { return -ENOTDIR; }
     if (!user_range_ok(buf, n)) { return -EFAULT; }
     if ((buf + 1) % 3 != 0) { return -EINVAL; }          // must hold whole words
+    inode_accessed(dir);                                // reading a directory reads its data
     var used: int = 0;
     var name: [81]char;
     var info: [2]int;

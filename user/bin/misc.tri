@@ -2,11 +2,12 @@
 //
 //   rmdir dir ...        basename path [suffix]   dirname path
 //   env [NAME=v ...] [cmd [args]]                 printenv [NAME]
-//   uname [-asnrvm]      date [+format]           clear
+//   uname [-asnrvm]      date [-u] [-d date | -r file] [+format]   clear
 //   seq [first] last     tee [-a] [file ...]      yes [word]
 //   kill [-sig] pid ...  test / [ expression      sleep is separate
 //   id [user]            whoami                   groups [user]
 //   chown owner[:group] file ...                  chgrp group file ...
+//   stat [-c format] file ...                     time command [args]
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
@@ -148,17 +149,203 @@ fn do_uname(argc: int, argv: **char) -> int {
     return 0;
 }
 
+// fmt with %N (the nanoseconds, nine digits) put in, for strftime
+fn expand_nanos(fmt: *char, ns: int, out: *char, max: int) {
+    var at: int = 0;
+    var i: int = 0;
+    while (fmt[i] != 0 && at < max - 12) {
+        if (fmt[i] == '%' && fmt[i + 1] == 'N') {
+            var d: int = 100000000;
+            while (d > 0) { out[at] = ('0' + ns / d % 10) as char; at += 1; d /= 10; }
+            i += 2;
+            continue;
+        }
+        if (fmt[i] == '%' && fmt[i + 1] != 0) { out[at] = '%'; out[at + 1] = fmt[i + 1]; at += 2; i += 2; continue; }
+        out[at] = fmt[i];
+        at += 1;
+        i += 1;
+    }
+    out[at] = 0;
+}
+
+// date [-u] [-d date | -r file] [+format]: now (or that date, or the
+// file's modification time), UTC. -u is accepted: Trinux keeps UTC only.
 fn do_date(argc: int, argv: **char) -> int {
+    var u: *char = "date [-u] [-d date | -r file] [+format]";
     var fmt: *char = "%a %b %e %H:%M:%S UTC %Y";
-    if (argc > 2 || (argc == 2 && argv[1][0] != '+')) { return usage("date [+format]"); }
-    if (argc == 2) { fmt = &argv[1][1]; }
+    var ts: timespec;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    var i: int = 1;
+    while (i < argc && argv[i][0] == '-') {
+        if (streq(argv[i], "-u")) { i += 1; continue; }
+        if (i + 1 >= argc) { return usage(u); }
+        if (streq(argv[i], "-d")) {
+            if (parse_date(argv[i + 1], &ts) < 0) {
+                fputs(STDERR_FILENO, "date: invalid date: ");
+                fputs(STDERR_FILENO, argv[i + 1]);
+                fputs(STDERR_FILENO, "\n");
+                return 1;
+            }
+        } else if (streq(argv[i], "-r")) {
+            var st: stat_t;
+            if (stat(argv[i + 1], &st) < 0) { perror2("date", argv[i + 1]); return 1; }
+            ts.tv_sec = st.st_mtime;
+            ts.tv_nsec = 0;
+        } else {
+            return usage(u);
+        }
+        i += 2;
+    }
+    if (i < argc) {
+        if (argv[i][0] != '+' || i + 1 < argc) { return usage(u); }
+        fmt = &argv[i][1];
+    }
+    var f2: [243]char;
+    expand_nanos(fmt, ts.tv_nsec, &f2[0], 243);
     var t: tm;
-    gmtime_r(time(null), &t);
+    gmtime_r(ts.tv_sec, &t);
     var buf: [243]char;
-    strftime(&buf[0], 243, fmt, &t);
+    strftime(&buf[0], 243, &f2[0], &t);
     puts(&buf[0]);
     puts("\n");
     return 0;
+}
+
+fn type_name(m: int) -> *char {
+    if (S_ISDIR(m)) { return "directory"; }
+    if (S_ISCHR(m)) { return "character special file"; }
+    if (S_ISFIFO(m)) { return "fifo"; }
+    if (m / 4096 % 16 == 12) { return "socket"; }
+    return "regular file";
+}
+
+fn put_octal(v: int, width: int) {
+    var d: [15]char;
+    var n: int = 0;
+    loop {
+        d[n] = ('0' + v % 8) as char;
+        n += 1;
+        v /= 8;
+        if (v == 0) { break; }
+    }
+    while (n < width) { d[n] = '0'; n += 1; }
+    while (n > 0) { n -= 1; write(STDOUT_FILENO, &d[n], 1); }
+}
+
+fn put_perm(m: int) {
+    var b: [11]char;
+    b[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISFIFO(m) ? 'p' : '-';
+    var bits: *char = "rwxrwxrwx";
+    var k: int = 0;
+    var w: int = 256;
+    while (k < 9) {
+        b[k + 1] = m / w % 2 != 0 ? bits[k] : '-';
+        w /= 2;
+        k += 1;
+    }
+    b[10] = 0;
+    puts(&b[0]);
+}
+
+fn put_when(label: *char, t: int) {
+    var b: tm;
+    gmtime_r(t, &b);
+    var buf: [81]char;
+    strftime(&buf[0], 81, "%Y-%m-%d %H:%M:%S UTC", &b);
+    puts(label);
+    puts(&buf[0]);
+    puts("\n");
+}
+
+// stat [-c format] file ...: a file's inode. The format's conversions are
+// %n name, %s size, %b blocks, %i inode, %h links, %u %g owner and group
+// IDs, %U %G their names, %a mode (octal), %A mode (rwx), %F type, %X %Y
+// %Z the access, modification and change times (seconds), %x %y %z the
+// same as dates, %% a percent sign.
+fn do_stat(argc: int, argv: **char) -> int {
+    var fmt: *char = null;
+    var i: int = 1;
+    if (i + 1 < argc && streq(argv[i], "-c")) { fmt = argv[i + 1]; i += 2; }
+    if (i >= argc) { return usage("stat [-c format] file ..."); }
+    var status: int = 0;
+    while (i < argc) {
+        var st: stat_t;
+        if (stat(argv[i], &st) < 0) { perror2("stat", argv[i]); status = 1; i += 1; continue; }
+        if (fmt == null) {
+            puts("  File: "); puts(argv[i]); puts("\n");
+            puts("  Size: "); put_int(st.st_size); puts("  Blocks: "); put_int(st.st_blocks);
+            puts("  IO Block: "); put_int(st.st_blksize); puts("  "); puts(type_name(st.st_mode)); puts("\n");
+            puts("Device: "); put_int(st.st_dev); puts("  Inode: "); put_int(st.st_ino); puts("  Links: "); put_int(st.st_nlink); puts("\n");
+            puts("Access: ("); put_octal(st.st_mode % 4096, 4); puts("/"); put_perm(st.st_mode);
+            puts(")  Uid: ("); put_int(st.st_uid); puts("/"); puts(user_name(st.st_uid));
+            puts(")  Gid: ("); put_int(st.st_gid); puts("/"); puts(group_name(st.st_gid)); puts(")\n");
+            put_when("Access: ", st.st_atime);
+            put_when("Modify: ", st.st_mtime);
+            put_when("Change: ", st.st_ctime);
+        } else {
+            var k: int = 0;
+            while (fmt[k] != 0) {
+                if (fmt[k] != '%' || fmt[k + 1] == 0) { write(STDOUT_FILENO, &fmt[k], 1); k += 1; continue; }
+                k += 1;
+                var c: int = fmt[k];
+                k += 1;
+                if (c == 'n') { puts(argv[i]); }
+                else if (c == 's') { put_int(st.st_size); }
+                else if (c == 'b') { put_int(st.st_blocks); }
+                else if (c == 'i') { put_int(st.st_ino); }
+                else if (c == 'h') { put_int(st.st_nlink); }
+                else if (c == 'u') { put_int(st.st_uid); }
+                else if (c == 'g') { put_int(st.st_gid); }
+                else if (c == 'U') { puts(user_name(st.st_uid)); }
+                else if (c == 'G') { puts(group_name(st.st_gid)); }
+                else if (c == 'a') { put_octal(st.st_mode % 4096, 1); }
+                else if (c == 'A') { put_perm(st.st_mode); }
+                else if (c == 'F') { puts(type_name(st.st_mode)); }
+                else if (c == 'X') { put_int(st.st_atime); }
+                else if (c == 'Y') { put_int(st.st_mtime); }
+                else if (c == 'Z') { put_int(st.st_ctime); }
+                else if (c == 'x' || c == 'y' || c == 'z') {
+                    var tt: int = c == 'x' ? st.st_atime : c == 'y' ? st.st_mtime : st.st_ctime;
+                    var b2: tm;
+                    gmtime_r(tt, &b2);
+                    var buf2: [81]char;
+                    strftime(&buf2[0], 81, "%Y-%m-%d %H:%M:%S UTC", &b2);
+                    puts(&buf2[0]);
+                }
+                else if (c == '%') { puts("%"); }
+                else { puts("%"); write(STDOUT_FILENO, &fmt[k - 1], 1); }
+            }
+            puts("\n");
+        }
+        i += 1;
+    }
+    return status;
+}
+
+// time command [args]: run it and write how long it took (the monotonic
+// clock, in seconds with three places) to stderr as "real 1.234"; the
+// exit status is the command's (127 if it cannot be run). Trinux keeps no
+// per-process CPU times, so there is no user or sys line.
+fn do_time(argc: int, argv: **char) -> int {
+    if (argc < 2) { return usage("time command [args]"); }
+    var t0: long = ltime_now(CLOCK_MONOTONIC);
+    var pid: int = fork();
+    if (pid < 0) { perror2("time", "fork"); return 1; }
+    if (pid == 0) {
+        execvp(argv[1], argv + 1);
+        perror2("time", argv[1]);
+        _exit(127);
+    }
+    var ws: int;
+    while (waitpid(pid, &ws, 0) < 0 && errno == EINTR) { }
+    var dt: long = ltime_now(CLOCK_MONOTONIC) - t0;
+    var b: [81]char;
+    ltime_text(dt, 3, &b[0]);
+    fputs(STDERR_FILENO, "real ");
+    fputs(STDERR_FILENO, &b[0]);
+    fputs(STDERR_FILENO, "\n");
+    if (WIFEXITED(ws)) { return WEXITSTATUS(ws); }
+    return 128 + WTERMSIG(ws);
 }
 
 fn do_seq(argc: int, argv: **char) -> int {
@@ -412,6 +599,8 @@ fn main(argc: int, argv: **char) -> int {
     if (streq(me, "printenv")) { return do_printenv(argc, argv); }
     if (streq(me, "uname")) { return do_uname(argc, argv); }
     if (streq(me, "date")) { return do_date(argc, argv); }
+    if (streq(me, "stat")) { return do_stat(argc, argv); }
+    if (streq(me, "time")) { return do_time(argc, argv); }
     if (streq(me, "clear")) { puts("\e[H\e[2J"); return 0; }
     if (streq(me, "seq")) { return do_seq(argc, argv); }
     if (streq(me, "tee")) { return do_tee(argc, argv); }

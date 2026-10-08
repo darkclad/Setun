@@ -1,4 +1,10 @@
-// time.h for tlibc: time, gmtime and a small strftime-like formatter (UTC only).
+// time.h for tlibc: time, gmtime, timegm and strftime (UTC only), and
+// precise time as a `long`.
+//
+// A timestamp is one word of seconds around 1970-01-01 UTC (+-120,000
+// years). Precise time is a long (81 trits): t / 3^54 seconds, so the top
+// word holds the seconds (rounded) and the lower 54 trits a balanced
+// base-3 fraction of a second, about 3.9e-26 s per step.
 
 import "tlibc.tri";
 
@@ -28,29 +34,58 @@ fn days_in_month(m: int, y: int) -> int {
     return 31;
 }
 
+// floor(a / b) for b > 0
+fn time_fdiv(a: int, b: int) -> int {
+    var q: int = a / b;
+    if (a % b < 0) { q -= 1; }
+    return q;
+}
+
+// The day number (0 = 1970-01-01) of a date in the proleptic Gregorian
+// calendar, m 1..12 (H. Hinnant's days_from_civil, in 400-year eras).
+fn time_days(y: int, m: int, d: int) -> int {
+    if (m <= 2) { y -= 1; }
+    var era: int = time_fdiv(y, 400);
+    var yoe: int = y - era * 400;                      // 0..399
+    var mp: int = (m + 9) % 12;                        // March = 0
+    var doy: int = (153 * mp + 2) / 5 + d - 1;
+    var doe: int = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
 // Seconds since 1970-01-01 UTC into broken-down time.
 fn gmtime_r(t: int, out: *tm) -> *tm {
-    var days: int = t / 86400;
-    var secs: int = t % 86400;
-    if (secs < 0) { secs += 86400; days -= 1; }
+    var days: int = time_fdiv(t, 86400);
+    var secs: int = t - days * 86400;
     out.tm_hour = secs / 3600;
     out.tm_min = secs / 60 % 60;
     out.tm_sec = secs % 60;
     out.tm_wday = ((days % 7) + 11) % 7;               // 1970-01-01 was a Thursday
-    var y: int = 1970;
-    loop {
-        var len: int = is_leap(y) ? 366 : 365;
-        if (days >= 0 && days < len) { break; }
-        if (days < 0) { y -= 1; days += is_leap(y) ? 366 : 365; }
-        else { days -= len; y += 1; }
-    }
+    // civil_from_days
+    var z: int = days + 719468;
+    var era: int = time_fdiv(z, 146097);
+    var doe: int = z - era * 146097;
+    var yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    var y: int = yoe + era * 400;
+    var doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    var mp: int = (5 * doy + 2) / 153;
+    var d: int = doy - (153 * mp + 2) / 5 + 1;
+    var m: int = mp < 10 ? mp + 3 : mp - 9;            // 1..12
+    if (m <= 2) { y += 1; }
     out.tm_year = y - 1900;
-    out.tm_yday = days;
-    var m: int = 0;
-    while (days >= days_in_month(m, y)) { days -= days_in_month(m, y); m += 1; }
-    out.tm_mon = m;
-    out.tm_mday = days + 1;
+    out.tm_mon = m - 1;
+    out.tm_mday = d;
+    out.tm_yday = days - time_days(y, 1, 1);
     return out;
+}
+
+// Broken-down UTC time (fields normalized: months, days, hours... out of
+// range carry over) to seconds since 1970-01-01.
+fn timegm(t: *tm) -> int {
+    var y: int = t.tm_year + 1900 + time_fdiv(t.tm_mon, 12);
+    var m: int = t.tm_mon - time_fdiv(t.tm_mon, 12) * 12;
+    var days: int = time_days(y, m + 1, 1) + t.tm_mday - 1;
+    return ((days * 24 + t.tm_hour) * 60 + t.tm_min) * 60 + t.tm_sec;
 }
 
 fn put2(buf: *char, at: int, v: int, pad: char) -> int {
@@ -65,38 +100,273 @@ fn put_str(buf: *char, at: int, s: *char) -> int {
     return at;
 }
 
-// %Y %m %d %e %H %M %S %a %b %j %s %%; anything else is copied. Returns the length.
+var time_day_names: [7]*char = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+var time_month_names: [12]*char = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+
+fn put_abbr(buf: *char, at: int, s: *char) -> int {
+    var k: int = 0;
+    while (k < 3 && s[k] != 0) { buf[at] = s[k]; at += 1; k += 1; }
+    return at;
+}
+
+// strftime's conversions: %Y %C %y %m %d %e %j %H %I %M %S %p %a %A %b %h
+// %B %u %w %s %Z (UTC) %T (%H:%M:%S) %R (%H:%M) %D (%m/%d/%y) %F
+// (%Y-%m-%d) %n %t %%; anything else is copied. Returns the length.
 fn strftime(buf: *char, max: int, fmt: *char, t: *tm) -> int {
-    var days: *char = "SunMonTueWedThuFriSat";
-    var months: *char = "JanFebMarAprMayJunJulAugSepOctNovDec";
     var at: int = 0;
     var i: int = 0;
-    while (fmt[i] != 0 && at < max - 12) {
+    while (fmt[i] != 0 && at < max - 1) {
         if (fmt[i] != '%') { buf[at] = fmt[i]; at += 1; i += 1; continue; }
+        if (at > max - 16) { break; }            // a conversion writes at most 15
         i += 1;
         var c: char = fmt[i];
         if (c == 0) { break; }
         i += 1;
-        var num: [15]char;
+        var num: [28]char;
+        var y: int = t.tm_year + 1900;
         switch (c) {
-            case 'Y': at = put_str(buf, at, itoa(t.tm_year + 1900, &num[0]));
+            case 'Y': at = put_str(buf, at, itoa(y, &num[0]));
+            case 'C': at = put2(buf, at, time_fdiv(y, 100) % 100 < 0 ? 0 : time_fdiv(y, 100) % 100, '0');
+            case 'y': at = put2(buf, at, (y % 100 + 100) % 100, '0');
             case 'm': at = put2(buf, at, t.tm_mon + 1, '0');
             case 'd': at = put2(buf, at, t.tm_mday, '0');
             case 'e': at = put2(buf, at, t.tm_mday, ' ');
             case 'H': at = put2(buf, at, t.tm_hour, '0');
+            case 'I': at = put2(buf, at, (t.tm_hour + 11) % 12 + 1, '0');
             case 'M': at = put2(buf, at, t.tm_min, '0');
             case 'S': at = put2(buf, at, t.tm_sec, '0');
+            case 'p': at = put_str(buf, at, t.tm_hour < 12 ? "AM" : "PM");
             case 'j': {
                 var d: int = t.tm_yday + 1;
                 buf[at] = ('0' + d / 100) as char;
                 at = put2(buf, at + 1, d % 100, '0');
             }
-            case 'a': { var k: int = 0; while (k < 3) { buf[at] = days[3 * t.tm_wday + k]; at += 1; k += 1; } }
-            case 'b': { var k2: int = 0; while (k2 < 3) { buf[at] = months[3 * t.tm_mon + k2]; at += 1; k2 += 1; } }
+            case 'a': at = put_abbr(buf, at, time_day_names[t.tm_wday]);
+            case 'A': at = put_str(buf, at, time_day_names[t.tm_wday]);
+            case 'b', 'h': at = put_abbr(buf, at, time_month_names[t.tm_mon]);
+            case 'B': at = put_str(buf, at, time_month_names[t.tm_mon]);
+            case 'u': { buf[at] = ('0' + (t.tm_wday + 6) % 7 + 1) as char; at += 1; }
+            case 'w': { buf[at] = ('0' + t.tm_wday) as char; at += 1; }
+            case 's': at = put_str(buf, at, itoa(timegm(t), &num[0]));
+            case 'Z': at = put_str(buf, at, "UTC");
+            case 'T': {
+                at = put2(buf, at, t.tm_hour, '0');
+                buf[at] = ':';
+                at = put2(buf, at + 1, t.tm_min, '0');
+                buf[at] = ':';
+                at = put2(buf, at + 1, t.tm_sec, '0');
+            }
+            case 'R': {
+                at = put2(buf, at, t.tm_hour, '0');
+                buf[at] = ':';
+                at = put2(buf, at + 1, t.tm_min, '0');
+            }
+            case 'D': {
+                at = put2(buf, at, t.tm_mon + 1, '0');
+                buf[at] = '/';
+                at = put2(buf, at + 1, t.tm_mday, '0');
+                buf[at] = '/';
+                at = put2(buf, at + 1, (y % 100 + 100) % 100, '0');
+            }
+            case 'F': {
+                at = put_str(buf, at, itoa(y, &num[0]));
+                buf[at] = '-';
+                at = put2(buf, at + 1, t.tm_mon + 1, '0');
+                buf[at] = '-';
+                at = put2(buf, at + 1, t.tm_mday, '0');
+            }
+            case 'n': { buf[at] = '\n'; at += 1; }
+            case 't': { buf[at] = '\t'; at += 1; }
             case '%': { buf[at] = '%'; at += 1; }
             default: { buf[at] = '%'; buf[at + 1] = c; at += 2; }
         }
     }
     buf[at] = 0;
     return at;
+}
+
+// ---- precise time: a long, t / 3^54 seconds ----
+
+// 3^54: one second
+var LTIME_SECOND: long = 58149737003040059690390169;
+
+fn ltime_from_ts(ts: *timespec) -> long {
+    return (ts.tv_sec as long) * LTIME_SECOND + ((ts.tv_nsec as long) * LTIME_SECOND + 500000000) / 1000000000;
+}
+
+// The whole seconds below t (floor) and the nanoseconds past them.
+fn ltime_to_ts(t: long, ts: *timespec) {
+    var s: long = t / LTIME_SECOND;
+    var r: long = t % LTIME_SECOND;
+    if (r < 0) {
+        s -= 1;
+        r += LTIME_SECOND;
+    }
+    var ns: int = ((r * 1000000000 + LTIME_SECOND / 2) / LTIME_SECOND) as int;
+    if (ns == 1000000000) {
+        s += 1;
+        ns = 0;
+    }
+    ts.tv_sec = s as int;
+    ts.tv_nsec = ns;
+}
+
+// A clock (CLOCK_REALTIME, CLOCK_MONOTONIC) now, as a long.
+fn ltime_now(clk: int) -> long {
+    var ts: timespec;
+    if (clock_gettime(clk, &ts) < 0) { return 0; }
+    return ltime_from_ts(&ts);
+}
+
+// Whole seconds: t rounded toward minus infinity.
+fn ltime_seconds(t: long) -> int {
+    var s: long = t / LTIME_SECOND;
+    if (t % LTIME_SECOND < 0) { s -= 1; }
+    return s as int;
+}
+
+// t in decimal seconds with `digits` places (0..27), rounded to nearest,
+// into out (at least 42 + digits trytes). Returns the length.
+fn ltime_text(t: long, digits: int, out: *char) -> int {
+    var at: int = 0;
+    if (t < 0) {
+        out[0] = '-';
+        at = 1;
+        t = -t;
+    }
+    var s: long = t / LTIME_SECOND;
+    var r: long = t % LTIME_SECOND;
+    var frac: [28]char;
+    var k: int = 0;
+    while (k < digits) {
+        r *= 10;
+        frac[k] = ('0' + (r / LTIME_SECOND) as int) as char;
+        r %= LTIME_SECOND;
+        k += 1;
+    }
+    if (2 * r >= LTIME_SECOND) {
+        // round up: carry through the digits into the seconds
+        k = digits - 1;
+        while (k >= 0 && frac[k] == '9') { frac[k] = '0'; k -= 1; }
+        if (k >= 0) { frac[k] = (frac[k] + 1) as char; } else { s += 1; }
+    }
+    var whole: [41]char;
+    var n: int = 0;
+    loop {
+        whole[n] = ('0' + (s % 10) as int) as char;
+        n += 1;
+        s /= 10;
+        if (s == 0) { break; }
+    }
+    while (n > 0) { n -= 1; out[at] = whole[n]; at += 1; }
+    if (digits > 0) {
+        out[at] = '.';
+        at += 1;
+        k = 0;
+        while (k < digits) { out[at] = frac[k]; at += 1; k += 1; }
+    }
+    out[at] = 0;
+    return at;
+}
+
+// Decimal seconds ("-12", "1.5", "0.000001") as a long; *end (if not null)
+// is set past what was read. Up to 12 fraction digits count (the rest are
+// read and dropped).
+fn ltime_parse(s: *char, end: **char) -> long {
+    var neg: int = 0;
+    if (*s == '-' || *s == '+') {
+        neg = *s == '-';
+        s = s + 1;
+    }
+    var sec: long = 0;
+    while (*s >= '0' && *s <= '9') {
+        sec = sec * 10 + (*s - '0');
+        s = s + 1;
+    }
+    var num: long = 0;
+    var den: long = 1;
+    if (*s == '.') {
+        s = s + 1;
+        var k: int = 0;
+        while (*s >= '0' && *s <= '9') {
+            if (k < 12) {
+                num = num * 10 + (*s - '0');
+                den *= 10;
+            }
+            k += 1;
+            s = s + 1;
+        }
+    }
+    if (end != null) { *end = s; }
+    var t: long = sec * LTIME_SECOND + (num * LTIME_SECOND + den / 2) / den;
+    return neg ? -t : t;
+}
+
+// ---- dates as text ----
+
+// A run of digits at s[*at] (at most `max`): its value, or -1 if none.
+fn date_num(s: *char, at: *int, max: int) -> int {
+    var v: int = 0;
+    var n: int = 0;
+    while (n < max && s[*at] >= '0' && s[*at] <= '9') {
+        v = v * 10 + s[*at] - '0';
+        *at += 1;
+        n += 1;
+    }
+    return n > 0 ? v : -1;
+}
+
+// A date into ts: "@SECONDS[.FRACTION]" (seconds since 1970, may be
+// negative), or "YYYY-MM-DD", optionally followed by " " or "T" and
+// "HH:MM", ":SS" and ".FRACTION" (UTC). Returns 0, or -1 if s is not one.
+fn parse_date(s: *char, ts: *timespec) -> int {
+    if (s[0] == '@') {
+        var end: *char;
+        var t: long = ltime_parse(s + 1, &end);
+        if (end == s + 1 || *end != 0) { return -1; }
+        ltime_to_ts(t, ts);
+        return 0;
+    }
+    var at: int = 0;
+    var neg: int = 0;
+    if (s[0] == '-') { neg = 1; at = 1; }
+    var y: int = date_num(s, &at, 6);
+    if (y < 0 || s[at] != '-') { return -1; }
+    if (neg) { y = -y; }
+    at += 1;
+    var mo: int = date_num(s, &at, 2);
+    if (mo < 1 || mo > 12 || s[at] != '-') { return -1; }
+    at += 1;
+    var d: int = date_num(s, &at, 2);
+    if (d < 1 || d > days_in_month(mo - 1, y)) { return -1; }
+    var h: int = 0;
+    var mi: int = 0;
+    var sec: int = 0;
+    var ns: int = 0;
+    if (s[at] == ' ' || s[at] == 'T') {
+        at += 1;
+        h = date_num(s, &at, 2);
+        if (h < 0 || h > 23 || s[at] != ':') { return -1; }
+        at += 1;
+        mi = date_num(s, &at, 2);
+        if (mi < 0 || mi > 59) { return -1; }
+        if (s[at] == ':') {
+            at += 1;
+            sec = date_num(s, &at, 2);
+            if (sec < 0 || sec > 60) { return -1; }
+            if (s[at] == '.') {
+                var end2: *char;
+                var f: long = ltime_parse(s + at, &end2);
+                if (end2 == s + at + 1) { return -1; }
+                var fts: timespec;
+                ltime_to_ts(f, &fts);
+                ns = fts.tv_nsec;
+                at = (end2 - s) as int;
+            }
+        }
+    }
+    if (s[at] != 0) { return -1; }
+    ts.tv_sec = ((time_days(y, mo, d) * 24 + h) * 60 + mi) * 60 + sec;
+    ts.tv_nsec = ns;
+    return 0;
 }

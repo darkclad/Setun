@@ -67,7 +67,9 @@ struct Inode {
     fs: int;                          // FS_*
     mnt: int;                         // the mount it belongs to, or -1 (pipes)
     ino_no: int;                      // tfs: the disk inode; procfs: what it shows
-    mtime: int;                       // seconds (RTC)
+    atime: int;                       // seconds (RTC): the data last read (relatime),
+    mtime: int;                       // ...last written,
+    ctime: int;                       // ...the inode last changed
     parent: int;                      // ramfs: the directory containing it
     child: int;                       // ramfs DIR: first child, or -1
     sibling: int;                     // ramfs: next entry in the parent, or -1
@@ -139,6 +141,41 @@ fn copy_str(dst: *char, src: *char, max: int) {
     dst[k] = 0;
 }
 
+// ---- times ---------------------------------------------------------------------------------
+//
+// As Linux: writing data sets mtime and ctime; changing the inode (mode,
+// owner, links, its name) sets ctime; reading sets atime "relatime": only
+// when it is older than mtime or ctime, or a day old, so reads rarely cost
+// a disk write. A directory's entries are its data.
+
+fn inode_save(i: int) {
+    if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
+}
+
+fn inode_changed(i: int) {
+    inodes[i].ctime = in(RTC_SECONDS);
+    inode_save(i);
+}
+
+fn inode_modified(i: int) {
+    var now: int = in(RTC_SECONDS);
+    inodes[i].mtime = now;
+    inodes[i].ctime = now;
+    inode_save(i);
+}
+
+fn inode_accessed(i: int) {
+    var fs: int = inodes[i].fs;
+    if (fs != FS_TFS && fs != FS_RAM) { return; }
+    var n: *Inode = &inodes[i];
+    var now: int = in(RTC_SECONDS);
+    if (n.atime <= n.mtime || n.atime <= n.ctime || now - n.atime >= 86400) {
+        if (n.atime == now) { return; }
+        n.atime = now;
+        inode_save(i);
+    }
+}
+
 // ---- the inode table -------------------------------------------------------------------
 
 fn touch(i: int) -> int {
@@ -189,6 +226,8 @@ fn inode_init(i: int, type: int, mode: int, fs: int, mnt: int) {
     n.mnt = mnt;
     n.ino_no = 0;
     n.mtime = in(RTC_SECONDS);
+    n.atime = n.mtime;
+    n.ctime = n.mtime;
     n.parent = i;
     n.child = -1;
     n.sibling = -1;
@@ -439,8 +478,9 @@ fn vfs_create(path: *char, cwd: int, type: int, mode: int) -> int {
     if (fs == FS_PROC) { return -EACCES_; }
     var w: int = inode_permission(dir, MAY_WRITE + MAY_EXEC);
     if (w < 0) { return w; }
-    if (fs == FS_TFS) { return tfs_create(dir, &leaf[0], leaf_len, type, mode); }
-    return ram_create(dir, &leaf[0], leaf_len, type, mode);
+    var r: int = fs == FS_TFS ? tfs_create(dir, &leaf[0], leaf_len, type, mode) : ram_create(dir, &leaf[0], leaf_len, type, mode);
+    if (r >= 0) { inode_modified(dir); }
+    return r;
 }
 
 // Make every directory along an absolute `path` (like mkdir -p); returns the last.
@@ -490,9 +530,12 @@ fn vfs_unlink(path: *char, cwd: int, want_dir: int) -> int {
         if (n.type == I_DIR) { inodes[dir].nlink -= 1; }
         n.nlink = 0;
     }
+    inode_modified(dir);
     if (n.nlink <= 0 || n.type == I_DIR) {
         n.unlinked = 1;
         inode_release(i);
+    } else {
+        inode_changed(i);                // a link fewer
     }
     return 0;
 }
@@ -543,7 +586,12 @@ fn vfs_rename(oldpath: *char, newpath: *char, cwd: int) -> int {
     }
     var fs: int = inodes[od].fs;
     if (fs == FS_PROC) { return -EACCES_; }
-    if (fs == FS_TFS) { return tfs_rename(od, &leaf2[0], olen, src, nd, &leaf[0], leaf_len, dst); }
+    if (fs == FS_TFS) {
+        var tr: int = tfs_rename(od, &leaf2[0], olen, src, nd, &leaf[0], leaf_len, dst);
+        if (tr < 0) { return tr; }
+        renamed(od, nd, src);
+        return 0;
+    }
     // ramfs
     if (leaf_len > RAM_NAME_MAX) { return -ENAMETOOLONG; }
     if (dst >= 0) {
@@ -560,7 +608,15 @@ fn vfs_rename(oldpath: *char, newpath: *char, cwd: int) -> int {
         inodes[od].nlink -= 1;
         inodes[nd].nlink += 1;
     }
+    renamed(od, nd, src);
     return 0;
+}
+
+// after a rename: both directories' entries changed, and the file's name
+fn renamed(od: int, nd: int, src: int) {
+    inode_modified(od);
+    if (nd != od) { inode_modified(nd); }
+    inode_changed(src);
 }
 
 // The name of `child` inside directory `parent` into buf. Returns its length.
@@ -619,25 +675,32 @@ fn stat_ino(i: int) -> int { return inodes[i].fs == FS_RAM ? i : inodes[i].ino_n
 
 fn vfs_read(i: int, pos: int, buf: *tryte, n: int) -> int {
     var fs: int = inodes[i].fs;
-    if (fs == FS_TFS) { return tfs_read(i, pos, buf, n); }
     if (fs == FS_PROC) { return proc_read(i, pos, buf, n); }
-    return ram_read(i, pos, buf, n);
+    var r: int = fs == FS_TFS ? tfs_read(i, pos, buf, n) : ram_read(i, pos, buf, n);
+    if (r >= 0) { inode_accessed(i); }
+    return r;
 }
 
 fn vfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
     var fs: int = inodes[i].fs;
     inode_gen += 1;
     inodes[i].gen = inode_gen;
-    if (fs == FS_TFS) { return tfs_write(i, pos, buf, n); }
     if (fs == FS_PROC) { return -EACCES_; }
-    return ram_write(i, pos, buf, n);
+    var r: int = fs == FS_TFS ? tfs_write(i, pos, buf, n) : ram_write(i, pos, buf, n);
+    if (r > 0) { inode_modified(i); }
+    return r;
 }
 
 fn vfs_truncate(i: int) -> int {
     inode_gen += 1;
     inodes[i].gen = inode_gen;
-    if (inodes[i].fs == FS_TFS) { return tfs_truncate(i); }
-    inodes[i].size = 0;
+    if (inodes[i].fs == FS_TFS) {
+        var r: int = tfs_truncate(i);
+        if (r < 0) { return r; }
+    } else {
+        inodes[i].size = 0;
+    }
+    inode_modified(i);
     return 0;
 }
 

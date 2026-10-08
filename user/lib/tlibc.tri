@@ -158,6 +158,12 @@ fn chdir(path: *char) -> int { return _ret(syscall(49, path)); }
 fn rmdir(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, AT_REMOVEDIR)); }
 fn unlink(path: *char) -> int { return _ret(syscall(35, AT_FDCWD, path, 0)); }
 fn rename(old: *char, new: *char) -> int { return _ret(syscall(38, AT_FDCWD, old, AT_FDCWD, new)); }
+// a file's access and modification times: times[0], times[1] (null: both
+// now; tv_nsec UTIME_NOW now, UTIME_OMIT unchanged); whole seconds kept
+const UTIME_NOW: int = 1073741823;
+const UTIME_OMIT: int = 1073741822;
+fn utimensat(dirfd: int, path: *char, times: *timespec, flags: int) -> int { return _ret(syscall(88, dirfd, path, times, flags)); }
+fn futimens(fd: int, times: *timespec) -> int { return _ret(syscall(88, fd, 0, times, 0)); }
 fn sync() { syscall(81); }
 fn fsync(fd: int) -> int { return _ret(syscall(82, fd)); }
 

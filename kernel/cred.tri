@@ -220,7 +220,7 @@ fn do_chown(i: int, u: int, g: int) -> int {
         if (inodes[i].mode / S_ISUID % 2 != 0) { inodes[i].mode -= S_ISUID; }
         if (inodes[i].mode / S_ISGID % 2 != 0) { inodes[i].mode -= S_ISGID; }
     }
-    if (inodes[i].fs == FS_TFS) { tfs_isave(i); }
+    inode_changed(i);
     return 0;
 }
 

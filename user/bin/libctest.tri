@@ -366,6 +366,115 @@ fn system_calls() {
     ok("EFAULT: execve with a bad path", fails(execve(1000 as *char, null, null), EFAULT));
 }
 
+// gmtime, timegm, strftime and dates; precise time as a long; the three
+// inode times
+fn times_and_dates() {
+    var t: tm;
+    var b: [81]char;
+    gmtime_r(-1, &t);
+    strftime(&b[0], 81, "%F %T", &t);
+    ok("gmtime before 1970", streq(&b[0], "1969-12-31 23:59:59"));
+    gmtime_r(-62135596800, &t);                         // the first day of year 1
+    strftime(&b[0], 81, "%Y-%m-%d %a", &t);
+    ok("gmtime of year 1", streq(&b[0], "1-01-01 Mon"));
+    gmtime_r(3786825600000, &t);                        // a hundred thousand years on
+    ok("gmtime far ahead", t.tm_year + 1900 == 121969 && timegm(&t) == 3786825600000);
+    gmtime_r(951782400, &t);                            // 2000-02-29
+    ok("gmtime of 2000-02-29", t.tm_mon == 1 && t.tm_mday == 29 && t.tm_yday == 59 && t.tm_wday == 2);
+    var k: int = -100000;
+    var round: int = 1;
+    while (k < 100000) {
+        var v: int = k * 7777777;
+        gmtime_r(v, &t);
+        if (timegm(&t) != v) { round = 0; }
+        k += 1111;
+    }
+    ok("timegm undoes gmtime", round);
+    t.tm_year = 126;
+    t.tm_mon = 13;                                      // February 2027
+    t.tm_mday = 0;                                      // the last of January
+    t.tm_hour = 25;
+    t.tm_min = 0;
+    t.tm_sec = 0;
+    gmtime_r(timegm(&t), &t);
+    strftime(&b[0], 81, "%F %T", &t);
+    ok("timegm normalizes", streq(&b[0], "2027-02-01 01:00:00"));
+    gmtime_r(1728400000, &t);
+    strftime(&b[0], 81, "%A %B %y %I%p %u %w %s %D %R %Z %C", &t);
+    ok("strftime conversions", streq(&b[0], "Tuesday October 24 03PM 2 2 1728400000 10/08/24 15:06 UTC 20"));
+    // precise time
+    var ts: timespec;
+    ts.tv_sec = 1728400000;
+    ts.tv_nsec = 123456789;
+    var l: long = ltime_from_ts(&ts);
+    ltime_text(l, 9, &b[0]);
+    ok("a timespec as a long", streq(&b[0], "1728400000.123456789") && ltime_seconds(l) == 1728400000);
+    var back: timespec;
+    ltime_to_ts(l, &back);
+    ok("and back", back.tv_sec == 1728400000 && back.tv_nsec == 123456789);
+    ltime_text(ltime_parse("-0.25", null), 3, &b[0]);
+    ok("negative time", streq(&b[0], "-0.250"));
+    ltime_to_ts(ltime_parse("-0.25", null), &back);
+    ok("negative time as a timespec", back.tv_sec == -1 && back.tv_nsec == 750000000);
+    ltime_text(ltime_parse("2.9999999", null), 3, &b[0]);
+    ok("rounding carries into the seconds", streq(&b[0], "3.000"));
+    ltime_text(LTIME_SECOND / 3, 6, &b[0]);
+    ok("a third of a second", streq(&b[0], "0.333333"));
+    ok("the top word holds the seconds", ((l >> 54) as int) == 1728400000);
+    ok("subtraction gives durations", ltime_parse("10.5", null) - ltime_parse("8.5", null) == ltime_parse("2", null) && ltime_parse("10.5", null) - ltime_parse("8.25", null) - ltime_parse("2.25", null) <= 1);
+    // dates
+    ok("parse_date @", parse_date("@1728400000.5", &ts) == 0 && ts.tv_sec == 1728400000 && ts.tv_nsec == 500000000);
+    ok("parse_date YYYY-MM-DD HH:MM:SS", parse_date("2024-10-08 15:06:40", &ts) == 0 && ts.tv_sec == 1728400000);
+    ok("parse_date T and a fraction", parse_date("2024-10-08T15:06:40.25", &ts) == 0 && ts.tv_sec == 1728400000 && ts.tv_nsec == 250000000);
+    ok("parse_date before 1970", parse_date("1969-07-20 20:17", &ts) == 0 && ts.tv_sec == -14182980);
+    ok("parse_date refuses February 30", parse_date("2024-02-30", &ts) < 0);
+    ok("parse_date refuses 24:00", parse_date("2024-02-03 24:00", &ts) < 0);
+    ok("parse_date refuses junk", parse_date("2024-02-03x", &ts) < 0 && parse_date("@", &ts) < 0 && parse_date("@1x", &ts) < 0);
+    // the inode's times
+    var fd: int = open("/home/tm", O_WRONLY + O_CREAT + O_TRUNC, 420);
+    close(fd);
+    var tv: [2]timespec;
+    tv[0].tv_sec = 1000000000;
+    tv[0].tv_nsec = 0;
+    tv[1].tv_sec = 1100000000;
+    tv[1].tv_nsec = 0;
+    var st: stat_t;
+    ok("utimensat sets both", utimensat(AT_FDCWD, "/home/tm", &tv[0], 0) == 0 && stat("/home/tm", &st) == 0 && st.st_atime == 1000000000 && st.st_mtime == 1100000000);
+    var now: int = time(null);
+    ok("utimensat changes ctime to now", st.st_ctime >= now - 2 && st.st_ctime <= now);
+    tv[0].tv_nsec = UTIME_OMIT;
+    tv[1].tv_sec = 1200000000;
+    ok("UTIME_OMIT keeps one", utimensat(AT_FDCWD, "/home/tm", &tv[0], 0) == 0 && stat("/home/tm", &st) == 0 && st.st_atime == 1000000000 && st.st_mtime == 1200000000);
+    tv[0].tv_nsec = UTIME_NOW;
+    tv[1].tv_nsec = UTIME_OMIT;
+    ok("UTIME_NOW", utimensat(AT_FDCWD, "/home/tm", &tv[0], 0) == 0 && stat("/home/tm", &st) == 0 && st.st_atime >= now - 2 && st.st_mtime == 1200000000);
+    tv[1].tv_nsec = 1000000000;
+    ok("EINVAL: utimensat a billion nanoseconds", fails(utimensat(AT_FDCWD, "/home/tm", &tv[0], 0), EINVAL));
+    ok("ENOENT: utimensat a missing file", fails(utimensat(AT_FDCWD, "/home/none", null, 0), ENOENT));
+    ok("EPERM: utimensat in /proc", fails(utimensat(AT_FDCWD, "/proc/uptime", null, 0), EPERM));
+    ok("EFAULT: utimensat bad times", fails(utimensat(AT_FDCWD, "/home/tm", 1000 as *timespec, 0), EFAULT));
+    tv[0].tv_sec = 1000000000;
+    tv[0].tv_nsec = 0;
+    tv[1].tv_sec = 1000000000;
+    tv[1].tv_nsec = 0;
+    fd = open("/home/tm", O_RDWR, 0);
+    futimens(fd, &tv[0]);
+    write(fd, "x" as *tryte, 1);
+    fstat(fd, &st);
+    ok("a write sets mtime and ctime", st.st_mtime >= now - 2 && st.st_ctime >= now - 2 && st.st_atime == 1000000000);
+    futimens(fd, &tv[0]);
+    chmod("/home/tm", 384);
+    fstat(fd, &st);
+    ok("chmod sets ctime only", st.st_mtime == 1000000000 && st.st_ctime >= now - 2);
+    lseek(fd, 0, SEEK_SET);
+    var c: [1]char;
+    read(fd, &c[0] as *tryte, 1);
+    fstat(fd, &st);
+    ok("a read sets atime (it was older than mtime)", st.st_atime >= now - 2);
+    close(fd);
+    unlink("/home/tm");
+}
+
 var alarms: int;
 fn on_alarm(sig: int) { alarms += 1; }
 
@@ -491,6 +600,7 @@ fn main(argc: int, argv: **char) -> int {
     options();
     system_calls();
     timers_and_offsets();
+    times_and_dates();
     puts(failures == 0 ? "libctest: all passed\n" : "libctest: some checks FAILED\n");
     return failures != 0;
 }

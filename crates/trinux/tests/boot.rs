@@ -232,9 +232,9 @@ fn k4_shell_files_dirs_and_status() {
         "&& ls\n/tmp/a/b\na\nf\n",
         "$ ls /\nbin\ndev\netc\nhome\nmnt\nproc\nroot\nsbin\ntmp\n",
         "$ ls -l /bin/true /etc\n-rwxr-xr-x 1 root     root    ",
-        "/etc:\n-rw-r--r-- 1 root     root          44 group\n",
-        "-rw-r--r-- 1 root     root          64 motd\n",
-        "-rw------- 1 root     root         134 shadow\n",
+        "/etc:\n-rw-r--r-- 1 root     root          44 Jan  1  1970 group\n",       // (mkdisk writes time 0)
+        "-rw-r--r-- 1 root     root          64 Jan  1  1970 motd\n",
+        "-rw------- 1 root     root         134 Jan  1  1970 shadow\n",
         "Welcome to Trinux on Setun-11̅.\nEverything here is a power of 3.\n",
         "status 1\n",
         "or-ran\nand-ran\n",

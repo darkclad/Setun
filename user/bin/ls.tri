@@ -1,12 +1,20 @@
-// ls [-a] [-l] [path ...]: list directory contents, sorted by name.
+// ls [-acltur] [path ...]: list directory contents, sorted by name; -l
+// long form with the modification time, -t sorted by time (newest
+// first), -u the access time and -c the change time instead, -r reversed.
 
 import "../lib/tlibc.tri";
 import "../lib/pwd.tri";
+import "../lib/time.tri";
 
 var names: [243][27]char;
+var times: [243]int;
 var count: int;
 var show_all: int;
 var long_form: int;
+var by_time: int;
+var which_time: int;                     // 'm', 'a' (-u) or 'c' (-c)
+var reverse: int;
+var now: int;
 
 fn copy_name(dst: *char, src: *char) {
     var k: int = 0;
@@ -14,17 +22,39 @@ fn copy_name(dst: *char, src: *char) {
     dst[k] = 0;
 }
 
+// The time ls shows and sorts by.
+fn chosen_time(st: *stat_t) -> int {
+    if (which_time == 'a') { return st.st_atime; }
+    if (which_time == 'c') { return st.st_ctime; }
+    return st.st_mtime;
+}
+
+// Does entry a come before entry b? By name, or by time (newest first,
+// then by name); -r reverses either.
+fn before(a: *char, ta: int, b: *char, tb: int) -> int {
+    var r: int;
+    if (by_time && ta != tb) {
+        r = ta > tb ? -1 : 1;
+    } else {
+        r = strcmp(a, b);
+    }
+    return reverse ? r > 0 : r < 0;
+}
+
 fn sort_names() {
     var i: int = 1;
     while (i < count) {
         var tmp: [27]char;
         copy_name(&tmp[0], &names[i][0]);
+        var tt: int = times[i];
         var j: int = i - 1;
-        while (j >= 0 && strcmp(&names[j][0], &tmp[0]) > 0) {
+        while (j >= 0 && before(&tmp[0], tt, &names[j][0], times[j])) {
             copy_name(&names[j + 1][0], &names[j][0]);
+            times[j + 1] = times[j];
             j -= 1;
         }
         copy_name(&names[j + 1][0], &tmp[0]);
+        times[j + 1] = tt;
         i += 1;
     }
 }
@@ -73,17 +103,36 @@ fn put_padded(v: int, width: int) {
     puts(s);
 }
 
+// "Oct  8 13:30" within six months of now, "Oct  8  2025" otherwise (as
+// POSIX ls -l).
+fn put_time(t: int) {
+    var b: tm;
+    gmtime_r(t, &b);
+    var buf: [41]char;
+    var half_year: int = 15778476;
+    if (t <= now && now - t < half_year) {
+        strftime(&buf[0], 41, "%b %e %H:%M", &b);
+    } else {
+        strftime(&buf[0], 41, "%b %e  %Y", &b);
+    }
+    puts(&buf[0]);
+}
+
+fn path_of(dir: *char, name: *char, path: *char) {
+    var k: int = 0;
+    if (dir != null) {
+        while (dir[k] != 0) { path[k] = dir[k]; k += 1; }
+        path[k] = '/';
+        k += 1;
+    }
+    copy_name(&path[k], name);
+}
+
 // One entry; `dir` is null when `name` is already a path.
 fn show(dir: *char, name: *char) {
     if (long_form) {
         var path: [243]char;
-        var k: int = 0;
-        if (dir != null) {
-            while (dir[k] != 0) { path[k] = dir[k]; k += 1; }
-            path[k] = '/';
-            k += 1;
-        }
-        copy_name(&path[k], name);
+        path_of(dir, name, &path[0]);
         var st: stat_t;
         if (stat(&path[0], &st) == 0) {
             put_mode(st.st_mode);
@@ -97,6 +146,8 @@ fn show(dir: *char, name: *char) {
             put_name(&last_group[0]);
             puts(" ");
             put_padded(st.st_size, 7);
+            puts(" ");
+            put_time(chosen_time(&st));
             puts(" ");
         }
     }
@@ -120,10 +171,21 @@ fn list(path: *char, heading: int) -> int {
         if (e.d_name[0] == '.' && !show_all) { continue; }
         if (count < 243) {
             copy_name(&names[count][0], &e.d_name[0]);
+            times[count] = 0;
             count += 1;
         }
     }
     closedir(d);
+    if (by_time) {
+        var i0: int = 0;
+        while (i0 < count) {
+            var p: [243]char;
+            path_of(path, &names[i0][0], &p[0]);
+            var es: stat_t;
+            if (stat(&p[0], &es) == 0) { times[i0] = chosen_time(&es); }
+            i0 += 1;
+        }
+    }
     sort_names();
     if (heading) { puts(path); puts(":\n"); }
     var i: int = 0;
@@ -132,17 +194,24 @@ fn list(path: *char, heading: int) -> int {
 }
 
 fn main(argc: int, argv: **char) -> int {
+    which_time = 'm';
     var i: int = 1;
     while (i < argc && argv[i][0] == '-' && argv[i][1] != 0) {
         var k: int = 1;
         while (argv[i][k] != 0) {
-            if (argv[i][k] == 'a') { show_all = 1; }
-            else if (argv[i][k] == 'l') { long_form = 1; }
-            else { fputs(STDERR_FILENO, "usage: ls [-al] [path ...]\n"); return 2; }
+            var c: int = argv[i][k];
+            if (c == 'a') { show_all = 1; }
+            else if (c == 'l') { long_form = 1; }
+            else if (c == 't') { by_time = 1; }
+            else if (c == 'u') { which_time = 'a'; }
+            else if (c == 'c') { which_time = 'c'; }
+            else if (c == 'r') { reverse = 1; }
+            else { fputs(STDERR_FILENO, "usage: ls [-acltur] [path ...]\n"); return 2; }
             k += 1;
         }
         i += 1;
     }
+    now = time(null);
     if (i == argc) { return list(".", 0); }
     var status: int = 0;
     var many: int = argc - i > 1;
