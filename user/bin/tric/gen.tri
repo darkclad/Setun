@@ -11,8 +11,9 @@ const W_MAX: int = 3812798742493;
 var code: cvec;
 
 // The optimization level (-O): 0 none, 1 the peephole pass and jumps
-// straight to where a condition leads. The host's levels 2..4 are not
-// ported yet.
+// straight to where a condition leads, 2 register locals and direct
+// operands, 3 held temporaries and calls with arguments in registers. The
+// host's level 4 (inlining) is not ported yet.
 var opt_level: int;
 var fn_has_asm: int;                     // the function being compiled has an asm block
 
@@ -304,6 +305,490 @@ var lowest_slot: int;
 var ret_ty: int;
 var ret_label: int;
 
+// ---- register locals and direct operands (level 2) ------------------------------------------
+//
+// After the host's reg_eligible, alloc_local_reg, simple_operand,
+// simple_addr and their callers: int and pointer locals whose address is
+// never taken live in the callee-saved r-1..r-9 (and, in a leaf function,
+// in caller-saved registers nothing else uses there); real locals of a leaf
+// in f-1..f-9; right operands that are constants, register locals or named
+// scalars are used where they are, without the stack.
+
+var lc_reg: ivec;                        // per local: its register (a string), or 0
+var no_regs: int = 1;                    // no register locals in this function
+var fn_leaf: int;                        // it makes no real call
+var free_regs: ivec;                     // registers free for locals (the last goes first)
+var used_regs: ivec;                     // every one it has used, in order
+var free_fregs: ivec;                    // f registers free for real locals (leaf functions)
+var taken: ivec;                         // names whose address is taken (`&x`)
+var callees: ivec;                       // the direct calls (-1: through a pointer)
+var scan_asm: int;
+
+var local_regs: [9]*char = { "r-1", "r-2", "r-3", "r-4", "r-5", "r-6", "r-7", "r-8", "r-9" };
+var leaf_regs: [8]*char = { "r9", "r10", "r-10", "r-11", "r-12", "r-13", "r7", "r8" };
+var freal_regs: [9]*char = { "f-1", "f-2", "f-3", "f-4", "f-5", "f-6", "f-7", "f-8", "f-9" };
+
+fn o2() -> int { return opt_level >= 2; }
+
+fn iv_has(v: *ivec, x: int) -> int {
+    var k: int = 0;
+    while (k < v.n) { if (v.p[k] == x) { return 1; } k += 1; }
+    return 0;
+}
+
+fn is_local_reg(r: *char) -> int { return r[0] == 'r' && r[1] == '-' && r[2] >= '1' && r[2] <= '9' && r[3] == 0; }
+
+// ---- the body scan: addresses taken, inline assembly, calls ----
+
+fn scan_ex(x: int) {
+    if (x < 0) { return; }
+    var k: int = ex_kind.p[x];
+    if (k == E_UNARY) {
+        var a: int = ex_a.p[x];
+        if (ex_op.p[x] == U_ADDR && ex_kind.p[a] == E_NAME) { iv_push(&taken, ex_v.p[a]); }
+        scan_ex(a);
+    } else if (k == E_FIELD || k == E_CAST) {
+        scan_ex(ex_a.p[x]);
+    } else if (k == E_BINARY || k == E_ASSIGN || k == E_INDEX) {
+        scan_ex(ex_a.p[x]);
+        scan_ex(ex_b.p[x]);
+    } else if (k == E_CALL) {
+        var f: int = ex_a.p[x];
+        iv_push(&callees, ex_kind.p[f] == E_NAME ? ex_v.p[f] : -1);
+        scan_ex(f);
+        var i: int = 0;
+        while (i < ex_n.p[x]) { scan_ex(lists.p[ex_v.p[x] + i]); i += 1; }
+    } else if (k == E_COND) {
+        scan_ex(ex_a.p[x]);
+        scan_ex(ex_b.p[x]);
+        scan_ex(ex_c.p[x]);
+    } else if (k == E_LIST) {
+        var j: int = 0;
+        while (j < ex_n.p[x]) { scan_ex(lists.p[ex_v.p[x] + j]); j += 1; }
+    }
+}
+
+fn scan_st(s: int) {
+    if (s < 0) { return; }
+    var k: int = st_kind.p[s];
+    if (k == S_VAR) { scan_ex(vd_init.p[st_a.p[s]]); }
+    else if (k == S_EXPR || k == S_RETURN) { scan_ex(st_a.p[s]); }
+    else if (k == S_BLOCK) {
+        var i: int = 0;
+        while (i < st_n.p[s]) { scan_st(lists.p[st_l.p[s] + i]); i += 1; }
+    } else if (k == S_IF) { scan_ex(st_a.p[s]); scan_st(st_b.p[s]); scan_st(st_c.p[s]); }
+    else if (k == S_WHILE) { scan_ex(st_a.p[s]); scan_st(st_b.p[s]); }
+    else if (k == S_LOOP) { scan_st(st_b.p[s]); }
+    else if (k == S_FOR) { scan_st(st_a.p[s]); scan_ex(st_b.p[s]); scan_ex(st_c.p[s]); scan_st(st_d.p[s]); }
+    else if (k == S_SIGN) { scan_ex(st_a.p[s]); scan_st(st_b.p[s]); scan_st(st_c.p[s]); scan_st(st_d.p[s]); }
+    else if (k == S_SWITCH) {
+        scan_ex(st_a.p[s]);
+        var q: int = 0;
+        while (q < st_n.p[s]) {
+            var c: int = st_l.p[s] + q;
+            var j: int = 0;
+            while (j < cs_nvals.p[c]) { scan_ex(lists.p[cs_vals.p[c] + j]); j += 1; }
+            scan_st(cs_body.p[c]);
+            q += 1;
+        }
+        scan_st(st_b.p[s]);
+    } else if (k == S_ASM) { scan_asm = 1; }
+}
+
+// ---- allocation ----
+
+fn reg_eligible(name: int, ty: int) -> int {
+    return !no_regs && (ty == t_int || tk(ty) == TY_PTR) && !iv_has(&taken, name) && free_regs.n > 0;
+}
+
+fn freg_eligible(name: int, ty: int) -> int {
+    return is_real(ty) && !no_regs && fn_leaf && !iv_has(&taken, name) && free_fregs.n > 0;
+}
+
+fn dup_check(name: int, pos: int) {
+    var k: int = scopes.p[scopes.n - 1];
+    while (k < lc_name.n) {
+        if (lc_name.p[k] == name) { m0(); mq(name_str(name)); ms(" is already declared in this block"); fail(pos); }
+        k += 1;
+    }
+}
+
+fn push_reg_local(name: int, ty: int, r: *char) {
+    iv_push(&lc_name, name);
+    iv_push(&lc_ty, ty);
+    iv_push(&lc_off, 0);
+    iv_push(&lc_reg, r as int);
+}
+
+fn alloc_local_reg(name: int, ty: int, pos: int) -> *char {
+    dup_check(name, pos);
+    free_regs.n -= 1;
+    var r: *char = free_regs.p[free_regs.n] as *char;
+    if (!iv_has(&used_regs, r as int)) { iv_push(&used_regs, r as int); }
+    push_reg_local(name, ty, r);
+    return r;
+}
+
+fn alloc_local_freg(name: int, ty: int, pos: int) -> *char {
+    dup_check(name, pos);
+    free_fregs.n -= 1;
+    var r: *char = free_fregs.p[free_fregs.n] as *char;
+    push_reg_local(name, ty, r);
+    return r;
+}
+
+fn release_reg(r: *char) {
+    if (r[0] == 'f') { iv_push(&free_fregs, r as int); } else { iv_push(&free_regs, r as int); }
+}
+
+fn pop_local() {
+    lc_name.n -= 1;
+    lc_ty.n -= 1;
+    lc_off.n -= 1;
+    lc_reg.n -= 1;
+}
+
+// ---- operands ----
+
+var rl_ty: int;                          // reg_local's type
+var so_ty: int;                          // simple_operand's
+var lo_ty: int;                          // left_operand's
+var sa_ty: int;                          // simple_addr's
+var ip_k: int;                           // index_parts's constant
+
+// The register of local x, if it is a register local (not a real one).
+fn reg_local(x: int) -> *char {
+    if (ex_kind.p[x] != E_NAME) { return null; }
+    var l: int = lookup_local(ex_v.p[x]);
+    if (l < 0 || lc_reg.p[l] == 0 || is_real(lc_ty.p[l])) { return null; }
+    rl_ty = lc_ty.p[l];
+    return lc_reg.p[l] as *char;
+}
+
+// The f register of a real local held in one.
+fn freg_local(x: int) -> *char {
+    if (ex_kind.p[x] != E_NAME) { return null; }
+    var l: int = lookup_local(ex_v.p[x]);
+    if (l < 0 || lc_reg.p[l] == 0 || !is_real(lc_ty.p[l])) { return null; }
+    return lc_reg.p[l] as *char;
+}
+
+// [fp+off] / [label] of a named local or global (into c)
+fn c_mem(c: *cvec, base: *char, off: int) {
+    cv_push(c, '[');
+    cv_str(c, base);
+    if (off > 0) { cv_push(c, '+'); cv_int(c, off); }
+    else if (off < 0) { cv_int(c, off); }
+    cv_push(c, ']');
+}
+
+fn c_label(c: *cvec, n: int) {
+    cv_push(c, '[');
+    if (g_kind[n] == G_EXTERN) { cv_str(c, name_str(n)); } else { cv_int(c, g_val[n]); }
+    cv_push(c, ']');
+}
+
+fn c_reset(c: *cvec) { c.n = 0; }
+fn c_end(c: *cvec) { cv_push(c, 0); c.n -= 1; }
+
+var so_buf: cvec;
+
+// A right operand needing no evaluation in r1: a register local, or a
+// scalar variable in memory (loaded into r2). The register, or null.
+fn simple_operand(x: int) -> *char {
+    if (!o2()) { return null; }
+    var r: *char = reg_local(x);
+    if (r != null) { so_ty = rl_ty; return r; }
+    if (ex_kind.p[x] != E_NAME) { return null; }
+    var n: int = ex_v.p[x];
+    var l: int = lookup_local(n);
+    var ty: int;
+    c_reset(&so_buf);
+    if (l >= 0) {
+        ty = lc_ty.p[l];
+        c_mem(&so_buf, "fp", lc_off.p[l]);
+    } else if (g_kind[n] == G_VAR || g_kind[n] == G_EXTERN) {
+        ty = g_ty[n];
+        c_label(&so_buf, n);
+    } else {
+        return null;
+    }
+    if (!is_scalar(ty) || is_real(ty)) { return null; }
+    c_end(&so_buf);
+    ln(); o(is_tsz(ty) ? "ldt r2, " : "ldw r2, "); o(so_buf.p); nl();
+    so_ty = ty;
+    return "r2";
+}
+
+// Could simple_operand take x? (Nothing emitted.)
+fn is_simple_operand(x: int) -> int {
+    if (!o2()) { return 0; }
+    if (reg_local(x) != null) { return 1; }
+    if (ex_kind.p[x] != E_NAME) { return 0; }
+    var n: int = ex_v.p[x];
+    var l: int = lookup_local(n);
+    var ty: int;
+    if (l >= 0) { ty = lc_ty.p[l]; }
+    else if (g_kind[n] == G_VAR || g_kind[n] == G_EXTERN) { ty = g_ty[n]; }
+    else { return 0; }
+    return is_scalar(ty) && !is_real(ty);
+}
+
+// Like simple_operand, but a variable in memory is loaded into tmp.
+fn simple_operand_into(x: int, tmp: *char) -> *char {
+    var r: *char = reg_local(x);
+    if (r != null) { so_ty = rl_ty; return r; }
+    r = simple_operand(x);
+    if (r == null) { return null; }
+    if (!streq(tmp, "r2")) { ln(); o("mov "); o(tmp); o(", r2"); nl(); }
+    return streq(tmp, "r1") ? "r1" : "r2";
+}
+
+// A left operand: a register local stays where it is; anything else goes
+// into r1. The register (and lo_ty).
+fn left_operand(a: int) -> *char {
+    if (o2()) {
+        var r: *char = reg_local(a);
+        if (r != null) { lo_ty = decay(rl_ty); return r; }
+    }
+    lo_ty = decay(expr(a));
+    return "r1";
+}
+
+// The memory operand of a named real variable not in a register (into c); 0 if none.
+fn real_var_operand(x: int, c: *cvec) -> int {
+    if (!o2() || ex_kind.p[x] != E_NAME) { return 0; }
+    var n: int = ex_v.p[x];
+    var l: int = lookup_local(n);
+    c_reset(c);
+    if (l >= 0) {
+        if (!is_real(lc_ty.p[l]) || lc_reg.p[l] != 0) { return 0; }
+        c_mem(c, "fp", lc_off.p[l]);
+    } else if ((g_kind[n] == G_VAR || g_kind[n] == G_EXTERN) && is_real(g_ty[n])) {
+        c_label(c, n);
+    } else {
+        return 0;
+    }
+    c_end(c);
+    return 1;
+}
+
+// An index as (the rest, ip_k): i + 2, 2 + i and i - 2 give (i, ±2).
+fn index_parts(x: int) -> int {
+    if (ex_kind.p[x] == E_BINARY && ex_op.p[x] == B_ADD) {
+        var vb: int = const_eval(ex_b.p[x]);
+        if (ce_ok) {
+            var r: int = index_parts(ex_a.p[x]);
+            ip_k += vb;
+            return r;
+        }
+        var va: int = const_eval(ex_a.p[x]);
+        if (ce_ok) {
+            var r2: int = index_parts(ex_b.p[x]);
+            ip_k += va;
+            return r2;
+        }
+        ip_k = 0;
+        return x;
+    }
+    if (ex_kind.p[x] == E_BINARY && ex_op.p[x] == B_SUB) {
+        var vs: int = const_eval(ex_b.p[x]);
+        if (ce_ok) {
+            var r3: int = index_parts(ex_a.p[x]);
+            ip_k -= vs;
+            return r3;
+        }
+    }
+    ip_k = 0;
+    return x;
+}
+
+fn fits_operand(t: int) -> int { return is_scalar(t) || is_real(t); }
+
+// where an object starts: a register + offset (bk 1), or an address (bk 2)
+var bk: int;
+var b_reg: *char;
+var b_off: int;
+var b_ty: int;
+
+fn base_of(a: int) -> int {
+    bk = 0;
+    if (ex_kind.p[a] != E_NAME) { return 0; }
+    var n: int = ex_v.p[a];
+    var l: int = lookup_local(n);
+    if (l >= 0) {
+        bk = 1;
+        b_ty = lc_ty.p[l];
+        if (lc_reg.p[l] != 0) { b_reg = lc_reg.p[l] as *char; b_off = 0; }
+        else { b_reg = "fp"; b_off = lc_off.p[l]; }
+        return 1;
+    }
+    if (g_kind[n] == G_VAR) { bk = 2; b_ty = g_ty[n]; b_off = g_val[n]; return 1; }
+    return 0;
+}
+
+fn base_operand(c: *cvec, extra: int) {
+    c_reset(c);
+    if (bk == 1) { c_mem(c, b_reg, b_off + extra); }
+    else { cv_push(c, '['); cv_int(c, b_off + extra); cv_push(c, ']'); }
+    c_end(c);
+}
+
+// The memory operand (into c, and sa_ty) of a scalar or real lvalue whose
+// address needs no evaluation in r1 (the host's simple_addr_ex); only tmp
+// is written. 0 if not (nothing emitted, mostly).
+fn simple_addr_ex(x: int, tmp: *char, any_index: int, c: *cvec) -> int {
+    if (!o2()) { return 0; }
+    c_reset(c);
+    var k: int = ex_kind.p[x];
+    if (k == E_INDEX) {
+        if (!base_of(ex_a.p[x])) { return 0; }
+        var elem: int;
+        if (bk == 1 && !streq(b_reg, "fp") && tk(b_ty) == TY_PTR) { elem = ty_a.p[b_ty]; }
+        else if ((bk == 2 || streq(b_reg, "fp")) && tk(b_ty) == TY_ARRAY) { elem = ty_a.p[b_ty]; }
+        else { return 0; }
+        if (!fits_operand(elem) || elem == t_void) { return 0; }
+        var sz: int = size(elem);
+        var i: int = ex_b.p[x];
+        var kc: int = const_eval(i);
+        if (ce_ok) { base_operand(c, kc * sz); sa_ty = elem; return 1; }
+        // the base may be changed by the index's own code: keep it
+        var sbk: int = bk;
+        var sreg: *char = b_reg;
+        var soff: int = b_off;
+        var ii: int = index_parts(i);
+        var kk: int = ip_k;
+        var ir: *char;
+        var ti: int;
+        if (is_simple_operand(ii)) {
+            ir = simple_operand_into(ii, tmp);
+            ti = so_ty;
+        } else if (any_index && is_integer(peek_type(ii))) {
+            ti = expr(ii);
+            ir = "r1";
+        } else {
+            return 0;
+        }
+        if (!is_integer(ti)) { return 0; }
+        if (sz != 1) { ln(); o("mul "); o(tmp); o(", "); o(ir); o(", "); oi(sz); nl(); }
+        else if (!streq(ir, tmp)) { ln(); o("mov "); o(tmp); o(", "); o(ir); nl(); }
+        if (sbk == 1) { ln(); o("add "); o(tmp); o(", "); o(tmp); o(", "); o(sreg); nl(); }
+        c_reset(c);                      // (the index's own code may have used it)
+        c_mem(c, tmp, soff + kk * sz);
+        c_end(c);
+        sa_ty = elem;
+        return 1;
+    }
+    if (k == E_UNARY && ex_op.p[x] == U_DEREF) {
+        if (!base_of(ex_a.p[x])) { return 0; }
+        if (bk == 1 && b_off == 0 && !streq(b_reg, "fp") && tk(b_ty) == TY_PTR) {
+            var t: int = ty_a.p[b_ty];
+            if (fits_operand(t) && t != t_void) {
+                c_reset(c);
+                cv_push(c, '[');
+                cv_str(c, b_reg);
+                cv_push(c, ']');
+                c_end(c);
+                sa_ty = t;
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (k == E_FIELD) {
+        if (!base_of(ex_a.p[x])) { return 0; }
+        var id: int = -1;
+        if (bk == 1 && !streq(b_reg, "fp") && tk(b_ty) == TY_PTR) {
+            if (tk(ty_a.p[b_ty]) != TY_STRUCT) { return 0; }
+            id = ty_b.p[ty_a.p[b_ty]];
+        } else if ((bk == 2 || streq(b_reg, "fp")) && tk(b_ty) == TY_STRUCT) {
+            id = ty_b.p[b_ty];
+        } else {
+            return 0;
+        }
+        var f: int = field_of(id, ex_v.p[x]);
+        if (f < 0) { return 0; }
+        if (!fits_operand(fd_ty.p[f])) { return 0; }
+        base_operand(c, fd_off.p[f]);
+        sa_ty = fd_ty.p[f];
+        return 1;
+    }
+    return 0;
+}
+
+var sa_buf: cvec;
+
+fn simple_addr(x: int, tmp: *char, c: *cvec) -> int { return simple_addr_ex(x, tmp, 0, c); }
+
+// A load into r1 (f1) from a memory operand.
+fn load_operand(t: int, op: *char) {
+    ln();
+    if (is_real(t)) { o("fldd f1, "); } else { o(is_tsz(t) ? "ldt r1, " : "ldw r1, "); }
+    o(op);
+    nl();
+}
+
+fn store_operand(t: int, val: *char, op: *char) {
+    ln(); o(is_tsz(t) ? "stt " : "stw "); o(val); o(", "); o(op); nl();
+}
+
+// Could evaluating x change a variable (a call or an assignment in it)?
+fn has_effects(x: int) -> int {
+    var k: int = ex_kind.p[x];
+    if (k == E_CALL || k == E_ASSIGN) { return 1; }
+    if (k == E_UNARY || k == E_FIELD || k == E_CAST) { return has_effects(ex_a.p[x]); }
+    if (k == E_BINARY || k == E_INDEX) { return has_effects(ex_a.p[x]) || has_effects(ex_b.p[x]); }
+    if (k == E_COND) { return has_effects(ex_a.p[x]) || has_effects(ex_b.p[x]) || has_effects(ex_c.p[x]); }
+    if (k == E_LIST) {
+        var j: int = 0;
+        while (j < ex_n.p[x]) { if (has_effects(lists.p[ex_v.p[x] + j])) { return 1; } j += 1; }
+    }
+    return 0;
+}
+
+var ci_buf: cvec;
+
+// lhs op= rhs in place (a variable in memory, an element or a field, with a
+// constant or simple rhs): 1 and ci_ty, or 0.
+var ci_ty: int;
+fn compound_in_place(op: int, lhs: int, rhs: int) -> int {
+    var cv: int = const_eval(rhs);
+    var rc: int = ce_ok;
+    if (!o2() || !(rc || is_simple_operand(rhs))) { return 0; }
+    var lt: int = -1;
+    c_reset(&ci_buf);
+    if (ex_kind.p[lhs] == E_NAME) {
+        var n: int = ex_v.p[lhs];
+        var l: int = lookup_local(n);
+        if (l >= 0) {
+            if (lc_reg.p[l] == 0) { c_mem(&ci_buf, "fp", lc_off.p[l]); c_end(&ci_buf); lt = lc_ty.p[l]; }
+        } else if (g_kind[n] == G_VAR || g_kind[n] == G_EXTERN) {
+            c_label(&ci_buf, n);
+            c_end(&ci_buf);
+            lt = g_ty[n];
+        }
+    }
+    if (lt < 0) {
+        if (!simple_addr(lhs, "r3", &ci_buf)) { return 0; }
+        lt = sa_ty;
+    }
+    if (!is_scalar(lt) || is_real(lt)) { m0(); ms("cannot apply an operator to a whole "); mty(lt); fail(ex_pos.p[lhs]); }
+    var rt: int;
+    if (rc) {
+        rt = t_int;
+    } else {
+        var src: *char = simple_operand(rhs);
+        if (!streq(src, "r2")) { ln(); o("mov r2, "); o(src); nl(); }
+        rt = decay(so_ty);
+    }
+    load_operand(lt, ci_buf.p);
+    var res: int = arith(op, lt, rt, cv, rc, ex_pos.p[rhs]);
+    check_assign(lt, res, rhs);
+    store_operand(lt, "r1", ci_buf.p);
+    ci_ty = lt;
+    return 1;
+}
+
 fn lookup_local(n: int) -> int {
     var k: int = lc_name.n - 1;
     while (k >= 0) { if (lc_name.p[k] == n) { return k; } k -= 1; }
@@ -323,6 +808,7 @@ fn alloc_local(name: int, ty: int, pos: int) -> int {
     iv_push(&lc_name, name);
     iv_push(&lc_ty, ty);
     iv_push(&lc_off, off);
+    iv_push(&lc_reg, 0);
     return off;
 }
 
@@ -330,6 +816,12 @@ fn begin_fn(ret: int) {
     lc_name.n = 0;
     lc_ty.n = 0;
     lc_off.n = 0;
+    lc_reg.n = 0;
+    free_regs.n = 0;
+    var k: int = 8;
+    while (k >= 0) { iv_push(&free_regs, local_regs[k] as int); k -= 1; }
+    used_regs.n = 0;
+    fn_leaf = 0;
     scopes.n = 0;
     iv_push(&scopes, 0);
     next_slot = -3;
@@ -776,6 +1268,7 @@ fn compile(data_org: int) {
     em("push fp");
     em("mov fp, sp");
     begin_fn(t_void);
+    no_regs = 1;
     var body_start: int = code.n;
     k = 0;
     while (k < in_x.n) { init_object(0, in_addr.p[k], in_ty.p[k], in_x.p[k]); k += 1; }
@@ -843,28 +1336,79 @@ fn function(it: int) {
     var pos: int = it_pos.p[it];
     var intr: int = it_d.p[it];
     begin_fn(ty_a.p[fty]);
+    var body: int = it_c.p[it];
+    // addresses taken, inline assembly, calls (level 2: register locals)
+    taken.n = 0;
+    callees.n = 0;
+    scan_asm = 0;
+    scan_st(body);
+    no_regs = !o2() || scan_asm;
+    // a leaf: every call is a builtin (inlining comes at level 4)
+    if (!no_regs) {
+        fn_leaf = 1;
+        var c: int = 0;
+        while (c < callees.n) {
+            var cn: int = callees.p[c];
+            if (cn < 0 || !is_builtin(name_str(cn)) || (g_kind[cn] == G_FUNC && g_def[cn])) { fn_leaf = 0; }
+            c += 1;
+        }
+        if (fn_leaf) {
+            // the free caller-saved registers go first: no saving
+            var lr: int = 7;
+            while (lr >= 0) { iv_push(&free_regs, leaf_regs[lr] as int); lr -= 1; }
+        }
+    }
+    // real locals in f-1..f-9, in leaf functions only
+    free_fregs.n = 0;
+    if (fn_leaf && !no_regs) {
+        var fk: int = 8;
+        while (fk >= 0) { iv_push(&free_fregs, freal_regs[fk] as int); fk -= 1; }
+    }
     var fn_start: int = code.n;
     fn_has_asm = 0;
     o(name_str(name));
     o(":\n");
     if (intr) { interrupt_regs(0); }
-    em("push lr");
-    em("push fp");
-    em("mov fp, sp");
+    // the frame (optimized: one sp adjustment instead of two pushes)
+    var fast: int = o2() && !scan_asm && !intr;
+    if (fast) {
+        em("stw lr, [sp-3]");
+        em("stw fp, [sp-6]");
+        em("sub fp, sp, 6");
+    } else {
+        em("push lr");
+        em("push fp");
+        em("mov fp, sp");
+    }
     var frame_at: int = code.n;
     // parameters: integers in r1..r6, then the stack (fp+6, fp+9, ...);
-    // reals in f1..f9; each copied into its slot
+    // reals in f1..f9; each copied into its slot or register
     var i: int = 0;
     var j: int = 0;
     var k: int = 0;
     while (k < it_n.p[it]) {
         var pm: int = lists.p[it_a.p[it] + k];
         var t: int = ty_list.p[ty_b.p[fty] + k];
-        var off: int = alloc_local(pm_name.p[pm], t, pos);
+        var pn: int = pm_name.p[pm];
+        var off: int = alloc_local(pn, t, pos);
         k += 1;
         if (is_real(t)) {
             j += 1;
+            if (freg_eligible(pn, t)) {
+                pop_local();             // the slot goes unused
+                var fr: *char = alloc_local_freg(pn, t, pos);
+                ln(); o("fmov "); o(fr); o(", f"); oi(j); nl();
+                continue;
+            }
             ln(); o("fstd f"); oi(j); o(", "); om("fp", off); nl();
+            continue;
+        }
+        if (reg_eligible(pn, t)) {
+            pop_local();                 // the slot goes unused
+            var rr: *char = alloc_local_reg(pn, t, pos);
+            if (i < 6) { ln(); o("mov "); o(rr); o(", r"); oi(i + 1); nl(); }
+            else { ln(); o("ldw "); o(rr); o(", "); om("fp", 6 + 3 * (i - 6)); nl(); }
+            i += 1;
             continue;
         }
         var st: *char = is_tsz(t) ? "stt r" : "stw r";
@@ -876,14 +1420,62 @@ fn function(it: int) {
         }
         i += 1;
     }
-    var body: int = it_c.p[it];
     k = 0;
     while (k < st_n.p[body]) { stmt(lists.p[st_l.p[body] + k]); k += 1; }
-    insert_frame(frame_at, -lowest_slot);
+    // the frame, and below it the callee-saved registers it uses
+    var frame: int = -lowest_slot;
+    var nsaves: int = 0;
+    var u: int = 0;
+    while (u < used_regs.n) { if (is_local_reg(used_regs.p[u] as *char)) { nsaves += 1; } u += 1; }
+    var total: int = frame + 3 * nsaves;
+    var pro: cvec;
+    pro.p = null;
+    pro.n = 0;
+    pro.cap = 0;
+    if (fast) {
+        cv_str(&pro, "        sub sp, sp, ");
+        cv_int(&pro, total + 6);
+        cv_push(&pro, '\n');
+    } else if (total > 0) {
+        cv_str(&pro, "        sub sp, sp, ");
+        cv_int(&pro, total);
+        cv_push(&pro, '\n');
+    }
+    var sk: int = 0;
+    u = 0;
+    while (u < used_regs.n) {
+        var sr: *char = used_regs.p[u] as *char;
+        if (is_local_reg(sr)) {
+            sk += 1;
+            cv_str(&pro, "        stw ");
+            cv_str(&pro, sr);
+            cv_str(&pro, ", ");
+            c_mem(&pro, "fp", -frame - 3 * sk);
+            cv_push(&pro, '\n');
+        }
+        u += 1;
+    }
+    if (pro.n > 0) { insert_line(frame_at, &pro); free(pro.p as *tryte); }
     lab(ret_label);
-    em("mov sp, fp");
-    em("pop fp");
-    em("pop lr");
+    sk = 0;
+    u = 0;
+    while (u < used_regs.n) {
+        var rs: *char = used_regs.p[u] as *char;
+        if (is_local_reg(rs)) {
+            sk += 1;
+            ln(); o("ldw "); o(rs); o(", "); om("fp", -frame - 3 * sk); nl();
+        }
+        u += 1;
+    }
+    if (fast) {
+        em("ldw lr, [fp+3]");
+        em("add sp, fp, 6");
+        em("ldw fp, [fp]");
+    } else {
+        em("mov sp, fp");
+        em("pop fp");
+        em("pop lr");
+    }
     if (intr) {
         interrupt_regs(1);
         em("iret");
@@ -899,12 +1491,19 @@ fn scope_open() {
     iv_push(&scopes, lc_name.n);
 }
 
-fn scope_close() {
+fn scope_close() { scope_end(1); }
+
+fn scope_end(release: int) {
     scopes.n -= 1;
     var start: int = scopes.p[scopes.n];
+    if (release) {
+        var k: int = start;
+        while (k < lc_reg.n) { if (lc_reg.p[k] != 0) { release_reg(lc_reg.p[k] as *char); } k += 1; }
+    }
     lc_name.n = start;
     lc_ty.n = start;
     lc_off.n = start;
+    lc_reg.n = start;
 }
 
 // A block of statements: a scope of its own.
@@ -938,6 +1537,20 @@ fn stmt(s: int) {
         var ty: int = resolve(vd_ty.p[d], vd_pos.p[d]);
         if (ty == t_void) { fail_at(vd_pos.p[d], "a variable cannot be void", null); }
         var init: int = vd_init.p[d];
+        // a real one in a leaf function: an f register
+        if (freg_eligible(vd_name.p[d], ty)) {
+            if (init >= 0) { expr_real(init); }
+            var fr: *char = alloc_local_freg(vd_name.p[d], ty, vd_pos.p[d]);
+            if (init >= 0) { ln(); o("fmov "); o(fr); o(", f1"); nl(); }
+            return;
+        }
+        // a word scalar whose address is never taken: a register
+        if (reg_eligible(vd_name.p[d], ty)) {
+            if (init >= 0) { check_assign(ty, expr(init), init); }
+            var rr: *char = alloc_local_reg(vd_name.p[d], ty, vd_pos.p[d]);
+            if (init >= 0) { ln(); o("mov "); o(rr); o(", r1"); nl(); }
+            return;
+        }
         if (init >= 0) {
             // the slot first, then the initialiser (which must not see
             // the new name), then the name at that slot
@@ -1033,7 +1646,7 @@ fn stmt(s: int) {
             e_l("b ", ftop);
         }
         lab(fend);
-        scope_close();
+        scope_end(0);                    // (the host keeps a for loop's registers taken)
         next_slot = fsaved;
         return;
     }
@@ -1178,6 +1791,7 @@ fn is_comparison(op: int) -> int { return op >= B_LT && op <= B_NE; }
 // comparison of register locals and constants, or one alone (no register
 // locals yet below level 2: constants).
 fn cheap_plain(x: int) -> int {
+    if (reg_local(x) != null) { return 1; }
     const_eval(x);
     return ce_ok;
 }
@@ -1361,6 +1975,8 @@ fn comparable(ta: int, tb: int) -> int {
 fn compare(a: int, b: int) -> int {
     if (peek_real(a) || peek_real(b)) {
         expr_real(a);
+        var fr: *char = freg_local(b);
+        if (fr != null) { ln(); o("fcmp f1, "); o(fr); nl(); return 1; }
         push_f1();
         expr_real(b);
         em("fmov f2, f1");
@@ -1370,10 +1986,20 @@ fn compare(a: int, b: int) -> int {
     }
     var v: int = const_eval(b);
     var bc: int = ce_ok;
-    var ta: int = decay(expr(a));
+    var simple: int = bc || is_simple_operand(b);
+    var left: *char = "r1";
+    var ta: int;
+    if (simple) { left = left_operand(a); ta = lo_ty; } else { ta = decay(expr(a)); }
     if (bc) {
         if (!(is_integer(ta) || (is_pointer(ta) && v == 0))) { m0(); ms("cannot compare "); mty(ta); ms(" with a number"); fail(ex_pos.p[b]); }
-        e_i("cmp r1, ", v);
+        ln(); o("cmp "); o(left); o(", "); oi(v); nl();
+        return 0;
+    }
+    if (simple) {
+        var rreg: *char = simple_operand(b);
+        var tb0: int = decay(so_ty);
+        if (!comparable(ta, tb0)) { m0(); ms("cannot compare "); mty(ta); ms(" with "); mty(tb0); fail(ex_pos.p[b]); }
+        ln(); o("cmp "); o(left); o(", "); o(rreg); nl();
         return 0;
     }
     em("push r1");
@@ -1541,6 +2167,10 @@ fn expr(x: int) -> int {
         if (l >= 0) {
             var lt: int = lc_ty.p[l];
             var off: int = lc_off.p[l];
+            if (lc_reg.p[l] != 0) {
+                ln(); o(is_real(lt) ? "fmov f1, " : "mov r1, "); o(lc_reg.p[l] as *char); nl();
+                return lt;
+            }
             if (is_real(lt)) { ln(); o("fldd f1, "); om("fp", off); nl(); }
             else if (is_scalar(lt)) { ln(); o(is_tsz(lt) ? "ldt r1, " : "ldw r1, "); om("fp", off); nl(); }
             else { e_i("add r1, fp, ", off); }
@@ -1591,6 +2221,7 @@ fn expr(x: int) -> int {
             return t_int;
         }
         if (op == U_DEREF) {
+            if (simple_addr_ex(x, "r2", 1, &sa_buf)) { var st0: int = sa_ty; load_operand(st0, sa_buf.p); return st0; }
             var dt: int = addr(x);
             load(dt);
             return dt;
@@ -1606,6 +2237,7 @@ fn expr(x: int) -> int {
     if (k == E_ASSIGN) { return assign(ex_op.p[x], ex_a.p[x], ex_b.p[x]); }
     if (k == E_CALL) { return gen_call(x); }
     if (k == E_INDEX || k == E_FIELD) {
+        if (simple_addr_ex(x, "r2", 1, &sa_buf)) { var st1: int = sa_ty; load_operand(st1, sa_buf.p); return st1; }
         var it: int = addr(x);
         load(it);
         return it;
@@ -1738,49 +2370,50 @@ fn m_op(op: int) {
     while (op_names[k] != ' ') { cv_push(&mb, op_names[k]); k += 1; }
 }
 
-// the right operand: the immediate, or r2
+// the right operand: the immediate, or the register
+var ar_rreg: *char = "r2";
 fn o_operand(imm: int, has_imm: int) {
-    if (has_imm) { oi(imm); } else { o("r2"); }
+    if (has_imm) { oi(imm); } else { o(ar_rreg); }
 }
 
 // r1 := r1 op (an immediate, or r2); lt, rt the operand types
 fn arith(op: int, lt: int, rt: int, imm: int, has_imm: int, pos: int) -> int {
+    return arith_regs(op, lt, rt, "r1", imm, has_imm, "r2", pos);
+}
+
+// r1 := left op (an immediate, or rreg) (the host's arith_regs)
+fn arith_regs(op: int, lt: int, rt: int, left: *char, imm: int, has_imm: int, rreg: *char, pos: int) -> int {
+    ar_rreg = rreg;
     if (op == B_ADD || op == B_SUB) {
         var le: int = ptr_elem(lt);
         var re: int = ptr_elem(rt);
         if (le >= 0 && is_integer(rt)) {
             var sz: int = size(le);
             if (sz < 1) { sz = 1; }
-            ln();
             if (has_imm) {
-                o(op == B_ADD ? "add r1, r1, " : "sub r1, r1, ");
-                oi(imm * sz);
+                ln(); o(op == B_ADD ? "add r1, " : "sub r1, "); o(left); o(", "); oi(imm * sz); nl();
             } else if (sz != 1) {
-                o("mul r2, r2, ");
-                oi(sz);
-                nl();
-                ln();
-                o(op == B_ADD ? "add r1, r1, r2" : "sub r1, r1, r2");
+                ln(); o("mul r2, "); o(rreg); o(", "); oi(sz); nl();
+                ln(); o(op == B_ADD ? "add r1, " : "sub r1, "); o(left); o(", r2"); nl();
             } else {
-                o(op == B_ADD ? "add r1, r1, r2" : "sub r1, r1, r2");
+                ln(); o(op == B_ADD ? "add r1, " : "sub r1, "); o(left); o(", "); o(rreg); nl();
             }
-            nl();
             return lt;
         }
         if (is_integer(lt) && re >= 0 && op == B_ADD) {
             var sz2: int = size(re);
             if (sz2 < 1) { sz2 = 1; }
             if (sz2 != 1) {
-                e_i("mul r1, r1, ", sz2);
+                ln(); o("mul r1, "); o(left); o(", "); oi(sz2); nl();
                 ln(); o("add r1, r1, "); o_operand(imm, has_imm); nl();
             } else {
-                ln(); o("add r1, r1, "); o_operand(imm, has_imm); nl();
+                ln(); o("add r1, "); o(left); o(", "); o_operand(imm, has_imm); nl();
             }
             return rt;
         }
         if (le >= 0 && re >= 0 && op == B_SUB) {
             if (le != re) { m0(); ms("cannot subtract "); mty(rt); ms(" from "); mty(lt); fail(pos); }
-            ln(); o("sub r1, r1, "); o_operand(imm, has_imm); nl();
+            ln(); o("sub r1, "); o(left); o(", "); o_operand(imm, has_imm); nl();
             var sz3: int = size(le);
             if (sz3 < 1) { sz3 = 1; }
             if (sz3 != 1) { e_i("div r1, r1, ", sz3); }
@@ -1793,15 +2426,15 @@ fn arith(op: int, lt: int, rt: int, imm: int, has_imm: int, pos: int) -> int {
     var m: *char = op == B_ADD ? "add" : op == B_SUB ? "sub" : op == B_MUL ? "mul" : op == B_DIV ? "div" : op == B_MOD ? "mod" : op == B_MIN ? "min" : op == B_MAX ? "max" : "sh";
     if (op == B_SHR) {
         if (has_imm) {
-            e_i("sh r1, r1, ", -imm);
+            ln(); o("sh r1, "); o(left); o(", "); oi(-imm); nl();
         } else {
-            em("neg r2, r2");
-            em("sh r1, r1, r2");
+            ln(); o("neg r2, "); o(rreg); nl();
+            ln(); o("sh r1, "); o(left); o(", r2"); nl();
         }
         return t_int;
     }
     if ((op == B_DIV || op == B_MOD) && has_imm && imm == 0) { fail_at(pos, "division by zero", null); }
-    ln(); o(m); o(" r1, r1, "); o_operand(imm, has_imm); nl();
+    ln(); o(m); o(" r1, "); o(left); o(", "); o_operand(imm, has_imm); nl();
     // min, max and the product of trits are trits
     return (op == B_MIN || op == B_MAX || op == B_MUL) && lt == t_trit && rt == t_trit ? t_trit : t_int;
 }
@@ -1860,6 +2493,9 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
     }
     if (is_real_arith(op) && (peek_real(a) || peek_real(b))) {
         expr_real(a);
+        var fr: *char = freg_local(b);
+        if (fr != null) { ln(); o(real_mnemonic(op)); o(" f1, f1, "); o(fr); nl(); return t_real; }
+        if (real_var_operand(b, &sa_buf)) { ln(); o("fldd f2, "); o(sa_buf.p); nl(); real_op(op); return t_real; }
         push_f1();
         expr_real(b);
         em("fmov f2, f1");
@@ -1867,10 +2503,51 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
         real_op(op);
         return t_real;
     }
+    // a constant on the left of a commutative operator: on the right it is
+    // an immediate (256 * x is x * 256)
+    if (o2() && (op == B_ADD || op == B_MUL || op == B_MIN || op == B_MAX)) {
+        const_eval(a);
+        var ac: int = ce_ok;
+        const_eval(b);
+        if (ac && !ce_ok && peek_type(a) == t_int && peek_type(b) == t_int) { return binary(op, b, a, pos); }
+    }
     var v: int = const_eval(b);
-    if (ce_ok) {
-        var lt: int = decay(expr(a));
-        return arith(op, lt, is_truth(b) ? t_trit : t_int, v, 1, pos);
+    var bc: int = ce_ok;
+    if (bc || is_simple_operand(b)) {
+        var left: *char = left_operand(a);
+        var lt: int = lo_ty;
+        if (bc) { return arith_regs(op, lt, is_truth(b) ? t_trit : t_int, left, v, 1, "r2", pos); }
+        var rreg: *char = simple_operand(b);
+        return arith_regs(op, lt, decay(so_ty), left, 0, 0, rreg, pos);
+    }
+    // the right side first, then the left, without the stack: when the
+    // left is a constant, or a simple variable the right cannot change
+    var av: int = const_eval(a);
+    var a_const: int = ce_ok;
+    var left_after: int = a_const || (is_simple_operand(a) && !has_effects(b));
+    if (o2() && left_after) {
+        var rt0: int = decay(expr(b));
+        em("mov r2, r1");
+        var lt0: int;
+        av = const_eval(a);
+        if (ce_ok) {
+            e_i("li r1, ", av);
+            lt0 = decay(peek_type(a));
+        } else {
+            var src: *char = reg_local(a);
+            if (src != null) {
+                ln(); o("mov r1, "); o(src); nl();
+                lt0 = decay(rl_ty);
+            } else {
+                // simple_operand loads into r2: keep the right side
+                em("mov r3, r2");
+                simple_operand(a);
+                em("mov r1, r2");
+                em("mov r2, r3");
+                lt0 = decay(so_ty);
+            }
+        }
+        return arith(op, lt0, rt0, 0, 0, pos);
     }
     var lt2: int = decay(expr(a));
     em("push r1");
@@ -1883,6 +2560,13 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
 fn assign_real(op: int, lhs: int, rhs: int) -> int {
     if (op == 0) {
         expr_real(rhs);
+        var fr: *char = freg_local(lhs);
+        if (fr != null) { ln(); o("fmov "); o(fr); o(", f1"); nl(); return t_real; }
+        if (real_var_operand(lhs, &sa_buf)) { ln(); o("fstd f1, "); o(sa_buf.p); nl(); return t_real; }
+        if (simple_addr(lhs, "r2", &sa_buf)) {
+            if (is_real(sa_ty)) { ln(); o("fstd f1, "); o(sa_buf.p); nl(); return t_real; }
+            fail_at(ex_pos.p[lhs], "a real cannot be stored there", null);
+        }
         push_f1();
         addr(lhs);
         pop_f1();
@@ -1890,6 +2574,14 @@ fn assign_real(op: int, lhs: int, rhs: int) -> int {
         return t_real;
     }
     if (!is_real_arith(op)) { m0(); ms("cannot apply "); m_op(op); ms(" to a real"); fail(ex_pos.p[lhs]); }
+    var cf: *char = freg_local(lhs);
+    if (cf != null) {
+        // the value also in f1, as after the store
+        expr_real(rhs);
+        ln(); o(real_mnemonic(op)); o(" f1, "); o(cf); o(", f1"); nl();
+        ln(); o("fmov "); o(cf); o(", f1"); nl();
+        return t_real;
+    }
     addr(lhs);
     em("push r1");
     expr_real(rhs);
@@ -1913,6 +2605,13 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
             var n: int = ex_v.p[lhs];
             var l: int = lookup_local(n);
             var g: int = g_kind[n];
+            if (l >= 0 && lc_reg.p[l] != 0) {
+                var rty: int = lc_ty.p[l];
+                var rr: *char = lc_reg.p[l] as *char;
+                check_assign(rty, expr(rhs), rhs);
+                ln(); o("mov "); o(rr); o(", r1"); nl();
+                return rty;
+            }
             if (l >= 0 || g == G_VAR || g == G_EXTERN) {
                 var ty: int = l >= 0 ? lc_ty.p[l] : g_ty[n];
                 if (!is_scalar(ty)) {
@@ -1927,6 +2626,13 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
             }
         }
         var rt: int = expr(rhs);
+        if (simple_addr(lhs, "r2", &sa_buf)) {
+            var slt: int = sa_ty;
+            if (!is_scalar(slt)) { m0(); ms("cannot assign a whole "); mty(slt); ms("; copy it field by field"); fail(ex_pos.p[lhs]); }
+            check_assign(slt, rt, rhs);
+            store_operand(slt, "r1", sa_buf.p);
+            return slt;
+        }
         em("push r1");
         var lt: int = addr(lhs);
         if (!is_scalar(lt)) { m0(); ms("cannot assign a whole "); mty(lt); ms("; copy it field by field"); fail(ex_pos.p[lhs]); }
@@ -1936,6 +2642,29 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
         em("mov r1, r2");
         return lt;
     }
+    // a register local: in place
+    if (ex_kind.p[lhs] == E_NAME) {
+        var cl: int = lookup_local(ex_v.p[lhs]);
+        if (cl >= 0 && lc_reg.p[cl] != 0) {
+            var clt: int = lc_ty.p[cl];
+            var cr: *char = lc_reg.p[cl] as *char;
+            var cimm: int = const_eval(rhs);
+            var chas: int = ce_ok;
+            var crt: int = t_int;
+            if (!chas) {
+                crt = decay(expr(rhs));
+                em("mov r2, r1");
+            }
+            ln(); o("mov r1, "); o(cr); nl();
+            var cres: int = arith(op, clt, crt, cimm, chas, ex_pos.p[rhs]);
+            check_assign(clt, cres, rhs);
+            ln(); o("mov "); o(cr); o(", r1"); nl();
+            return clt;
+        }
+    }
+    // a variable in memory, an element or a field, with a constant or
+    // simple right side: load, operate, store
+    if (compound_in_place(op, lhs, rhs)) { return ci_ty; }
     var at: int = addr(lhs);
     if (!is_scalar(at)) { m0(); ms("cannot apply an operator to a whole "); mty(at); fail(ex_pos.p[lhs]); }
     em("push r1");

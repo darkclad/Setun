@@ -112,36 +112,46 @@ fn tric_compare(s: &mut Session, p: &str, src: &str) {
 
 /// tric's optimization levels (TERNARY_WORLD phase A): at -O1 (the
 /// peephole pass, conditions jumping straight to their targets, rotated
-/// loops) tric writes exactly the host's level-1 assembly.
-#[test]
-fn tric_matches_the_host_at_level_1() {
-    let progs = ["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "sh", "tric"];
-    let opts = trine::Options { level: Some(1), ..trine::Options::user() };
+/// loops) and -O2 (register locals, direct operands, the fast frame) tric
+/// writes exactly the host's assembly at that level.
+fn tric_at_level(level: u8, progs: &[&str]) -> Session {
+    let opts = trine::Options { level: Some(level), ..trine::Options::user() };
     let user = trinux::user_dir();
     let want: Vec<(String, String)> = progs
         .iter()
         .map(|p| {
             let b = trine::build_file(&user.join(format!("bin/{p}.tri")), &opts).unwrap_or_else(|e| panic!("{p}: {e}"));
-            (format!("{p}.O1.s"), b.asm)
+            (format!("{p}.O{level}.s"), b.asm)
         })
         .collect();
     let extra: Vec<(&str, &str)> = want.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
-    let disk = disk_with_trine(&progs, &extra);
+    let disk = disk_with_trine(progs, &extra);
     let mut s = Session::boot_disk(&disk, false);
     for p in progs {
         let o = s.cmd_max(
-            &format!("mkdir -p /usr/obj; tric -O1 -S -o /usr/obj/{p}.s /usr/src/bin/{p}.tri; echo status $?; md5sum /usr/obj/{p}.s /usr/src/{p}.O1.s"),
+            &format!("mkdir -p /usr/obj; tric -O{level} -S -o /usr/obj/{p}.s /usr/src/bin/{p}.tri; echo status $?; md5sum /usr/obj/{p}.s /usr/src/{p}.O{level}.s"),
             200_000_000_000,
         );
         assert!(o.contains("status 0"), "{p}: {o}");
-        let (a, b) = (md5_of(&o, &format!("/usr/obj/{p}.s")), md5_of(&o, &format!("/usr/src/{p}.O1.s")));
+        let (a, b) = (md5_of(&o, &format!("/usr/obj/{p}.s")), md5_of(&o, &format!("/usr/src/{p}.O{level}.s")));
         if a != b {
-            let d = s.cmd_max(&format!("diff /usr/src/{p}.O1.s /usr/obj/{p}.s | head -30"), 20_000_000_000);
-            panic!("{p}: tric -O1 and the host differ:\n{d}");
+            let d = s.cmd_max(&format!("diff /usr/src/{p}.O{level}.s /usr/obj/{p}.s | head -30"), 20_000_000_000);
+            panic!("{p}: tric -O{level} and the host differ:\n{d}");
         }
     }
-    // -O0 is the unoptimized output still; levels above 1 are not there yet
-    has(&s.cmd("tric -O2 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
+    s
+}
+
+#[test]
+fn tric_matches_the_host_at_level_1() {
+    tric_at_level(1, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "sh", "tric"]);
+}
+
+#[test]
+fn tric_matches_the_host_at_level_2() {
+    let mut s = tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
+    // levels above 2 are not there yet
+    has(&s.cmd("tric -O3 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
 }
 
 /// Real literals: the decimal is converted exactly and rounded once, ties to

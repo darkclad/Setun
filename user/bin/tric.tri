@@ -345,7 +345,7 @@ fn main(argc: int, argv: **char) -> int {
         if (c == 'S') { asm_only = 1; }
         else if (c == 'o') { outpath = optarg; }
         else if (c == 'v') { verbose = 1; }
-        else if (c == 'O' && optarg[0] >= '0' && optarg[0] <= '1' && optarg[1] == 0) { opt_level = optarg[0] - '0'; }
+        else if (c == 'O' && optarg[0] >= '0' && optarg[0] <= '2' && optarg[1] == 0) { opt_level = optarg[0] - '0'; }
         else { return usage(); }
         c = getopt(argc, argv, "So:vO:");
     }

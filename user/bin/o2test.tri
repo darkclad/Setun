@@ -1,0 +1,94 @@
+// /bin/o2test: code shapes for tric's optimization level 2 (selfhost.rs
+// compares tric -O2 with the host): register locals under pressure (a for
+// loop's variable keeps its register to the end of the function, as the
+// host does), real locals in f registers in a leaf, parameters past the
+// sixth, elements and fields through register pointers, compound
+// assignments on elements, fields, globals and trytes, constants on the
+// left of commutative operators, and right sides evaluated first.
+
+import "../lib/tlibc.tri";
+
+struct pt {
+    x: int;
+    y: int;
+    t: tryte;
+}
+
+var gp: pt;
+var garr: [27]int;
+var gr: real;
+var gn: int = 5;
+
+// a leaf with real locals: f-1.. hold them
+fn leafy(a: real, b: real) -> real {
+    var s: real = a * b;
+    var u: real = s + a;
+    s += u;
+    return s - b;
+}
+
+// more parameters than r1..r6
+fn many(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int {
+    return a + 2 * b + 3 * c + d * e - f + g * 10 + h * 100;
+}
+
+fn pointers(p: *pt, q: *int, n: int) -> int {
+    p.x = n;
+    p.y += 7;
+    p.t += 1;
+    q[n] = 3 * n;
+    q[n + 1] += q[n];
+    *q = q[n + 1] - 1;
+    return p.x + p.y + *q + q[n - 1 + 2];
+}
+
+fn pressure(n: int) -> int {
+    var total: int = 0;
+    for (var i: int = 0; i < n; i += 1) { total += i; }
+    for (var j: int = 0; j < n; j += 1) { total += 2 * j; }
+    // after the loops: r-1 and r-2 (i, j) stay taken
+    var a: int = n + 1;
+    var b: int = a * 2;
+    var c: int = b - a;
+    var d: int = c + gn;
+    var e: int = 3 + d;                  // a constant on the left: an immediate
+    var f: int = 10 * e;
+    var g: int = gn - many(a, b, c, d, e, f, 1, 2);   // gn after the call
+    var h: int = gn * (a + many(1, 2, 3, 4, 5, 6, 7, 8));
+    {
+        var k: int = h % 97;
+        total += k;
+    }
+    var m: int = total;                  // k's register again
+    return a + b + c + d + e + f + g + h + m;
+}
+
+fn arrays() -> int {
+    var loc: [9]int;
+    var i: int = 0;
+    while (i < 9) { loc[i] = i * i; i += 1; }
+    loc[3] += 5;
+    garr[4] = loc[3];
+    garr[4] *= 2;
+    garr[i - 2] = garr[4] + loc[i - 1];
+    gp.x = 4;
+    gp.x += garr[7];
+    gp.t = 12;
+    gp.t -= 2;
+    gn += gp.x;
+    var s: int = 0;
+    i = 0;
+    while (i < 9) { s += loc[i] + garr[i]; i += 1; }
+    return s + gp.x + gp.t;
+}
+
+fn main() -> int {
+    gr = leafy(1.5, 2.0);
+    var buf: [9]int;
+    var p: pt;
+    p.y = 1;
+    p.t = 2;
+    var r: int = pointers(&p, &buf[0], 3) + pressure(6) + arrays() + (gr as int);
+    puts("o2test: ok\n");
+    return r % 7;
+}
