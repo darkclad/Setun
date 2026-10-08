@@ -746,6 +746,108 @@ fn has_effects(x: int) -> int {
     return 0;
 }
 
+
+// ---- level 3: temporaries held in registers, calls with arguments in registers ----
+
+var iheld: int;                          // r4.. holding left operands
+var fheld: int;                          // f3.. holding real ones
+
+fn o3() -> int { return opt_level >= 3; }
+
+// Is there a call in x (which may change r4..r6 and the f registers)?
+// (The host's real_calls: below level 4 nothing is inlined, so any call.)
+fn has_calls(x: int) -> int {
+    var k: int = ex_kind.p[x];
+    if (k == E_CALL) { return 1; }
+    if (k == E_UNARY || k == E_FIELD || k == E_CAST) { return has_calls(ex_a.p[x]); }
+    if (k == E_BINARY || k == E_INDEX || k == E_ASSIGN) { return has_calls(ex_a.p[x]) || has_calls(ex_b.p[x]); }
+    if (k == E_COND) { return has_calls(ex_a.p[x]) || has_calls(ex_b.p[x]) || has_calls(ex_c.p[x]); }
+    if (k == E_LIST) {
+        var j: int = 0;
+        while (j < ex_n.p[x]) { if (has_calls(lists.p[ex_v.p[x] + j])) { return 1; } j += 1; }
+    }
+    return 0;
+}
+
+var held_r: [3]*char = { "r4", "r5", "r6" };
+var held_f: [7]*char = { "f3", "f4", "f5", "f6", "f7", "f8", "f9" };
+
+// Hold r1 in r4..r6 while x is evaluated: the register, or null (then
+// use the stack). Release with iheld -= 1.
+fn hold_r1(x: int) -> *char {
+    if (!o3() || iheld >= 3 || has_calls(x)) { return null; }
+    var r: *char = held_r[iheld];
+    iheld += 1;
+    ln(); o("mov "); o(r); o(", r1"); nl();
+    return r;
+}
+
+fn hold_f1(x: int) -> *char {
+    if (!o3() || fheld >= 7 || has_calls(x)) { return null; }
+    var r: *char = held_f[fheld];
+    fheld += 1;
+    ln(); o("fmov "); o(r); o(", f1"); nl();
+    return r;
+}
+
+// A direct call with at most six integer arguments: only those before
+// the last one that is not simple go through the stack; that one goes
+// straight to its register, the simple ones after it at the end.
+fn arg_simple(a: int) -> int {
+    const_eval(a);
+    return ce_ok || is_simple_operand(a);
+}
+
+fn call_in_registers(direct: int, args: int, na: int, ps: int, ret: int) -> int {
+    var last: int = -1;
+    var k: int = na - 1;
+    while (k >= 0 && last < 0) { if (!arg_simple(lists.p[args + k])) { last = k; } k -= 1; }
+    var pushed: int = last >= 0 ? last : 0;
+    k = 0;
+    while (k < pushed) {
+        var a: int = lists.p[args + k];
+        check_assign(ty_list.p[ps + k], expr(a), a);
+        em("push r1");
+        k += 1;
+    }
+    if (last >= 0) {
+        var am: int = lists.p[args + last];
+        check_assign(ty_list.p[ps + last], expr(am), am);
+        if (last > 0) { ln(); o("mov r"); oi(last + 1); o(", r1"); nl(); }
+    }
+    k = 0;
+    while (k < pushed) {
+        ln(); o("ldw r"); oi(k + 1); o(", "); om("sp", 3 * (pushed - 1 - k)); nl();
+        k += 1;
+    }
+    k = last >= 0 ? last + 1 : 0;
+    while (k < na) {
+        var a2: int = lists.p[args + k];
+        var t: int = peek_type(a2);
+        check_assign(ty_list.p[ps + k], t, a2);
+        // straight into its register
+        var v: int = const_eval(a2);
+        if (ce_ok) {
+            ln(); o("li r"); oi(k + 1); o(", "); oi(v); nl();
+        } else {
+            var src: *char = reg_local(a2);
+            if (src != null) {
+                ln(); o("mov r"); oi(k + 1); o(", "); o(src); nl();
+            } else {
+                var n: int = ex_v.p[a2];
+                var l: int = lookup_local(n);
+                ln(); o(is_tsz(t) ? "ldt r" : "ldw r"); oi(k + 1); o(", ");
+                if (l >= 0) { om("fp", lc_off.p[l]); } else { oc('['); o_label(n); oc(']'); }
+                nl();
+            }
+        }
+        k += 1;
+    }
+    ln(); o("call "); o(name_str(direct)); nl();
+    if (pushed > 0) { e_i("add sp, sp, ", 3 * pushed); }
+    return ret;
+}
+
 var ci_buf: cvec;
 
 // lhs op= rhs in place (a variable in memory, an element or a field, with a
@@ -1977,6 +2079,13 @@ fn compare(a: int, b: int) -> int {
         expr_real(a);
         var fr: *char = freg_local(b);
         if (fr != null) { ln(); o("fcmp f1, "); o(fr); nl(); return 1; }
+        var fh: *char = hold_f1(b);
+        if (fh != null) {
+            expr_real(b);
+            fheld -= 1;
+            ln(); o("fcmp "); o(fh); o(", f1"); nl();
+            return 1;
+        }
         push_f1();
         expr_real(b);
         em("fmov f2, f1");
@@ -2002,9 +2111,15 @@ fn compare(a: int, b: int) -> int {
         ln(); o("cmp "); o(left); o(", "); o(rreg); nl();
         return 0;
     }
-    em("push r1");
+    var held: *char = hold_r1(b);
+    if (held == null) { em("push r1"); }
     var tb: int = decay(expr(b));
     if (!comparable(ta, tb)) { m0(); ms("cannot compare "); mty(ta); ms(" with "); mty(tb); fail(ex_pos.p[b]); }
+    if (held != null) {
+        iheld -= 1;
+        ln(); o("cmp "); o(held); o(", r1"); nl();
+        return 0;
+    }
     em("mov r2, r1");
     em("pop r1");
     em("cmp r1, r2");
@@ -2496,6 +2611,13 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
         var fr: *char = freg_local(b);
         if (fr != null) { ln(); o(real_mnemonic(op)); o(" f1, f1, "); o(fr); nl(); return t_real; }
         if (real_var_operand(b, &sa_buf)) { ln(); o("fldd f2, "); o(sa_buf.p); nl(); real_op(op); return t_real; }
+        var bh: *char = hold_f1(b);
+        if (bh != null) {
+            expr_real(b);
+            fheld -= 1;
+            ln(); o(real_mnemonic(op)); o(" f1, "); o(bh); o(", f1"); nl();
+            return t_real;
+        }
         push_f1();
         expr_real(b);
         em("fmov f2, f1");
@@ -2550,6 +2672,14 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
         return arith(op, lt0, rt0, 0, 0, pos);
     }
     var lt2: int = decay(expr(a));
+    var ih: *char = hold_r1(b);
+    if (ih != null) {
+        var rth: int = decay(expr(b));
+        iheld -= 1;
+        em("mov r2, r1");
+        ln(); o("mov r1, "); o(ih); nl();
+        return arith(op, lt2, rth, 0, 0, pos);
+    }
     em("push r1");
     var rt: int = decay(expr(b));
     em("mov r2, r1");
@@ -2768,6 +2898,7 @@ fn gen_call(x: int) -> int {
         e_i("add sp, sp, ", total + (direct >= 0 ? 0 : 3));
         return ty_a.p[fty];
     }
+    if (o3() && direct >= 0 && na <= 6) { return call_in_registers(direct, args, na, ps, ty_a.p[fty]); }
     k = 0;
     while (k < na) {
         var a2: int = lists.p[args + k];

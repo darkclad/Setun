@@ -149,9 +149,14 @@ fn tric_matches_the_host_at_level_1() {
 
 #[test]
 fn tric_matches_the_host_at_level_2() {
-    let mut s = tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
-    // levels above 2 are not there yet
-    has(&s.cmd("tric -O3 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
+    tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
+}
+
+#[test]
+fn tric_matches_the_host_at_level_3() {
+    let mut s = tric_at_level(3, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
+    // level 4 is not there yet
+    has(&s.cmd("tric -O4 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
 }
 
 /// Real literals: the decimal is converted exactly and rounded once, ties to

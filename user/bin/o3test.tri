@@ -1,0 +1,26 @@
+// /bin/o3test: code shapes for tric's optimization level 3 (selfhost.rs
+// compares tric -O3 with the host): left operands held in r4, r5, r6 (and
+// on the stack past them) while right sides nest, reals held in f3.. the
+// same way, a call stopping it, and calls with their arguments straight
+// in registers.
+
+import "../lib/tlibc.tri";
+
+var g: [9]int = { 3, 1, 4, 1, 5, 9, 2, 6, 5 };
+var h: [9]real;
+
+fn three(a: int, b: int, c: int) -> int { return a * 100 + b * 10 + c; }
+
+fn main() -> int {
+    // four levels to the right: r4, r5, r6, then the stack
+    var x: int = g[0] - (g[1] * (g[2] - (g[3] + (g[4] - g[5] * g[6]))));
+    var i: int = 0;
+    while (i < 9) { h[i] = i * 1.5; i += 1; }
+    var y: real = h[1] - (h[2] * (h[3] - (h[4] + (h[5] - h[6] * h[7]))));
+    // a call on the right: nothing held across it
+    var z: int = g[1] + three(g[2], g[3] + x, 7);
+    // arguments: the last complicated one straight to its register
+    var w: int = three(g[4] + 1, x, 5) + three(1, 2, g[7] * 2) + three(x, i, z);
+    puts("o3test: ok\n");
+    return (x + (y as int) + z + w) % 7;
+}
