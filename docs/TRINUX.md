@@ -609,7 +609,7 @@ line per check.
 | `/var/log` | daemon logs |
 | `/var/www` | `httpd`'s files (`index.html`) |
 | `/usr/share` | `font8x8`, `unifont` |
-| `/usr/lib` | `sftp-server`, `trwtest/`, and `trine/` (the Trine standard library: `ports.tri rt.tri console.tri keymap.tri real.tri math.tri`) |
+| `/usr/lib` | `sftp-server`, `trwtest/`, and `trine/` (the Trine standard library: `ports.tri rt.tri console.tri keymap.tri real.tri math.tri long.tri`, and `long.s`, the runtime `tric` appends for `long`) |
 | `/usr/src` | `hello.tri`, `lib/` (tlibc and every library module as source), `bin/tric.tri` and `bin/tric/` (the compiler's own source) |
 
 `mkdisk` makes programs 0755 and other files 0644, owned by root, with

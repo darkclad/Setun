@@ -20,7 +20,7 @@ const USER_BASE: int = -847288609443;
 const USER_DATA: int = -847288078002;   // USER_BASE + 27 pages
 
 var stdlib_dir: *char = "/usr/lib/trine/";
-var stdlib_names: *char = "ports.tri rt.tri console.tri keymap.tri real.tri math.tri ";
+var stdlib_names: *char = "ports.tri rt.tri console.tri keymap.tri real.tri math.tri long.tri ";
 
 fn usage() -> int {
     fputs(STDERR_FILENO, "usage: tric [-S] [-v] [-O level] [-o out] file.tri\n");
@@ -274,8 +274,18 @@ fn start_output() {
     out.n = 0;
 }
 
-// The pools and the equates after the code.
+// The long runtime (if the code calls it), the pools and the equates
+// after the code.
 fn finish_output() {
+    if (long_rt) {
+        var rp: *char = join(stdlib_dir, "long.s");
+        var rt: *char = read_file(rp);
+        if (rt == null) { perror2("tric", rp); exit(1); }
+        var j: int = 0;
+        while (j < src_n) { cv_push(&out, rt[j]); j += 1; }
+        free(rt as *tryte);
+        free(rp as *tryte);
+    }
     var k: int = 0;
     while (k < rp_w0.n) {
         put(".Lreal");

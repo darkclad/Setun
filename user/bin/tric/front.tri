@@ -199,16 +199,17 @@ const T_IDENT: int = 5;
 const T_KW: int = 6;
 const T_PUNCT: int = 7;
 const T_EOF: int = 8;
+const T_LONG: int = 9;                  // a literal past one word: its number in lw_*
 
 // keywords, in the host's order: their codes are 1..
-var kw_list: *char = "fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real unknown TRUE FALSE ";
+var kw_list: *char = "fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false null void trit tryte int char real unknown TRUE FALSE long ";
 // punctuation, longest first (the host's order): codes 1..
 var pu_list: *char = "<<= >>= <=> -> << >> <= >= == != && || += -= *= /= %= &= |= + - * / % < > = ! ~ & | ? : ; , . ( ) [ ] { } @ ";
 
-const KW_COUNT: int = 34;
+const KW_COUNT: int = 35;
 const PU_COUNT: int = 43;
 
-var kw_name: [35]int;                    // keyword code -> name id
+var kw_name: [36]int;                    // keyword code -> name id
 var pu_text: [44]*char;
 
 fn lex_init() {
@@ -299,13 +300,39 @@ fn lit_fail(pos: int, base: int, over: int) {
     fail(pos);
 }
 
-// v * b + d, or the literal does not fit (in a word, here)
-fn lit_step(pos: int, base: int, v: int, b: int, d: int) -> int {
+// Does v * b + d still fit in a word?
+fn lit_fits(v: int, b: int, d: int) -> int {
     var w: int = 3812798742493;
-    if (v > w / b || v < -(w / b)) { lit_fail(pos, base, 1); }
+    if (v > w / b || v < -(w / b)) { return 0; }
     var r: int = v * b;
-    if ((d > 0 && r > w - d) || (d < 0 && r < -w - d)) { lit_fail(pos, base, 1); }
-    return r + d;
+    return !((d > 0 && r > w - d) || (d < 0 && r < -w - d));
+}
+
+// literals past one word (longs): their words, high first, by number
+var lw_hi: ivec;
+var lw_mid: ivec;
+var lw_lo: ivec;
+
+// (3^81 - 1) / 2, the largest long
+var long_max: long = 0t111111111111111111111111111111111111111111111111111111111111111111111111111111111;
+
+// floor(a / b) for b > 0
+fn floor_div(a: int, b: int) -> int { return (a - ((a % b + b) % b)) / b; }
+
+// Does v * b + d still fit in a long, -max <= v * b + d <= max? With
+// max = q b + r: v <= q + floor((r - d) / b) and v >= -(q + floor((r + d) / b))
+// (nothing computed past max, which would wrap).
+fn long_fits(v: long, b: int, d: int) -> int {
+    var q: long = long_max / b;
+    var r: int = (long_max % b) as int;
+    return v <= q + floor_div(r - d, b) && v >= -(q + floor_div(r + d, b));
+}
+
+fn add_long_tok(v: long, pos: int) {
+    var w: *int = &v as *int;
+    iv_push(&lw_hi, w[0]);
+    iv_push(&lw_mid, w[1]);
+    add_tok(T_LONG, iv_push(&lw_lo, w[2]), pos);
 }
 
 fn bad_digit(pos: int, msg: *char, d: int) {
@@ -359,6 +386,8 @@ fn lex(src: *char, n: int, file: int) {
                     fail_at(pos, ds == lx_i ? "0t digits are 1, 0 and T (the old + and - are gone)" : "a 0t literal followed by + or -: put a space before the operator (the old + and - digits are gone)", null);
                 }
                 var v: int = 0;
+                var lv: long = 0;                // past a word: a long
+                var big: int = 0;
                 var any: int = 0;
                 var k: int = ds;
                 while (k < lx_i) {
@@ -366,26 +395,36 @@ fn lex(src: *char, n: int, file: int) {
                     k += 1;
                     if (d == '_') { continue; }
                     var dv: int = 0;
+                    var b: int = 16;
                     if (base == 't') {
                         if (d == '1') { dv = 1; } else if (d == '0') { dv = 0; } else if (d == 'T' || d == 't' || d == -'1') { dv = -1; }
                         else { bad_digit(pos, "bad 0t literal: invalid ternary digit ", d); }
-                        v = lit_step(pos, base, v, 3, dv);
+                        b = 3;
                     } else if (base == 'z') {
                         dv = z_digit(d);
                         if (dv == -100) { bad_digit(pos, "bad 0z literal: invalid ternary digit ", d); }
                         if (dv == 0 && d < 0) { bad_digit(pos, "bad 0z literal: ", d); }
-                        v = lit_step(pos, base, v, 27, dv);
+                        b = 27;
                     } else {
                         if (d >= '0' && d <= '9') { dv = d - '0'; }
                         else if (d >= 'a' && d <= 'f') { dv = d - 'a' + 10; }
                         else if (d >= 'A' && d <= 'F') { dv = d - 'A' + 10; }
                         else { bad_digit(pos, "bad 0x literal: invalid hexadecimal digit ", d); }
-                        v = lit_step(pos, base, v, 16, dv);
+                    }
+                    if (!big && !lit_fits(v, b, dv)) {
+                        big = 1;
+                        lv = v;
+                    }
+                    if (big) {
+                        if (!long_fits(lv, b, dv)) { lit_fail(pos, base, 1); }
+                        lv = lv * b + dv;
+                    } else {
+                        v = v * b + dv;
                     }
                     any = 1;
                 }
                 if (!any) { lit_fail(pos, base, 0); }
-                add_tok(T_INT, v, pos);
+                if (big) { add_long_tok(lv, pos); } else { add_tok(T_INT, v, pos); }
                 continue;
             }
             while (lx_i < lx_n && (is_dig(lx_s[lx_i]) || lx_s[lx_i] == '_')) { bump(); }
@@ -418,16 +457,25 @@ fn lex(src: *char, n: int, file: int) {
                 add_tok(T_REAL, new_string(&buf[0], tl), pos);
             } else {
                 var v2: int = 0;
+                var lv2: long = 0;               // past a word: a long
+                var big2: int = 0;
                 var j: int = 0;
                 while (j < tl) {
                     if (!is_dig(buf[j])) { fail_at(pos, "bad number", &buf[0]); }
-                    // (a number past the word is refused here: the host reads
-                    // it, then finds it does not fit)
-                    if (v2 > (3812798742493 - (buf[j] - '0')) / 10) { fail_at(pos, "bad number", &buf[0]); }
-                    v2 = v2 * 10 + buf[j] - '0';
+                    var dd2: int = buf[j] - '0';
+                    if (!big2 && !lit_fits(v2, 10, dd2)) {
+                        big2 = 1;
+                        lv2 = v2;
+                    }
+                    if (big2) {
+                        if (!long_fits(lv2, 10, dd2)) { fail_at(pos, "bad number", &buf[0]); }
+                        lv2 = lv2 * 10 + dd2;
+                    } else {
+                        v2 = v2 * 10 + dd2;
+                    }
                     j += 1;
                 }
-                add_tok(T_INT, v2, pos);
+                if (big2) { add_long_tok(lv2, pos); } else { add_tok(T_INT, v2, pos); }
             }
             continue;
         }
@@ -521,6 +569,7 @@ const E_SIZEOF: int = 14;
 const E_COND: int = 15;
 const E_LIST: int = 16;
 const E_TRUTH: int = 17;                // a Kleene truth value (a trit): v = +1, 0, -1
+const E_LONG: int = 18;                 // a literal past one word: v = its number in lw_*
 
 // binary operators (the host's order)
 const B_ADD: int = 1;
@@ -581,6 +630,7 @@ const TE_NAMED: int = 6;
 const TE_PTR: int = 7;
 const TE_ARRAY: int = 8;
 const TE_FN: int = 9;
+const TE_LONG: int = 10;
 
 var te_kind: ivec;
 var te_a: ivec;                          // the target/element type expr, or the name
@@ -707,6 +757,7 @@ fn eat(s: *char) -> int {
 fn describe() {
     var k: int = tkind();
     if (k == T_INT) { ms("number "); mi(tval()); }
+    else if (k == T_LONG) { ms("a long number"); }
     else if (k == T_REAL) { ms("number "); cv_push(&mb, 0); mb.n -= 1; ms_n(str_at(tval()), str_n(tval())); }
     else if (k == T_CHAR) { ms("a character literal"); }
     else if (k == T_STR) { ms("a string"); }
@@ -765,6 +816,7 @@ fn parse_type() -> int {
         var kw: *char = name_str(kw_name[tval()]);
         if (streq(kw, "int")) { advance(); return new_te(TE_INT, 0, 0, 0, 0); }
         if (streq(kw, "real")) { advance(); return new_te(TE_REAL, 0, 0, 0, 0); }
+        if (streq(kw, "long")) { advance(); return new_te(TE_LONG, 0, 0, 0, 0); }
         if (streq(kw, "tryte") || streq(kw, "char")) { advance(); return new_te(TE_TRYTE, 0, 0, 0, 0); }
         if (streq(kw, "trit")) { advance(); return new_te(TE_TRIT, 0, 0, 0, 0); }
         if (streq(kw, "void")) { advance(); return new_te(TE_VOID, 0, 0, 0, 0); }
@@ -924,6 +976,7 @@ fn parse_primary() -> int {
     var k: int = tkind();
     var v: int = tval();
     if (k == T_INT) { advance(); return new_expr(E_INT, 0, 0, 0, 0, v, 0, pos); }
+    if (k == T_LONG) { advance(); return new_expr(E_LONG, 0, 0, 0, 0, v, 0, pos); }
     if (k == T_REAL) { advance(); return new_expr(E_REAL, 0, 0, 0, 0, v, 0, pos); }
     if (k == T_CHAR) { advance(); return new_expr(E_CHAR, 0, 0, 0, 0, v, 0, pos); }
     if (k == T_STR) { advance(); return new_expr(E_STR, 0, 0, 0, 0, v, 0, pos); }

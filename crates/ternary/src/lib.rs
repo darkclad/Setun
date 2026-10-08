@@ -622,6 +622,73 @@ pub fn parse_prefixed(base: char, digits: &str) -> Result<i64, String> {
     }
 }
 
+/// The value of a literal as an 81-trit integer (Trine's `long`): its words,
+/// high first. `base` is `t`, `z` or `x` as for [`parse_prefixed`] (with its
+/// digit errors), or `d` for decimal digits; a value past 81 trits is an
+/// error ("... does not fit").
+pub fn parse_wide(base: char, digits: &str) -> Result<[i64; 3], String> {
+    const W: i128 = 7_625_597_484_987; // 3^27
+    // x := x * b + d in three balanced words, low first
+    let mut x = [0i128; 3];
+    let mut step = |b: i128, d: i128| -> bool {
+        let mut carry = d;
+        for w in x.iter_mut() {
+            let v = *w * b + carry;
+            let lo = wrap_trits(v, 27);
+            *w = lo;
+            carry = (v - lo) / W;
+        }
+        carry == 0
+    };
+    match base {
+        't' => {
+            for (c, over) in digit_marks(digits).map_err(|e| e.to_string())? {
+                let d = match (c, over) {
+                    ('1', false) => 1,
+                    ('1', true) | ('T' | 't', false) => -1,
+                    ('0', false) => 0,
+                    (_, true) => return Err(ParseError::BadOverline(c).to_string()),
+                    _ => return Err(ParseError::BadChar(c).to_string()),
+                };
+                if !step(3, d) {
+                    return Err(ParseError::Overflow.to_string());
+                }
+            }
+        }
+        'z' => {
+            for (c, over) in digit_marks(digits).map_err(|e| e.to_string())? {
+                let d = b27_value(c).ok_or(if over { ParseError::BadOverline(c) } else { ParseError::BadChar(c) }).map_err(|e| e.to_string())?;
+                if over && d == 0 {
+                    return Err(ParseError::BadOverline(c).to_string());
+                }
+                if !step(27, if over { -d } else { d } as i128) {
+                    return Err(ParseError::Overflow.to_string());
+                }
+            }
+        }
+        'x' | 'd' => {
+            if base == 'x' && digits.contains(OVERLINE) {
+                return Err("hexadecimal digits cannot be overlined".into());
+            }
+            let h: String = digits.chars().filter(|&c| c != '_').collect();
+            if h.is_empty() {
+                return Err(if base == 'x' { "empty hexadecimal literal" } else { "empty literal" }.into());
+            }
+            let radix = if base == 'x' { 16 } else { 10 };
+            for c in h.chars() {
+                let Some(d) = c.to_digit(radix) else {
+                    return Err(if base == 'x' { format!("invalid hexadecimal digit {c:?}") } else { format!("invalid digit {c:?}") });
+                };
+                if !step(radix as i128, d as i128) {
+                    return Err(if base == 'x' { "hexadecimal literal does not fit" } else { "number does not fit" }.into());
+                }
+            }
+        }
+        _ => return Err(format!("unknown literal prefix 0{base}")),
+    }
+    Ok([x[2] as i64, x[1] as i64, x[0] as i64])
+}
+
 /// Split digit text into (character, overlined) pairs, skipping `_` and
 /// whitespace. An overline must follow a character that can take one; a
 /// second overline, or one with nothing before it, is an error.

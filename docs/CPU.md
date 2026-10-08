@@ -367,6 +367,7 @@ The assembler picks `ALUQ` when the constant is known and fits ±13, `ALUI` othe
 | 21 | `abs rd, ra` | `rd :=` \|`ra`\| | S | – | – |
 
 - **The carry trit.** The exact sum of two words lies within ±(3^27 − 1). If it exceeds the word range, the result wraps by 3^27 and C is +1 (positive overflow) or −1 (negative overflow); otherwise C is 0. A three-word add is `add` on the low words, then `adc` on the middle and `adc` on the high words.
+- **`SBC` subtracts the carry** (as the ISA specifies), but `SUB` leaves C so that the exact difference is `result + C·3^27`: the next word needs C *added*. So `sub` then `sbc` does not make a multi-word subtraction. Negate the subtrahend instead (exact in balanced ternary: `neg` each word) and use `add`/`adc`, as Trine's `long` runtime does (`crates/trine/lib/long.s`). Nothing in the tree uses `SBC`.
 - **The product.** For words a and b the exact product is `hi·3^27 + lo`, with `lo` = `mul a, b` and `hi` = `mulh a, b`, both balanced words. `mul` sets C to the sign of `hi`, so C ≠ 0 exactly when the product did not fit.
 - **Two divisions.** `div`/`mod` follow C: −7 `div` 2 = −3, −7 `mod` 2 = −1. `divr`/`modr` round to nearest: 8 `divr` 3 = 3, 8 `modr` 3 = −1. When the exact quotient is a half (b even), the emulator chooses the remainder +|b|/2: 7 `divr` 2 = 3, −7 `divr` 2 = −4 (the ISA does not specify ties). No quotient overflows.
 - `mov rd, ra` is `add rd, ra, r0`.

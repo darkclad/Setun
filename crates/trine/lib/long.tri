@@ -1,0 +1,48 @@
+// long.tri: decimal text for Trine's 81-trit `long`.
+
+// The decimal text of v into out, which takes up to 41 trytes (a sign, 39
+// digits and the NUL); returns its length.
+fn ltoa(v: long, out: *char) -> int {
+    var buf: [40]char;
+    var n: int = 0;
+    var neg: int = v < 0;
+    loop {
+        var d: int = (v % 10) as int;
+        if (d < 0) { d = -d; }
+        buf[n] = ('0' + d) as char;
+        n += 1;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    var k: int = 0;
+    if (neg) {
+        out[0] = '-';
+        k = 1;
+    }
+    while (n > 0) {
+        n -= 1;
+        out[k] = buf[n];
+        k += 1;
+    }
+    out[k] = 0;
+    return k;
+}
+
+// The value of decimal text: spaces, an optional sign, then digits (it
+// stops at the first other character; past 81 trits it wraps).
+fn atol(s: *char) -> long {
+    while (*s == ' ' || *s == '\t' || *s == '\n') { s = s + 1; }
+    var neg: int = 0;
+    if (*s == '-') {
+        neg = 1;
+        s = s + 1;
+    } else if (*s == '+') {
+        s = s + 1;
+    }
+    var v: long = 0;
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10 + (*s - '0');
+        s = s + 1;
+    }
+    return neg ? -v : v;
+}

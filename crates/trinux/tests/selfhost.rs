@@ -73,6 +73,7 @@ fn disk_with_trine(progs: &[&str], extra: &[(&str, &str)]) -> Vec<i16> {
     for p in tree(&user.join("../crates/trine/lib")) {
         add(&mut files, format!("/usr/lib/trine/{}", p.file_name().unwrap().to_str().unwrap()), &p);
     }
+    add(&mut files, "/usr/lib/trine/long.s".into(), &user.join("../crates/trine/lib/long.s"));
     let opts = trine::Options { optimize: false, ..trine::Options::user() };
     for p in progs {
         let src = user.join(format!("bin/{p}.tri"));
@@ -144,27 +145,32 @@ fn tric_at_level(level: u8, progs: &[&str]) -> Session {
 
 #[test]
 fn tric_matches_the_host_at_level_1() {
-    tric_at_level(1, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "sh", "tric"]);
+    tric_at_level(1, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "longtest", "sh", "tric"]);
 }
 
 #[test]
 fn tric_matches_the_host_at_level_2() {
-    let mut s = tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
-    // and what it builds runs: compound assignments narrow trits and trytes
+    let mut s = tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "longtest", "sh", "tric"]);
+    // and what it builds runs: compound assignments narrow trits and
+    // trytes; longs (with the runtime appended)
     let o = s.cmd_max("tric -O2 -o /tmp/o1 /usr/src/bin/o1test.tri; /tmp/o1", 200_000_000_000);
     has(&o, &["o1test: ok"]);
+    let o = s.cmd_max("tric -O2 -o /tmp/lt /usr/src/bin/longtest.tri; /tmp/lt; echo status $?", 200_000_000_000);
+    has(&o, &["longtest: ok", "status 0"]);
 }
 
 #[test]
 fn tric_matches_the_host_at_level_3() {
-    tric_at_level(3, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
+    tric_at_level(3, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "longtest", "sh", "tric"]);
 }
 
 /// Level 4 is everything (the host's default build): inlining, and the
 /// functions nothing reaches left out.
 #[test]
 fn tric_matches_the_host_at_level_4() {
-    let mut s = tric_at_level(4, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "sh", "tric"]);
+    let mut s = tric_at_level(4, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "o3test", "longtest", "sh", "tric"]);
+    let o = s.cmd_max("tric -O4 -o /tmp/lt /usr/src/bin/longtest.tri; /tmp/lt; echo status $?", 200_000_000_000);
+    has(&o, &["longtest: ok", "status 0"]);
     has(&s.cmd("tric -O5 -S -o /tmp/x.s /usr/src/bin/echo.tri; echo status $?"), &["usage: tric", "status 2"]);
 }
 
@@ -208,12 +214,15 @@ fn tric_converts_reals_as_the_host_does() {
 
 #[test]
 fn tric_matches_the_host_compiler() {
-    let progs = ["echo", "cat", "sh", "edit", "tas", "tric", "libctest", "wget"];
+    let progs = ["echo", "cat", "sh", "edit", "tas", "tric", "libctest", "wget", "longtest"];
     let disk = disk_with_trine(&progs, &[]);
     let mut s = Session::boot_disk(&disk, false);
     for p in progs {
         tric_same_as_host(&mut s, p);
     }
+    // what tric builds unoptimized runs too
+    let o = s.cmd_max("tric -o /tmp/lt /usr/src/bin/longtest.tri; /tmp/lt; echo status $?", 200_000_000_000);
+    has(&o, &["longtest: ok", "status 0"]);
 }
 
 /// The fixed point: tric (built by the host) builds tric; that one builds
@@ -298,6 +307,19 @@ fn tric_reports_errors_as_the_host_does() {
         // text beyond U+2671 (A6)
         ("bigchar.tri", "fn main() -> int { return '日'; }\n"),
         ("bigchar2.tri", "fn main() -> int { return '日本'; }\n"),
+        // long
+        ("longint.tri", "fn main() -> int { var l: long = 5; var i: int = l; return i; }\n"),
+        ("longlit.tri", "fn main() -> int { return 1000000000000000000000; }\n"),
+        ("longreal.tri", "fn main() -> int { var l: long = 1.5; return 0; }\n"),
+        ("longshift.tri", "fn main() -> int { var l: long = 5; l = l << l; return 0; }\n"),
+        ("longptr.tri", "fn main() -> int { var a: [3]int; var l: long = 1; var p: *int = &a[0]; p = p + l; return 0; }\n"),
+        ("longdiv.tri", "fn main() -> int { var l: long = 5; l %= 0; return 0; }\n"),
+        ("longconst.tri", "const C: long = 5;\nfn main() -> int { return 0; }\n"),
+        ("longcmp.tri", "fn main() -> int { var l: long = 1; return l < null; }\n"),
+        ("longcast.tri", "fn main() -> int { var l: long = 1; var p: *int = l as *int; return 0; }\n"),
+        ("longbig.tri", "fn main() -> int { var l: long = 1000000000000000000000000000000000000000; return 0; }\n"),
+        ("longbig3.tri", "fn main() -> int { var l: long = 0t1000000000000000000000000000000000000000000000000000000000000000000000000000000000; return 0; }\n"),
+        ("longtok.tri", "fn main() -> int { return 1 100000000000000; }\n"),
     ];
     let disk = disk_with_trine(&[], bad);
     let mut s = Session::boot_disk(&disk, false);

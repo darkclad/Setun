@@ -22,6 +22,9 @@ pub struct Error {
     pub msg: String,
 }
 
+/// The long runtime (`lib/long.s`): appended to a program whose code uses it.
+pub const LONG_RUNTIME: &str = include_str!("../lib/long.s");
+
 /// The standard library, embedded so programs build anywhere.
 pub const STDLIB: &[(&str, &str)] = &[
     ("ports.tri", include_str!("../lib/ports.tri")),
@@ -30,6 +33,7 @@ pub const STDLIB: &[(&str, &str)] = &[
     ("keymap.tri", include_str!("../lib/keymap.tri")),
     ("real.tri", include_str!("../lib/real.tri")),
     ("math.tri", include_str!("../lib/math.tri")),
+    ("long.tri", include_str!("../lib/long.tri")),
 ];
 
 /// What the build produces.

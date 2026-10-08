@@ -7,6 +7,8 @@ pub enum TypeExpr {
     Int,
     /// The FPU's real81.
     Real,
+    /// An 81-trit integer: three words.
+    Long,
     Tryte,
     Trit,
     Void,
@@ -55,6 +57,8 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
+    /// An integer literal past one word: a `long`, its words high first.
+    Long([i64; 3]),
     /// A Kleene truth value, a `trit`: `true` +1, `unknown` 0, `false` −1.
     Truth(i64),
     /// A decimal real literal.

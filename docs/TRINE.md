@@ -150,6 +150,25 @@ undefined.
 A local without an initialiser has an unspecified value. A global without
 one is zero.
 
+For numbers past a word there is `long`, 81 trits (three words, up to
+about ±2.2·10^38). It has the integer operators, mixes with the smaller
+types, and `long.tri` prints it:
+
+```trine
+import "console.tri";
+import "long.tri";
+
+fn main() -> int {
+    var f: long = 1;
+    var n: int = 2;
+    while (n <= 30) { f *= n; n += 1; }     // 30! = 265252859812191058636308480000000
+    var text: [41]char;
+    ltoa(f, &text[0]);
+    print(&text[0]);
+    return (f % 1000003) as int;
+}
+```
+
 ## 3. Functions
 
 ```trine
@@ -548,7 +567,7 @@ local of the same name hides the builtin.
 ```text
 fn var const struct return if else while for loop break continue sign
 switch case default as sizeof import extern interrupt asm true false
-unknown TRUE FALSE null void trit tryte int char real
+unknown TRUE FALSE null void trit tryte int char real long
 ```
 
 `neg`, `zero` and `pos` are contextual: they are `sign` arm labels when
@@ -592,9 +611,14 @@ character `…` ``.
   followed by + or -: put a space before the operator``), because `+` and
   `-` were once base-3 digits. `0t1 - 1` and `0t1 -1` are fine.
 - A letter right after a decimal number is an error: ``bad number `1x` ``.
-- A literal that does not fit in a word is refused where it is used:
-  `constant N does not fit in a word`. A constant must also fit the type it
-  initialises (`19683 does not fit in tryte`).
+- A literal that does not fit in a word is a `long` (Section 2.6), up to
+  81 trits: (3^81 − 1)/2 = 221713244121518884974124815309574946401, or
+  `0t` followed by 81 `1`s. Past that it is an error: ``bad number `…` ``,
+  `bad 0t literal: ternary literal does not fit`, `bad 0x literal:
+  hexadecimal literal does not fit`. A constant expression computed past a
+  word (`3000000000000 + 3000000000000`) is still refused: `constant N
+  does not fit in a word`. A constant must also fit the type it initialises
+  (`19683 does not fit in tryte`).
 
 ### 1.7 Real literals
 
@@ -654,6 +678,7 @@ program); treat them as read-only.
 | `trit` | 1 | −1, 0, +1 (stored in a tryte) | no |
 | `tryte`, `char` | 1 | −9841 … 9841 | no |
 | `int` | 3 | −3 812 798 742 493 … 3 812 798 742 493 | yes |
+| `long` | 9 | ±(3^81 − 1)/2 (Section 2.6) | yes |
 | `real` | 9 | real81 (Section 7) | yes |
 | `*T` | 3 | an address | yes |
 | `fn(A, B) -> R` | 3 | a function's address | yes |
@@ -744,11 +769,12 @@ variable, is passed as an argument, or is returned. The rule
 |---|---|
 | the same type | always (an array first becomes a pointer to its element) |
 | `int` | `trit`, `tryte` |
+| `long` | `trit`, `tryte`, `int` |
 | `tryte` | `trit`; an integer constant in −9841…9841 |
 | `trit` | an integer constant in −1…1 |
 | a pointer or function type | `null` |
 | `*T` | `*void`, and `*void` from any pointer |
-| `real` | any integer (where a real is expected) |
+| `real` | any integer or `long` (where a real is expected) |
 
 Everything else is an error:
 
@@ -776,9 +802,48 @@ widens to `int` implicitly.
 | pointer, function | integer | the address (narrowed as above for `tryte`/`trit`) |
 | integer | `real` | exact |
 | `real` | integer | rounded to nearest, ties to even; out of range or NaN saturates and raises IV (Section 7); then narrowed |
+| integer | `long` | the value |
+| `long` | `int`, `tryte`, `trit` | the low 27, 9 or 1 trits |
+| `long` | `real` | rounded to nearest, ties to even |
+| `real` | `long` | rounded to nearest, ties to even; out of range, the nearest end of the range; NaN, 0 |
 
 Other conversions are ``cannot convert *real to real`` and the like. Use
 `sgn(x)` for a sign, not `x as trit`.
+
+### 2.6 `long`
+
+`long` is an 81-trit balanced integer: three words, the high one first in
+memory (its address is the high word's centre), and in registers `r1`
+(low), `r2`, `r3` (high).
+
+- **Operators:** `+ - * / %` (`/` truncates and `%` takes the sign of the
+  dividend, as for `int`; dividing by zero traps as an `int` division
+  does), unary `-`, `& | ~` (tritwise), `<< >>` by an `int` count (`>>`
+  rounds to nearest; a count of 81 or more gives 0), the comparisons and
+  `<=>`, compound assignment, `?:`. As a condition a `long` is true when
+  it is not zero, and `sign (l)` branches on its sign.
+- **Mixing:** with a `long`, an integer operand is widened; with a `real`,
+  the `long` is converted (Section 2.5). A shift's count must be an
+  integer: `cannot apply Shl to long and long`. A `long` with a pointer is
+  `cannot apply Add to *int and long`.
+- **Arithmetic wraps** modulo 3^81.
+- **Not allowed:** a `long` as an array index or `switch` value
+  (`expected an integer, found long`), a `long` constant (`a constant of
+  type long is not supported`), a `long` parameter of `main`.
+- **Storage:** locals, globals (with initialisers), fields, arrays and
+  pointers. A `long` is never kept in a register between statements.
+- **Calls:** a `long` parameter takes three argument slots, low word
+  first (`r1`…`r3` for the first), and a `long` result comes back in
+  `r1`…`r3` (Section 9.2).
+- **The runtime:** negation, loads, stores and conversions from integers
+  are inline. The other operations call routines in `lib/long.s`
+  (`_trine_ladd`, `_trine_lmul`, `_trine_ldiv`, `_trine_lcmp`, …), which
+  the compiler appends to a program that uses them. Each takes its left
+  operand on the stack and its right one in `r1`…`r3`, returns its result
+  in `r1`…`r3`, and keeps every other register, so code around it keeps
+  its values in registers.
+- **Text:** `long.tri` in the standard library has `ltoa` and `atol`
+  (Section 10).
 
 ## 3. Expressions
 
@@ -1538,8 +1603,11 @@ Locals are allocated in whole words.
 - Reals take `f1`…`f9` in order among the reals, while the other
   arguments take `r1`…`r6` in order among themselves. A function with real
   parameters has no stack arguments.
+- A `long` argument takes three integer slots, low word first: the first
+  `long` in `r1`…`r3`. With real parameters, all the integer slots
+  together are at most six.
 - Structs and arrays are passed as pointers.
-- The result is in `r1`, or `f1` for a real.
+- The result is in `r1`, `f1` for a real, `r1`…`r3` for a `long`.
 
 This is the ISA's suggested ABI, so Trine and assembly can call each
 other in both directions. Assembly called from Trine must preserve
@@ -1564,8 +1632,16 @@ other in both directions. Assembly called from Trine must preserve
 
 ## 10. The standard library
 
-The six modules are embedded in the compiler and found by `import`
-without a path (Section 5.9). In Trinux they are in `/usr/lib/trine`.
+The seven modules are embedded in the compiler and found by `import`
+without a path (Section 5.9). In Trinux they are in `/usr/lib/trine`,
+with `long.s`, the `long` runtime (Section 2.6).
+
+`long.tri` holds decimal text for `long`:
+
+| Function | Does |
+|---|---|
+| `ltoa(v: long, out: *char) -> int` | the decimal text of `v` into `out` (at most 41 trytes with the NUL); its length |
+| `atol(s: *char) -> long` | the value of decimal text: spaces, an optional sign, digits (it stops at the first other character) |
 
 ### 10.1 `rt.tri`: memory and strings
 
@@ -1688,8 +1764,9 @@ more. tlibc imports `rt.tri`. It is described with Trinux in
    order, then the function bodies, then `_trine_init`. Every expression
    leaves its value in `r1` (a real in `f1`).
 5. **Peephole** (`peephole.rs`): rewrites each function's assembly.
-6. **Startup code** (`crt0`) and, for the bare machine, the fault vector
-   table are added.
+6. **Startup code** (`crt0`), the `long` runtime (`lib/long.s`, when the
+   code calls it) and, for the bare machine, the fault vector table are
+   added.
 7. **Assembler** (`setun-asm`): the text becomes an image (ROM, boot
    sector or flat).
 
@@ -1805,7 +1882,7 @@ assembly (write it with `-S` to look). Only the first error is reported.
 | `goto`, labels | yes | no |
 | `do … while` | yes | no (`loop { … if (!c) break; }`) |
 | Variadic functions | yes | no |
-| `long`, `float`, `double` | yes | `real` (real81) only; no 81-trit integer |
+| `long`, `float`, `double` | several widths | `long`, 81 trits; `real` (real81) only |
 | Unsigned arithmetic | yes | none; `band`/`bor`/`bxor`/`bsh`/`bext`/`brot` for binary data |
 | Floating `%` | `fmod` (truncating) | IEEE remainder (rounding) |
 | Initialiser for an aggregate | `{ … }` | `{ … }`; a string for a tryte array |
@@ -1834,7 +1911,7 @@ extern      = "extern" ( "fn" signature | "var" IDENT ":" type ) ";" ;
 signature   = IDENT "(" [ param { "," param } ] ")" [ "->" type ] ;
 param       = IDENT ":" type ;
 
-type        = "int" | "tryte" | "char" | "trit" | "real" | "void" | IDENT
+type        = "int" | "tryte" | "char" | "trit" | "real" | "long" | "void" | IDENT
             | "*" type
             | "[" expr "]" type
             | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
@@ -1911,7 +1988,7 @@ Notes:
 | `true`, `unknown`, `false` | the Kleene truth values, `trit` +1, 0, −1 |
 | `TRUE`, `FALSE` | the binary truth values, `int` 1, 0 |
 | `null` | the null pointer |
-| `void`, `trit`, `tryte`, `int`, `char`, `real` | types |
+| `void`, `trit`, `tryte`, `int`, `char`, `real`, `long` | types |
 
 Contextual: `neg`, `zero`, `pos` (arm labels inside `sign`). Attribute
 names after `@`: `align`, `at`.

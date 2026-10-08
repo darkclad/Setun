@@ -138,6 +138,7 @@ There are 27 general registers of 27 trits, `r-13 … r0 … r13`. A register in
 
 - **S** replaces the binary sign and zero flags.
 - **C** is non-zero exactly when a result overflowed. It also feeds `ADC`/`SBC` for multi-word arithmetic.
+- **Erratum (found 2026-10-08):** `SUB` sets C so that the exact difference is `rd + C·3^27`, and `SBC` subtracts C, so `SUB` then `SBC` does not chain into a multi-word subtraction (the carry would have to be added). Multi-word subtraction adds the negated subtrahend with `ADD`/`ADC` (negation is exact). A fix would define `SBC` as `ra − b + C`; it is left as specified until a decision, and no code uses `SBC`.
 - S and C are saved with MODE on every trap.
 
 ### 2.3 Control registers

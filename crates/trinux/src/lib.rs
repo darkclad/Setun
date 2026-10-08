@@ -269,6 +269,8 @@ pub fn source_files() -> Vec<(String, PathBuf)> {
     for p in tree(&u.join("../crates/trine/lib")) {
         v.push((format!("/usr/lib/trine/{}", name(&p)), p));
     }
+    // the long runtime, which the compiler appends to code that uses it
+    v.push(("/usr/lib/trine/long.s".into(), u.join("../crates/trine/lib/long.s")));
     v.push(("/usr/src/bin/tric.tri".into(), u.join("bin/tric.tri")));
     for p in tree(&u.join("bin/tric")) {
         v.push((format!("/usr/src/bin/tric/{}", name(&p)), p));

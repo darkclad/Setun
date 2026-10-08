@@ -91,6 +91,7 @@ const TY_PTR: int = 7;
 const TY_ARRAY: int = 8;
 const TY_STRUCT: int = 9;
 const TY_FN: int = 10;
+const TY_LONG: int = 11;
 
 // PTR: a = target; ARRAY: a = element, b = length; STRUCT: b = id;
 // FN: a = result, b = first parameter in ty_list, c = parameter count.
@@ -111,6 +112,7 @@ var t_trit: int;
 var t_void: int;
 var t_null: int;
 var t_str: int;                          // *tryte
+var t_long: int;
 
 fn mk(kind: int, a: int, b: int, c: int, l: *int) -> int {
     var h: int = kind * 7 + a * 31 + b * 131 + c * 17;
@@ -164,6 +166,7 @@ fn types_init() {
     t_void = mk(TY_VOID, 0, 0, 0, null);
     t_null = mk(TY_NULL, 0, 0, 0, null);
     t_str = mk_ptr(t_tryte);
+    t_long = mk(TY_LONG, 0, 0, 0, null);
 }
 
 fn tk(t: int) -> int { return ty_kind.p[t]; }
@@ -171,6 +174,7 @@ fn is_integer(t: int) -> int { var k: int = tk(t); return k == TY_INT || k == TY
 fn is_pointer(t: int) -> int { return tk(t) == TY_PTR || tk(t) == TY_NULL; }
 fn is_scalar(t: int) -> int { var k: int = tk(t); return is_integer(t) || k == TY_PTR || k == TY_FN || k == TY_NULL; }
 fn is_real(t: int) -> int { return t == t_real; }
+fn is_long(t: int) -> int { return t == t_long; }
 fn is_tsz(t: int) -> int { return t == t_tryte || t == t_trit; }
 fn decay(t: int) -> int { return tk(t) == TY_ARRAY ? mk_ptr(ty_a.p[t]) : t; }
 fn ptr_elem(t: int) -> int { return tk(t) == TY_PTR ? ty_a.p[t] : -1; }
@@ -191,7 +195,7 @@ var s_of: *int;                          // name -> struct id + 1
 fn size(t: int) -> int {
     var k: int = tk(t);
     if (k == TY_INT || k == TY_PTR || k == TY_FN || k == TY_NULL) { return 3; }
-    if (k == TY_REAL) { return 9; }
+    if (k == TY_REAL || k == TY_LONG) { return 9; }
     if (k == TY_TRYTE || k == TY_TRIT) { return 1; }
     if (k == TY_VOID) { return 0; }
     if (k == TY_ARRAY) { return ty_b.p[t] * size(ty_a.p[t]); }
@@ -216,6 +220,7 @@ fn mty(t: int) {
     var k: int = tk(t);
     if (k == TY_INT) { ms("int"); }
     else if (k == TY_REAL) { ms("real"); }
+    else if (k == TY_LONG) { ms("long"); }
     else if (k == TY_TRYTE) { ms("tryte"); }
     else if (k == TY_TRIT) { ms("trit"); }
     else if (k == TY_VOID) { ms("void"); }
@@ -1011,9 +1016,13 @@ fn inlinable(n: int) -> int {
     if (!o4() || n < 0 || !ic_done[n] || ic_cost[n] < 0) { return 0; }
     if (g_kind[n] != G_FUNC) { return 0; }
     var fty: int = g_ty[n];
-    if (ty_c.p[fty] > 6 || is_real(ty_a.p[fty])) { return 0; }
+    if (ty_c.p[fty] > 6 || is_real(ty_a.p[fty]) || is_long(ty_a.p[fty])) { return 0; }
     var k: int = 0;
-    while (k < ty_c.p[fty]) { if (is_real(ty_list.p[ty_b.p[fty] + k])) { return 0; } k += 1; }
+    while (k < ty_c.p[fty]) {
+        var pt: int = ty_list.p[ty_b.p[fty] + k];
+        if (is_real(pt) || is_long(pt)) { return 0; }
+        k += 1;
+    }
     var from: int = calls_of(fn_item[n]);
     var ok: int = 1;
     var j: int = from;
@@ -1073,9 +1082,13 @@ fn inline_candidate(n: int, fty: int) -> int {
     var cost: int = ic_cost[n];
     // the outermost inlining pays for the whole tree
     if (inlining.n == 0 && inlined + cost > INLINE_BUDGET) { return -1; }
-    var plain: int = ty_c.p[fty] <= 6 && !is_real(ty_a.p[fty]);
+    var plain: int = ty_c.p[fty] <= 6 && !is_real(ty_a.p[fty]) && !is_long(ty_a.p[fty]);
     var k: int = 0;
-    while (k < ty_c.p[fty]) { if (is_real(ty_list.p[ty_b.p[fty] + k])) { plain = 0; } k += 1; }
+    while (k < ty_c.p[fty]) {
+        var pt: int = ty_list.p[ty_b.p[fty] + k];
+        if (is_real(pt) || is_long(pt)) { plain = 0; }
+        k += 1;
+    }
     var it: int = fn_item[n];
     var locals: int = vc_list(it_c.p[it]);
     var need: int = it_n.p[it] + locals;
@@ -1521,7 +1534,7 @@ fn sizeof_const(te: int) -> int {
     ce_ok = 1;
     var k: int = te_kind.p[te];
     if (k == TE_INT || k == TE_PTR || k == TE_FN) { return 3; }
-    if (k == TE_REAL) { return 9; }
+    if (k == TE_REAL || k == TE_LONG) { return 9; }
     if (k == TE_TRYTE || k == TE_TRIT) { return 1; }
     if (k == TE_NAMED) {
         var s: int = s_of[te_a.p[te]] - 1;
@@ -1614,6 +1627,7 @@ fn resolve(te: int, pos: int) -> int {
     var k: int = te_kind.p[te];
     if (k == TE_INT) { return t_int; }
     if (k == TE_REAL) { return t_real; }
+    if (k == TE_LONG) { return t_long; }
     if (k == TE_TRYTE) { return t_tryte; }
     if (k == TE_TRIT) { return t_trit; }
     if (k == TE_VOID) { return t_void; }
@@ -1763,21 +1777,22 @@ fn fn_signature(it: int) {
     var n: int = it_n.p[it];
     var j: int = 0;
     var nreal: int = 0;
+    var slots: int = 0;                  // argument slots: a long takes three
     while (j < n) {
         var t: int = resolve(pm_ty.p[lists.p[it_a.p[it] + j]], pos);
         iv_push(&tmp_stack, t);
-        if (is_real(t)) { nreal += 1; }
+        if (is_real(t)) { nreal += 1; } else { slots += is_long(t) ? 3 : 1; }
         j += 1;
     }
     var ret: int = resolve(it_b.p[it], pos);
     j = 0;
     while (j < n) {
         var p: int = tmp_stack.p[from + j];
-        if (!is_scalar(p) && !is_real(p)) { m0(); ms("parameter of type "); mty(p); ms(" must be passed as a pointer"); fail(pos); }
+        if (!is_scalar(p) && !is_real(p) && !is_long(p)) { m0(); ms("parameter of type "); mty(p); ms(" must be passed as a pointer"); fail(pos); }
         j += 1;
     }
-    if (nreal > 9 || (nreal > 0 && n - nreal > 6)) { fail_at(pos, "a function with real parameters takes at most 9 reals and 6 other parameters", null); }
-    if (!is_scalar(ret) && ret != t_void && !is_real(ret)) { m0(); ms("cannot return "); mty(ret); ms(" by value; return a pointer"); fail(pos); }
+    if (nreal > 9 || (nreal > 0 && slots > 6)) { fail_at(pos, "a function with real parameters takes at most 9 reals and 6 other parameters", null); }
+    if (!is_scalar(ret) && ret != t_void && !is_real(ret) && !is_long(ret)) { m0(); ms("cannot return "); mty(ret); ms(" by value; return a pointer"); fail(pos); }
     var intr: int = it_c.p[it] >= 0 && it_d.p[it];
     if (intr && (n > 0 || ret != t_void)) { fail_at(pos, "an interrupt fn takes no parameters and returns nothing", null); }
     var ty: int = mk(TY_FN, ret, 0, n, tmp_stack.p + from);
@@ -2020,6 +2035,19 @@ fn function(it: int) {
             ln(); o("fstd f"); oi(j); o(", "); om("fp", off); nl();
             continue;
         }
+        if (is_long(t)) {
+            var w: int = 0;
+            while (w < 3) {
+                if (i < 6) { ln(); o("stw r"); oi(i + 1); o(", "); om("fp", off + 6 - 3 * w); nl(); }
+                else {
+                    ln(); o("ldw r1, "); om("fp", 6 + 3 * (i - 6)); nl();
+                    ln(); o("stw r1, "); om("fp", off + 6 - 3 * w); nl();
+                }
+                i += 1;
+                w += 1;
+            }
+            continue;
+        }
         if (reg_eligible(pn, t)) {
             pop_local();                 // the slot goes unused
             var rr: *char = alloc_local_reg(pn, t, pos);
@@ -2099,7 +2127,10 @@ fn function(it: int) {
     } else {
         em("ret");
     }
-    if (opt_level >= 1 && !fn_has_asm) { peephole(fn_start); }
+    if (opt_level >= 1 && !fn_has_asm) {
+        pp_ret_long = is_long(ret_ty);   // a long result is live in r1..r3 at the return
+        peephole(fn_start);
+    }
 }
 
 // ---- statements ------------------------------------------------------------------------------
@@ -2272,8 +2303,20 @@ fn stmt(s: int) {
         if (ex_kind.p[x] == E_BINARY && ex_op.p[x] == B_CMP3) {
             compare(ex_a.p[x], ex_b.p[x]);
         } else {
-            need_integer(expr(x), ex_pos.p[x]);
-            em("cmp r1, 0");
+            var sty: int = expr(x);
+            if (is_long(sty)) {
+                // the sign of the first non-zero word, high first
+                var sl: int = new_label();
+                em("cmp r3, 0");
+                e_l("bne ", sl);
+                em("cmp r2, 0");
+                e_l("bne ", sl);
+                em("cmp r1, 0");
+                lab(sl);
+            } else {
+                need_integer(sty, ex_pos.p[x]);
+                em("cmp r1, 0");
+            }
         }
         var ln_: int = new_label();
         var lp: int = new_label();
@@ -2327,6 +2370,8 @@ fn stmt(s: int) {
             fail_at(ex_pos.p[r], "a void function cannot return a value", null);
         } else if (ret_ty == t_real) {
             expr_real(r);
+        } else if (is_long(ret_ty)) {
+            expr_long(r);
         } else {
             check_assign(ret_ty, expr(r), r);
         }
@@ -2553,6 +2598,7 @@ fn condition_value(x: int) {
         fail_at(ex_pos.p[x], "a trit is not a condition (`false` is −1, which would hold): use `sign (t) { neg: ... zero: ... pos: ... }`, or compare, as in `t == true`", null);
     }
     if (is_real(t)) { real_truth(); return; }
+    if (is_long(t)) { long_truth(); return; }
     if (!is_scalar(decay(t))) { m0(); mty(t); ms(" cannot be used as a condition"); fail(ex_pos.p[x]); }
 }
 
@@ -2581,7 +2627,207 @@ fn expr_real(x: int) {
     var t: int = expr(x);
     if (is_real(t)) { return; }
     if (is_integer(t)) { em("fcvtif f1, r1"); return; }
+    if (is_long(t)) { long_call("ltor"); return; }
     m0(); ms("expected a real, found "); mty(t); fail(ex_pos.p[x]);
+}
+
+// ---- long: 81-trit integers (the host's long_* functions; the runtime is
+// /usr/lib/trine/long.s, appended to the output when the code calls it) ----
+
+var long_rt: int;                        // the code calls the long runtime
+
+fn peek_long(x: int) -> int { return is_long(peek_type(x)); }
+
+fn long_call(f: *char) {
+    long_rt = 1;
+    ln(); o("call _trine_"); o(f); nl();
+}
+
+// an integer in r1 as a long in r1..r3 (the high words 0)
+fn widen() { em("li r2, 0"); em("li r3, 0"); }
+
+// the long in r1..r3 pushed, to lie at [sp] as in memory (the high word first)
+fn push_long() { em("push r1"); em("push r2"); em("push r3"); }
+
+// x as a long into r1..r3: a long as it is, an integer widened
+fn expr_long(x: int) {
+    var t: int = decay(expr(x));
+    if (is_long(t)) { return; }
+    if (is_integer(t)) { widen(); return; }
+    m0(); ms("expected long, found "); mty(t);
+    if (is_real(t)) { ms(" (use `as` to convert)"); }
+    fail(ex_pos.p[x]);
+}
+
+// The memory operands of a named long's words (high, middle, low), a local
+// in the frame or a global, as new strings in lv[0..3]: 1, or 0 if x is none.
+fn long_var_ops(x: int, lv: **char) -> int {
+    if (ex_kind.p[x] != E_NAME) { return 0; }
+    var n: int = ex_v.p[x];
+    var l: int = lookup_local(n);
+    var c: cvec;
+    c.p = null;
+    c.n = 0;
+    c.cap = 0;
+    var w: int = 0;
+    if (l >= 0) {
+        if (!is_long(lc_ty.p[l])) { return 0; }
+        while (w < 3) {
+            c_reset(&c);
+            c_mem(&c, "fp", lc_off.p[l] + 3 * w);
+            c_end(&c);
+            lv[w] = strdup(c.p);
+            w += 1;
+        }
+    } else if ((g_kind[n] == G_VAR || g_kind[n] == G_EXTERN) && is_long(g_ty[n])) {
+        while (w < 3) {
+            c_reset(&c);
+            cv_push(&c, '[');
+            if (g_kind[n] == G_EXTERN) {
+                cv_str(&c, name_str(n));
+                if (w > 0) { cv_push(&c, '+'); cv_int(&c, 3 * w); }
+            } else {
+                cv_int(&c, g_val[n] + 3 * w);
+            }
+            cv_push(&c, ']');
+            c_end(&c);
+            lv[w] = strdup(c.p);
+            w += 1;
+        }
+    } else {
+        return 0;
+    }
+    if (c.p != null) { free(c.p as *tryte); }
+    return 1;
+}
+
+fn free_ops(lv: **char) {
+    free(lv[0] as *tryte);
+    free(lv[1] as *tryte);
+    free(lv[2] as *tryte);
+}
+
+fn load_long_ops(lv: **char) {
+    ln(); o("ldw r3, "); o(lv[0]); nl();
+    ln(); o("ldw r2, "); o(lv[1]); nl();
+    ln(); o("ldw r1, "); o(lv[2]); nl();
+}
+
+fn store_long_ops(lv: **char) {
+    ln(); o("stw r3, "); o(lv[0]); nl();
+    ln(); o("stw r2, "); o(lv[1]); nl();
+    ln(); o("stw r1, "); o(lv[2]); nl();
+}
+
+// the long pushed at [sp] stored at the address in r1 and left in r1..r3,
+// then it and `extra` more words dropped from the stack
+fn store_long_pushed(extra: int) {
+    var k: int = 0;
+    while (k < 3) {
+        ln(); o("ldw r2, "); om("sp", 3 * k); nl();
+        ln(); o("stw r2, "); om("r1", 3 * k); nl();
+        k += 1;
+    }
+    em("ldw r3, [sp]");
+    em("ldw r2, [sp+3]");
+    em("ldw r1, [sp+6]");
+    e_i("add sp, sp, ", 9 + 3 * extra);
+}
+
+// r1 := non-zero exactly when the long in r1..r3 is
+fn long_truth() {
+    em("abs r1, r1");
+    em("abs r2, r2");
+    em("abs r3, r3");
+    em("max r1, r1, r2");
+    em("max r1, r1, r3");
+}
+
+// With a long left operand pushed: b evaluated, and r1..r3 := left op b
+// (b an int count for a shift), popped.
+fn long_apply(op: int, b: int, pos: int) -> int {
+    var shift: int = op == B_SHL || op == B_SHR;
+    if (op == B_DIV || op == B_MOD) {
+        var bv: int = const_eval(b);
+        if (ce_ok && bv == 0) { fail_at(pos, "division by zero", null); }
+    }
+    var tb: int = decay(expr(b));
+    if (!(is_integer(tb) || (is_long(tb) && !shift))) { m0(); ms("cannot apply "); m_op(op); ms(" to long and "); mty(tb); fail(pos); }
+    if (shift) {
+        if (op == B_SHR) { em("neg r1, r1"); }
+        long_call("lsh");
+    } else {
+        if (!is_long(tb)) { widen(); }
+        long_call(op == B_ADD ? "ladd" : op == B_SUB ? "lsub" : op == B_MUL ? "lmul" : op == B_DIV ? "ldiv" : op == B_MOD ? "lmod" : op == B_MIN ? "lmin" : "lmax");
+    }
+    em("add sp, sp, 9");
+    return t_long;
+}
+
+// r1..r3 := a op b, one side a long (the other may be an integer, widened;
+// a shift's count is an int)
+fn long_binary(op: int, a: int, b: int, pos: int) -> int {
+    var shift: int = op == B_SHL || op == B_SHR;
+    var ta: int = decay(expr(a));
+    if (!(is_long(ta) || (is_integer(ta) && !shift))) {
+        var tb: int = decay(peek_type(b));
+        m0(); ms("cannot apply "); m_op(op); ms(" to "); mty(ta); ms(" and "); mty(tb); fail(pos);
+    }
+    if (!is_long(ta)) { widen(); }
+    push_long();
+    return long_apply(op, b, pos);
+}
+
+// two operands, one a long: S = sign(a - b)
+fn long_compare(a: int, b: int) {
+    var ta: int = decay(expr(a));
+    if (!(is_long(ta) || is_integer(ta))) {
+        var tb0: int = decay(peek_type(b));
+        m0(); ms("cannot compare "); mty(ta); ms(" with "); mty(tb0); fail(ex_pos.p[b]);
+    }
+    if (!is_long(ta)) { widen(); }
+    push_long();
+    var tb: int = decay(expr(b));
+    if (!(is_long(tb) || is_integer(tb))) { m0(); ms("cannot compare "); mty(ta); ms(" with "); mty(tb); fail(ex_pos.p[b]); }
+    if (!is_long(tb)) { widen(); }
+    long_call("lcmp");
+    em("add sp, sp, 9");
+    em("cmp r1, 0");
+}
+
+// assignment to a long lvalue (plain, op 0, or compound)
+fn assign_long(op: int, lhs: int, rhs: int) -> int {
+    var lv: [3]*char;
+    var direct: int = long_var_ops(lhs, &lv[0]);
+    if (op == 0) {
+        expr_long(rhs);
+        if (direct) {
+            store_long_ops(&lv[0]);
+        } else {
+            push_long();
+            addr(lhs);
+            store_long_pushed(0);
+        }
+    } else if (direct) {
+        load_long_ops(&lv[0]);
+        push_long();
+        long_apply(op, rhs, ex_pos.p[rhs]);
+        store_long_ops(&lv[0]);
+    } else {
+        // the address first, then the right side
+        addr(lhs);
+        em("push r1");
+        em("ldw r3, [r1]");
+        em("ldw r2, [r1+3]");
+        em("ldw r1, [r1+6]");
+        push_long();
+        long_apply(op, rhs, ex_pos.p[rhs]);
+        push_long();
+        em("ldw r1, [sp+9]");
+        store_long_pushed(1);
+    }
+    if (direct) { free_ops(&lv[0]); }
+    return t_long;
 }
 
 fn comparable(ta: int, tb: int) -> int {
@@ -2609,6 +2855,10 @@ fn compare(a: int, b: int) -> int {
         pop_f1();
         em("fcmp f1, f2");
         return 1;
+    }
+    if (peek_long(a) || peek_long(b)) {
+        long_compare(a, b);
+        return 0;
     }
     var v: int = const_eval(b);
     var bc: int = ce_ok;
@@ -2691,6 +2941,13 @@ fn init_object(frame: int, off: int, ty: int, x: int) {
         ln(); o("fstd f1, "); op_place(frame, off); nl();
         return;
     }
+    if (is_long(ty)) {
+        expr_long(x);
+        ln(); o("stw r3, "); op_place(frame, off); nl();
+        ln(); o("stw r2, "); op_place(frame, off + 3); nl();
+        ln(); o("stw r1, "); op_place(frame, off + 6); nl();
+        return;
+    }
     if (is_scalar(ty)) {
         check_assign(ty, expr(x), x);
         ln(); o(is_tsz(ty) ? "stt r1, " : "stw r1, "); op_place(frame, off); nl();
@@ -2719,6 +2976,11 @@ fn zero_object(frame: int, off: int, ty: int) {
         return;
     }
     if (ty == t_real) { ln(); o("fstd f0, "); op_place(frame, off); nl(); return; }
+    if (is_long(ty)) {
+        var w: int = 0;
+        while (w < 3) { ln(); o("stw r0, "); op_place(frame, off + 3 * w); nl(); w += 1; }
+        return;
+    }
     ln(); o(is_tsz(ty) ? "stt r0, " : "stw r0, "); op_place(frame, off); nl();
 }
 
@@ -2732,6 +2994,7 @@ fn check_assign(dst: int, src: int, x: int) {
     var ok: int = 0;
     if (dst == src) { ok = 1; }
     else if (dst == t_int && is_integer(src)) { ok = 1; }
+    else if (dst == t_long && is_integer(src)) { ok = 1; }
     else if (dst == t_tryte && src == t_trit) { ok = 1; }
     else if ((dst == t_tryte || dst == t_trit) && (src == t_int || src == t_tryte)) {
         var lim: int = dst == t_tryte ? 9841 : 1;
@@ -2748,7 +3011,7 @@ fn check_assign(dst: int, src: int, x: int) {
     mty(dst);
     ms(", found ");
     mty(src);
-    if (is_integer(dst) && is_integer(src)) { ms(" (use `as` to narrow)"); }
+    if (is_integer(dst) && (is_integer(src) || is_long(src))) { ms(" (use `as` to narrow)"); }
     else if (is_integer(dst) && is_real(src)) { ms(" (use `as` to convert)"); }
     fail(ex_pos.p[x]);
 }
@@ -2757,6 +3020,7 @@ fn check_assign(dst: int, src: int, x: int) {
 
 fn load(t: int) {
     if (is_real(t)) { em("fldd f1, [r1]"); }
+    else if (is_long(t)) { em("ldw r3, [r1]"); em("ldw r2, [r1+3]"); em("ldw r1, [r1+6]"); }
     else if (is_scalar(t)) { em(is_tsz(t) ? "ldt r1, [r1]" : "ldw r1, [r1]"); }
 }
 
@@ -2781,6 +3045,13 @@ fn expr(x: int) -> int {
         e_i("li r1, ", v);
         return t;
     }
+    if (k == E_LONG) {
+        var li: int = ex_v.p[x];
+        e_i("li r1, ", lw_lo.p[li]);
+        e_i("li r2, ", lw_mid.p[li]);
+        e_i("li r3, ", lw_hi.p[li]);
+        return t_long;
+    }
     if (k == E_REAL) {
         var sid: int = ex_v.p[x];
         if (!real_from_decimal(str_at(sid), str_n(sid))) { m0(); ms("bad number "); ms_n(str_at(sid), str_n(sid)); fail(pos); }
@@ -2804,6 +3075,7 @@ fn expr(x: int) -> int {
                 return lt;
             }
             if (is_real(lt)) { ln(); o("fldd f1, "); om("fp", off); nl(); }
+            else if (is_long(lt)) { var lvl: [3]*char; long_var_ops(x, &lvl[0]); load_long_ops(&lvl[0]); free_ops(&lvl[0]); }
             else if (is_scalar(lt)) { ln(); o(is_tsz(lt) ? "ldt r1, " : "ldw r1, "); om("fp", off); nl(); }
             else { e_i("add r1, fp, ", off); }
             return lt;
@@ -2812,6 +3084,7 @@ fn expr(x: int) -> int {
         if (g == G_VAR || g == G_EXTERN) {
             var gt: int = g_ty[n];
             if (is_real(gt)) { ln(); o("fldd f1, ["); o_label(n); o("]"); nl(); }
+            else if (is_long(gt)) { var lvg: [3]*char; long_var_ops(x, &lvg[0]); load_long_ops(&lvg[0]); free_ops(&lvg[0]); }
             else if (is_scalar(gt)) { ln(); o(is_tsz(gt) ? "ldt r1, [" : "ldw r1, ["); o_label(n); o("]"); nl(); }
             else { ln(); o("la r1, "); o_label(n); nl(); }
             return gt;
@@ -2838,6 +3111,7 @@ fn expr(x: int) -> int {
         if (op == U_NEG) {
             var nt: int = expr(a);
             if (is_real(nt)) { em("fneg f1, f1"); return t_real; }
+            if (is_long(nt)) { em("neg r1, r1"); em("neg r2, r2"); em("neg r3, r3"); return t_long; }
             need_integer(nt, ex_pos.p[a]);
             em("neg r1, r1");
             return nt == t_trit ? t_trit : t_int;
@@ -2877,6 +3151,18 @@ fn expr(x: int) -> int {
     if (k == E_CAST) {
         var to: int = resolve(ex_v.p[x], pos);
         var from: int = decay(expr(ex_a.p[x]));
+        // longs: an integer widens, a long narrows to its low trits, a real
+        // rounds to the nearest long and a long to the nearest real
+        if (is_long(to) || is_long(from)) {
+            if (is_long(to) && is_long(from)) { return to; }
+            if (is_long(to) && is_integer(from)) { widen(); return to; }
+            if (is_long(to) && is_real(from)) { long_call("rtol"); return to; }
+            if (to == t_int) { return to; }
+            if (to == t_tryte) { em("ext r1, r1, 19, 9"); return to; }
+            if (to == t_trit) { em("ext r1, r1, 27, 1"); return to; }
+            if (is_real(to)) { long_call("ltor"); return to; }
+            m0(); ms("cannot convert "); mty(from); ms(" to "); mty(to); fail(pos);
+        }
         if (is_real(to) || is_real(from)) {
             if (is_real(to) && is_real(from)) { return t_real; }
             if (is_real(to) && is_integer(from)) { em("fcvtif f1, r1"); return t_real; }
@@ -2913,6 +3199,15 @@ fn expr(x: int) -> int {
             expr_real(cb);
             lab(lend);
             return t_real;
+        }
+        if (peek_long(ca) || peek_long(cb)) {
+            cond_jump_false(c, lelse);
+            expr_long(ca);
+            e_l("b ", lend);
+            lab(lelse);
+            expr_long(cb);
+            lab(lend);
+            return t_long;
         }
         cond_jump_false(c, lelse);
         var ta: int = decay(expr(ca));
@@ -3142,6 +3437,7 @@ fn binary(op: int, a: int, b: int, pos: int) -> int {
         real_op(op);
         return t_real;
     }
+    if ((is_real_arith(op) || op == B_SHL || op == B_SHR) && (peek_long(a) || peek_long(b))) { return long_binary(op, a, b, pos); }
     // a constant on the left of a commutative operator: on the right it is
     // an immediate (256 * x is x * 256)
     if (o2() && (op == B_ADD || op == B_MUL || op == B_MIN || op == B_MAX)) {
@@ -3246,6 +3542,7 @@ fn whole(t: int, pos: int, what: *char) {
 
 fn assign(op: int, lhs: int, rhs: int) -> int {
     if (peek_real(lhs)) { return assign_real(op, lhs, rhs); }
+    if (peek_long(lhs)) { return assign_long(op, lhs, rhs); }
     if (op == 0) {
         // a named variable: straight to it
         if (ex_kind.p[lhs] == E_NAME) {
@@ -3374,10 +3671,17 @@ fn gen_call(x: int) -> int {
         if (ic >= 0) { return inline_call(ic, fty, args, na); }
     }
     var nreal: int = 0;
+    var ns: int = 0;                     // argument slots: a long takes three (low word first)
+    var has_long: int = 0;
     var k: int = 0;
-    while (k < np) { if (is_real(ty_list.p[ps + k])) { nreal += 1; } k += 1; }
+    while (k < np) {
+        var pk: int = ty_list.p[ps + k];
+        if (is_real(pk)) { nreal += 1; } else { ns += is_long(pk) ? 3 : 1; }
+        if (is_long(pk)) { has_long = 1; }
+        k += 1;
+    }
     if (nreal > 0) {
-        if (nreal > 9 || np - nreal > 6) { fail_at(pos, "a call with real arguments takes at most 9 reals and 6 other arguments", null); }
+        if (nreal > 9 || ns > 6) { fail_at(pos, "a call with real arguments takes at most 9 reals and 6 other arguments", null); }
         var total: int = 0;
         k = 0;
         while (k < na) {
@@ -3386,6 +3690,10 @@ fn gen_call(x: int) -> int {
             if (is_real(p)) {
                 expr_real(a);
                 push_f1();
+                total += 9;
+            } else if (is_long(p)) {
+                expr_long(a);
+                push_long();
                 total += 9;
             } else {
                 check_assign(p, expr(a), a);
@@ -3403,6 +3711,14 @@ fn gen_call(x: int) -> int {
                 off -= 9;
                 j += 1;
                 ln(); o("fldd f"); oi(j); o(", "); om("sp", off); nl();
+            } else if (is_long(ty_list.p[ps + k])) {
+                off -= 9;
+                var w: int = 0;
+                while (w < 3) {
+                    i += 1;
+                    ln(); o("ldw r"); oi(i); o(", "); om("sp", off + 6 - 3 * w); nl();
+                    w += 1;
+                }
             } else {
                 off -= 3;
                 i += 1;
@@ -3419,22 +3735,27 @@ fn gen_call(x: int) -> int {
         e_i("add sp, sp, ", total + (direct >= 0 ? 0 : 3));
         return ty_a.p[fty];
     }
-    if (o3() && direct >= 0 && na <= 6) { return call_in_registers(direct, args, na, ps, ty_a.p[fty]); }
+    if (o3() && direct >= 0 && na <= 6 && !has_long) { return call_in_registers(direct, args, na, ps, ty_a.p[fty]); }
     k = 0;
     while (k < na) {
         var a2: int = lists.p[args + k];
-        check_assign(ty_list.p[ps + k], expr(a2), a2);
-        em("push r1");
+        if (is_long(ty_list.p[ps + k])) {
+            expr_long(a2);
+            push_long();
+        } else {
+            check_assign(ty_list.p[ps + k], expr(a2), a2);
+            em("push r1");
+        }
         k += 1;
     }
-    var m: int = na < 6 ? na : 6;
+    var m: int = ns < 6 ? ns : 6;
     k = 0;
     while (k < m) {
-        ln(); o("ldw r"); oi(k + 1); o(", "); om("sp", 3 * (na - 1 - k)); nl();
+        ln(); o("ldw r"); oi(k + 1); o(", "); om("sp", 3 * (ns - 1 - k)); nl();
         k += 1;
     }
     // stack arguments: reversed, so the seventh is lowest
-    var sk: int = na - 6;
+    var sk: int = ns - 6;
     if (sk < 0) { sk = 0; }
     k = 0;
     while (k < sk / 2) {
@@ -3446,11 +3767,11 @@ fn gen_call(x: int) -> int {
         ln(); o("stw r7, "); om("sp", hi); nl();
         k += 1;
     }
-    var cleanup: int = na;
+    var cleanup: int = ns;
     if (direct >= 0) {
         ln(); o("call "); o(name_str(direct)); nl();
     } else {
-        ln(); o("ldw r7, "); om("sp", 3 * na); nl();
+        ln(); o("ldw r7, "); om("sp", 3 * ns); nl();
         em("jalr lr, r7");
         cleanup += 1;
     }

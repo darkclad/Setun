@@ -78,6 +78,14 @@ details that are easy to get wrong in a port:
 - **A for loop keeps its register.** The host gives a block's register
   locals back at its end, but not a `for` loop's own variable; `tric`
   copies that.
+- **`long` the same way.** A literal past one word becomes a `long` token
+  in both (`tric` reads it as an `int` while it fits, then as a `long`,
+  itself using `long` arithmetic, with the overflow test written so that
+  nothing it computes wraps). When the code calls the `long` runtime,
+  `tric` appends `/usr/lib/trine/long.s` where the host appends the same
+  file, `crates/trine/lib/long.s`, so the two outputs stay identical.
+  `/bin/longtest` (`user/bin/longtest.tri`) is compiled at every level and
+  run.
 
 ## The optimizer
 

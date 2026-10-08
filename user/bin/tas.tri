@@ -781,9 +781,9 @@ fn parse_line(s: *char, n: int) {
         }
         return;
     }
-    var long: int = 0;
+    var wide: int = 0;
     if (ml > 2 && mn[ml - 2] == '.' && mn[ml - 1] == 'l') {
-        long = 1;
+        wide = 1;
         ml -= 2;
         mn[ml] = 0;
     }
@@ -791,7 +791,7 @@ fn parse_line(s: *char, n: int) {
     if (code == 0) { die("unknown instruction", &mn[0]); }
     var nops: int = split_and_parse(rest, rn, 0);
     add_stmt(K_INST, code, first, nops);
-    st_long[st_used - 1] = long as tryte;
+    st_long[st_used - 1] = wide as tryte;
 }
 
 // ---- instruction sizes and encoding ----------------------------------------------------------
@@ -805,30 +805,30 @@ fn alu_b(m: int) -> int {
     return m + 5;                              // band.. = 23..27, mrg.. = 28..31
 }
 
-fn op_small(o: int, lim: int, long: int) -> int {
-    if (long || o_kind[o] != O_EXPR) { return 0; }
+fn op_small(o: int, lim: int, wide: int) -> int {
+    if (wide || o_kind[o] != O_EXPR) { return 0; }
     var v: int = constant(o_e[o]);
     return c_ok && v <= lim && v >= -lim;
 }
 
-fn inst_size(i: int, long: int) -> int {
+fn inst_size(i: int, wide: int) -> int {
     var m: int = st_m[i];
     var o: int = st_o[i];
     var n: int = st_n[i];
     if (is_alu_binary(m) || m == M_CMP) {
-        if (n > 0 && o_kind[o + n - 1] == O_EXPR && !op_small(o + n - 1, 13, long)) { return 2; }
+        if (n > 0 && o_kind[o + n - 1] == O_EXPR && !op_small(o + n - 1, 13, wide)) { return 2; }
         return 1;
     }
     if ((m >= M_LDT && m <= M_LDT + 4) || (m >= M_FLDS && m <= M_FLDS + 3)) {
         var size: int = m == M_LDT || m == M_LDT + 2 ? 1 : m == M_FLDS + 1 || m == M_FLDS + 3 ? 9 : 3;
-        if (n > 1 && o_kind[o + 1] == O_MEM && !long) {
+        if (n > 1 && o_kind[o + 1] == O_MEM && !wide) {
             var v: int = constant(o_e[o + 1]);
             if (c_ok && v % size == 0 && v / size <= 13 && v / size >= -13) { return 1; }
         }
         return 2;
     }
     if (m == M_MOV || m == M_MOV + 1) {                        // mov, li
-        if (n > 1 && o_kind[o + 1] == O_EXPR && !op_small(o + 1, 364, long)) { return 2; }
+        if (n > 1 && o_kind[o + 1] == O_EXPR && !op_small(o + 1, 364, wide)) { return 2; }
         return 1;
     }
     // la lea jal call br3 ext ins bext brot fli
@@ -838,7 +838,7 @@ fn inst_size(i: int, long: int) -> int {
         return n > 1 && o_kind[o + 1] == O_MEM ? 1 : 2;
     }
     if (m == M_MOV + 11 || m == M_MOV + 12) { return 2; }       // push, pop
-    if (m >= M_B && m <= M_B + 9 && long) { return 2; }
+    if (m >= M_B && m <= M_B + 9 && wide) { return 2; }
     return 1;
 }
 

@@ -21,6 +21,8 @@ pub enum Ty {
     Int,
     /// The FPU's real81: three words, held in f registers.
     Real,
+    /// An 81-trit integer: three words, held in r1 (low), r2, r3 (high).
+    Long,
     Tryte,
     Trit,
     Void,
@@ -43,6 +45,9 @@ impl Ty {
     }
     fn is_real(&self) -> bool {
         *self == Ty::Real
+    }
+    fn is_long(&self) -> bool {
+        *self == Ty::Long
     }
     fn is_tryte_sized(&self) -> bool {
         matches!(self, Ty::Tryte | Ty::Trit)
@@ -73,6 +78,7 @@ impl fmt::Display for TyFmt<'_> {
         match self.0 {
             Ty::Int => write!(f, "int"),
             Ty::Real => write!(f, "real"),
+            Ty::Long => write!(f, "long"),
             Ty::Tryte => write!(f, "tryte"),
             Ty::Trit => write!(f, "trit"),
             Ty::Void => write!(f, "void"),
@@ -667,6 +673,8 @@ pub struct Compiler {
     free_fregs: Vec<&'static str>,
     /// Integer temporaries held in r4, r5, r6 (instead of the stack).
     iheld: usize,
+    /// Some code calls the long runtime (lib/long.s): it goes into the output.
+    long_rt: bool,
     labels: usize,
     data_cursor: i64,
     data_start: i64,
@@ -712,6 +720,7 @@ impl Compiler {
             fheld: 0,
             free_fregs: Vec::new(),
             iheld: 0,
+            long_rt: false,
             labels: 0,
             data_cursor: 0,
             data_start: 0,
@@ -888,9 +897,214 @@ impl Compiler {
         } else if t.is_integer() {
             self.emit("fcvtif f1, r1");
             Ok(())
+        } else if t.is_long() {
+            self.long_call("ltor");
+            Ok(())
         } else {
             err(e.pos, format!("expected a real, found {}", self.tyname(&t)))
         }
+    }
+
+    fn peek_long(&mut self, e: &Expr) -> R<bool> {
+        Ok(self.peek_type(e)?.is_long())
+    }
+
+    /// Call a routine of the long runtime (lib/long.s).
+    fn long_call(&mut self, f: &str) {
+        self.long_rt = true;
+        self.emit(format!("call _trine_{f}"));
+    }
+
+    /// An integer in r1 as a long in r1..r3 (balanced: the high words are 0).
+    fn widen(&mut self) {
+        self.emit("li r2, 0");
+        self.emit("li r3, 0");
+    }
+
+    /// Push the long in r1..r3, so that it lies at [sp] as in memory (the
+    /// high word first).
+    fn push_long(&mut self) {
+        self.emit("push r1");
+        self.emit("push r2");
+        self.emit("push r3");
+    }
+
+    /// Evaluate `e` as a long into r1..r3: a long as it is, an integer widened.
+    fn expr_long(&mut self, e: &Expr) -> R<()> {
+        let t = self.expr(e)?.decay();
+        if t.is_long() {
+            Ok(())
+        } else if t.is_integer() {
+            self.widen();
+            Ok(())
+        } else {
+            let hint = if t.is_real() { " (use `as` to convert)" } else { "" };
+            err(e.pos, format!("expected long, found {}{hint}", self.tyname(&t)))
+        }
+    }
+
+    /// The memory operands of a named long's words (high, middle, low): a
+    /// local in the frame or a global.
+    fn long_var_ops(&self, e: &Expr) -> Option<[String; 3]> {
+        let ExprKind::Name(n) = &e.kind else { return None };
+        match self.lookup_local(n) {
+            Some(l) => l.ty.is_long().then(|| [mem("fp", l.off), mem("fp", l.off + 3), mem("fp", l.off + 6)]),
+            None => match self.globals.get(n) {
+                Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) if ty.is_long() => Some(match label.parse::<i64>() {
+                    Ok(a) => [format!("[{a}]"), format!("[{}]", a + 3), format!("[{}]", a + 6)],
+                    Err(_) => [format!("[{label}]"), format!("[{label}+3]"), format!("[{label}+6]")],
+                }),
+                _ => None,
+            },
+        }
+    }
+
+    fn load_long_ops(&mut self, ops: &[String; 3]) {
+        self.emit(format!("ldw r3, {}", ops[0]));
+        self.emit(format!("ldw r2, {}", ops[1]));
+        self.emit(format!("ldw r1, {}", ops[2]));
+    }
+
+    fn store_long_ops(&mut self, ops: &[String; 3]) {
+        self.emit(format!("stw r3, {}", ops[0]));
+        self.emit(format!("stw r2, {}", ops[1]));
+        self.emit(format!("stw r1, {}", ops[2]));
+    }
+
+    /// Store the long pushed at [sp] at the address in r1 and leave it in
+    /// r1..r3, then drop it and `extra` more words from the stack.
+    fn store_long_pushed(&mut self, extra: i64) {
+        for k in 0..3 {
+            self.emit(format!("ldw r2, {}", mem("sp", 3 * k)));
+            self.emit(format!("stw r2, {}", mem("r1", 3 * k)));
+        }
+        self.emit("ldw r3, [sp]");
+        self.emit("ldw r2, [sp+3]");
+        self.emit("ldw r1, [sp+6]");
+        self.emit(format!("add sp, sp, {}", 9 + 3 * extra));
+    }
+
+    /// r1 := non-zero exactly when the long in r1..r3 is: the tritwise
+    /// maximum of the words' magnitudes (a positive word has a +1 trit).
+    fn long_truth(&mut self) {
+        self.emit("abs r1, r1");
+        self.emit("abs r2, r2");
+        self.emit("abs r3, r3");
+        self.emit("max r1, r1, r2");
+        self.emit("max r1, r1, r3");
+    }
+
+    /// With a long left operand pushed: evaluate `b`, and r1..r3 := left op
+    /// b (b an int count for a shift), popped.
+    fn long_apply(&mut self, op: BinOp, b: &Expr, pos: Pos) -> R<Ty> {
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        if matches!(op, BinOp::Div | BinOp::Mod) && self.const_eval(b) == Some(0) {
+            return err(pos, "division by zero");
+        }
+        let tb = self.expr(b)?.decay();
+        if !(tb.is_integer() || tb.is_long() && !shift) {
+            return err(pos, format!("cannot apply {op:?} to long and {}", self.tyname(&tb)));
+        }
+        if shift {
+            if op == BinOp::Shr {
+                self.emit("neg r1, r1");
+            }
+            self.long_call("lsh");
+        } else {
+            if !tb.is_long() {
+                self.widen();
+            }
+            let f = match op {
+                BinOp::Add => "ladd",
+                BinOp::Sub => "lsub",
+                BinOp::Mul => "lmul",
+                BinOp::Div => "ldiv",
+                BinOp::Mod => "lmod",
+                BinOp::Min => "lmin",
+                _ => "lmax",
+            };
+            self.long_call(f);
+        }
+        self.emit("add sp, sp, 9");
+        Ok(Ty::Long)
+    }
+
+    /// r1..r3 := a op b where one side is a long (the other may be an
+    /// integer, widened; a shift's count is an int).
+    fn long_binary(&mut self, op: BinOp, a: &Expr, b: &Expr, pos: Pos) -> R<Ty> {
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let ta = self.expr(a)?.decay();
+        if !(ta.is_long() || ta.is_integer() && !shift) {
+            let tb = self.peek_type(b)?.decay();
+            return err(pos, format!("cannot apply {op:?} to {} and {}", self.tyname(&ta), self.tyname(&tb)));
+        }
+        if !ta.is_long() {
+            self.widen();
+        }
+        self.push_long();
+        self.long_apply(op, b, pos)
+    }
+
+    /// Evaluate two operands, one of them a long, and set S = sign(a - b).
+    fn long_compare(&mut self, a: &Expr, b: &Expr) -> R<()> {
+        let ta = self.expr(a)?.decay();
+        if !(ta.is_long() || ta.is_integer()) {
+            let tb = self.peek_type(b)?.decay();
+            return err(b.pos, format!("cannot compare {} with {}", self.tyname(&ta), self.tyname(&tb)));
+        }
+        if !ta.is_long() {
+            self.widen();
+        }
+        self.push_long();
+        let tb = self.expr(b)?.decay();
+        if !(tb.is_long() || tb.is_integer()) {
+            return err(b.pos, format!("cannot compare {} with {}", self.tyname(&ta), self.tyname(&tb)));
+        }
+        if !tb.is_long() {
+            self.widen();
+        }
+        self.long_call("lcmp");
+        self.emit("add sp, sp, 9");
+        self.emit("cmp r1, 0");
+        Ok(())
+    }
+
+    /// Assignment to a long lvalue (plain or compound).
+    fn assign_long(&mut self, op: Option<BinOp>, lhs: &Expr, rhs: &Expr) -> R<Ty> {
+        let direct = self.long_var_ops(lhs);
+        match op {
+            None => {
+                self.expr_long(rhs)?;
+                if let Some(ops) = direct {
+                    self.store_long_ops(&ops);
+                } else {
+                    self.push_long();
+                    self.addr(lhs)?;
+                    self.store_long_pushed(0);
+                }
+            }
+            Some(op) => {
+                if let Some(ops) = direct {
+                    self.load_long_ops(&ops);
+                    self.push_long();
+                    self.long_apply(op, rhs, rhs.pos)?;
+                    self.store_long_ops(&ops);
+                } else {
+                    // the address first, then the right side
+                    self.addr(lhs)?;
+                    self.emit("push r1");
+                    self.emit("ldw r3, [r1]");
+                    self.emit("ldw r2, [r1+3]");
+                    self.emit("ldw r1, [r1+6]");
+                    self.push_long();
+                    self.long_apply(op, rhs, rhs.pos)?;
+                    self.push_long();
+                    self.emit("ldw r1, [sp+9]");
+                    self.store_long_pushed(1);
+                }
+            }
+        }
+        Ok(Ty::Long)
     }
 
     /// After a real is in f1: r1 := 1 if it is non-zero (a NaN counts as
@@ -922,6 +1136,10 @@ impl Compiler {
             self.real_truth();
             return Ok(());
         }
+        if t.is_long() {
+            self.long_truth();
+            return Ok(());
+        }
         self.need_condition(&t, e.pos)
     }
 
@@ -930,7 +1148,7 @@ impl Compiler {
     fn size(&self, t: &Ty) -> i64 {
         match t {
             Ty::Int | Ty::Ptr(_) | Ty::Fn(..) | Ty::Null => 3,
-            Ty::Real => 9,
+            Ty::Real | Ty::Long => 9,
             Ty::Tryte | Ty::Trit => 1,
             Ty::Void => 0,
             Ty::Array(n, e) => n * self.size(e),
@@ -956,6 +1174,7 @@ impl Compiler {
         Ok(match t {
             TypeExpr::Int => Ty::Int,
             TypeExpr::Real => Ty::Real,
+            TypeExpr::Long => Ty::Long,
             TypeExpr::Tryte => Ty::Tryte,
             TypeExpr::Trit => Ty::Trit,
             TypeExpr::Void => Ty::Void,
@@ -1089,7 +1308,7 @@ impl Compiler {
     fn sizeof_const(&self, t: &TypeExpr) -> Option<i64> {
         Some(match t {
             TypeExpr::Int | TypeExpr::Ptr(_) | TypeExpr::Fn(..) => 3,
-            TypeExpr::Real => 9,
+            TypeExpr::Real | TypeExpr::Long => 9,
             TypeExpr::Tryte | TypeExpr::Trit => 1,
             TypeExpr::Void => return None,
             TypeExpr::Named(n) => {
@@ -1212,15 +1431,16 @@ impl Compiler {
                     let ps = f.params.iter().map(|p| self.resolve(&p.ty, f.pos)).collect::<R<Vec<_>>>()?;
                     let ret = self.resolve(&f.ret, f.pos)?;
                     for p in &ps {
-                        if !p.is_scalar() && !p.is_real() {
+                        if !p.is_scalar() && !p.is_real() && !p.is_long() {
                             return err(f.pos, format!("parameter of type {} must be passed as a pointer", self.tyname(p)));
                         }
                     }
                     let nreal = ps.iter().filter(|p| p.is_real()).count();
-                    if nreal > 9 || (nreal > 0 && ps.len() - nreal > 6) {
+                    let slots: usize = ps.iter().filter(|p| !p.is_real()).map(|p| if p.is_long() { 3 } else { 1 }).sum();
+                    if nreal > 9 || (nreal > 0 && slots > 6) {
                         return err(f.pos, "a function with real parameters takes at most 9 reals and 6 other parameters");
                     }
-                    if !ret.is_scalar() && ret != Ty::Void && !ret.is_real() {
+                    if !ret.is_scalar() && ret != Ty::Void && !ret.is_real() && !ret.is_long() {
                         return err(f.pos, format!("cannot return {} by value; return a pointer", self.tyname(&ret)));
                     }
                     if f.interrupt && (!ps.is_empty() || ret != Ty::Void) {
@@ -1328,6 +1548,9 @@ impl Compiler {
 
         let mut text = self.code.join("\n");
         text.push('\n');
+        if self.long_rt {
+            text += crate::LONG_RUNTIME;
+        }
         for (l, w) in &self.reals {
             text += &format!("{l}: .word {}, {}, {}\n", w[0], w[1], w[2]);
         }
@@ -1451,6 +1674,19 @@ impl Compiler {
                 self.emit(format!("fstd f{j}, {}", mem("fp", off)));
                 continue;
             }
+            if t.is_long() {
+                for k in 0..3 {
+                    let dst = mem("fp", off + 6 - 3 * k);
+                    if i < 6 {
+                        self.emit(format!("stw r{}, {dst}", i + 1));
+                    } else {
+                        self.emit(format!("ldw r1, {}", mem("fp", 6 + 3 * (i - 6))));
+                        self.emit(format!("stw r1, {dst}"));
+                    }
+                    i += 1;
+                }
+                continue;
+            }
             if self.reg_eligible(&p.name, t) {
                 // the slot from alloc_local above goes unused
                 self.locals.pop();
@@ -1522,7 +1758,7 @@ impl Compiler {
         }
         if self.o(1) && !has_asm {
             let mut lines = self.code.split_off(fn_start);
-            crate::peephole::run(&mut lines);
+            crate::peephole::run(&mut lines, self.ret_ty.is_long());
             self.code.extend(lines);
         }
         Ok(())
@@ -1693,8 +1929,19 @@ impl Compiler {
                     self.compare(a, b)?; // unordered reals: S = 0, the zero arm
                 } else {
                     let t = self.expr(e)?;
-                    self.need_integer(&t, e.pos)?;
-                    self.emit("cmp r1, 0");
+                    if t.is_long() {
+                        // the sign of the first non-zero word, high first
+                        let l = self.new_label();
+                        self.emit("cmp r3, 0");
+                        self.emit(format!("bne {l}"));
+                        self.emit("cmp r2, 0");
+                        self.emit(format!("bne {l}"));
+                        self.emit("cmp r1, 0");
+                        self.label(&l);
+                    } else {
+                        self.need_integer(&t, e.pos)?;
+                        self.emit("cmp r1, 0");
+                    }
                 }
                 let (ln, lp, lz, lend) = (self.new_label(), self.new_label(), self.new_label(), self.new_label());
                 let (tn, tp) = (self.new_label(), self.new_label());
@@ -1764,6 +2011,7 @@ impl Compiler {
                     (None, _) => return err(s.pos, format!("this function must return a {}", self.tyname(&ret))),
                     (Some(e), Ty::Void) => return err(e.pos, "a void function cannot return a value"),
                     (Some(e), Ty::Real) => self.expr_real(e)?,
+                    (Some(e), Ty::Long) => self.expr_long(e)?,
                     (Some(e), _) => {
                         let t = self.expr(e)?;
                         self.check_assign(&ret, &t, e)?;
@@ -1929,6 +2177,10 @@ impl Compiler {
             self.emit("fcmp f1, f2");
             return Ok(true);
         }
+        if self.peek_long(a)? || self.peek_long(b)? {
+            self.long_compare(a, b)?;
+            return Ok(false);
+        }
         let b_const = self.const_eval(b);
         let simple = b_const.is_some() || self.is_simple_operand(b);
         let (left, ta) = if simple { self.left_operand(a)? } else { ("r1", self.expr(a)?.decay()) };
@@ -2039,6 +2291,12 @@ impl Compiler {
                 self.emit(format!("fstd f1, {}", place.operand()));
                 Ok(())
             }
+            (Ty::Long, _) => {
+                self.expr_long(init)?;
+                let ops = [place.operand(), place.plus(3).operand(), place.plus(6).operand()];
+                self.store_long_ops(&ops);
+                Ok(())
+            }
             (t, _) if t.is_scalar() => {
                 let got = self.expr(init)?;
                 self.check_assign(t, &got, init)?;
@@ -2065,6 +2323,11 @@ impl Compiler {
                 }
             }
             Ty::Real => self.emit(format!("fstd f0, {}", place.operand())),
+            Ty::Long => {
+                for k in 0..3 {
+                    self.emit(format!("stw r0, {}", place.plus(3 * k).operand()));
+                }
+            }
             t => {
                 let st = if t.is_tryte_sized() { "stt" } else { "stw" };
                 self.emit(format!("{st} r0, {}", place.operand()));
@@ -2085,6 +2348,7 @@ impl Compiler {
         let ok = match (dst, &src) {
             (a, b) if a == b => true,
             (Ty::Int, s) if s.is_integer() => true,
+            (Ty::Long, s) if s.is_integer() => true,
             (Ty::Tryte, Ty::Trit) => true,
             (Ty::Tryte | Ty::Trit, Ty::Int | Ty::Tryte) => {
                 let lim = if *dst == Ty::Tryte { 9841 } else { 1 };
@@ -2097,7 +2361,7 @@ impl Compiler {
         if ok {
             Ok(())
         } else {
-            let hint = if dst.is_integer() && src.is_integer() {
+            let hint = if dst.is_integer() && (src.is_integer() || src.is_long()) {
                 " (use `as` to narrow)"
             } else if dst.is_integer() && src.is_real() {
                 " (use `as` to convert)"
@@ -2277,6 +2541,10 @@ impl Compiler {
     fn load(&mut self, t: &Ty) {
         if t.is_real() {
             self.emit("fldd f1, [r1]");
+        } else if t.is_long() {
+            self.emit("ldw r3, [r1]");
+            self.emit("ldw r2, [r1+3]");
+            self.emit("ldw r1, [r1+6]");
         } else if t.is_scalar() {
             let op = if t.is_tryte_sized() { "ldt" } else { "ldw" };
             self.emit(format!("{op} r1, [r1]"));
@@ -2313,6 +2581,12 @@ impl Compiler {
         }
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Char(_) | ExprKind::Truth(_) => unreachable!("constants are folded"),
+            ExprKind::Long(w) => {
+                self.emit(format!("li r1, {}", w[2]));
+                self.emit(format!("li r2, {}", w[1]));
+                self.emit(format!("li r3, {}", w[0]));
+                Ok(Ty::Long)
+            }
             ExprKind::Real(t) => {
                 let (r, _) = setun_real::Real::from_decimal(t).map_err(|m| Error { pos: e.pos, msg: m })?;
                 self.load_real(r);
@@ -2341,6 +2615,9 @@ impl Compiler {
                     }
                     if ty.is_real() {
                         self.emit(format!("fldd f1, {}", mem("fp", off)));
+                    } else if ty.is_long() {
+                        let ops = self.long_var_ops(e).expect("a long local");
+                        self.load_long_ops(&ops);
                     } else if ty.is_scalar() {
                         let op = if ty.is_tryte_sized() { "ldt" } else { "ldw" };
                         self.emit(format!("{op} r1, {}", mem("fp", off)));
@@ -2353,6 +2630,9 @@ impl Compiler {
                     Some(Global::Var { ty, label }) | Some(Global::Extern { ty, label }) => {
                         if ty.is_real() {
                             self.emit(format!("fldd f1, [{label}]"));
+                        } else if ty.is_long() {
+                            let ops = self.long_var_ops(e).expect("a long global");
+                            self.load_long_ops(&ops);
                         } else if ty.is_scalar() {
                             let op = if ty.is_tryte_sized() { "ldt" } else { "ldw" };
                             self.emit(format!("{op} r1, [{label}]"));
@@ -2384,6 +2664,12 @@ impl Compiler {
                     if t.is_real() {
                         self.emit("fneg f1, f1");
                         return Ok(Ty::Real);
+                    }
+                    if t.is_long() {
+                        self.emit("neg r1, r1");
+                        self.emit("neg r2, r2");
+                        self.emit("neg r3, r3");
+                        return Ok(Ty::Long);
                     }
                     self.need_integer(&t, x.pos)?;
                     self.emit("neg r1, r1");
@@ -2436,6 +2722,21 @@ impl Compiler {
             ExprKind::Cast(x, t) => {
                 let to = self.resolve(t, e.pos)?;
                 let from = self.expr(x)?.decay();
+                // longs: an integer widens, a long narrows to its low trits,
+                // a real rounds to the nearest long and a long to the nearest real
+                if to.is_long() || from.is_long() {
+                    match (&to, &from) {
+                        (Ty::Long, Ty::Long) => {}
+                        (Ty::Long, f) if f.is_integer() => self.widen(),
+                        (Ty::Long, Ty::Real) => self.long_call("rtol"),
+                        (Ty::Int, Ty::Long) => {}
+                        (Ty::Tryte, Ty::Long) => self.emit("ext r1, r1, 19, 9"),
+                        (Ty::Trit, Ty::Long) => self.emit("ext r1, r1, 27, 1"),
+                        (Ty::Real, Ty::Long) => self.long_call("ltor"),
+                        _ => return err(e.pos, format!("cannot convert {} to {}", self.tyname(&from), self.tyname(&to))),
+                    }
+                    return Ok(to);
+                }
                 // reals: integer → real exactly; real → integer rounds to nearest
                 if to.is_real() || from.is_real() {
                     return match (&to, &from) {
@@ -2485,6 +2786,15 @@ impl Compiler {
                     self.expr_real(b)?;
                     self.label(&lend);
                     return Ok(Ty::Real);
+                }
+                if self.peek_long(a)? || self.peek_long(b)? {
+                    self.cond_jump_false(c, &lelse)?;
+                    self.expr_long(a)?;
+                    self.emit(format!("b {lend}"));
+                    self.label(&lelse);
+                    self.expr_long(b)?;
+                    self.label(&lend);
+                    return Ok(Ty::Long);
                 }
                 self.cond_jump_false(c, &lelse)?;
                 let ta = self.expr(a)?.decay();
@@ -2849,6 +3159,11 @@ impl Compiler {
                     self.real_op(op);
                     return Ok(Ty::Real);
                 }
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Min | BinOp::Max | BinOp::Shl | BinOp::Shr)
+                    && (self.peek_long(a)? || self.peek_long(b)?)
+                {
+                    return self.long_binary(op, a, b, pos);
+                }
                 // a constant on the left of a commutative operator: on the
                 // right, it is an immediate (256 * x is x * 256)
                 if self.o(2)
@@ -2987,6 +3302,9 @@ impl Compiler {
         if self.peek_real(lhs)? {
             return self.assign_real(op, lhs, rhs);
         }
+        if self.peek_long(lhs)? {
+            return self.assign_long(op, lhs, rhs);
+        }
         match op {
             None => {
                 // Fast path: a named scalar variable.
@@ -3122,23 +3440,28 @@ impl Compiler {
             }
         }
         let nreal = params.iter().filter(|p| p.is_real()).count();
+        // argument slots: a long takes three (low word first)
+        let slots: usize = params.iter().filter(|p| !p.is_real()).map(|p| if p.is_long() { 3 } else { 1 }).sum();
         if nreal > 0 {
             // each argument pushed in turn (a real takes three words), then
             // integers into r1..r6 and reals into f1..f9
-            if nreal > 9 || params.len() - nreal > 6 {
+            if nreal > 9 || slots > 6 {
                 return err(pos, "a call with real arguments takes at most 9 reals and 6 other arguments");
             }
             for (a, p) in args.iter().zip(&params) {
                 if p.is_real() {
                     self.expr_real(a)?;
                     self.push_f1();
+                } else if p.is_long() {
+                    self.expr_long(a)?;
+                    self.push_long();
                 } else {
                     let t = self.expr(a)?;
                     self.check_assign(p, &t, a)?;
                     self.emit("push r1");
                 }
             }
-            let sizes: Vec<i64> = params.iter().map(|p| if p.is_real() { 9 } else { 3 }).collect();
+            let sizes: Vec<i64> = params.iter().map(|p| if p.is_real() || p.is_long() { 9 } else { 3 }).collect();
             let total: i64 = sizes.iter().sum();
             let (mut i, mut j, mut off) = (0, 0, total);
             for (p, sz) in params.iter().zip(&sizes) {
@@ -3146,6 +3469,11 @@ impl Compiler {
                 if p.is_real() {
                     j += 1;
                     self.emit(format!("fldd f{j}, {}", mem("sp", off)));
+                } else if p.is_long() {
+                    for k in 0..3 {
+                        i += 1;
+                        self.emit(format!("ldw r{i}, {}", mem("sp", off + 6 - 3 * k)));
+                    }
                 } else {
                     i += 1;
                     self.emit(format!("ldw r{i}, {}", mem("sp", off)));
@@ -3162,15 +3490,21 @@ impl Compiler {
             self.emit(format!("add sp, sp, {cleanup}"));
             return Ok(*ret);
         }
-        if self.o(3) && direct.is_some() && args.len() <= 6 {
+        let has_long = params.iter().any(|p| p.is_long());
+        if self.o(3) && direct.is_some() && args.len() <= 6 && !has_long {
             return self.call_in_registers(&direct.as_ref().unwrap().0, args, &params, *ret);
         }
         for (a, p) in args.iter().zip(&params) {
+            if p.is_long() {
+                self.expr_long(a)?;
+                self.push_long();
+                continue;
+            }
             let t = self.expr(a)?;
             self.check_assign(p, &t, a)?;
             self.emit("push r1");
         }
-        let n = args.len() as i64;
+        let n = slots as i64;
         for i in 0..n.min(6) {
             self.emit(format!("ldw r{}, {}", i + 1, mem("sp", 3 * (n - 1 - i))));
         }
@@ -3356,7 +3690,9 @@ impl Compiler {
             return false;
         }
         let plain = match self.globals.get(name) {
-            Some(Global::Func { ty: Ty::Fn(ps, ret), .. }) => ps.len() <= 6 && !ps.iter().any(|p| p.is_real()) && !ret.is_real(),
+            Some(Global::Func { ty: Ty::Fn(ps, ret), .. }) => {
+                ps.len() <= 6 && !ps.iter().any(|p| p.is_real() || p.is_long()) && !ret.is_real() && !ret.is_long()
+            }
             _ => false,
         };
         let mut callees = Vec::new();
@@ -3382,7 +3718,7 @@ impl Compiler {
         if self.inlining.is_empty() && self.inlined + cost > INLINE_BUDGET {
             return None;
         }
-        let plain = params.len() <= 6 && !params.iter().any(|p| p.is_real()) && !ret.is_real();
+        let plain = params.len() <= 6 && !params.iter().any(|p| p.is_real() || p.is_long()) && !ret.is_real() && !ret.is_long();
         // a called function has nine registers of its own; inlined, it
         // shares the caller's, and spilling would cost more than the call
         let f = &self.fns[name];

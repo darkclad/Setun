@@ -5,6 +5,8 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(i64),
+    /// An integer literal past one word: an 81-trit `long`, its words high first.
+    Long([i64; 3]),
     /// A decimal real literal, as written (checked).
     Real(String),
     Char(i64),
@@ -31,8 +33,13 @@ pub struct Token {
 const KEYWORDS: &[&str] = &[
     "fn", "var", "const", "struct", "return", "if", "else", "while", "for", "loop", "break", "continue", "sign",
     "switch", "case", "default", "as", "sizeof", "import", "extern", "interrupt", "asm", "true", "false", "unknown", "TRUE", "FALSE",
-    "null", "void", "trit", "tryte", "int", "char", "real",
+    "null", "void", "trit", "tryte", "int", "char", "real", "long",
 ];
+
+/// An integer literal's token: an `int` when it fits in a word, else a `long`.
+fn int_token(w: [i64; 3]) -> Tok {
+    if w[0] == 0 && w[1] == 0 { Tok::Int(w[2]) } else { Tok::Long(w) }
+}
 
 // Longest first.
 const PUNCT: &[&str] = &[
@@ -106,8 +113,8 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                         "a 0t literal followed by + or -: put a space before the operator (the old + and - digits are gone)".into()
                     }));
                 }
-                let v = ternary::parse_prefixed(base, &digits).map_err(|e| err(format!("bad 0{base} literal: {e}")))?;
-                out.push(Token { tok: Tok::Int(v), pos });
+                let w = ternary::parse_wide(base, &digits).map_err(|e| err(format!("bad 0{base} literal: {e}")))?;
+                out.push(Token { tok: int_token(w), pos });
                 continue;
             }
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -143,8 +150,8 @@ pub fn lex(src: &str, file: u16) -> Result<Vec<Token>, Error> {
                 setun_real::Real::from_decimal(&t).map_err(|_| err(format!("bad number `{t}`")))?;
                 out.push(Token { tok: Tok::Real(t), pos });
             } else {
-                let v = t.parse::<i64>().map_err(|_| err(format!("bad number `{t}`")))?;
-                out.push(Token { tok: Tok::Int(v), pos });
+                let w = ternary::parse_wide('d', &t).map_err(|_| err(format!("bad number `{t}`")))?;
+                out.push(Token { tok: int_token(w), pos });
             }
             continue;
         }

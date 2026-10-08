@@ -31,10 +31,11 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - `0zDD5̅` (balanced base 27: `0`–`9` and `A`–`D` = 0…13 in either case; a negative digit is overlined with U+0305 COMBINING OVERLINE; see ISA §1.1)
   - `0x1F` (hexadecimal, for values from binary systems; nothing wraps, so a sign is written with unary minus)
   - A malformed literal is an error that says what is wrong (a bar on `0`, two bars, `E` as a digit, the old `+`/`-` base-3 digits…), and a constant must fit its type.
+  - A literal that does not fit in a word is a `long` (up to 81 trits, ±(3^81 − 1)/2: 39 decimal digits); past that it is an error.
 - **Real literals:** `2.5`, `1e10`, `6.02e-23`, `1_000.5`: digits with a point and digits, an exponent, or both (`1.` and `.5` are not reals). A letter right after a number is an error. The value is rounded to the nearest `real`.
 - **Character literals:** `'A'`, `'Ж'`, `'\n'`. The value is the Unicode code point, of type `tryte`. Escapes are `\n \t \r \e \0 \\ \' \"` (`\e` is ESC, 27, for terminal escape sequences).
 - **String literals:** `"Привет"`. A NUL-terminated array of trytes, one character per tryte, except that a character above U+2671 takes three (ISA §8.4: `"日本"` is 6 trytes). Its type is `*tryte`, pointing at the first character. A character literal cannot hold such a character ("takes three trytes: use a string"); tlibc's `tstr_next`, `tstr_chars` and `tchar_put` read and write them.
-- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false unknown TRUE FALSE null void trit tryte int char real`
+- **Keywords:** `fn var const struct return if else while for loop break continue sign switch case default as sizeof import extern interrupt asm true false unknown TRUE FALSE null void trit tryte int char real long`
 - `neg`, `zero` and `pos` are **contextual**: they are arm labels only when followed by `:` inside `sign { }`, and ordinary names everywhere else.
 
 ## 3. Types
@@ -44,6 +45,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
 | `trit` | 1 | −1, 0, +1 | three-state flags, signs. Stored in a tryte. |
 | `tryte`, alias `char` | 1 | −9 841 … 9 841 | a `char` holds one Unicode code point |
 | `int` | 3 | ±3 812 798 742 493 | the machine word: 27 trits |
+| `long` | 9 | ±(3^81 − 1)/2 ≈ ±2.2·10^38 | 81 trits: three words, the high one first in memory |
 | `real` | 9 | ±3^9840, 72-trit precision, ±∞, NaN | the FPU's real81 (ISA §14): about 34 decimal digits |
 | `*T` | 3 | an address | a pointer is a word |
 | `[N]T` | N·sizeof(T), rounded up (§4) | | fixed-size array |
@@ -59,6 +61,7 @@ The name means "threefold". Source files use `.tri`. **⚠ REVIEW**
   - Use `sgn(x)` for the sign.
   - `as` also converts between pointer types, and between pointers and `int`.
 - **Overflow wraps** modulo 3^27 (balanced) and is never undefined.
+- **Longs:** `long` is an 81-trit integer with the operators of `int` (`+ - * / %`, `& | ~`, `<< >>` by an `int` count, the comparisons, `<=>`, and as a condition, true when non-zero), wrapping modulo 3^81. An `int`, `tryte` or `trit` converts to `long` implicitly, and mixed with a `long` it is widened; `l as int` (or `as tryte`, `as trit`) keeps the low trits; `l as real` and `x as long` convert to the nearest value (a real out of range gives the nearest end of the range, a NaN 0), and a `long` mixed with a `real` is converted. A `long` cannot index an array, be a `switch` value or a `const`. Most operations call a small runtime that the compiler appends to the program (`lib/long.s`); `long.tri` in the standard library has `ltoa` and `atol` for decimal text.
 - **Reals:** an integer converts to `real` implicitly; `x as int` rounds a real to the nearest integer (ties to even) and saturates, with the IV flag, on NaN or out of range. Arithmetic `+ - * / %` follows the FPU (round to nearest; `%` is the exact IEEE remainder), and `|`/`&` on reals are max/min. Comparisons with a NaN are unordered: every one is false except `!=`. A real is true when it is non-zero, so a NaN is true. Exceptions are masked by default and only set the sticky flags in `fsr()`.
 
 ## 4. Memory layout and addresses ⚠ REVIEW
@@ -340,7 +343,7 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 6. **C division semantics** for `/` and `%`, with rounding division available through builtins.
 7. **One compilation unit** with textual `import`, and `_` for private names.
 8. **No `volatile`:** every access to addressable memory happens as written; the optimizer (§16) never removes or reorders one.
-9. **What v1 leaves out:** `long`, struct values, varargs, generics and macros. (Floats were left out at first; `real` has since been added.)
+9. **What v1 leaves out:** struct values, varargs, generics and macros. (`long` was left out at first; it has since been added, §3.) (Floats were left out at first; `real` has since been added.)
 
 ## 15. Changes from v0.1
 
@@ -376,7 +379,7 @@ func        = [ "interrupt" ] "fn" IDENT "(" [ param { "," param } ] ")" [ "->" 
 extern      = "extern" ( "fn" IDENT "(" [ param { "," param } ] ")" [ "->" type ]
                        | "var" IDENT ":" type ) ";" ;
 param       = IDENT ":" type ;
-type        = "int" | "tryte" | "char" | "trit" | "real" | "void" | IDENT
+type        = "int" | "tryte" | "char" | "trit" | "real" | "long" | "void" | IDENT
             | "*" type | "[" expr "]" type | "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
 init        = expr | "{" [ init { "," init } ] "}" ;
 block       = "{" { stmt } "}" ;

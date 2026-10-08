@@ -1,0 +1,96 @@
+// /bin/longtest: Trine's 81-trit `long` in a Trinux program, self-checking
+// (selfhost.rs compiles it with tric at each level, compares the assembly
+// with the host's and runs it): literals, the operators, conversions,
+// longs in memory, as parameters (some on the stack) and results.
+
+import "../lib/tlibc.tri";
+import "long.tri";
+
+var fails: int;
+
+fn ck(what: *char, got: long, want: long) {
+    if (got != want) {
+        var b: [41]char;
+        puts("longtest: FAILED ");
+        puts(what);
+        puts(": ");
+        ltoa(got, &b[0]);
+        puts(&b[0]);
+        puts(" not ");
+        ltoa(want, &b[0]);
+        puts(&b[0]);
+        puts("\n");
+        fails += 1;
+    }
+}
+
+struct S { t: tryte; x: long; n: int; }
+var gs: S;
+var ga: [3]long;
+var gl: long = 1000000000000000000;
+
+fn mix(a: int, x: long, b: int, y: long, c: int) -> long { return x * a + y * b + c; }
+fn seven(x: long, y: long, c: int) -> long { return x - y + c; }   // nine slots: three on the stack
+fn twice(p: *long) { *p = *p * 2; }
+fn rl(x: real, l: long) -> long { return l + (x as long); }
+
+fn fact(n: int) -> long {
+    var r: long = 1;
+    while (n > 1) { r *= n; n -= 1; }
+    return r;
+}
+
+fn main() -> int {
+    var a: long = 123456789012345678901234567890;
+    var b: long = -98765432109876543210;
+    ck("*", a * b, 122043352437383057238278198803597910280);
+    ck("/", a / b, -1249999988);
+    ck("%", a % b, 60185185207253086410);
+    ck("+", a + b, 123456788913580246791358024680);
+    ck("-", a - b, 123456789111111111011111111100);
+    ck("&", a & b, -5294023134910139622597069753);
+    ck("|", a | b, 128750812048490386413955094433);
+    ck("<<", a << 20, -12959282117242660335670119658322408913);
+    ck(">>", a >> 30, 599621692087215);
+    ck("as int", a as int, -331325849736);
+    ck("as tryte", a as tryte, -1485);
+    ck("as trit", (a as trit) as int, 0);
+    ck("max", 0t111111111111111111111111111111111111111111111111111111111111111111111111111111111, 221713244121518884974124815309574946401);
+    ck("0z", 0z100000000000000000000, 42391158275216203514294433201);
+    ck("0x", 0x123456789ABCDEF0123456789, 90144042682896311822508713865);
+    ck("fact", fact(30), 265252859812191058636308480000000);
+    ck("square", fact(30) * fact(30), 65014560309718323516230532606034714104);
+    ck("mix", mix(7, a, 11, b, -13), 864197521999999999099999999907);
+    ck("seven", seven(a, b, 5), 123456789111111111011111111105);
+    ck("real", rl(2.5, gl), 1000000000000000002);
+    ck("to real", ((a as real) / 1e20) as long, 1234567890);
+    // comparisons, sign, truth
+    var n: int = 0;
+    if (a > b) { n += 1; }
+    if (b < 0) { n += 10; }
+    if (a != b && !(a == b)) { n += 100; }
+    sign (b <=> a) { neg: { n += 1000; } zero: { } pos: { } }
+    sign (b) { neg: { n += 10000; } zero: { } pos: { } }
+    var z: long = 0;
+    if (!z && a) { n += 100000; }
+    ck("tests", n, 111111);
+    // memory: fields, arrays, pointers, compound assignment
+    gs.t = 'A';
+    gs.n = 9;
+    gs.x = -77;
+    gs.x += 7000000000000000000000;
+    ck("field", gs.x, 6999999999999999999923);
+    ga[0] = fact(20);
+    ga[1] = ga[0] + 1;
+    twice(&ga[1]);
+    ga[2] = gl;
+    ga[2] /= 1000;
+    var p: *long = &ga[0];
+    p[0] -= 1;
+    ck("array", ga[0] + ga[1] + ga[2], 7298706024529920000 + 2 + 1000000000000000 - 1);
+    ck("cond", n > 5 ? a : b, a);
+    ck("text", atol("-123456789012345678901234567890"), -a);
+    if (gs.t != 'A' || gs.n != 9) { ck("neighbours", 0, 1); }
+    if (fails == 0) { puts("longtest: ok\n"); }
+    return fails;
+}

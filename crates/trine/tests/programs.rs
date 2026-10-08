@@ -75,7 +75,11 @@ fn ternary_literals_refused() {
     assert!(e.contains("2 does not fit in trit"), "{e}");
     let e = compile_err("fn main() -> int { var t: tryte = 0z1000; return t; }");
     assert!(e.contains("expected tryte, found int"), "{e}");
+    // past a word a literal is a long, which an int will not take
     let e = compile_err("fn main() -> int { return 0z1000000000; }");
+    assert!(e.contains("expected int, found long"), "{e}");
+    // a constant computed past a word still does not fit
+    let e = compile_err("fn main() -> int { return 3000000000000 + 3000000000000; }");
     assert!(e.contains("does not fit in a word"), "{e}");
 }
 

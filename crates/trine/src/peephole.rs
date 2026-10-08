@@ -12,7 +12,13 @@
 //! Anything it does not understand (inline assembly, an unknown mnemonic,
 //! a jump it cannot follow) makes it leave the function alone.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+
+thread_local! {
+    /// The function returns a long: r1..r3 are live at its `ret`.
+    static RET_LONG: Cell<bool> = const { Cell::new(false) };
+}
 
 const FLAGS: u32 = 1 << 27;
 /// sp and fp: writes to them always stay.
@@ -160,11 +166,19 @@ fn info(i: &Ins) -> Option<Info> {
         "hlt" | "fence" | "tlbflush" => inf(0, 0, false, false),
         "tlbinv" => inf(src(0), 0, false, false),
         "sys" => inf(args() | bit(13), bit(1) | FLAGS, false, false),
+        // the long runtime (lib/long.s) reads and writes r1..r3 only
+        "call" if a.len() == 1 && a[0].starts_with("_trine_") => {
+            let r123 = bit(1) | bit(2) | bit(3);
+            inf(r123 | bit(13), r123 | bit(12) | FLAGS, false, false)
+        }
         "call" if a.len() == 1 => inf(args() | bit(13), clobbered(), false, false),
         "jal" if a.len() == 2 => inf(args() | bit(13), clobbered() | reg0(), false, false),
         "jalr" if a.len() >= 2 && reg0() != bit(0) => inf(src(1) | args() | bit(13), clobbered() | reg0(), false, false),
         "ret" if a.is_empty() => {
             let mut uses = bit(1) | bit(11) | bit(12) | bit(13);
+            if RET_LONG.with(Cell::get) {
+                uses |= bit(2) | bit(3);
+            }
             for r in -9..=-1 {
                 uses |= bit(r);
             }
@@ -409,7 +423,8 @@ const PIECE: usize = 250;
 /// analysis, so a long function (generated, straight-line code) goes in
 /// pieces, each taking everything as live after its end: no rewrite then
 /// needs to know what follows, and the time grows linearly.
-pub fn run(lines: &mut Vec<String>) {
+pub fn run(lines: &mut Vec<String>, ret_long: bool) {
+    RET_LONG.with(|c| c.set(ret_long));
     if lines.len() <= WHOLE {
         run_piece(lines, 0);
         return;

@@ -155,6 +155,9 @@ fn pp_set(p: *pline, uses: int, defs: int, pure: int, dst0: int, ctl: int) {
     p.ctl = ctl;
 }
 
+// The function returns a long: r1..r3 are live at its `ret`.
+var pp_ret_long: int;
+
 // How the instruction behaves (crates/trine/src/peephole.rs: info).
 fn pp_info(p: *pline) {
     p.iok = 0;
@@ -205,6 +208,12 @@ fn pp_info(p: *pline) {
     if (streq(o, "hlt") || streq(o, "fence") || streq(o, "tlbflush")) { pp_set(p, 0, 0, 0, 0, 0); return; }
     if (streq(o, "tlbinv")) { pp_set(p, pp_src(p, 0), 0, 0, 0, 0); return; }
     if (streq(o, "sys")) { pp_set(p, bor(pp_args(), pp_bit(13)), bor(pp_bit(1), fl), 0, 0, 0); return; }
+    // the long runtime (lib/long.s) reads and writes r1..r3 only
+    if (streq(o, "call") && n == 1 && strncmp(p.av[0], "_trine_", 7) == 0) {
+        var r123: int = bor(bor(pp_bit(1), pp_bit(2)), pp_bit(3));
+        pp_set(p, bor(r123, pp_bit(13)), bor(bor(r123, pp_bit(12)), fl), 0, 0, 0);
+        return;
+    }
     if (streq(o, "call") && n == 1) { pp_set(p, bor(pp_args(), pp_bit(13)), pp_clobbered(), 0, 0, 0); return; }
     if (streq(o, "jal") && n == 2) { pp_set(p, bor(pp_args(), pp_bit(13)), bor(pp_clobbered(), reg0), 0, 0, 0); return; }
     if (streq(o, "jalr") && n >= 2 && reg0 != pp_bit(0)) {
@@ -213,6 +222,7 @@ fn pp_info(p: *pline) {
     }
     if (streq(o, "ret") && n == 0) {
         var u: int = pp_bit(1) + pp_bit(11) + pp_bit(12) + pp_bit(13);
+        if (pp_ret_long) { u = bor(u, bor(pp_bit(2), pp_bit(3))); }
         var r: int = -9;
         while (r <= -1) { u = bor(u, pp_bit(r)); r += 1; }
         pp_set(p, u, 0, 0, 0, 3);
