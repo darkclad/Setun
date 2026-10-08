@@ -189,10 +189,10 @@ fn k6_inconsistent_superblock_is_refused() {
 fn k6_initramfs_root_still_boots() {
     // The initramfs is loaded into one block of 3^k pages, and 243 sectors
     // is the most that fits beside the kernel in 729 pages of RAM. The
-    // test programs and the network and crypto tools no longer fit in
-    // that, and are not needed to boot.
+    // test programs, the network and crypto tools and the media tools no
+    // longer fit in that, and are not needed to boot.
     let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest", "/sbin/telnetd", "/bin/nc", "/bin/paint", "/bin/colors"];
-    let files: Vec<_> = trinux::default_files().into_iter().filter(|(name, _)| !heavy.iter().any(|h| name.contains(h))).collect();
+    let files: Vec<_> = trinux::default_files().into_iter().filter(|(name, src)| !heavy.iter().any(|h| name.contains(h)) && !src.ends_with("media.tri")).collect();
     let disk = trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Initramfs).unwrap_or_else(|e| panic!("{e}")).trytes;
     let (out, _) = session(&disk, &["echo ramfs root", "ls /proc/1", "exit"], 100_000_000);
     let count = format!("initramfs: {} files", files.len());

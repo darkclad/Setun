@@ -27,7 +27,7 @@ fn ssh_by_password_and_known_hosts() {
     assert!(o.contains("localhost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"), "{o}");
     // the second time the key is known: no warning
     let o = with_password(&mut s, "ssh -i /nokey -p 22 root@localhost uname -m", "root");
-    assert!(o.contains("setun26\n") && !o.contains("Warning"), "{o}");
+    assert!(o.contains("setun11\u{305}\n") && !o.contains("Warning"), "{o}");
     // three wrong passwords
     let start = s.out.len();
     s.send("ssh -i /nokey user@127.0.0.1 true; echo status $?\n");

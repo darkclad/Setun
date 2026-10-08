@@ -47,7 +47,7 @@ through the BIOS ([`BOOT.md`](BOOT.md)) and starts `/sbin/init` as process 1.
 `uname -a` prints:
 
 ```text
-Trinux setun 0.1 #7 K7 balanced ternary setun26
+Trinux setun 0.1 #8 K8 balanced ternary setun11̅
 ```
 
 ### 1.2 Design principles
@@ -569,7 +569,24 @@ quits.
 | `tas` | `tas [-r] [-o out] file.s` | the assembler; output a TEF executable, or with `-r` the bare image |
 | `hello` | `hello [args]` | prints its pid, parent and arguments; exit status = argc |
 
-### 4.8 Tests and diagnostics
+### 4.8 Data formats
+
+The ternary file formats of [FORMATS.md](FORMATS.md), and their adapters
+at the binary border. One program, `/bin/media`, under each name.
+
+| Command | Synopsis | Description |
+|---|---|---|
+| `ttv` | `ttv file` · `ttv -c text out` | print a TTV file in its text notation, or make one from the notation (`null`, `true`, `unknown`, `false`, integers of any size, reals, `"text"`, `x"0a1f"` octets, `[…]` lists, `{key: value}` maps) |
+| `wav2tau` | `wav2tau in.wav out.tau` | PCM WAV (8, 16 or 24 bits, 1 to 9 channels) to TAU, one balanced word a sample |
+| `tau2wav` | `tau2wav [-b 8\|16\|24] in.tau out.wav` | TAU to PCM WAV (16 bits by default), rounding to the nearest; a WAV→TAU→WAV round trip is exact |
+| `tone` | `tone [-r rate] [-a amplitude] freq seconds out.tau` | a sine wave (rate 8000, amplitude 0.5 of full scale) |
+| `tauinfo` | `tauinfo file` | rate, channels, frames, length and peak |
+| `ppm2tim` | `ppm2tim [-r] in.ppm out.tim` | binary PPM (P6) or PGM (P5), 8 bits a sample, to TIM at 6 trits a sample (v − 128), predicted (`-r`: raw) |
+| `tim2ppm` | `tim2ppm in.tim out.ppm` | TIM to PPM (RGB) or PGM (grey); a PPM→TIM→PPM round trip is exact |
+| `timinfo` | `timinfo file` | size, channels, depth, and the space prediction saves |
+| `timview` | `timview file` | draw a TIM picture, centred on mid-grey, in 640×480 graphics mode; Enter returns to the text console |
+
+### 4.9 Tests and diagnostics
 
 These programs hold scenarios the host's test suites run. Each prints one
 line per check.
@@ -586,6 +603,7 @@ line per check.
 | `mtxtest` | shared memory, futex, the one-trit mutex, `MRG`/`STWM`/`TCP`/`TCN`/`TREV`/`CAS3` |
 | `chartest` | 3-tryte characters and UTF-8 at the border |
 | `dstest` | packed flags, Kleene vectors, the 3-ary heap, the B-tree |
+| `fmttest` | tvarints, TTV and TIM: round trips, known answers, and the malformed inputs each must refuse |
 | `nettest` | socket calls and their errors on loopback |
 | `cryptotest`, `pktest` | crypto against published vectors |
 | `fdcheck` | exits with the number of open descriptors among 3..26 |
@@ -1845,6 +1863,17 @@ and §14.
 | `heap3.tri` | a 3-ary min-heap of (key, value): `h3_init`, `h3_push`, `h3_peek`, `h3_pop`, `h3_size`, `h3_free`, `h3_valid` |
 | `btree.tri` | an int → int B-tree with up to 27 keys a node: `bt_init`, `bt_get`, `bt_put`, `bt_del`, `bt_count`, `bt_walk`, `bt_height`, `bt_free` |
 | `wcwidth.tri` | `tchar_width(cp)`, `tstr_width(s)` |
+
+### 16.9 Data formats
+
+The formats are specified in [FORMATS.md](FORMATS.md).
+
+| Module | Functions |
+|---|---|
+| `tvarint.tri` | balanced varints, 8-trit groups least significant first with a control trit (+1 more follows, 0 the last, −1 free for containers): `tvar_put(buf, v) -> n`, `tvar_put_long`, `tvar_get(buf, n, *v) -> used` (−1 if cut short, not canonical or past a word), `tvar_get_long`, `tvar_control(t)`, `tvar_group(t)`; and a word as 3 trytes, most significant first: `tw_put(p, v)`, `tw_get(p)` |
+| `ttv.tri` | TTV tagged values. Writing into a growing `TtvBuf` (`ttv_init`; `p`, `n`, `err`): `ttv_null`, `ttv_truth`, `ttv_int`, `ttv_long`, `ttv_real`, `ttv_text`, `ttv_octets`, `ttv_list(b, count)`, `ttv_map(b, count)`. Reading with a `TtvReader` (`ttv_reader(r, p, n)`): `ttv_kind`, `ttv_read_null`, `ttv_read_truth` (−2 if invalid), `ttv_read_int`, `ttv_read_long`, `ttv_read_real`, `ttv_read_text`, `ttv_read_octets`, `ttv_read_count(r, TTV_LIST\|TTV_MAP)`, `ttv_skip`, `ttv_at_end`; a failure sets `r.err` and every later read fails |
+| `tau.tri` | TAU sound: `tau_header`, `tau_read_header` (checks magic, version, rate, channels 1–9, the length), `tau_sample`, `tau_set_sample` |
+| `tim.tri` | TIM pictures: `struct Tim` (`w`, `h`, `ch`, `depth`, `s`), `tim_alloc`, `tim_write(t, TIM_RAW\|TIM_PREDICTED, *TtvBuf)`, `tim_read(p, n, *Tim)` (−1 for anything malformed), `tim_predict` (the median edge predictor), `tim_limit(depth)` |
 
 ---
 

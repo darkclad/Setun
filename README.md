@@ -32,6 +32,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/TRINUX.md`](docs/TRINUX.md): **the Trinux manual**: the shell, every command, files, processes, signals, the window system, networking, system calls and libraries
 - [`docs/TRINE.md`](docs/TRINE.md): **the Trine manual**: a tutorial and the complete language reference, builtins, the standard library, the compilers and their optimization levels
 - [`docs/REAL.md`](docs/REAL.md): the real27/real81 floating-point standard, with its conformance vectors
+- [`docs/FORMATS.md`](docs/FORMATS.md): the ternary data formats: tvarint balanced varints, TTV tagged values, TAU sound, TIM pictures
 - [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the normative ISA specification (v0.7: integer, floating-point and vector instructions)
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the compact language reference
@@ -48,6 +49,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 | Path | What |
 |---|---|
 | `crates/ternary` | balanced-ternary fixed-width integers (`Trit`, `Tryte`, `Word`, `Tern<N>`) |
+| `crates/real` | real27/real81 floating point, correctly rounded, and its conformance vectors ([`docs/REAL.md`](docs/REAL.md)) |
 | `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, memory map, devices (interrupt controller, timer, RTC, keyboard, mouse, serial, DMA disks, display renderer), `Machine` |
 | `crates/asm` | assembler, disassembler and the `setun-asm` tool ([`docs/ASSEMBLER.md`](docs/ASSEMBLER.md)) |
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |

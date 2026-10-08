@@ -146,11 +146,15 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest", "mtxtest", "vectest", "chartest", "dstest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
+        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "fmttest", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
     // One multi-call program under many names (hard links on tfs).
+    // The ternary data formats (docs/FORMATS.md).
+    for applet in ["ttv", "wav2tau", "tau2wav", "tone", "tauinfo", "ppm2tim", "tim2ppm", "timinfo", "timview"] {
+        v.push((format!("/bin/{applet}"), u.join("bin/media.tri")));
+    }
     for applet in [
         "rmdir", "basename", "dirname", "env", "printenv", "uname", "date", "clear", "seq", "tee", "yes", "kill", "test", "[",
         "id", "whoami", "groups", "chown", "chgrp", "stat", "time",
@@ -197,7 +201,8 @@ fn compiled(name: &str, src: &Path) -> bool {
 }
 
 /// The trytes of the file at `name` on a disk: a `.tri` source is compiled
-/// to TEF, unless it goes in as a source (a name ending in `.tri`); anything
+/// to TEF, unless it goes in as a source (a name ending in `.tri`); a
+/// `.wav`, `.ppm`, `.pgm` or `.bin` file is copied octet for octet; anything
 /// else is copied as text (one code point per tryte).
 pub fn disk_file(name: &str, src: &Path) -> Result<Vec<i16>, String> {
     if src == Path::new(FONT_SOURCE) {
@@ -208,6 +213,11 @@ pub fn disk_file(name: &str, src: &Path) -> Result<Vec<i16>, String> {
     }
     if compiled(name, src) {
         return tef(src);
+    }
+    // binary files from the border: one octet per tryte
+    if src.extension().is_some_and(|e| ["wav", "ppm", "pgm", "bin"].iter().any(|b| e == *b)) {
+        let bytes = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        return Ok(bytes.into_iter().map(|b| b as i16).collect());
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("{}: {e}", src.display()))?;
     // a character followed by U+0305 is stored overlined (negated)

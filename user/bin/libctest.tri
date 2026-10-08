@@ -301,7 +301,7 @@ fn options() {
 
 fn system_calls() {
     var u: utsname;
-    ok("uname", uname(&u) == 0 && streq(&u.sysname[0], "Trinux") && streq(&u.machine[0], "setun26"));
+    ok("uname", uname(&u) == 0 && streq(&u.sysname[0], "Trinux") && streq(&u.machine[0], "setun11̅"));
     ok("EFAULT: uname into the kernel", fails(uname(1000 as *utsname), EFAULT));
     var ts: timespec;
     ok("clock_gettime realtime", clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec > 1700000000);

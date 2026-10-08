@@ -1,0 +1,113 @@
+// tvarint.tri: balanced integers of any size in trytes (docs/FORMATS.md §1).
+//
+// Each tryte is a control trit (trit 1: +1 more follows, 0 the last, -1
+// not a tvarint) and an 8-trit balanced group (-3280..3280); the groups
+// are the value's balanced base-6561 digits, least significant first. The
+// encoding is canonical: as few trytes as the value needs.
+
+const TVAR_GROUP: int = 6561;           // 3^8
+const TVAR_HALF: int = 3280;            // (3^8 - 1) / 2
+
+// a balanced group: the value's lowest base-6561 digit
+fn tvar_digit(v: int) -> int {
+    var d: int = v % TVAR_GROUP;
+    if (d > TVAR_HALF) { d -= TVAR_GROUP; }
+    if (d < -TVAR_HALF) { d += TVAR_GROUP; }
+    return d;
+}
+
+// Write v as a tvarint at buf (room for 4 trytes): its length.
+fn tvar_put(buf: *tryte, v: int) -> int {
+    var n: int = 0;
+    loop {
+        var d: int = tvar_digit(v);
+        v = (v - d) / TVAR_GROUP;
+        if (v == 0) {
+            buf[n] = d as tryte;
+            return n + 1;
+        }
+        buf[n] = (TVAR_GROUP + d) as tryte;
+        n += 1;
+    }
+    return n;
+}
+
+fn tvar_digit_long(v: long) -> int {
+    var d: int = (v % TVAR_GROUP) as int;
+    if (d > TVAR_HALF) { d -= TVAR_GROUP; }
+    if (d < -TVAR_HALF) { d += TVAR_GROUP; }
+    return d;
+}
+
+// A long (room for 11 trytes).
+fn tvar_put_long(buf: *tryte, v: long) -> int {
+    var n: int = 0;
+    loop {
+        var d: int = tvar_digit_long(v);
+        v = (v - d) / TVAR_GROUP;
+        if (v == 0) {
+            buf[n] = d as tryte;
+            return n + 1;
+        }
+        buf[n] = (TVAR_GROUP + d) as tryte;
+        n += 1;
+    }
+    return n;
+}
+
+// The control trit and group of a tryte.
+fn tvar_control(t: int) -> int { return t > TVAR_HALF ? 1 : (t < -TVAR_HALF ? -1 : 0); }
+fn tvar_group(t: int) -> int { return t - tvar_control(t) * TVAR_GROUP; }
+
+// Read a tvarint of at most `max` trytes from buf[0..n) into the long *v:
+// the trytes used, or -1 (truncated, a control trit -1, too long, or not
+// canonical).
+fn tvar_get_long_max(buf: *tryte, n: int, max: int, v: *long) -> int {
+    var k: int = 0;
+    var acc: long = 0;
+    var scale: long = 1;
+    loop {
+        if (k >= n || k >= max) { return -1; }
+        var t: int = buf[k];
+        var c: int = tvar_control(t);
+        if (c < 0) { return -1; }
+        var g: int = tvar_group(t);
+        if (k == 10 && (g > 1 || g < -1)) { return -1; }   // past 81 trits
+        acc += scale * g;
+        k += 1;
+        if (c == 0) {
+            if (k > 1 && g == 0) { return -1; }      // not canonical
+            *v = acc;
+            return k;
+        }
+        scale *= TVAR_GROUP;
+    }
+    return -1;
+}
+
+fn tvar_get_long(buf: *tryte, n: int, v: *long) -> int { return tvar_get_long_max(buf, n, 11, v); }
+
+// An int: at most 4 trytes, and the value must fit in a word.
+fn tvar_get(buf: *tryte, n: int, v: *int) -> int {
+    var l: long;
+    var k: int = tvar_get_long_max(buf, n, 4, &l);
+    if (k < 0 || l > 3812798742493 || l < -3812798742493) { return -1; }
+    *v = l as int;
+    return k;
+}
+
+// A word in a file: three trytes, the most significant first.
+fn tw_put(p: *tryte, v: int) {
+    var lo: int = v % 19683;
+    if (lo > 9841) { lo -= 19683; }
+    if (lo < -9841) { lo += 19683; }
+    var rest: int = (v - lo) / 19683;
+    var mid: int = rest % 19683;
+    if (mid > 9841) { mid -= 19683; }
+    if (mid < -9841) { mid += 19683; }
+    p[0] = ((rest - mid) / 19683) as tryte;
+    p[1] = mid as tryte;
+    p[2] = lo as tryte;
+}
+
+fn tw_get(p: *tryte) -> int { return (p[0] * 19683 + p[1]) * 19683 + p[2]; }

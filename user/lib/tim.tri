@@ -1,0 +1,157 @@
+// tim.tri: TIM pictures (docs/FORMATS.md §4). A header of 8 words (magic
+// "TIM", version 1, width, height, channels 1 or 3, depth 1..9 trits per
+// sample, coding 0 raw or 1 predicted, 0), then the samples: balanced,
+// row by row, the channels of a pixel together. Predicted coding stores
+// each sample's residual from LOCO-I's median edge predictor as a
+// tvarint, and a run of zero residuals as one tryte with control trit -1.
+
+import "stdlib.tri";
+import "tvarint.tri";
+import "ttv.tri";                     // TtvBuf: a growing tryte buffer
+
+const TIM_MAGIC: int = 32544758012;     // the trytes 'T' 'I' 'M'
+const TIM_HEADER: int = 24;             // trytes
+const TIM_RAW: int = 0;
+const TIM_PREDICTED: int = 1;
+
+struct Tim {
+    w: int;
+    h: int;
+    ch: int;
+    depth: int;
+    s: *tryte;                        // w * h * ch samples
+}
+
+fn tim_limit(depth: int) -> int {
+    var m: int = 1;
+    var k: int = 0;
+    while (k < depth) { m *= 3; k += 1; }
+    return (m - 1) / 2;
+}
+
+// A picture's samples: 0, or -1 (no memory, or a bad size).
+fn tim_alloc(t: *Tim, w: int, h: int, ch: int, depth: int) -> int {
+    if (w <= 0 || h <= 0 || w > 19683 || h > 19683 || (ch != 1 && ch != 3) || depth < 1 || depth > 9) { return -1; }
+    t.w = w;
+    t.h = h;
+    t.ch = ch;
+    t.depth = depth;
+    t.s = malloc(w * h * ch);
+    return t.s == null ? -1 : 0;
+}
+
+// The prediction for sample (x, y, c) from those already known.
+fn tim_predict(t: *Tim, x: int, y: int, c: int) -> int {
+    var row: int = t.w * t.ch;
+    var at: int = (y * t.w + x) * t.ch + c;
+    var a: int = x > 0 ? t.s[at - t.ch] : 0;
+    var b: int = y > 0 ? t.s[at - row] : 0;
+    var d: int = x > 0 && y > 0 ? t.s[at - row - t.ch] : 0;
+    var lo: int = a < b ? a : b;
+    var hi: int = a < b ? b : a;
+    if (d >= hi) { return lo; }
+    if (d <= lo) { return hi; }
+    return a + b - d;
+}
+
+fn tim_put_run(out: *TtvBuf, run: int) {
+    if (run > 0) { ttv_put(out, run - TVAR_GROUP); }    // control -1, group = the run
+}
+
+// Encode t into out (header and samples).
+fn tim_write(t: *Tim, coding: int, out: *TtvBuf) {
+    if (!ttv_room(out, TIM_HEADER)) { return; }
+    var h: *tryte = out.p + out.n;
+    tw_put(h, TIM_MAGIC);
+    tw_put(h + 3, 1);
+    tw_put(h + 6, t.w);
+    tw_put(h + 9, t.h);
+    tw_put(h + 12, t.ch);
+    tw_put(h + 15, t.depth);
+    tw_put(h + 18, coding);
+    tw_put(h + 21, 0);
+    out.n += TIM_HEADER;
+    var n: int = t.w * t.h * t.ch;
+    if (coding == TIM_RAW) {
+        if (!ttv_room(out, n)) { return; }
+        var k: int = 0;
+        while (k < n) { out.p[out.n + k] = t.s[k]; k += 1; }
+        out.n += n;
+        return;
+    }
+    var run: int = 0;
+    var y: int = 0;
+    while (y < t.h) {
+        var x: int = 0;
+        while (x < t.w) {
+            var c: int = 0;
+            while (c < t.ch) {
+                var r: int = t.s[(y * t.w + x) * t.ch + c] - tim_predict(t, x, y, c);
+                if (r == 0) {
+                    run += 1;
+                    if (run == TVAR_HALF) { tim_put_run(out, run); run = 0; }
+                } else {
+                    tim_put_run(out, run);
+                    run = 0;
+                    if (ttv_room(out, 4)) { out.n += tvar_put(out.p + out.n, r); }
+                }
+                c += 1;
+            }
+            x += 1;
+        }
+        y += 1;
+    }
+    tim_put_run(out, run);
+}
+
+// Decode the TIM file of n trytes at p into t: 0, or -1 if it is not a
+// valid one (t.s is then not allocated, or freed).
+fn tim_read(p: *tryte, n: int, t: *Tim) -> int {
+    if (n < TIM_HEADER || tw_get(p) != TIM_MAGIC || tw_get(p + 3) != 1) { return -1; }
+    var coding: int = tw_get(p + 18);
+    if (coding != TIM_RAW && coding != TIM_PREDICTED) { return -1; }
+    if (tim_alloc(t, tw_get(p + 6), tw_get(p + 9), tw_get(p + 12), tw_get(p + 15)) < 0) { return -1; }
+    var lim: int = tim_limit(t.depth);
+    var total: int = t.w * t.h * t.ch;
+    var at: int = TIM_HEADER;
+    if (coding == TIM_RAW) {
+        if (n != TIM_HEADER + total) { free(t.s); return -1; }
+        var k: int = 0;
+        while (k < total) {
+            var v: int = p[at + k];
+            if (v > lim || v < -lim) { free(t.s); return -1; }
+            t.s[k] = v as tryte;
+            k += 1;
+        }
+        return 0;
+    }
+    var run: int = 0;
+    var i: int = 0;
+    while (i < total) {
+        var r: int = 0;
+        if (run > 0) {
+            run -= 1;
+        } else {
+            if (at >= n) { free(t.s); return -1; }
+            var b: int = p[at];
+            if (tvar_control(b) < 0) {
+                run = tvar_group(b);
+                if (run < 1) { free(t.s); return -1; }
+                at += 1;
+                run -= 1;
+            } else {
+                var used: int = tvar_get(p + at, n - at, &r);
+                if (used < 0 || r == 0) { free(t.s); return -1; }   // a zero is always a run
+                at += used;
+            }
+        }
+        var c: int = i % t.ch;
+        var px: int = i / t.ch;
+        var v2: int = tim_predict(t, px % t.w, px / t.w, c) + r;
+        if (v2 > lim || v2 < -lim) { free(t.s); return -1; }
+        t.s[i] = v2 as tryte;
+        i += 1;
+    }
+    if (run != 0 || at != n) { free(t.s); return -1; }       // left over
+    return 0;
+}

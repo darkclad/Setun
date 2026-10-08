@@ -876,7 +876,7 @@ fn k7_utilities() {
             "is-file\nis-dir\ncompound\n",
             "0\n1\n",
             "trit\ntrit\ntrit\n",
-            "Trinux\nTrinux setun26\n      11\n",
+            "Trinux\nTrinux setun11\u{305}\n      11\n",
             "gone\n",
             "d1\n",
         ],

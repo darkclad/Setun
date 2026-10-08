@@ -1,0 +1,683 @@
+// A multi-call program for the ternary data formats (docs/FORMATS.md):
+//
+//   ttv file                    print a TTV file in the notation below
+//   ttv -c text out             make a TTV file from the notation
+//   wav2tau in.wav out.tau      tau2wav [-b 8|16|24] in.tau out.wav
+//   tone [-r rate] [-a amplitude] freq seconds out.tau
+//   tauinfo file
+//   ppm2tim [-r] in.ppm out.tim tim2ppm in.tim out.ppm
+//   timinfo file                timview file
+//
+// The TTV notation: null, true, unknown, false, integers (any size),
+// reals (with a point or an exponent), "text" (with \" \\ \n), x"0a1f"
+// (octets in hexadecimal), [value, ...] and {key: value, ...}.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/tvarint.tri";
+import "../lib/ttv.tri";
+import "../lib/tau.tri";
+import "../lib/tim.tri";
+import "long.tri";
+import "real.tri";
+import "math.tri";
+
+fn name_of(path: *char) -> *char {
+    var s: *char = strrchr(path, '/');
+    return s == null ? path : &s[1];
+}
+
+fn fail(prog: *char, what: *char, arg: *char) -> int {
+    fputs(STDERR_FILENO, prog);
+    fputs(STDERR_FILENO, ": ");
+    fputs(STDERR_FILENO, what);
+    if (arg != null) { fputs(STDERR_FILENO, arg); }
+    fputs(STDERR_FILENO, "\n");
+    return 1;
+}
+
+fn usage(s: *char) -> int {
+    fputs(STDERR_FILENO, "usage: ");
+    fputs(STDERR_FILENO, s);
+    fputs(STDERR_FILENO, "\n");
+    return 2;
+}
+
+// ---- files ----
+
+// A whole file into a new buffer: its length, or -1 (errno set).
+fn read_whole(path: *char, into: **tryte) -> int {
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { return -1; }
+    var st: stat_t;
+    fstat(fd, &st);
+    var buf: *tryte = malloc(st.st_size + 1);
+    if (buf == null) { close(fd); errno = ENOMEM; return -1; }
+    var n: int = 0;
+    loop {
+        var r: int = read(fd, (buf + n) as *char, st.st_size - n);
+        if (r < 0) { close(fd); free(buf); return -1; }
+        if (r == 0) { break; }
+        n += r;
+    }
+    close(fd);
+    *into = buf;
+    return n;
+}
+
+fn write_whole(path: *char, p: *tryte, n: int) -> int {
+    var fd: int = open(path, O_WRONLY + O_CREAT + O_TRUNC, 420);
+    if (fd < 0) { return -1; }
+    var done: int = 0;
+    while (done < n) {
+        var w: int = write(fd, (p + done) as *char, n - done);
+        if (w <= 0) { close(fd); return -1; }
+        done += w;
+    }
+    return close(fd);
+}
+
+// ---- ttv: printing ----
+
+fn put_long(v: long) {
+    var b: [41]char;
+    ltoa(v, &b[0]);
+    puts(&b[0]);
+}
+
+fn put_real(x: real) {
+    var b: [81]char;
+    rtoa(x, 36, &b[0]);
+    puts(&b[0]);
+    // a real always shows as one: with a point or an exponent
+    if (strchr(&b[0], '.') == null && strchr(&b[0], 'e') == null && strchr(&b[0], 'n') == null) { puts(".0"); }
+}
+
+fn hexdigit(v: int) -> char { return (v < 10 ? '0' + v : 'a' + v - 10) as char; }
+
+var text_buf: [6561]char;
+
+// One value: 0, or -1 if the input is not valid TTV.
+fn print_value(r: *TtvReader) -> int {
+    var k: int = ttv_kind(r);
+    if (k == TTV_NULL) { ttv_read_null(r); puts("null"); return 0; }
+    if (k == TTV_TRUTH) {
+        var t: int = ttv_read_truth(r);
+        if (t == -2) { return -1; }
+        puts(t > 0 ? "true" : (t < 0 ? "false" : "unknown"));
+        return 0;
+    }
+    if (k == TTV_INT) {
+        var v: long;
+        if (ttv_read_long(r, &v) < 0) { return -1; }
+        put_long(v);
+        return 0;
+    }
+    if (k == TTV_REAL) {
+        var x: real;
+        if (ttv_read_real(r, &x) < 0) { return -1; }
+        put_real(x);
+        return 0;
+    }
+    if (k == TTV_TEXT) {
+        var n: int = ttv_read_text(r, &text_buf[0], 6560);
+        if (n < 0) { return -1; }
+        puts("\"");
+        var i: int = 0;
+        while (i < n) {
+            var c: int = text_buf[i];
+            if (c == '"' || c == '\\') { puts("\\"); write(STDOUT_FILENO, &text_buf[i], 1); }
+            else if (c == '\n') { puts("\\n"); }
+            else { write(STDOUT_FILENO, &text_buf[i], 1); }
+            i += 1;
+        }
+        puts("\"");
+        return 0;
+    }
+    if (k == TTV_OCTETS) {
+        var n2: int = ttv_read_octets(r, &text_buf[0] as *tryte, 6560);
+        if (n2 < 0) { return -1; }
+        puts("x\"");
+        var j: int = 0;
+        while (j < n2) {
+            var o: int = text_buf[j];
+            if (o < 0 || o > 255) { return -1; }
+            var h: [2]char;
+            h[0] = hexdigit(o / 16);
+            h[1] = hexdigit(o % 16);
+            write(STDOUT_FILENO, &h[0], 2);
+            j += 1;
+        }
+        puts("\"");
+        return 0;
+    }
+    if (k == TTV_LIST || k == TTV_MAP) {
+        var c: int = ttv_read_count(r, k);
+        if (c < 0) { return -1; }
+        puts(k == TTV_LIST ? "[" : "{");
+        var q: int = 0;
+        while (q < c) {
+            if (q > 0) { puts(", "); }
+            if (print_value(r) < 0) { return -1; }
+            if (k == TTV_MAP) {
+                puts(": ");
+                if (print_value(r) < 0) { return -1; }
+            }
+            q += 1;
+        }
+        puts(k == TTV_LIST ? "]" : "}");
+        return 0;
+    }
+    return -1;
+}
+
+// ---- ttv: the notation ----
+
+var src: *char;
+var at: int;
+
+fn skip_ws() { while (src[at] == ' ' || src[at] == '\t' || src[at] == '\n') { at += 1; } }
+
+fn starts(s: *char) -> int {
+    var k: int = 0;
+    while (s[k] != 0) { if (src[at + k] != s[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+fn hexval(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+// One value from src[at..] into b: 0, or -1 (at is where it went wrong).
+fn parse_value(b: *TtvBuf) -> int {
+    skip_ws();
+    if (starts("null")) { at += 4; ttv_null(b); return 0; }
+    if (starts("true")) { at += 4; ttv_truth(b, true); return 0; }
+    if (starts("false")) { at += 5; ttv_truth(b, false); return 0; }
+    if (starts("unknown")) { at += 7; ttv_truth(b, unknown); return 0; }
+    var c: int = src[at];
+    if (c == '"') {
+        at += 1;
+        var n: int = 0;
+        while (src[at] != '"') {
+            if (src[at] == 0 || n >= 6560) { return -1; }
+            var ch: int = src[at];
+            if (ch == '\\') {
+                at += 1;
+                ch = src[at] == 'n' ? '\n' : src[at];
+                if (ch == 0) { return -1; }
+            }
+            text_buf[n] = ch as char;
+            n += 1;
+            at += 1;
+        }
+        at += 1;
+        text_buf[n] = 0;
+        ttv_text(b, &text_buf[0]);
+        return 0;
+    }
+    if (c == 'x' && src[at + 1] == '"') {
+        at += 2;
+        var m: int = 0;
+        while (src[at] != '"') {
+            var hi: int = hexval(src[at]);
+            var lo: int = hexval(src[at + 1]);
+            if (hi < 0 || lo < 0 || m >= 6560) { return -1; }
+            text_buf[m] = (hi * 16 + lo) as char;
+            m += 1;
+            at += 2;
+        }
+        at += 1;
+        ttv_octets(b, &text_buf[0] as *tryte, m);
+        return 0;
+    }
+    if (c == '[' || c == '{') {
+        var map: int = c == '{';
+        at += 1;
+        // the count goes first: write the items to a buffer of their own
+        var items: TtvBuf;
+        ttv_init(&items);
+        var count: int = 0;
+        skip_ws();
+        if (src[at] != (map ? '}' : ']')) {
+            loop {
+                if (parse_value(&items) < 0) { return -1; }
+                if (map) {
+                    skip_ws();
+                    if (src[at] != ':') { return -1; }
+                    at += 1;
+                    if (parse_value(&items) < 0) { return -1; }
+                }
+                count += 1;
+                skip_ws();
+                if (src[at] == ',') { at += 1; continue; }
+                break;
+            }
+        }
+        skip_ws();
+        if (src[at] != (map ? '}' : ']')) { return -1; }
+        at += 1;
+        if (map) { ttv_map(b, count); } else { ttv_list(b, count); }
+        if (ttv_room(b, items.n)) {
+            var k: int = 0;
+            while (k < items.n) { b.p[b.n + k] = items.p[k]; k += 1; }
+            b.n += items.n;
+        }
+        free(items.p);
+        return 0;
+    }
+    if (c == '-' || c == '+' || (c >= '0' && c <= '9')) {
+        // a real has a point or an exponent; otherwise an integer
+        var e: int = at + 1;
+        while (src[e] >= '0' && src[e] <= '9') { e += 1; }
+        if (src[e] == '.' || src[e] == 'e' || src[e] == 'E') {
+            var end: *char;
+            var x: real = strtor(&src[at], &end);
+            if (end == &src[at]) { return -1; }
+            at = (end - src) as int;
+            ttv_real(b, x);
+            return 0;
+        }
+        var neg: int = c == '-';
+        if (c == '-' || c == '+') { at += 1; }
+        if (src[at] < '0' || src[at] > '9') { return -1; }
+        var v: long = 0;
+        while (src[at] >= '0' && src[at] <= '9') {
+            v = v * 10 + (src[at] - '0');
+            at += 1;
+        }
+        ttv_long(b, neg ? -v : v);
+        return 0;
+    }
+    return -1;
+}
+
+fn do_ttv(argc: int, argv: **char) -> int {
+    if (argc == 4 && streq(argv[1], "-c")) {
+        src = argv[2];
+        at = 0;
+        var b: TtvBuf;
+        ttv_init(&b);
+        if (parse_value(&b) < 0) { return fail("ttv", "cannot read the notation at: ", &src[at]); }
+        skip_ws();
+        if (src[at] != 0) { return fail("ttv", "more after the value: ", &src[at]); }
+        if (b.err) { return fail("ttv", "out of memory", null); }
+        if (write_whole(argv[3], b.p, b.n) < 0) { perror2("ttv", argv[3]); return 1; }
+        return 0;
+    }
+    if (argc != 2) { return usage("ttv file | ttv -c text out"); }
+    var p: *tryte;
+    var n: int = read_whole(argv[1], &p);
+    if (n < 0) { perror2("ttv", argv[1]); return 1; }
+    var r: TtvReader;
+    ttv_reader(&r, p, n);
+    var status: int = 0;
+    while (!ttv_at_end(&r)) {
+        if (print_value(&r) < 0) { puts("\n"); return fail("ttv", "not valid TTV: ", argv[1]); }
+        puts("\n");
+    }
+    return status;
+}
+
+// ---- sound ----
+
+fn le(p: *tryte, k: int, bytes: int) -> int {
+    var v: int = 0;
+    var i: int = bytes - 1;
+    while (i >= 0) { v = v * 256 + p[k + i]; i -= 1; }
+    return v;
+}
+
+fn put_le(p: *tryte, k: int, v: int, bytes: int) {
+    var i: int = 0;
+    while (i < bytes) {
+        var o: int = v % 256;
+        if (o < 0) { o += 256; }
+        p[k + i] = o as tryte;
+        v = (v - o) / 256;
+        i += 1;
+    }
+}
+
+fn is_tag(p: *tryte, k: int, tag: *char) -> int {
+    var i: int = 0;
+    while (i < 4) { if (p[k + i] != tag[i]) { return 0; } i += 1; }
+    return 1;
+}
+
+fn pow3(k: int) -> int {
+    var v: int = 1;
+    while (k > 0) { v *= 3; k -= 1; }
+    return v;
+}
+
+fn do_wav2tau(argc: int, argv: **char) -> int {
+    if (argc != 3) { return usage("wav2tau in.wav out.tau"); }
+    var p: *tryte;
+    var n: int = read_whole(argv[1], &p);
+    if (n < 0) { perror2("wav2tau", argv[1]); return 1; }
+    if (n < 12 || !is_tag(p, 0, "RIFF") || !is_tag(p, 8, "WAVE")) { return fail("wav2tau", "not a WAV file: ", argv[1]); }
+    var k: int = 12;
+    var fmt: int = -1;
+    var data: int = -1;
+    var dlen: int = 0;
+    while (k + 8 <= n) {
+        var len: int = le(p, k + 4, 4);
+        if (is_tag(p, k, "fmt ")) { fmt = k + 8; }
+        if (is_tag(p, k, "data")) { data = k + 8; dlen = len; }
+        k += 8 + len + len % 2;
+    }
+    if (fmt < 0 || data < 0 || data + dlen > n) { return fail("wav2tau", "no fmt or data chunk in ", argv[1]); }
+    var ch: int = le(p, fmt + 2, 2);
+    var rate: int = le(p, fmt + 4, 4);
+    var bits: int = le(p, fmt + 14, 2);
+    if (le(p, fmt, 2) != 1 || (bits != 8 && bits != 16 && bits != 24) || ch < 1 || ch > 9) {
+        return fail("wav2tau", "only PCM of 8, 16 or 24 bits and 1 to 9 channels: ", argv[1]);
+    }
+    var bps: int = bits / 8;
+    var frames: int = dlen / (bps * ch);
+    var out: *tryte = malloc(TAU_HEADER + 3 * frames * ch);
+    if (out == null) { return fail("wav2tau", "out of memory", null); }
+    tau_header(out, rate, ch, frames);
+    var scale: int = bits == 8 ? pow3(21) : (bits == 16 ? pow3(16) : pow3(10));
+    var i: int = 0;
+    while (i < frames * ch) {
+        var s: int = le(p, data + i * bps, bps);
+        if (bits == 8) { s -= 128; }
+        else if (s >= pow2(bits - 1)) { s -= pow2(bits); }
+        tau_set_sample(out, i, s * scale);
+        i += 1;
+    }
+    if (write_whole(argv[2], out, TAU_HEADER + 3 * frames * ch) < 0) { perror2("wav2tau", argv[2]); return 1; }
+    return 0;
+}
+
+fn pow2(k: int) -> int {
+    var v: int = 1;
+    while (k > 0) { v *= 2; k -= 1; }
+    return v;
+}
+
+fn do_tau2wav(argc: int, argv: **char) -> int {
+    var bits: int = 16;
+    var c: int = getopt(argc, argv, "b:");
+    while (c != -1) {
+        if (c == 'b') { bits = atoi(optarg); } else { return usage("tau2wav [-b 8|16|24] in.tau out.wav"); }
+        c = getopt(argc, argv, "b:");
+    }
+    if (optind + 2 != argc || (bits != 8 && bits != 16 && bits != 24)) { return usage("tau2wav [-b 8|16|24] in.tau out.wav"); }
+    var p: *tryte;
+    var n: int = read_whole(argv[optind], &p);
+    if (n < 0) { perror2("tau2wav", argv[optind]); return 1; }
+    var rate: int;
+    var ch: int;
+    var frames: int;
+    if (tau_read_header(p, n, &rate, &ch, &frames) < 0) { return fail("tau2wav", "not a TAU file: ", argv[optind]); }
+    var bps: int = bits / 8;
+    var dlen: int = frames * ch * bps;
+    var w: *tryte = malloc(44 + dlen);
+    if (w == null) { return fail("tau2wav", "out of memory", null); }
+    var hdr: *char = "RIFF....WAVEfmt ";
+    var k: int = 0;
+    while (k < 16) { w[k] = hdr[k] as tryte; k += 1; }
+    put_le(w, 4, 36 + dlen, 4);
+    put_le(w, 16, 16, 4);
+    put_le(w, 20, 1, 2);
+    put_le(w, 22, ch, 2);
+    put_le(w, 24, rate, 4);
+    put_le(w, 28, rate * ch * bps, 4);
+    put_le(w, 32, ch * bps, 2);
+    put_le(w, 34, bits, 2);
+    w[36] = 'd' as tryte;
+    w[37] = 'a' as tryte;
+    w[38] = 't' as tryte;
+    w[39] = 'a' as tryte;
+    put_le(w, 40, dlen, 4);
+    var scale: int = bits == 8 ? pow3(21) : (bits == 16 ? pow3(16) : pow3(10));
+    var top: int = pow2(bits - 1) - 1;
+    var i: int = 0;
+    while (i < frames * ch) {
+        var s: int = divr(tau_sample(p, i), scale);     // rounded to nearest
+        if (s > top) { s = top; }
+        if (s < -top - 1) { s = -top - 1; }
+        if (bits == 8) { s += 128; }
+        put_le(w, 44 + i * bps, s, bps);
+        i += 1;
+    }
+    if (write_whole(argv[optind + 1], w, 44 + dlen) < 0) { perror2("tau2wav", argv[optind + 1]); return 1; }
+    return 0;
+}
+
+fn do_tone(argc: int, argv: **char) -> int {
+    var u: *char = "tone [-r rate] [-a amplitude] freq seconds out.tau";
+    var rate: int = 8000;
+    var amp: real = 0.5;
+    var c: int = getopt(argc, argv, "r:a:");
+    while (c != -1) {
+        if (c == 'r') { rate = atoi(optarg); }
+        else if (c == 'a') { amp = atof(optarg); }
+        else { return usage(u); }
+        c = getopt(argc, argv, "r:a:");
+    }
+    if (optind + 3 != argc || rate <= 0 || amp < 0.0 || amp > 1.0) { return usage(u); }
+    var freq: real = atof(argv[optind]);
+    var secs: real = atof(argv[optind + 1]);
+    var frames: int = (secs * rate) as int;
+    if (frames < 0 || frames > 531441) { return usage(u); }
+    var out: *tryte = malloc(TAU_HEADER + 3 * frames);
+    if (out == null) { return fail("tone", "out of memory", null); }
+    tau_header(out, rate, 1, frames);
+    var full: real = amp * TAU_FULL;
+    var w: real = 2.0 * pi() * freq / rate;
+    var i: int = 0;
+    while (i < frames) {
+        tau_set_sample(out, i, (full * sin(w * i)) as int);
+        i += 1;
+    }
+    if (write_whole(argv[optind + 2], out, TAU_HEADER + 3 * frames) < 0) { perror2("tone", argv[optind + 2]); return 1; }
+    return 0;
+}
+
+fn do_tauinfo(argc: int, argv: **char) -> int {
+    if (argc != 2) { return usage("tauinfo file"); }
+    var p: *tryte;
+    var n: int = read_whole(argv[1], &p);
+    if (n < 0) { perror2("tauinfo", argv[1]); return 1; }
+    var rate: int;
+    var ch: int;
+    var frames: int;
+    if (tau_read_header(p, n, &rate, &ch, &frames) < 0) { return fail("tauinfo", "not a TAU file: ", argv[1]); }
+    var peak: int = 0;
+    var i: int = 0;
+    while (i < frames * ch) {
+        var s: int = tau_sample(p, i);
+        if (s < 0) { s = -s; }
+        if (s > peak) { peak = s; }
+        i += 1;
+    }
+    puts(argv[1]); puts(": TAU, "); put_int(rate); puts(" Hz, "); put_int(ch); puts(ch == 1 ? " channel, " : " channels, ");
+    put_int(frames); puts(" frames (");
+    var b: [81]char;
+    rtoa((frames as real) / rate, 6, &b[0]);
+    puts(&b[0]); puts(" s), peak ");
+    rtoa((peak as real) / TAU_FULL, 4, &b[0]);
+    puts(&b[0]); puts(" of full scale\n");
+    return 0;
+}
+
+// ---- pictures ----
+
+var hdr_at: int;
+
+// The next number of a PNM header (after blanks and # comments), or -1.
+fn pnm_num(p: *tryte, n: int) -> int {
+    loop {
+        while (hdr_at < n && (p[hdr_at] == ' ' || p[hdr_at] == '\t' || p[hdr_at] == '\n' || p[hdr_at] == '\r')) { hdr_at += 1; }
+        if (hdr_at < n && p[hdr_at] == '#') {
+            while (hdr_at < n && p[hdr_at] != '\n') { hdr_at += 1; }
+            continue;
+        }
+        break;
+    }
+    if (hdr_at >= n || p[hdr_at] < '0' || p[hdr_at] > '9') { return -1; }
+    var v: int = 0;
+    while (hdr_at < n && p[hdr_at] >= '0' && p[hdr_at] <= '9') { v = v * 10 + p[hdr_at] - '0'; hdr_at += 1; }
+    return v;
+}
+
+fn do_ppm2tim(argc: int, argv: **char) -> int {
+    var raw: int = 0;
+    var c: int = getopt(argc, argv, "r");
+    while (c != -1) {
+        if (c == 'r') { raw = 1; } else { return usage("ppm2tim [-r] in.ppm out.tim"); }
+        c = getopt(argc, argv, "r");
+    }
+    if (optind + 2 != argc) { return usage("ppm2tim [-r] in.ppm out.tim"); }
+    var p: *tryte;
+    var n: int = read_whole(argv[optind], &p);
+    if (n < 0) { perror2("ppm2tim", argv[optind]); return 1; }
+    if (n < 2 || p[0] != 'P' || (p[1] != '6' && p[1] != '5')) { return fail("ppm2tim", "not a binary PPM (P6) or PGM (P5): ", argv[optind]); }
+    var ch: int = p[1] == '6' ? 3 : 1;
+    hdr_at = 2;
+    var w: int = pnm_num(p, n);
+    var h: int = pnm_num(p, n);
+    var maxv: int = pnm_num(p, n);
+    if (w <= 0 || h <= 0 || maxv <= 0 || maxv > 255 || hdr_at >= n) { return fail("ppm2tim", "a bad header in ", argv[optind]); }
+    hdr_at += 1;                          // the one blank after the maximum
+    if (hdr_at + w * h * ch > n) { return fail("ppm2tim", "the picture is cut short: ", argv[optind]); }
+    var t: Tim;
+    if (tim_alloc(&t, w, h, ch, 6) < 0) { return fail("ppm2tim", "too big: ", argv[optind]); }
+    var i: int = 0;
+    while (i < w * h * ch) { t.s[i] = (p[hdr_at + i] - 128) as tryte; i += 1; }
+    var out: TtvBuf;
+    ttv_init(&out);
+    tim_write(&t, raw ? TIM_RAW : TIM_PREDICTED, &out);
+    if (out.err) { return fail("ppm2tim", "out of memory", null); }
+    if (write_whole(argv[optind + 1], out.p, out.n) < 0) { perror2("ppm2tim", argv[optind + 1]); return 1; }
+    return 0;
+}
+
+// A sample as an 8-bit value: depth 6 exactly (s + 128), others scaled.
+fn to_octet(s: int, depth: int) -> int {
+    var v: int;
+    if (depth == 6) { v = s + 128; }
+    else {
+        var lim: int = tim_limit(depth);
+        v = lim == 0 ? 128 : ((s + lim) * 255 + lim) / (2 * lim);
+    }
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+fn load_tim(prog: *char, path: *char, t: *Tim, size: *int) -> int {
+    var p: *tryte;
+    var n: int = read_whole(path, &p);
+    if (n < 0) { perror2(prog, path); return -1; }
+    *size = n;
+    if (tim_read(p, n, t) < 0) { fail(prog, "not a valid TIM file: ", path); free(p); return -1; }
+    free(p);
+    return 0;
+}
+
+fn do_tim2ppm(argc: int, argv: **char) -> int {
+    if (argc != 3) { return usage("tim2ppm in.tim out.ppm"); }
+    var t: Tim;
+    var size: int;
+    if (load_tim("tim2ppm", argv[1], &t, &size) < 0) { return 1; }
+    var head: [41]char;
+    var num: [15]char;
+    strcpy(&head[0], t.ch == 3 ? "P6\n" : "P5\n");
+    strcat(&head[0], itoa(t.w, &num[0]));
+    strcat(&head[0], " ");
+    strcat(&head[0], itoa(t.h, &num[0]));
+    strcat(&head[0], "\n255\n");
+    var hl: int = strlen(&head[0]);
+    var total: int = t.w * t.h * t.ch;
+    var out: *tryte = malloc(hl + total);
+    if (out == null) { return fail("tim2ppm", "out of memory", null); }
+    var k: int = 0;
+    while (k < hl) { out[k] = head[k] as tryte; k += 1; }
+    k = 0;
+    while (k < total) { out[hl + k] = to_octet(t.s[k], t.depth) as tryte; k += 1; }
+    if (write_whole(argv[2], out, hl + total) < 0) { perror2("tim2ppm", argv[2]); return 1; }
+    return 0;
+}
+
+fn do_timinfo(argc: int, argv: **char) -> int {
+    if (argc != 2) { return usage("timinfo file"); }
+    var t: Tim;
+    var size: int;
+    if (load_tim("timinfo", argv[1], &t, &size) < 0) { return 1; }
+    var raw: int = TIM_HEADER + t.w * t.h * t.ch;
+    puts(argv[1]); puts(": TIM "); put_int(t.w); puts("x"); put_int(t.h);
+    puts(t.ch == 3 ? " RGB, " : " grey, "); put_int(t.depth); puts(" trits a sample, ");
+    put_int(size); puts(" trytes (raw "); put_int(raw); puts(", ");
+    put_int((raw - size) * 100 / raw); puts("% saved)\n");
+    return 0;
+}
+
+// a sample to the display's 3 trits (-13..13): balanced rounding drops trits
+fn to_display(s: int, depth: int) -> int {
+    if (depth >= 3) { return divr(s, pow3(depth - 3)); }
+    return s * pow3(3 - depth);
+}
+
+fn do_timview(argc: int, argv: **char) -> int {
+    var i0: int = 1;
+    if (i0 + 1 != argc) { return usage("timview file"); }
+    var t: Tim;
+    var size: int;
+    if (load_tim("timview", argv[i0], &t, &size) < 0) { return 1; }
+    var fd: int = open("/dev/fb0", O_RDWR, 0);
+    if (fd < 0) { perror2("timview", "/dev/fb0"); return 1; }
+    var info: fb_info;
+    ioctl(fd, FBIOGET_VSCREENINFO, &info as int);
+    info.mode = 0;
+    if (ioctl(fd, FBIOPUT_VSCREENINFO, &info as int) < 0) { perror2("timview", "graphics mode"); return 1; }
+    ioctl(fd, FBIOGET_VSCREENINFO, &info as int);
+    var px: *tryte = mmap(0, info.xres * info.yres, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0) as *tryte;
+    if (px as int == MAP_FAILED) { perror2("timview", "mmap"); return 1; }
+    var k: int = 0;
+    while (k < info.xres * info.yres) { px[k] = 0; k += 1; }       // mid-grey
+    var x0: int = t.w < info.xres ? (info.xres - t.w) / 2 : 0;
+    var y0: int = t.h < info.yres ? (info.yres - t.h) / 2 : 0;
+    var y: int = 0;
+    while (y < t.h && y0 + y < info.yres) {
+        var x: int = 0;
+        while (x < t.w && x0 + x < info.xres) {
+            var at: int = (y * t.w + x) * t.ch;
+            var r: int = to_display(t.s[at], t.depth);
+            var g: int = t.ch == 3 ? to_display(t.s[at + 1], t.depth) : r;
+            var b: int = t.ch == 3 ? to_display(t.s[at + 2], t.depth) : r;
+            px[(y0 + y) * info.pitch + x0 + x] = (r * 729 + g * 27 + b) as tryte;
+            x += 1;
+        }
+        y += 1;
+    }
+    // the picture lasts while /dev/fb0 is open: until a key
+    var key: [1]char;
+    read(STDIN_FILENO, &key[0], 1);
+    info.mode = -1;
+    ioctl(fd, FBIOPUT_VSCREENINFO, &info as int);
+    return 0;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var me: *char = name_of(argv[0]);
+    if (streq(me, "ttv")) { return do_ttv(argc, argv); }
+    if (streq(me, "wav2tau")) { return do_wav2tau(argc, argv); }
+    if (streq(me, "tau2wav")) { return do_tau2wav(argc, argv); }
+    if (streq(me, "tone")) { return do_tone(argc, argv); }
+    if (streq(me, "tauinfo")) { return do_tauinfo(argc, argv); }
+    if (streq(me, "ppm2tim")) { return do_ppm2tim(argc, argv); }
+    if (streq(me, "tim2ppm")) { return do_tim2ppm(argc, argv); }
+    if (streq(me, "timinfo")) { return do_timinfo(argc, argv); }
+    if (streq(me, "timview")) { return do_timview(argc, argv); }
+    fputs(STDERR_FILENO, me);
+    fputs(STDERR_FILENO, ": unknown applet\n");
+    return 127;
+}

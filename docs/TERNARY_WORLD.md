@@ -29,7 +29,7 @@ flowchart LR
         L2["2 · Physical layer and circuits<br/>requirements only; the emulator is the machine"]
         L3["3 · CPU and ISA<br/>core ISA and FPU done; masks, atomics, vectors next"]
         L4["4 · Memory and storage<br/>addressing, paging, tfs done; ECC as a spec"]
-        L5["5 · Data formats<br/>text, executables done; float standard, codecs ahead"]
+        L5["5 · Data formats<br/>text, executables, floats, varints, sound, pictures done"]
         L6["6 · Interconnect, I/O, networking<br/>binary stack done; native ternary links ahead"]
         L7["7 · Security and cryptography<br/>border crypto done; ML-KEM, GF(3) research ahead"]
         L8["8 · Software stack<br/>Trinux, self-hosting done; ternary idioms next"]
@@ -137,9 +137,10 @@ Formats are where a ternary world either stays ternary or quietly turns into bin
 | Text | One Unicode code point per tryte; an overlined character is the negated code point | Fixed width, no UTF-8 decoding, overline for free | Done |
 | Text beyond U+2671 | A lead tryte (−2 plain, −3 overlined) followed by 2 trytes in −9841…−33 covers all of Unicode; built in tlibc, the UTF-8 border and the font path | CJK and emoji without giving up one tryte per common character | Done |
 | Floating point standard | real27 / real81 written up as a standalone standard ([`REAL.md`](REAL.md)): formats, rounding, operations, exceptions, text conversion; 14,000 conformance vectors from an independent exact reference, which the library and the FPU both pass | A ternary IEEE 754 that other ternary machines can adopt | Done |
-| Images | 27 levels per channel, 3^9 colours per tryte; a lossless file format whose prediction residuals are stored balanced | Residuals are signed by nature, so balanced storage needs no offset | Planned |
-| Audio | Balanced samples of one word (3 trytes, about 42.8 bits). A tryte (14.3 bits) falls short of 16-bit audio, and 2 trytes is not a power of 3 | Silence is 0 with no DC offset; the range is symmetric | Planned |
-| Compression and serialization | Entropy coding in base 3; varints in balanced base 27; type tags in trits | Signed varints need no zigzag trick | Planned |
+| Images | 27 levels per channel, 3^9 colours per tryte; TIM ([`FORMATS.md`](FORMATS.md)), a lossless format of 1 to 9 trits a sample whose median-edge prediction residuals are stored as balanced varints, with runs of zeros in one tryte; `ppm2tim`, `tim2ppm`, `timview` | Residuals are signed by nature, so balanced storage needs no offset | Done |
+| Audio | Balanced samples of one word (3 trytes, about 42.8 bits). A tryte (14.3 bits) falls short of 16-bit audio, and 2 trytes is not a power of 3. TAU ([`FORMATS.md`](FORMATS.md)); `wav2tau`, `tau2wav` (exact round trips for 8, 16 and 24 bits), `tone` | Silence is 0 with no DC offset; the range is symmetric | Done |
+| Serialization | tvarint: balanced varints of 8-trit groups and a control trit, canonical, for int and `long`; TTV: tagged values (null, truth, integer, real, text, octets, list, map) in trytes ([`FORMATS.md`](FORMATS.md)); the `ttv` tool and its text notation | Signed varints need no zigzag trick; a truth is one trit-valued tryte | Done |
+| Compression | Entropy coding in base 3 | Arithmetic coding over three symbols wastes nothing on binary rounding | Planned |
 | Executables | TEF, the Trinux executable format | Already tryte-native | Done |
 
 Decided 2026-10-06:

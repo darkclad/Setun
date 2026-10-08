@@ -39,8 +39,8 @@ fn sys_uname(buf: int) -> int {
     copy_str(&u.sysname[0], "Trinux", 65);
     copy_str(&u.nodename[0], "setun", 65);
     copy_str(&u.release[0], TRINUX_VERSION, 65);
-    copy_str(&u.version[0], "#7 K7 balanced ternary", 65);
-    copy_str(&u.machine[0], "setun26", 65);
+    copy_str(&u.version[0], "#8 K8 balanced ternary", 65);
+    copy_str(&u.machine[0], "setun11̅", 65);      // Setun-11̅: the overlined 1 is one tryte
     copy_str(&u.domainname[0], "(none)", 65);
     return 0;
 }

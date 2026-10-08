@@ -1,0 +1,232 @@
+// ttv.tri: trit-tagged values (docs/FORMATS.md §2): a tag tryte, then the
+// payload. Tags: 0 null, 1 truth (one tryte: -1, 0, +1), 2 integer (a
+// tvarint), 3 real (a real81's 9 trytes), 4 text and 5 octets (a tvarint
+// length, then the trytes), 6 list and 7 map (a tvarint count, then the
+// values; a map's are key-value pairs).
+
+import "stdlib.tri";
+import "string.tri";
+import "tvarint.tri";
+
+const TTV_NULL: int = 0;
+const TTV_TRUTH: int = 1;
+const TTV_INT: int = 2;
+const TTV_REAL: int = 3;
+const TTV_TEXT: int = 4;
+const TTV_OCTETS: int = 5;
+const TTV_LIST: int = 6;
+const TTV_MAP: int = 7;
+
+// ---- writing ----
+
+struct TtvBuf {
+    p: *tryte;
+    n: int;
+    cap: int;
+    err: int;                         // out of memory
+}
+
+fn ttv_init(b: *TtvBuf) {
+    b.cap = 243;
+    b.p = malloc(b.cap);
+    b.n = 0;
+    b.err = b.p == null;
+}
+
+fn ttv_room(b: *TtvBuf, k: int) -> int {
+    if (b.err) { return 0; }
+    if (b.n + k > b.cap) {
+        var c: int = b.cap;
+        while (b.n + k > c) { c *= 3; }
+        var q: *tryte = realloc(b.p, c);
+        if (q == null) { b.err = 1; return 0; }
+        b.p = q;
+        b.cap = c;
+    }
+    return 1;
+}
+
+fn ttv_put(b: *TtvBuf, t: int) {
+    if (ttv_room(b, 1)) { b.p[b.n] = t as tryte; b.n += 1; }
+}
+
+fn ttv_put_tv(b: *TtvBuf, v: long) {
+    if (ttv_room(b, 11)) { b.n += tvar_put_long(b.p + b.n, v); }
+}
+
+fn ttv_null(b: *TtvBuf) { ttv_put(b, TTV_NULL); }
+
+fn ttv_truth(b: *TtvBuf, t: trit) {
+    ttv_put(b, TTV_TRUTH);
+    ttv_put(b, t as int);
+}
+
+fn ttv_long(b: *TtvBuf, v: long) {
+    ttv_put(b, TTV_INT);
+    ttv_put_tv(b, v);
+}
+
+fn ttv_int(b: *TtvBuf, v: int) { ttv_long(b, v); }
+
+fn ttv_real(b: *TtvBuf, x: real) {
+    ttv_put(b, TTV_REAL);
+    if (!ttv_room(b, 9)) { return; }
+    var src: *tryte = bytes(&x);
+    var k: int = 0;
+    while (k < 9) { b.p[b.n + k] = src[k]; k += 1; }
+    b.n += 9;
+}
+
+fn ttv_trytes(b: *TtvBuf, tag: int, s: *tryte, len: int) {
+    ttv_put(b, tag);
+    ttv_put_tv(b, len);
+    if (!ttv_room(b, len)) { return; }
+    var k: int = 0;
+    while (k < len) { b.p[b.n + k] = s[k]; k += 1; }
+    b.n += len;
+}
+
+fn ttv_text(b: *TtvBuf, s: *char) { ttv_trytes(b, TTV_TEXT, s as *tryte, strlen(s)); }
+
+fn ttv_octets(b: *TtvBuf, p: *tryte, len: int) { ttv_trytes(b, TTV_OCTETS, p, len); }
+
+// A list or map of `count` values (or pairs): write them next.
+fn ttv_list(b: *TtvBuf, count: int) {
+    ttv_put(b, TTV_LIST);
+    ttv_put_tv(b, count);
+}
+
+fn ttv_map(b: *TtvBuf, count: int) {
+    ttv_put(b, TTV_MAP);
+    ttv_put_tv(b, count);
+}
+
+// ---- reading ----
+
+struct TtvReader {
+    p: *tryte;
+    n: int;
+    at: int;
+    err: int;                         // malformed: every read after fails
+}
+
+fn ttv_reader(r: *TtvReader, p: *tryte, n: int) {
+    r.p = p;
+    r.n = n;
+    r.at = 0;
+    r.err = 0;
+}
+
+fn ttv_at_end(r: *TtvReader) -> int { return !r.err && r.at == r.n; }
+
+// The next value's tag (not consumed), or -1 at the end or after an error.
+fn ttv_kind(r: *TtvReader) -> int {
+    if (r.err || r.at >= r.n) { return -1; }
+    var t: int = r.p[r.at];
+    return t >= TTV_NULL && t <= TTV_MAP ? t : -1;
+}
+
+fn ttv_fail(r: *TtvReader) -> int {
+    r.err = 1;
+    return -1;
+}
+
+// Consume a tag, which must be `want`.
+fn ttv_tag(r: *TtvReader, want: int) -> int {
+    if (ttv_kind(r) != want) { return ttv_fail(r); }
+    r.at += 1;
+    return 0;
+}
+
+fn ttv_get_tv(r: *TtvReader, v: *long) -> int {
+    var k: int = tvar_get_long(r.p + r.at, r.n - r.at, v);
+    if (k < 0) { return ttv_fail(r); }
+    r.at += k;
+    return 0;
+}
+
+fn ttv_read_null(r: *TtvReader) -> int { return ttv_tag(r, TTV_NULL); }
+
+// A truth: +1, 0 or -1; -2 if it is not one.
+fn ttv_read_truth(r: *TtvReader) -> int {
+    if (ttv_tag(r, TTV_TRUTH) < 0 || r.at >= r.n) { ttv_fail(r); return -2; }
+    var t: int = r.p[r.at];
+    if (t < -1 || t > 1) { ttv_fail(r); return -2; }
+    r.at += 1;
+    return t;
+}
+
+fn ttv_read_long(r: *TtvReader, v: *long) -> int {
+    if (ttv_tag(r, TTV_INT) < 0) { return -1; }
+    return ttv_get_tv(r, v);
+}
+
+// An integer that must fit in a word.
+fn ttv_read_int(r: *TtvReader, v: *int) -> int {
+    var l: long;
+    if (ttv_read_long(r, &l) < 0) { return -1; }
+    if (l > 3812798742493 || l < -3812798742493) { return ttv_fail(r); }
+    *v = l as int;
+    return 0;
+}
+
+fn ttv_read_real(r: *TtvReader, x: *real) -> int {
+    if (ttv_tag(r, TTV_REAL) < 0 || r.n - r.at < 9) { return ttv_fail(r); }
+    var dst: *tryte = bytes(x);
+    var k: int = 0;
+    while (k < 9) { dst[k] = r.p[r.at + k]; k += 1; }
+    r.at += 9;
+    return 0;
+}
+
+// A text or octets payload into out (room for max trytes and a NUL): its
+// length, or -1.
+fn ttv_read_trytes(r: *TtvReader, tag: int, out: *tryte, max: int) -> int {
+    var len: long;
+    if (ttv_tag(r, tag) < 0 || ttv_get_tv(r, &len) < 0) { return -1; }
+    if (len < 0 || len > r.n - r.at || len > max) { return ttv_fail(r); }
+    var n: int = len as int;
+    var k: int = 0;
+    while (k < n) { out[k] = r.p[r.at + k]; k += 1; }
+    if (tag == TTV_TEXT) { out[n] = 0; }
+    r.at += n;
+    return n;
+}
+
+fn ttv_read_text(r: *TtvReader, out: *char, max: int) -> int { return ttv_read_trytes(r, TTV_TEXT, out as *tryte, max); }
+fn ttv_read_octets(r: *TtvReader, out: *tryte, max: int) -> int { return ttv_read_trytes(r, TTV_OCTETS, out, max); }
+
+// A list's or map's count, or -1.
+fn ttv_read_count(r: *TtvReader, tag: int) -> int {
+    var c: long;
+    if (ttv_tag(r, tag) < 0 || ttv_get_tv(r, &c) < 0) { return -1; }
+    if (c < 0 || c > r.n) { return ttv_fail(r); }    // each value takes a tryte at least
+    return c as int;
+}
+
+// Skip one value (and everything in it): 0, or -1.
+fn ttv_skip(r: *TtvReader) -> int {
+    var k: int = ttv_kind(r);
+    if (k < 0) { return ttv_fail(r); }
+    if (k == TTV_NULL) { r.at += 1; return 0; }
+    if (k == TTV_TRUTH) { return ttv_read_truth(r) == -2 ? -1 : 0; }
+    if (k == TTV_INT) { var v: long; return ttv_read_long(r, &v); }
+    if (k == TTV_REAL) { var x: real; return ttv_read_real(r, &x); }
+    if (k == TTV_TEXT || k == TTV_OCTETS) {
+        var len: long;
+        r.at += 1;
+        if (ttv_get_tv(r, &len) < 0) { return -1; }
+        if (len < 0 || len > r.n - r.at) { return ttv_fail(r); }
+        r.at += len as int;
+        return 0;
+    }
+    var c: int = ttv_read_count(r, k);
+    if (c < 0) { return -1; }
+    var items: int = k == TTV_MAP ? 2 * c : c;
+    var i: int = 0;
+    while (i < items) {
+        if (ttv_skip(r) < 0) { return -1; }
+        i += 1;
+    }
+    return 0;
+}

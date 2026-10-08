@@ -1,0 +1,34 @@
+// tau.tri: TAU sound files (docs/FORMATS.md §3): a header of 6 words
+// (magic "TAU", version 1, rate, channels 1..9, frames, 0), then one
+// balanced word per sample, frames in order, channels interleaved.
+
+import "tvarint.tri";
+
+const TAU_MAGIC: int = 32544600556;     // the trytes 'T' 'A' 'U'
+const TAU_HEADER: int = 18;             // trytes
+const TAU_FULL: int = 3812798742493;    // full scale
+
+fn tau_header(p: *tryte, rate: int, channels: int, frames: int) {
+    tw_put(p, TAU_MAGIC);
+    tw_put(p + 3, 1);
+    tw_put(p + 6, rate);
+    tw_put(p + 9, channels);
+    tw_put(p + 12, frames);
+    tw_put(p + 15, 0);
+}
+
+// The header of a TAU file of n trytes at p: 0, or -1 if it is not one
+// (or is shorter than its samples).
+fn tau_read_header(p: *tryte, n: int, rate: *int, channels: *int, frames: *int) -> int {
+    if (n < TAU_HEADER || tw_get(p) != TAU_MAGIC || tw_get(p + 3) != 1) { return -1; }
+    *rate = tw_get(p + 6);
+    *channels = tw_get(p + 9);
+    *frames = tw_get(p + 12);
+    if (*rate <= 0 || *channels < 1 || *channels > 9 || *frames < 0) { return -1; }
+    if (n < TAU_HEADER + 3 * *channels * *frames) { return -1; }
+    return 0;
+}
+
+// Sample k (frame-major) of the file at p.
+fn tau_sample(p: *tryte, k: int) -> int { return tw_get(p + TAU_HEADER + 3 * k); }
+fn tau_set_sample(p: *tryte, k: int, v: int) { tw_put(p + TAU_HEADER + 3 * k, v); }
