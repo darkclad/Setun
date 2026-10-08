@@ -18,12 +18,20 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(dir).display());
     }
 
-    let rom = trine::bios_rom().expect("the BIOS compiles");
-    write_trytes(&out.join("bios.t1b2"), &rom);
-
-    let disk = trinux::build_disk(&trinux::kernel_dir()).expect("the Trinux disk builds");
-    let mut f = std::fs::File::create(out.join("trinux.rle")).unwrap();
-    f.write_all(&encode(&disk.trytes)).unwrap();
+    // the compiler recurses deeply on the biggest programs (tric): a build
+    // script's main thread has only 1 MB of stack on Windows
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let rom = trine::bios_rom().expect("the BIOS compiles");
+            write_trytes(&out.join("bios.t1b2"), &rom);
+            let disk = trinux::build_disk(&trinux::kernel_dir()).expect("the Trinux disk builds");
+            let mut f = std::fs::File::create(out.join("trinux.rle")).unwrap();
+            f.write_all(&encode(&disk.trytes)).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 fn write_trytes(path: &std::path::Path, t: &[i16]) {

@@ -36,7 +36,7 @@ Version history:
 - v0.4: Setun-70 compatibility mode dropped, default RAM 3^18.
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
-- v0.7: ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), the three-way compare-and-swap `CAS3` (§3.4.1), and the vector unit (majors 9–11, `MODE.VE`, vector −13; §15).
+- v0.7: `SBC` adds the carry (`ra − b + C`, so `SUB`/`SBC` chain; §3.3); ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), the three-way compare-and-swap `CAS3` (§3.4.1), and the vector unit (majors 9–11, `MODE.VE`, vector −13; §15).
 
 ---
 
@@ -138,7 +138,7 @@ There are 27 general registers of 27 trits, `r-13 … r0 … r13`. A register in
 
 - **S** replaces the binary sign and zero flags.
 - **C** is non-zero exactly when a result overflowed. It also feeds `ADC`/`SBC` for multi-word arithmetic.
-- **Erratum (found 2026-10-08):** `SUB` sets C so that the exact difference is `rd + C·3^27`, and `SBC` subtracts C, so `SUB` then `SBC` does not chain into a multi-word subtraction (the carry would have to be added). Multi-word subtraction adds the negated subtrahend with `ADD`/`ADC` (negation is exact). A fix would define `SBC` as `ra − b + C`; it is left as specified until a decision, and no code uses `SBC`.
+- **Multi-word arithmetic:** `SUB` sets C so that the exact difference is `rd + C·3^27`, and `SBC` *adds* C, so `SUB` then `SBC` chains a subtraction exactly as `ADD` then `ADC` chains an addition. (Until 2026-10-08 the specification had `SBC` subtract C, which broke the chain; nothing used it.)
 - S and C are saved with MODE on every trap.
 
 ### 2.3 Control registers
@@ -234,7 +234,7 @@ word 2:                                                           [ imm27 ]
 | 1 | `ADD` | `rd := ra + b`, C = carry trit |
 | 2 | `SUB` | `rd := ra − b` |
 | 3 | `ADC` | `rd := ra + b + C` |
-| 4 | `SBC` | `rd := ra − b − C` |
+| 4 | `SBC` | `rd := ra − b + C`, C = carry trit (C from the previous `SUB`/`SBC`: the difference's carry is added) |
 | 5 | `MUL` | low 27 trits of the product; C ≠ 0 on overflow |
 | 6 | `MULH` | high 27 trits of the 54-trit product |
 | 7 | `DIV` | quotient truncated toward zero (C semantics) |

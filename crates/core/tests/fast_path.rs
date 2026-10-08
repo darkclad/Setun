@@ -991,6 +991,43 @@ fn a_call_linking_into_its_target_register_in_compiled_code() {
     assert_eq!(reg_in(&st, 5), 30, "every call reached sub");
 }
 
+// ---- multi-word arithmetic: ADC and SBC chain ------------------------------
+
+#[test]
+fn three_word_add_and_subtract_chain_the_carry() {
+    // a - b with SUB, SBC, SBC and a + b with ADD, ADC, ADC: SUB leaves C so
+    // that the exact difference is result + C·3^27, and SBC adds it (ISA
+    // v0.7: ra − b + C). The low and middle words carry both ways.
+    const WW: i128 = 7_625_597_484_987;
+    let wm = (WW as i64 - 1) / 2;
+    let cases: [([i64; 3], [i64; 3]); 4] = [
+        ([5, -wm, wm - 3], [-7, wm, -wm + 2]),  // borrows down and up
+        ([-3, wm, -wm], [2, -wm, wm]),
+        ([0, 1, -wm], [0, -1, wm]),
+        ([11, 0, 0], [0, 0, 1]),                 // a borrow through a zero word
+    ];
+    let value = |x: [i64; 3]| (x[0] as i128 * WW + x[1] as i128) * WW + x[2] as i128;
+    for (a, b) in cases {
+        let mut prog = Vec::new();
+        // r1..r3 = a (high .. low), r4..r6 = b
+        for (k, v) in a.iter().chain(b.iter()).enumerate() {
+            prog.extend(isa::wide(op::LI, 0, k as i64 + 1, 0, *v));
+        }
+        prog.push(isa::rrr(op::ALU, alu::SUB, 7, 3, 6)); // low
+        prog.push(isa::rrr(op::ALU, alu::SBC, 8, 2, 5)); // middle
+        prog.push(isa::rrr(op::ALU, alu::SBC, 9, 1, 4)); // high
+        prog.push(isa::rrr(op::ALU, alu::ADD, 10, 3, 6));
+        prog.push(isa::rrr(op::ALU, alu::ADC, 11, 2, 5));
+        prog.push(isa::rrr(op::ALU, alu::ADC, 12, 1, 4));
+        prog.push(isa::rrr(op::SYS, sys::HLT, 0, 0, 0));
+        let (st, _) = both_ways_jit(1, |_| {}, &prog, 100);
+        let diff = [reg_in(&st, 9), reg_in(&st, 8), reg_in(&st, 7)];
+        let sum = [reg_in(&st, 12), reg_in(&st, 11), reg_in(&st, 10)];
+        assert_eq!(value(diff), value(a) - value(b), "{a:?} - {b:?} gave {diff:?}");
+        assert_eq!(value(sum), value(a) + value(b), "{a:?} + {b:?} gave {sum:?}");
+    }
+}
+
 // ---- ternary idioms (ISA v0.7: MRG, TCP, TCN, TREV, STWM) -----------------
 
 /// The vector a trap was taken for (FCAUSE's low five trits).

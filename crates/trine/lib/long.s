@@ -6,8 +6,6 @@
 ; out as in memory) and its right one in r1..r3, and leaves the result in
 ; r1..r3. Every other register is kept (f registers too, but f1 for a
 ; conversion to real), so code around a call keeps its values in them.
-; Subtraction adds the negation: SBC subtracts the carry where multi-word
-; subtraction needs it added.
 _trine_ladd:
         push  r4
         ldw   r4, [sp+9]
@@ -19,10 +17,15 @@ _trine_ladd:
         pop   r4
         ret
 _trine_lsub:
-        neg   r1, r1
-        neg   r2, r2
-        neg   r3, r3
-        b     _trine_ladd
+        push  r4
+        ldw   r4, [sp+9]
+        sub   r1, r4, r1
+        ldw   r4, [sp+6]
+        sbc   r2, r4, r2
+        ldw   r4, [sp+3]
+        sbc   r3, r4, r3
+        pop   r4
+        ret
 ; tritwise minimum and maximum (& and |)
 _trine_lmin:
         push  r4
@@ -288,15 +291,9 @@ _trine_ldm_ge:
         cmp   r7, r10
 _trine_ldm_c:
         blt   _trine_ldm_n
-        neg   r10, r10                ; R -= D as R + (-D), Q += 1
-        neg   r-10, r-10
-        neg   r-11, r-11
-        add   r7, r7, r10
-        adc   r8, r8, r-10
-        adc   r9, r9, r-11
-        neg   r10, r10
-        neg   r-10, r-10
-        neg   r-11, r-11
+        sub   r7, r7, r10             ; R -= D, Q += 1
+        sbc   r8, r8, r-10
+        sbc   r9, r9, r-11
         add   r4, r4, 1
         adc   r5, r5, r0
         adc   r6, r6, r0
@@ -321,15 +318,9 @@ _trine_ldm_b:
         cmp   r7, r10
 _trine_ldm_b2:
         blt   _trine_ldm_out
-        neg   r10, r10                ; R -= D as R + (-D), Q += 1
-        neg   r-10, r-10
-        neg   r-11, r-11
-        add   r7, r7, r10
-        adc   r8, r8, r-10
-        adc   r9, r9, r-11
-        neg   r10, r10
-        neg   r-10, r-10
-        neg   r-11, r-11
+        sub   r7, r7, r10             ; R -= D, Q += 1
+        sbc   r8, r8, r-10
+        sbc   r9, r9, r-11
         add   r4, r4, 1
         adc   r5, r5, r0
         adc   r6, r6, r0

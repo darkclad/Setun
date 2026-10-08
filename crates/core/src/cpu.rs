@@ -19,9 +19,9 @@ mod jit;
 /// PC after reset: −3^10, the centre of BIOS ROM frame −3.
 pub const RESET_PC: i64 = -59_049;
 
-/// `CPUID` value: ISA version (v0.5) in the low trits, and trit 1 (+1):
+/// `CPUID` value: ISA version (v0.7) in the low trits, and trit 1 (+1):
 /// the FPU is present (always +1 on Setun-26).
-pub const CPUID_VERSION: i64 = 5;
+pub const CPUID_VERSION: i64 = 7;
 pub const CPUID: i64 = CPUID_VERSION + 2_541_865_828_329; // + 3^26
 
 /// Kind of memory access, encoded as in `FCAUSE[22]`.
@@ -2031,7 +2031,9 @@ impl Cpu {
             alu::ADD => self.arith(x + y),
             alu::SUB => self.arith(x - y),
             alu::ADC => self.arith(x + y + self.c()),
-            alu::SBC => self.arith(x - y - self.c()),
+            // the carry SUB (or SBC) leaves is added: x − y + C chains a
+            // multi-word subtraction as ADC chains an addition
+            alu::SBC => self.arith(x - y + self.c()),
             alu::MUL => {
                 let (hi, lo) = split_product27(x, y);
                 self.set_c(hi.signum());

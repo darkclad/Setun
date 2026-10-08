@@ -43,7 +43,7 @@ fn sysctl() {
     assert_eq!(inp(&mut m, block::SYSCTL, 1), 27);
     out(&mut m, block::SYSCTL, 3, 'x' as i64);
     assert_eq!(m.dev.debug_log, vec!['x' as i64]);
-    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.5 with the FPU trit");
+    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.7 with the FPU trit");
 }
 
 #[test]
