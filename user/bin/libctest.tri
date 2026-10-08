@@ -366,6 +366,91 @@ fn system_calls() {
     ok("EFAULT: execve with a bad path", fails(execve(1000 as *char, null, null), EFAULT));
 }
 
+var alarms: int;
+fn on_alarm(sig: int) { alarms += 1; }
+
+// pread/pwrite, alarm and setitimer, vfork
+fn timers_and_offsets() {
+    var fd: int = open("/home/pio", O_RDWR + O_CREAT + O_TRUNC, 420);
+    write(fd, "0123456789" as *tryte, 10);
+    lseek(fd, 3, SEEK_SET);
+    var b: [11]char;
+    var n: int = pread(fd, &b[0] as *tryte, 4, 5);
+    b[4] = 0;
+    ok("pread at an offset", n == 4 && streq(&b[0], "5678"));
+    ok("pread leaves the position", lseek(fd, 0, SEEK_CUR) == 3);
+    ok("pwrite at an offset", pwrite(fd, "AB" as *tryte, 2, 8) == 2 && lseek(fd, 0, SEEK_CUR) == 3);
+    n = pread(fd, &b[0] as *tryte, 10, 0);
+    b[10] = 0;
+    ok("pwrite wrote there", n == 10 && streq(&b[0], "01234567AB"));
+    ok("pread past the end reads 0", pread(fd, &b[0] as *tryte, 4, 50) == 0);
+    ok("EINVAL: pread at a negative offset", fails(pread(fd, &b[0] as *tryte, 4, -1), EINVAL));
+    ok("EBADF: pwrite on a closed descriptor", fails(pwrite(25, &b[0] as *tryte, 1, 0), EBADF));
+    close(fd);
+    unlink("/home/pio");
+    var p: [2]int;
+    pipe(&p[0]);
+    ok("ESPIPE: pread on a pipe", fails(pread(p[0], &b[0] as *tryte, 1, 0), ESPIPE));
+    close(p[0]);
+    close(p[1]);
+    // alarm: SIGALRM after the seconds, pause until it; alarm(0) cancels
+    signal(SIGALRM, &on_alarm as int);
+    alarms = 0;
+    ok("alarm returns 0 with none set", alarm(1) == 0);
+    pause();
+    ok("alarm delivered SIGALRM", alarms == 1);
+    alarm(5);
+    ok("alarm returns the seconds left", alarm(0) == 5);
+    var it: itimerval;
+    getitimer(ITIMER_REAL, &it);
+    ok("alarm(0) cancels", it.it_value.tv_sec == 0 && it.it_value.tv_usec == 0);
+    // a repeating timer: three times every 0.05 s
+    it.it_interval.tv_sec = 0;
+    it.it_interval.tv_usec = 50000;
+    it.it_value.tv_sec = 0;
+    it.it_value.tv_usec = 50000;
+    alarms = 0;
+    setitimer(ITIMER_REAL, &it, null);
+    while (alarms < 3) { pause(); }
+    var cur: itimerval;
+    getitimer(ITIMER_REAL, &cur);
+    ok("setitimer repeats", alarms == 3 && cur.it_interval.tv_usec == 50000 && cur.it_value.tv_usec > 0);
+    it.it_value.tv_usec = 0;
+    it.it_interval.tv_usec = 0;
+    setitimer(ITIMER_REAL, &it, &cur);
+    ok("setitimer returns the old timer", cur.it_interval.tv_usec == 50000);
+    ok("EINVAL: ITIMER_VIRTUAL", fails(setitimer(1, &it, null), EINVAL));
+    it.it_value.tv_usec = 1000000;
+    ok("EINVAL: a million microseconds", fails(setitimer(ITIMER_REAL, &it, null), EINVAL));
+    ok("EFAULT: setitimer from the kernel", fails(setitimer(ITIMER_REAL, 1000 as *itimerval, null), EFAULT));
+    signal(SIGALRM, SIG_DFL);
+    // a child does not inherit the timer, nor find the one of the process
+    // whose slot it takes (the first child sets one and exits)
+    var pid: int = fork();
+    if (pid == 0) {
+        alarm(200);
+        _exit(0);
+    }
+    var ws0: int;
+    waitpid(pid, &ws0, 0);
+    alarm(100);
+    pid = fork();
+    if (pid == 0) {
+        var ct: itimerval;
+        getitimer(ITIMER_REAL, &ct);
+        _exit(ct.it_value.tv_sec == 0 ? 0 : 1);
+    }
+    var ws: int;
+    waitpid(pid, &ws, 0);
+    alarm(0);
+    ok("fork clears the child's timer", WIFEXITED(ws) && WEXITSTATUS(ws) == 0);
+    // vfork: a fork here
+    pid = vfork();
+    if (pid == 0) { _exit(42); }
+    waitpid(pid, &ws, 0);
+    ok("vfork", pid > 0 && WIFEXITED(ws) && WEXITSTATUS(ws) == 42);
+}
+
 // Password hashing (crypt.tri) and the account databases (pwd.tri).
 fn passwords() {
     var h: *char = crypt("root", "$md5$Tr1nux.r");
@@ -405,6 +490,7 @@ fn main(argc: int, argv: **char) -> int {
     files();
     options();
     system_calls();
+    timers_and_offsets();
     puts(failures == 0 ? "libctest: all passed\n" : "libctest: some checks FAILED\n");
     return failures != 0;
 }

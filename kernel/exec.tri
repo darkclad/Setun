@@ -1,4 +1,6 @@
-// exec: load TEF executables (docs/KERNEL.md §9) and build the user stack.
+// exec: load TEF executables (docs/KERNEL.md §9) and build the user stack;
+// a script ("#!interpreter [argument]" on its first line) runs its
+// interpreter instead, as Linux's binfmt_script does.
 //
 // TEF v1 header (6 words): magic, entry, text start (first tryte), text
 // size (trytes), bss start (first tryte), bss size. The text follows the
@@ -19,6 +21,8 @@ const E2BIG: int = 7;
 const ENOENT: int = 2;
 const ENOEXEC: int = 8;
 const ENOMEM: int = 12;
+const ELOOP: int = 40;
+const SCRIPT_DEPTH: int = 4;          // a script's interpreter may be a script, 4 deep
 
 // Arguments, copied into the kernel before the old address space goes.
 var exec_path: [81]char;
@@ -52,13 +56,85 @@ fn poke_word(l1: int, va: int, v: int) {
 
 // Load `exec_path` with the arguments in exec_buf/exec_arg into a fresh
 // address space. Returns 0 or -errno.
-fn exec_load() -> int {
+fn exec_load() -> int { return exec_load_at(0); }
+
+// the arguments rebuilt for a script, before they go back into exec_buf
+var script_buf: [2187]char;
+var script_arg: [81]int;
+var script_used: int;
+var script_n: int;
+
+fn script_add(s: *char, len: int) -> int {
+    if (script_n == MAX_ARGS || script_used + len + 1 > ARG_BYTES) { return 0; }
+    script_arg[script_n] = script_used;
+    var k: int = 0;
+    while (k < len) { script_buf[script_used + k] = s[k]; k += 1; }
+    script_buf[script_used + len] = 0;
+    script_used += len + 1;
+    script_n += 1;
+    return 1;
+}
+
+fn is_blank(c: int) -> int { return c == ' ' || c == '\t'; }
+
+// exec a script: line[0..n) is the start of the file, "#!...". The new
+// argv is { interpreter, [argument,] the script's path, argv[1..] }; the
+// environment stays. Returns 0 or -errno.
+fn exec_script(line: *char, n: int, fsize: int, depth: int) -> int {
+    if (depth >= SCRIPT_DEPTH) { return -ELOOP; }
+    var k: int = 2;
+    while (k < n && is_blank(line[k])) { k += 1; }
+    var is: int = k;
+    while (k < n && !is_blank(line[k]) && line[k] != '\n') { k += 1; }
+    var ie: int = k;
+    while (k < n && is_blank(line[k])) { k += 1; }
+    var as_: int = k;
+    while (k < n && line[k] != '\n') { k += 1; }
+    if (k == n && n < fsize) { return -ENOEXEC; }     // the first line is too long
+    var ae: int = k;
+    while (ae > as_ && is_blank(line[ae - 1])) { ae -= 1; }
+    if (ie == is) { return -ENOEXEC; }                // "#!" and no interpreter
+    if (ie - is > 80) { return -ENAMETOOLONG; }
+    script_used = 0;
+    script_n = 0;
+    var ok: int = script_add(line + is, ie - is);
+    if (ae > as_) { ok = ok && script_add(line + as_, ae - as_); }
+    ok = ok && script_add(&exec_path[0], strlen(&exec_path[0]));
+    var a: int = 1;
+    while (a < exec_argc) {
+        ok = ok && script_add(&exec_buf[exec_arg[a]], strlen(&exec_buf[exec_arg[a]]));
+        a += 1;
+    }
+    var argc: int = script_n;
+    var e: int = 0;
+    while (e < exec_envc) {
+        ok = ok && script_add(&exec_buf[exec_arg[exec_argc + e]], strlen(&exec_buf[exec_arg[exec_argc + e]]));
+        e += 1;
+    }
+    if (!ok) { return -E2BIG; }
+    var j: int = 0;
+    while (j < script_used) { exec_buf[j] = script_buf[j]; j += 1; }
+    j = 0;
+    while (j < script_n) { exec_arg[j] = script_arg[j]; j += 1; }
+    exec_used = script_used;
+    exec_argc = argc;
+    j = 0;
+    while (j < ie - is) { exec_path[j] = line[is + j]; j += 1; }
+    exec_path[j] = 0;
+    return exec_load_at(depth + 1);
+}
+
+fn exec_load_at(depth: int) -> int {
     var file: int = path_lookup(&exec_path[0], exec_cwd);
     if (file < 0) { return file; }
     if (inodes[file].type != I_REG) { return -13; }                 // EACCES
     var x: int = inode_permission(file, MAY_EXEC);
     if (x < 0) { return x; }
     var fsize: int = inodes[file].size;
+    // a script?
+    var line: [81]char;
+    var ln: int = vfs_read(file, 0, &line[0], fsize < 81 ? fsize : 81);
+    if (ln >= 2 && line[0] == '#' && line[1] == '!') { return exec_script(&line[0], ln, fsize, depth); }
     if (fsize < 18) { return -ENOEXEC; }
     var r: int = vfs_read(file, 0, bytes(&exec_hdr[0]), 18);
     if (r != 18) { return r < 0 ? r : -ENOEXEC; }

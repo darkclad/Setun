@@ -788,13 +788,18 @@ are created.
   FPU and vector state. It starts with no pending signals.
 - **execve** looks the program up through the VFS, relative to the working
   directory, and needs execute permission on a regular file (`EACCES`
-  otherwise). A file that is not TEF gives `ENOEXEC`. On success it resets
+  otherwise). A **script** (a first line `#!interpreter [argument]`) runs
+  its interpreter with argv = { interpreter, [argument,] the script's path,
+  argv[1..] }, as Linux's `binfmt_script`: spaces around the argument are
+  dropped and it stays one argument; the interpreter may itself be a
+  script, four deep (`ELOOP` past that); a `#!` with no interpreter or a
+  first line past 81 trytes is `ENOEXEC`. Any other file that is not TEF
+  gives `ENOEXEC`, and the shell then runs it as a shell script (POSIX).
+  On success it resets
   caught signals to `SIG_DFL` (ignored ones stay ignored), drops the FPU
   and vector state, closes the close-on-exec descriptors and records
   `comm` and `cmdline` for procfs. Argument and environment strings
-  together are at most 81 strings and 2187 trytes (`E2BIG`). There is no
-  `#!` handling in the kernel; the shell runs scripts given as `sh
-  script`.
+  together are at most 81 strings and 2187 trytes (`E2BIG`).
 - **exit** frees the address space at once, reparents the children to
   init and wakes a waiting parent, which also gets `SIGCHLD`. The exit
   status is the low 8 bits of the code.
@@ -1009,7 +1014,7 @@ ECHOE|ECHOK`; `VINTR`=3, `VQUIT`=28, `VERASE`=127, `VKILL`=21, `VEOF`=4,
 | `TCGETS` | 21505 | read termios |
 | `TCSETS`, `TCSETSW`, `TCSETSF` | 21506–21508 | set termios; `TCSETSF` also flushes input |
 | `TIOCGPGRP`, `TIOCSPGRP` | 21519, 21520 | the foreground group; it must exist in the caller's session |
-| `TIOCGWINSZ`, `TIOCSWINSZ` | 21523, 21524 | the window size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, one word each) |
+| `TIOCGWINSZ`, `TIOCSWINSZ` | 21523, 21524 | the window size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, one word each): the console is 80 × 30 cells, 640 × 480 pixels; a pty has what `TIOCSWINSZ` set (pixels 0 until then); a new size sends `SIGWINCH` to the foreground group; `EINVAL` for no rows or columns or a negative pixel size |
 | `TIOCGPTN` | 2147767344 | pty master: the pty number |
 | `TIOCSPTLCK` | 1074025521 | pty master: accepted |
 
@@ -1069,7 +1074,9 @@ There is no core dump. A process killed by a signal has that signal number
 as its wait status. A stopped process's parent gets `SIGCHLD` and a
 `wait4` wake-up. `SIGCONT` resumes a stopped process and cancels pending
 stop signals; a stop signal cancels a pending `SIGCONT`. Nothing in the
-kernel sends `SIGALRM`: there is no `alarm` or timer call.
+real interval timer (`setitimer(ITIMER_REAL)`, and tlibc's `alarm` on it)
+sends `SIGALRM`, at a resolution of one tick (1/100 s); a child starts
+without one, and `execve` keeps it.
 
 ### 9.2 Handlers and masks
 
@@ -1588,6 +1595,8 @@ descriptor (`EBADF`). Structures have one word per field. Time values are
 | 62 | `lseek` | `fd, offset, whence` | new offset | `ESPIPE` (pipes, sockets, terminals), `EINVAL` |
 | 63 | `read` | `fd, buf, n` | trytes read | `EAGAIN`, `EINTR`, `EIO` |
 | 64 | `write` | `fd, buf, n` | trytes written | `EPIPE`, `ENOSPC`, `EAGAIN` |
+| 67 | `pread64` | `fd, buf, n, offset` | trytes read | at `offset`, the file position unchanged; `ESPIPE` (pipes, sockets, terminals), `EINVAL` (offset < 0) |
+| 68 | `pwrite64` | `fd, buf, n, offset` | trytes written | as `pread64` |
 | 73 | `ppoll` | `fds, nfds, timeout, sigmask` | ready count | timeout null = forever; at most 81 fds; `EINVAL`, `EINTR`; `POLLIN` 1, `POLLOUT` 4, `POLLERR` 8, `POLLHUP` 16, `POLLNVAL` 32; `sigmask` ignored |
 | 79 | `newfstatat` | `dirfd, path, buf, flags` | 0 | `flags` ignored (no symbolic links) |
 | 80 | `fstat` | `fd, buf` | 0 | |
@@ -1609,6 +1618,8 @@ and `renameat` accept a relative path only with `AT_FDCWD` (`EINVAL`).
 | 94 | `exit_group` | `code` | does not return | the same as `exit` |
 | 98 | `futex` | `uaddr, op, val` | 0, or woken count | `EAGAIN`, `EINVAL`, `EFAULT`, `EINTR` |
 | 101 | `nanosleep` | `req, rem` | 0 | `EINVAL`, `EINTR` |
+| 102 | `getitimer` | `which, cur` | 0 | `which` must be `ITIMER_REAL` (0); `struct itimerval` = interval, value (each `timeval`: seconds, microseconds); `EINVAL`, `EFAULT` |
+| 103 | `setitimer` | `which, new, old` | 0 | as `getitimer`; the value rounds up to a tick; `EINVAL` for microseconds past 999999 or a negative time |
 | 112 | `clock_settime` | `clock, ts` | 0 | `CLOCK_REALTIME` only; `EPERM`, `EINVAL` |
 | 113 | `clock_gettime` | `clock, ts` | 0 | `CLOCK_REALTIME` 0 (the RTC), `CLOCK_MONOTONIC` 1 (ticks); `EINVAL` |
 | 124 | `sched_yield` | none | 0 | |
@@ -1620,7 +1631,7 @@ and `renameat` accept a relative path only with `AT_FDCWD` (`EINVAL`).
 | 179 | `sysinfo` | `info` | 0 | Linux field order; `mem_unit` = 1 tryte |
 | 214 | `brk` | `addr` | current break | |
 | 215 | `munmap` | `addr, len` | 0 | `EINVAL` (only the framebuffer mapping) |
-| 220 | `clone` | `SIGCHLD, …` | child pid / 0 | `EINVAL` (other flags), `EAGAIN`, `ENOMEM` |
+| 220 | `clone` | `SIGCHLD, …` | child pid / 0 | `SIGCHLD`, or `SIGCHLD \| CLONE_VM \| CLONE_VFORK` (vfork, run as a fork); `EINVAL` (other flags), `EAGAIN`, `ENOMEM` |
 | 221 | `execve` | `path, argv, envp` | does not return | `ENOENT`, `EACCES`, `ENOEXEC`, `E2BIG`, `EFAULT`, `ENOMEM` |
 | 222 | `mmap` | `addr, len, prot, flags, fd, off` | address | §7.5; `EINVAL`, `ENODEV`, `ENOMEM` |
 | 260 | `wait4` | `pid, status, options` | pid, or 0 | `WNOHANG` 1, `WUNTRACED` 2; `ECHILD`, `EINTR` |
@@ -1677,9 +1688,10 @@ and `renameat` accept a relative path only with `AT_FDCWD` (`EINVAL`).
 `ppoll` also work on sockets. [`NETWORK.md`](NETWORK.md) §4 has the
 details.
 
-Linux system calls not listed here (`vfork`, `pread`/`pwrite`,
-`symlinkat`, `readlinkat`, `truncate`, `alarm`, `setitimer`, threads) do
-not exist and give `ENOSYS`.
+Linux system calls not listed here (`symlinkat`, `readlinkat`,
+`truncate`, threads, the other timers) do not exist and give `ENOSYS`.
+(`alarm` and `vfork` are not system calls in Linux's generic table either:
+tlibc builds them on `setitimer` and `clone`.)
 
 ---
 
@@ -1692,7 +1704,7 @@ imports the Trine runtime (`rt.tri`), which provides `memset`, `memcpy`,
 
 ### 16.1 tlibc: the core (`tlibc.tri`)
 
-**Descriptors and files:** `read`, `write`, `close`, `lseek`, `dup`,
+**Descriptors and files:** `read`, `write`, `pread`, `pwrite`, `close`, `lseek`, `dup`,
 `dup2`, `pipe`, `open(path, flags, mode)`, `creat`, `fcntl`, `ioctl`,
 `stat(path, *stat_t)`, `fstat`, `S_ISDIR`/`S_ISREG`/`S_ISCHR`/`S_ISFIFO`,
 `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `chmod`, `chown`, `fchown`,
@@ -1704,7 +1716,7 @@ imports the Trine runtime (`rt.tri`), which provides `memset`, `memcpy`,
 (`d_ino`, `d_type`, `d_name`), `closedir`, `getdents64`. One directory can
 be open at a time.
 
-**Processes:** `fork`, `execve`, `execv` (with `environ`), `execvp`
+**Processes:** `fork`, `vfork` (a fork), `execve`, `execv` (with `environ`), `execvp`
 (`$PATH`), `_exit`, `exit` (no `atexit`), `waitpid`, `wait`,
 `WIFEXITED`, `WEXITSTATUS`, `WIFSIGNALED`, `WTERMSIG`, `WIFSTOPPED`,
 `WSTOPSIG`, `getpid`, `getppid`, `sched_yield`, `brk`, `sbrk`,
@@ -1723,7 +1735,8 @@ restorer), `signal(sig, handler) -> old`, `sigemptyset`, `sigaddset`,
 `strsignal(sig)`.
 
 **Time:** `nanosleep(*timespec, *timespec)`, `sleep(seconds) -> left`,
-`clock_gettime`, `clock_settime`.
+`clock_gettime`, `clock_settime`, `alarm(seconds) -> left`, `setitimer`,
+`getitimer` (`ITIMER_REAL`; `struct itimerval` of two `timeval`s).
 
 **Terminals:** `isatty`, `tcgetattr`, `tcsetattr(fd, TCSANOW, *termios)`,
 `posix_openpt`, `grantpt`, `unlockpt`, `ptsname_r`; `struct termios`,
@@ -1848,21 +1861,21 @@ and §14.
 6. **Times.** Inodes keep one time: `stat` reports the modification time as
    atime, mtime and ctime. `touch` does not update the time of an existing
    file. There is no `utime`.
-7. **Missing calls.** `alarm`, timers, `pread`/`pwrite`, `truncate`,
-   `vfork`, `select` (use `poll`), and real-time signals do not exist.
+7. **Missing calls.** `truncate`, `select` (use `poll`), real-time
+   signals and every timer but `ITIMER_REAL` do not exist. `vfork` is a
+   fork (the parent does not wait for the child's `execve`).
    `SIGTTOU` and `TOSTOP` are not implemented. `VMIN` and `VTIME` are
    ignored.
-8. **Scripts.** The kernel does not run `#!` scripts; run them with `sh`.
-9. **The shell** has no `IFS`; fields split on blanks. It reads no
+8. **The shell** has no `IFS`; fields split on blanks. It reads no
    profile files.
-10. **Scheduling** is round robin without priorities.
-11. **`mmap`** maps only the framebuffer and shared anonymous memory, and
+9. **Scheduling** is round robin without priorities.
+10. **`mmap`** maps only the framebuffer and shared anonymous memory, and
     `munmap` releases only the framebuffer.
-12. **Utilities** are smaller than their POSIX models: `rm` has no `-r` or
+11. **Utilities** are smaller than their POSIX models: `rm` has no `-r` or
     `-f`, `cp` has no `-r`, `tail` takes one file, `grep` has no `-E`.
-13. **Passwords** use a single salted MD5, which is fast and therefore
+12. **Passwords** use a single salted MD5, which is fast and therefore
     weak.
-14. **Users.** `opendir` handles one directory at a time in a process.
+13. **Users.** `opendir` handles one directory at a time in a process.
 
 ### 17.2 Limits
 

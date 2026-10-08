@@ -268,6 +268,8 @@ var want_pty: int;
 var term: [64]char;
 var cols: int = 80;
 var rows: int = 24;
+var xpix: int;                           // the client's window in pixels (0: not given)
+var ypix: int;
 var child: int;
 var master: int = -1;                     // pty mode
 var in_fd: int = -1;                      // pipe mode: the child's stdin
@@ -377,6 +379,8 @@ fn start_child(command: *char) -> int {
         var ws: winsize;
         ws.ws_row = rows;
         ws.ws_col = cols;
+        ws.ws_xpixel = xpix;
+        ws.ws_ypixel = ypix;
         ioctl(master, TIOCSWINSZ, &ws as int);
         child = fork();
         if (child < 0) { return -1; }
@@ -431,6 +435,8 @@ fn channel_request() {
         get_text(&term[0], 64);
         cols = get_u32();
         rows = get_u32();
+        xpix = get_u32();
+        ypix = get_u32();
         if (bad || child != 0) { channel_reply(want, 0); return; }
         want_pty = 1;
         channel_reply(want, 1);
@@ -462,10 +468,14 @@ fn channel_request() {
     if (streq(&type[0], "window-change")) {
         cols = get_u32();
         rows = get_u32();
+        xpix = get_u32();
+        ypix = get_u32();
         if (master >= 0) {
             var ws: winsize;
             ws.ws_row = rows;
             ws.ws_col = cols;
+            ws.ws_xpixel = xpix;
+            ws.ws_ypixel = ypix;
             ioctl(master, TIOCSWINSZ, &ws as int);
         }
         return;

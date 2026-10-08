@@ -136,6 +136,55 @@ fn k7_shell_language() {
 }
 
 #[test]
+fn scripts_run_their_interpreter() {
+    // "#!interpreter [argument]" (the kernel, as Linux's binfmt_script):
+    // argv = { interpreter, [argument,] the script, its arguments }; an
+    // interpreter may itself be a script, four deep; a text file without
+    // "#!" (ENOEXEC) runs in sh, as POSIX has it
+    let out = session(
+        &[
+            "echo '#!/bin/sh' > /tmp/s1; echo 'echo zero=$0 one=$1 two=$2' >> /tmp/s1",
+            "echo '#!/bin/echo hello' > /tmp/s2",
+            "echo '#!/tmp/s2' > /tmp/s3",
+            "echo '#!  /bin/echo   one arg  ' > /tmp/s4",
+            "echo '#!/tmp/lp' > /tmp/lp",
+            "echo '#!' > /tmp/bare; echo 'echo bare-fallback' >> /tmp/bare",
+            "echo 'echo plain $1' > /tmp/plain",
+            "echo '#!/nope/sh' > /tmp/miss",
+            "echo '#!/bin/sh' > /tmp/noexec; echo 'echo NEVER' >> /tmp/noexec",
+            "chmod 755 /tmp/s1 /tmp/s2 /tmp/s3 /tmp/s4 /tmp/lp /tmp/bare /tmp/plain /tmp/miss",
+            "/tmp/s1 a b",
+            "/tmp/s2 x",
+            "/tmp/s3 y",
+            "/tmp/s4",
+            "/tmp/lp; echo status $?",
+            "/tmp/bare; echo status $?",
+            "/tmp/plain q",
+            "/tmp/miss; echo status $?",
+            "/tmp/noexec; echo status $?",
+            "cd /tmp; ./s1 rel",
+        ],
+        3_000_000_000,
+    );
+    assert_has(
+        &out,
+        &[
+            "zero=/tmp/s1 one=a two=b",
+            "hello /tmp/s2 x",
+            "hello /tmp/s2 /tmp/s3 y",
+            "one arg /tmp/s4",
+            "/tmp/lp: Too many levels of symbolic links\nstatus 126",
+            "bare-fallback\nstatus 0",
+            "plain q",
+            "/tmp/miss: not found\nstatus 127",
+            "/tmp/noexec: Permission denied\nstatus 126",
+            "zero=./s1 one=rel",
+        ],
+    );
+    assert_lacks(&out, &["\nNEVER"]);
+}
+
+#[test]
 fn k7_shell_errors() {
     let out = session(
         &[

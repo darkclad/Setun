@@ -282,6 +282,25 @@ fn sys_write(fd: int, buf: int, n: int) -> int {
     return file_write(f, buf as *tryte, n);
 }
 
+// pread64/pwrite64: at offset `off`, leaving the file position alone
+fn sys_pio(fd: int, buf: int, n: int, off: int, write: int) -> int {
+    var f: int = fd_file(fd);
+    if (f < 0) { return f; }
+    if (!user_range_ok(buf, n)) { return -EFAULT; }
+    var node: *Inode = &inodes[files[f].ino];
+    var is_fb: int = node.type == I_CHR && node.rdev == DEV_FB0;
+    if (node.type == I_FIFO || node.type == I_SOCK || (node.type == I_CHR && !is_fb)) { return -ESPIPE; }
+    if (off < 0) { return -EINVAL; }
+    var saved: int = files[f].pos;
+    files[f].pos = off;
+    var r: int = write ? file_write(f, buf as *tryte, n) : file_read(f, buf as *tryte, n);
+    files[f].pos = saved;
+    return r;
+}
+
+fn sys_pread64(fd: int, buf: int, n: int, off: int) -> int { return sys_pio(fd, buf, n, off, 0); }
+fn sys_pwrite64(fd: int, buf: int, n: int, off: int) -> int { return sys_pio(fd, buf, n, off, 1); }
+
 fn sys_lseek(fd: int, off: int, whence: int) -> int {
     var f: int = fd_file(fd);
     if (f < 0) { return f; }

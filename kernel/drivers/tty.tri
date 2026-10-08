@@ -95,6 +95,8 @@ struct Tty {
     pgrp: int;                        // foreground process group (0 = none yet)
     rows: int;
     cols: int;
+    xpixel: int;                      // the size in pixels, as TIOCSWINSZ set it
+    ypixel: int;
     out: [2187]tryte;                 // pty: output waiting for the master
     out_head: int;
     out_count: int;
@@ -127,6 +129,8 @@ fn tty_reset(t: int) {
     y.pgrp = 0;
     y.rows = 24;
     y.cols = 80;
+    y.xpixel = 0;                     // unknown, as on Linux, until TIOCSWINSZ
+    y.ypixel = 0;
     y.out_head = 0;
     y.out_count = 0;
     y.master_open = 0;
@@ -140,6 +144,8 @@ fn tty_init() {
     ttys[0].pgrp = 1;
     ttys[0].rows = ROWS;
     ttys[0].cols = COLS;
+    ttys[0].xpixel = COLS * 8;        // text mode: 8 x 16 pixel cells, 640 x 480
+    ttys[0].ypixel = ROWS * 16;
     out(KBD_CTRL, 1);
     out(SERIAL_CTRL, 1);
     out(TPIC_UNMASK, IRQ_KEYBOARD);
@@ -468,15 +474,20 @@ fn tty_ioctl(t: int, cmd: int, arg: int) -> int {
             var w: *Winsize = arg as *Winsize;
             w.ws_row = y.rows;
             w.ws_col = y.cols;
-            w.ws_xpixel = y.cols * 8;
-            w.ws_ypixel = y.rows * 8;
+            w.ws_xpixel = y.xpixel;
+            w.ws_ypixel = y.ypixel;
             return 0;
         }
         case TIOCSWINSZ: {
             var w2: *Winsize = arg as *Winsize;
-            if (w2.ws_row <= 0 || w2.ws_col <= 0) { return -EINVAL; }
+            if (w2.ws_row <= 0 || w2.ws_col <= 0 || w2.ws_xpixel < 0 || w2.ws_ypixel < 0) { return -EINVAL; }
+            var changed: int = y.rows != w2.ws_row || y.cols != w2.ws_col || y.xpixel != w2.ws_xpixel || y.ypixel != w2.ws_ypixel;
             y.rows = w2.ws_row;
             y.cols = w2.ws_col;
+            y.xpixel = w2.ws_xpixel;
+            y.ypixel = w2.ws_ypixel;
+            // the foreground group hears of a new size (Linux: SIGWINCH)
+            if (changed && y.pgrp > 0) { send_signal_pgrp(y.pgrp, SIGWINCH); }
             return 0;
         }
     }

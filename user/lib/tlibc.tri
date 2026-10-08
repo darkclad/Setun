@@ -41,6 +41,7 @@ const ERANGE: int = 34;
 const ENAMETOOLONG: int = 36;
 const ENOSYS: int = 38;
 const ENOTEMPTY: int = 39;
+const ELOOP: int = 40;
 const E2BIG: int = 7;
 const EMLINK: int = 31;
 const EDOM: int = 33;
@@ -85,6 +86,7 @@ const SIGSEGV: int = 11;
 const SIGUSR2: int = 12;
 const SIGPIPE: int = 13;
 const SIGALRM: int = 14;
+const SIGWINCH: int = 28;
 const SIGTERM: int = 15;
 const SIGCHLD: int = 17;
 const SIGCONT: int = 18;
@@ -139,6 +141,9 @@ fn read(fd: int, buf: *char, n: int) -> int { return _ret(syscall(63, fd, buf, n
 fn write(fd: int, buf: *char, n: int) -> int { return _ret(syscall(64, fd, buf, n)); }
 fn close(fd: int) -> int { return _ret(syscall(57, fd)); }
 fn lseek(fd: int, off: int, whence: int) -> int { return _ret(syscall(62, fd, off, whence)); }
+// read and write at an offset, the file position left as it is
+fn pread(fd: int, buf: *tryte, n: int, off: int) -> int { return _ret(syscall(67, fd, buf, n, off)); }
+fn pwrite(fd: int, buf: *tryte, n: int, off: int) -> int { return _ret(syscall(68, fd, buf, n, off)); }
 fn dup(fd: int) -> int { return _ret(syscall(23, fd)); }
 fn dup2(fd: int, nfd: int) -> int {
     if (fd == nfd) {                                   // dup3 refuses this; dup2 only checks fd
@@ -194,6 +199,9 @@ fn sched_yield() -> int { return _ret(syscall(124)); }
 fn _exit(code: int) { syscall(93, code); }
 fn exit(code: int) { syscall(93, code); }           // no atexit handlers; stdio FILEs flush on fclose
 fn fork() -> int { return _ret(syscall(220, SIGCHLD, 0, 0, 0, 0)); }
+// vfork: clone(CLONE_VM | CLONE_VFORK | SIGCHLD), which Trinux runs as a
+// fork (the child has its own copy, and the parent goes on at once)
+fn vfork() -> int { return _ret(syscall(220, SIGCHLD + 256 + 16384, 0, 0, 0, 0)); }
 fn execve(path: *char, argv: **char, envp: **char) -> int { return _ret(syscall(221, path, argv, envp)); }
 fn execv(path: *char, argv: **char) -> int { return execve(path, argv, environ); }
 
@@ -703,6 +711,36 @@ struct timespec {
 
 fn nanosleep(req: *timespec, rem: *timespec) -> int { return _ret(syscall(101, req, rem)); }
 
+// Interval timers: only ITIMER_REAL (SIGALRM, 1/100 s resolution).
+struct timeval {
+    tv_sec: int;
+    tv_usec: int;
+}
+
+struct itimerval {
+    it_interval: timeval;
+    it_value: timeval;
+}
+
+const ITIMER_REAL: int = 0;
+fn getitimer(which: int, cur: *itimerval) -> int { return _ret(syscall(102, which, cur)); }
+fn setitimer(which: int, nv: *itimerval, old: *itimerval) -> int { return _ret(syscall(103, which, nv, old)); }
+
+// SIGALRM in `seconds` (0: none); the seconds left of the one before,
+// rounded up, as glibc's
+fn alarm(seconds: int) -> int {
+    var nv: itimerval;
+    var old: itimerval;
+    nv.it_interval.tv_sec = 0;
+    nv.it_interval.tv_usec = 0;
+    nv.it_value.tv_sec = seconds;
+    nv.it_value.tv_usec = 0;
+    if (setitimer(ITIMER_REAL, &nv, &old) < 0) { return 0; }
+    var left: int = old.it_value.tv_sec;
+    if (old.it_value.tv_usec > 0) { left += 1; }
+    return left;
+}
+
 const CLOCK_REALTIME: int = 0;
 const CLOCK_MONOTONIC: int = 1;
 fn clock_gettime(clk: int, ts: *timespec) -> int { return _ret(syscall(113, clk, ts)); }
@@ -825,6 +863,7 @@ fn strerror(e: int) -> *char {
         case ENAMETOOLONG: return "File name too long";
         case ENOSYS: return "Function not implemented";
         case ENOTEMPTY: return "Directory not empty";
+        case ELOOP: return "Too many levels of symbolic links";
         case EXDEV: return "Invalid cross-device link";
         case E2BIG: return "Argument list too long";
         case EMLINK: return "Too many links";

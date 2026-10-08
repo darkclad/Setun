@@ -154,10 +154,17 @@ fn ptys() {
     var ws: winsize;
     ws.ws_row = 33;
     ws.ws_col = 99;
+    ws.ws_xpixel = 792;
+    ws.ws_ypixel = 528;
     ioctl(m, TIOCSWINSZ, &ws as int);
     var ws2: winsize;
     ioctl(s, TIOCGWINSZ, &ws2 as int);
-    ok("the window size set on the master shows on the slave", ws2.ws_row == 33 && ws2.ws_col == 99);
+    ok("the window size set on the master shows on the slave", ws2.ws_row == 33 && ws2.ws_col == 99 && ws2.ws_xpixel == 792 && ws2.ws_ypixel == 528);
+    ws.ws_row = 0;
+    ok("EINVAL: a window of no rows", ioctl(m, TIOCSWINSZ, &ws as int) < 0 && errno == EINVAL);
+    ws.ws_row = 33;
+    ws.ws_ypixel = -1;
+    ok("EINVAL: a negative height", ioctl(m, TIOCSWINSZ, &ws as int) < 0 && errno == EINVAL);
     // ^C through the master reaches the slave's foreground group
     var pid: int = fork();
     if (pid == 0) {
@@ -219,7 +226,29 @@ fn ptys() {
     ok("closed ptys leave /dev/pts", left == 0);
 }
 
+var winches: int;
+fn on_winch(sig: int) { winches += 1; }
+
+// The console's window: 80 x 30 cells of 8 x 16 pixels; a new size is a
+// SIGWINCH for the foreground group (this one), the same size is not.
+fn console_window() {
+    var ws: winsize;
+    ok("the console's window", ioctl(0, TIOCGWINSZ, &ws as int) == 0 && ws.ws_row == 30 && ws.ws_col == 80 && ws.ws_xpixel == 640 && ws.ws_ypixel == 480);
+    signal(SIGWINCH, &on_winch as int);
+    winches = 0;
+    ws.ws_row = 29;
+    ioctl(0, TIOCSWINSZ, &ws as int);
+    ok("a new size sends SIGWINCH", winches == 1);
+    ioctl(0, TIOCSWINSZ, &ws as int);
+    ok("the same size sends none", winches == 1);
+    ws.ws_row = 30;
+    ioctl(0, TIOCSWINSZ, &ws as int);
+    ok("the size back, SIGWINCH again", winches == 2);
+    signal(SIGWINCH, SIG_DFL);
+}
+
 fn main(argc: int, argv: **char) -> int {
+    console_window();
     framebuffer();
     input();
     polling();

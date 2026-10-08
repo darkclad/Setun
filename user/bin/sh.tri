@@ -2503,12 +2503,25 @@ fn find_in_path(name: *char, out: *char) -> int {
 // In a child (or for exec): run argv; never returns.
 fn exec_external(argc: int, argv: **char) {
     var envp: **char = build_envp();
+    var path: [243]char;
+    var file: *char = argv[0];
     if (strchr(argv[0], '/') != null) {
-        execve(argv[0], argv, envp);
+        execve(file, argv, envp);
+    } else if (find_in_path(argv[0], &path[0])) {
+        file = &path[0];
+        execve(file, argv, envp);
     } else {
-        var path: [243]char;
-        if (find_in_path(argv[0], &path[0])) { execve(&path[0], argv, envp); }
-        else { errno = ENOENT; }
+        errno = ENOENT;
+    }
+    if (errno == ENOEXEC) {
+        // not an executable and no #!: a script for this shell (POSIX)
+        var av: [83]*char;
+        var k: int = 0;
+        av[0] = "sh";
+        av[1] = file;
+        while (k + 1 < argc && k < 80) { av[k + 2] = argv[k + 1]; k += 1; }
+        av[k + 2] = null;
+        execve("/bin/sh", &av[0], envp);
     }
     if (errno == ENOENT) {
         err(argv[0], ": not found");

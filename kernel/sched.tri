@@ -56,6 +56,8 @@ const SYS_GETDENTS64: int = 61;
 const SYS_LSEEK: int = 62;
 const SYS_READ: int = 63;
 const SYS_WRITE: int = 64;
+const SYS_PREAD64: int = 67;
+const SYS_PWRITE64: int = 68;
 const SYS_NEWFSTATAT: int = 79;
 const SYS_FSTAT: int = 80;
 const SYS_EXIT: int = 93;
@@ -98,6 +100,8 @@ const SYS_SYNC: int = 81;
 const SYS_FSYNC: int = 82;
 const SYS_REBOOT: int = 142;
 const SYS_NANOSLEEP: int = 101;
+const SYS_GETITIMER: int = 102;
+const SYS_SETITIMER: int = 103;
 const SYS_KILL: int = 129;
 const SYS_RT_SIGSUSPEND: int = 133;
 const SYS_RT_SIGACTION: int = 134;
@@ -166,6 +170,8 @@ struct Task {
     restart_nanosleep: int;           // the restarted nanosleep resumes at...
     nanosleep_until: int;             // ...this jiffy
     start_time: int;                  // jiffies at fork
+    it_at: int;                       // ITIMER_REAL: SIGALRM at this jiffy (0 = off)...
+    it_every: int;                    // ...then every this many (0 = once)
     cmdline_len: int;
     umask: int;
     fd_cloexec: [27]tryte;            // per descriptor: close on execve
@@ -277,6 +283,7 @@ fn schedule() {
 
 fn scheduler_tick() {
     tasks[current].ticks += 1;
+    itimer_tick();
     wake_up(TIMER_CHAN);
     schedule();
 }
@@ -365,6 +372,8 @@ fn do_fork(f: *int) -> int {
     fs_fork(parent, child);
     signals_fork(parent, child);
     child.start_time = jiffies;
+    child.it_at = 0;                  // a child has no timer of its own yet (POSIX)
+    child.it_every = 0;
     copy_str(&child.comm[0], &parent.comm[0], 27);
     var k: int = 0;
     while (k < 81) { child.cmdline[k] = parent.cmdline[k]; k += 1; }
@@ -665,6 +674,10 @@ fn do_syscall(f: *int, n: int) {
     switch (n) {
         case SYS_READ: f[F_R1] = sys_read(f[0], f[1], f[2]);
         case SYS_WRITE: f[F_R1] = sys_write(f[0], f[1], f[2]);
+        case SYS_PREAD64: f[F_R1] = sys_pread64(f[0], f[1], f[2], f[3]);
+        case SYS_PWRITE64: f[F_R1] = sys_pwrite64(f[0], f[1], f[2], f[3]);
+        case SYS_GETITIMER: f[F_R1] = sys_getitimer(f[0], f[1]);
+        case SYS_SETITIMER: f[F_R1] = sys_setitimer(f[0], f[1], f[2]);
         case SYS_OPENAT: f[F_R1] = sys_openat(f[0], f[1], f[2], f[3]);
         case SYS_CLOSE: f[F_R1] = sys_close(f[0]);
         case SYS_LSEEK: f[F_R1] = sys_lseek(f[0], f[1], f[2]);
@@ -686,7 +699,10 @@ fn do_syscall(f: *int, n: int) {
         case SYS_BRK: f[F_R1] = sys_brk(f[0]);
         case SYS_SYSINFO: f[F_R1] = sys_sysinfo(f[0]);
         case SYS_CLONE: {
-            if (f[0] != SIGCHLD) { f[F_R1] = -EINVAL; }      // only fork-style clone in v1
+            // fork-style clone only; vfork's CLONE_VM | CLONE_VFORK is a
+            // fork too (POSIX allows it: the child gets its own copy-on-write
+            // copy, and the parent runs on at once)
+            if (f[0] != SIGCHLD && f[0] != SIGCHLD + CLONE_VM + CLONE_VFORK) { f[F_R1] = -EINVAL; }
             else { f[F_R1] = do_fork(f); }
         }
         case SYS_EXECVE: {
@@ -755,4 +771,64 @@ fn do_syscall(f: *int, n: int) {
         case SYS_GETRANDOM: f[F_R1] = sys_getrandom(f[0], f[1], f[2]);
         default: f[F_R1] = -ENOSYS;
     }
+}
+
+// ---- interval timers: ITIMER_REAL (setitimer, and tlibc's alarm) ----
+
+const CLONE_VM: int = 256;
+const CLONE_VFORK: int = 16384;
+const ITIMER_REAL: int = 0;
+const USEC_PER_TICK: int = 10000;     // 1000000 / HZ
+
+// On every tick: each task's real timer due now gets SIGALRM, and starts
+// again if it repeats.
+fn itimer_tick() {
+    var i: int = 1;
+    while (i < task_top) {
+        var t: *Task = &tasks[i];
+        if (t.state != TASK_UNUSED && t.state != TASK_ZOMBIE && t.it_at > 0 && jiffies >= t.it_at) {
+            t.it_at = t.it_every > 0 ? jiffies + t.it_every : 0;
+            send_signal(i, SIGALRM);
+        }
+        i += 1;
+    }
+}
+
+// a timeval (seconds, microseconds) as ticks, rounded up; -1 if invalid
+fn tv_ticks(tv: *int) -> int {
+    if (tv[0] < 0 || tv[1] < 0 || tv[1] > 999999) { return -1; }
+    return tv[0] * HZ + (tv[1] + USEC_PER_TICK - 1) / USEC_PER_TICK;
+}
+
+fn ticks_tv(n: int, tv: *int) {
+    tv[0] = n / HZ;
+    tv[1] = n % HZ * USEC_PER_TICK;
+}
+
+// struct itimerval { it_interval: timeval; it_value: timeval; }: 4 words
+fn itimer_get(t: *Task, out: *int) {
+    ticks_tv(t.it_every, out);
+    ticks_tv(t.it_at > 0 ? (t.it_at > jiffies ? t.it_at - jiffies : 1) : 0, out + 2);
+}
+
+fn sys_getitimer(which: int, cur: int) -> int {
+    if (which != ITIMER_REAL) { return -EINVAL; }
+    if (!user_range_ok(cur, 12)) { return -EFAULT; }
+    itimer_get(current_task(), cur as *int);
+    return 0;
+}
+
+fn sys_setitimer(which: int, newp: int, oldp: int) -> int {
+    if (which != ITIMER_REAL) { return -EINVAL; }
+    if (newp == 0 || !user_range_ok(newp, 12)) { return -EFAULT; }
+    if (oldp != 0 && !user_range_ok(oldp, 12)) { return -EFAULT; }
+    var nv: *int = newp as *int;
+    var every: int = tv_ticks(nv);
+    var value: int = tv_ticks(nv + 2);
+    if (every < 0 || value < 0) { return -EINVAL; }
+    var t: *Task = current_task();
+    if (oldp != 0) { itimer_get(t, oldp as *int); }
+    t.it_every = every;
+    t.it_at = value > 0 ? jiffies + value : 0;
+    return 0;
 }
