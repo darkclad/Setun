@@ -149,7 +149,10 @@ fn tric_matches_the_host_at_level_1() {
 
 #[test]
 fn tric_matches_the_host_at_level_2() {
-    tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
+    let mut s = tric_at_level(2, &["echo", "cat", "edit", "calc", "dstest", "vectest", "chartest", "mtxtest", "o1test", "o2test", "sh", "tric"]);
+    // and what it builds runs: compound assignments narrow trits and trytes
+    let o = s.cmd_max("tric -O2 -o /tmp/o1 /usr/src/bin/o1test.tri; /tmp/o1", 200_000_000_000);
+    has(&o, &["o1test: ok"]);
 }
 
 #[test]

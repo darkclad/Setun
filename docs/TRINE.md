@@ -904,16 +904,12 @@ value. Assignment is an expression and associates to the right.
 value and `rhs`, and stores the result. On a `real`, only `+= -= *= /= %=
 &= |=` are allowed (``cannot apply Shl to a real``).
 
-On a `tryte` or `trit` variable, compound assignment stores the low tryte
-of the result without needing `as`: `t += 1` on a `tryte` holding 9841
-gives −9841. Two gaps remain in the current compiler:
-
-- the result is stored as a tryte even for a `trit`, so `k += 1` on a
-  `trit` holding 1 leaves 2 in it;
-- at `-O2` and above, when the right side is a plain variable of type
-  `int` (`t += x`), the assignment is refused with `expected tryte, found
-  int (use `as` to narrow)`, while lower levels accept it. Write `t = (t +
-  x) as tryte` to build at every level.
+On a `tryte` or `trit` variable, compound assignment narrows the result as
+`as` would, without needing `as`, at every optimization level: a `tryte`
+keeps the low 9 trits (`t += 1` on a `tryte` holding 9841 gives −9841), a
+`trit` its low trit (`k += 1` on a `trit` holding 1 gives −1, since 2 is
+1·3 − 1). The right side may be any integer expression (`t += x` with `x`
+an `int`).
 
 ### 3.10 Address, dereference, indexing, fields
 

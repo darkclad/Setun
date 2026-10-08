@@ -802,3 +802,42 @@ fn ternary_idiom_builtins_the_same_way() {
     "#;
     same_both_ways_src("idioms.tri", src, 20_000_000);
 }
+
+#[test]
+fn compound_assignment_narrows_at_every_level() {
+    // `t op= x` on a tryte or a trit narrows as `as` would, at every level:
+    // a trit keeps its low trit (1 + 1 = 2 = 1·3 − 1, so −1), a tryte its
+    // low 9 trits; and a variable right side is accepted at -O2 and above
+    // as below
+    let src = r#"
+        import "console.tri";
+        var gk: trit;
+        var gt: tryte = 9800 as tryte;
+        struct S { k: trit; t: tryte; }
+        var s: S;
+        fn put(v: int) { var b: [28]char; itoa(v, &b[0]); print(&b[0]); print(" "); }
+        fn main() -> int {
+            var k: trit = true;
+            var x: int = 100;
+            var t: tryte = 9800 as tryte;
+            var tk: [3]trit;
+            k += 1; put(k as int);                 // -1
+            k -= 1; put(k as int);                 // +1 (-2 wraps)
+            gk += x; put(gk as int);               // 100 = ...+1: low trit 1
+            gt += x; put(gt);                      // 9900 wraps to -9783
+            t += x; put(t);                        // the same in a local
+            t -= x * 3; put(t);
+            s.k += 2; put(s.k as int);             // -1
+            s.t += x; put(s.t);                    // 100
+            tk[1] = true; tk[1] *= 2; put(tk[1] as int);   // 2: -1
+            return 0;
+        }
+    "#;
+    let want = "-1 1 1 -9783 -9783 9600 -1 100 -1 ";
+    for l in 0..=4u8 {
+        let o = Options { level: Some(l), ..Options::rom() };
+        let b = build_source("narrow.tri", src, None, &o).unwrap_or_else(|e| panic!("-O{l}: {e}"));
+        let r = run_rom(&b.image, 10_000_000, "");
+        assert_eq!(r.serial, want, "-O{l}");
+    }
+}

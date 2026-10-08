@@ -349,7 +349,7 @@ fn plot(x: int, y: int, c: tryte) { FB[y * 640 + x] = c; }
 - **`as` binds after prefix operators.**
 - **Globals live in RAM** and are filled in by generated start-up code (§9).
 - **`trit(x, i)` parses as the builtin** even though `trit` is a type keyword.
-- **Compound assignment narrows implicitly:** `t += 1` on a `tryte` wraps, while `t = t + 1` still needs `as tryte`.
+- **Compound assignment narrows implicitly,** as `as` would: `t += x` on a `tryte` keeps the low 9 trits, `k += 1` on a `trit` its low trit; `t = t + x` still needs `as tryte`.
 
 ## 16. Optimization
 

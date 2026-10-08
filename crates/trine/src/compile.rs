@@ -3073,11 +3073,7 @@ impl Compiler {
                 self.emit("push r3");
                 self.load_from("r3", &lt);
                 let res = self.arith(op, &lt, &rt, None, rhs.pos)?;
-                if res.is_integer() && lt.is_tryte_sized() {
-                    // Compound assignment narrows implicitly (x += 1 on a tryte).
-                } else {
-                    self.check_assign(&lt, &res, rhs)?;
-                }
+                self.compound_narrow(&lt, &res, rhs)?;
                 self.emit("pop r3");
                 self.store(&lt, "r1", "[r3]");
                 Ok(lt)
@@ -3242,9 +3238,24 @@ impl Compiler {
         };
         self.load_operand(&lt, &operand);
         let res = self.arith(op, &lt, &rt, imm, rhs.pos)?;
-        self.check_assign(&lt, &res, rhs)?;
+        self.compound_narrow(&lt, &res, rhs)?;
         self.store(&lt, "r1", &operand);
         Ok(Some(lt))
+    }
+
+    /// A compound assignment's result in r1 narrows to a tryte-sized target
+    /// as `as` would (`t += x` on a tryte or a trit); other results must be
+    /// assignable. A tryte store keeps the low 9 trits itself; a trit keeps
+    /// its low trit.
+    fn compound_narrow(&mut self, lt: &Ty, res: &Ty, rhs: &Expr) -> R<()> {
+        if res.is_integer() && lt.is_tryte_sized() {
+            if *lt == Ty::Trit {
+                self.emit("ext r1, r1, 27, 1");
+            }
+            Ok(())
+        } else {
+            self.check_assign(lt, res, rhs)
+        }
     }
 
     /// A direct call with at most six integer arguments, optimized: the

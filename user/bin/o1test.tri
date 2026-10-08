@@ -27,8 +27,26 @@ fn shapes(n: int) -> int {
     return s;
 }
 
+// compound assignment narrows a trit or a tryte as `as` would, with a
+// constant or a variable right side, in memory and in a field
+struct NT { k: trit; t: tryte; }
+var gnt: NT;
+
+fn narrows(x: int) -> int {
+    var k: trit = true;
+    var t: tryte = 9800 as tryte;
+    var tk: [3]trit;
+    k += 1;                              // 2: -1
+    t += x;                              // 9900: -9783
+    gnt.k += x;                          // 100: low trit +1
+    gnt.t -= x * 3;
+    tk[1] = true;
+    tk[1] *= 2;                          // -1
+    return k == -1 && t == -9783 && gnt.k == 1 && gnt.t == -300 && tk[1] == -1;
+}
+
 fn main() -> int {
     var r: int = shapes(25);
-    puts(r == shapes(25) ? "o1test: ok\n" : "o1test: FAILED\n");
+    puts(r == shapes(25) && narrows(100) ? "o1test: ok\n" : "o1test: FAILED\n");
     return r % 7;
 }

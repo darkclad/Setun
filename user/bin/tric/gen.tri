@@ -1382,10 +1382,22 @@ fn compound_in_place(op: int, lhs: int, rhs: int) -> int {
     }
     load_operand(lt, ci_buf.p);
     var res: int = arith(op, lt, rt, cv, rc, ex_pos.p[rhs]);
-    check_assign(lt, res, rhs);
+    compound_narrow(lt, res, rhs);
     store_operand(lt, "r1", ci_buf.p);
     ci_ty = lt;
     return 1;
+}
+
+// A compound assignment's result in r1 narrows to a tryte-sized target as
+// `as` would (t += x on a tryte or a trit); other results must be
+// assignable. A tryte store keeps the low 9 trits itself; a trit keeps its
+// low trit.
+fn compound_narrow(lt: int, res: int, rhs: int) {
+    if (is_integer(res) && is_tsz(lt)) {
+        if (lt == t_trit) { em("ext r1, r1, 27, 1"); }
+    } else {
+        check_assign(lt, res, rhs);
+    }
 }
 
 fn lookup_local(n: int) -> int {
@@ -3309,7 +3321,7 @@ fn assign(op: int, lhs: int, rhs: int) -> int {
     em("push r3");
     em(is_tsz(at) ? "ldt r1, [r3]" : "ldw r1, [r3]");
     var res: int = arith(op, at, rt2, 0, 0, ex_pos.p[rhs]);
-    if (!(is_integer(res) && is_tsz(at))) { check_assign(at, res, rhs); }   // x += 1 on a tryte narrows
+    compound_narrow(at, res, rhs);
     em("pop r3");
     em(is_tsz(at) ? "stt r1, [r3]" : "stw r1, [r3]");
     return at;
