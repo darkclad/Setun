@@ -28,7 +28,7 @@ flowchart LR
         L1["1 · Number and logic foundations<br/>balanced arithmetic, Kleene logic done; true/unknown/false next"]
         L2["2 · Physical layer and circuits<br/>requirements only; the emulator is the machine"]
         L3["3 · CPU and ISA<br/>core ISA and FPU done; masks, atomics, vectors next"]
-        L4["4 · Memory and storage<br/>addressing, paging, tfs done; ECC as a spec"]
+        L4["4 · Memory and storage<br/>addressing, paging, tfs, ECC spec done"]
         L5["5 · Data formats<br/>text, executables, floats, varints, sound, pictures done"]
         L6["6 · Interconnect, I/O, networking<br/>binary stack done; native ternary links ahead"]
         L7["7 · Security and cryptography<br/>border crypto done; ML-KEM, GF(3) research ahead"]
@@ -118,14 +118,14 @@ Addressing and paging are done and are powers of 3 throughout. Still to design: 
 | Address space | 3^27 trytes, addressed by the centre; aligned means the address is a multiple of the size | No canonical-form rule; alignment is one divisibility test | Done |
 | Paging | 9 \| 9 \| 9 split, 3^9-tryte pages, one-word page-table entries with a 3-valued `RING` field | Each level indexes by one tryte, with no shifting or masking | Done |
 | Physical allocator | "triddy": a buddy allocator that splits blocks in 3 | Free blocks stay powers of 3 | Done |
-| Memory ECC | Shortened ternary Hamming code [31,27]: one 27-trit word + 4 check trits corrects any 1 trit error; perfect ternary Golay [11,6,5] where 2-error correction is needed. Specified for hardware only | 15% overhead for single correction (binary SECDED on 64 bits: 12.5%); Golay has no binary equal | Planned |
+| Memory ECC | [`ECC.md`](ECC.md): SEC-DED [33,27,4] for memory words (6 check trits whose columns form a cap in PG(5,3), of the least possible weight); the shortened Hamming code [31,27,3] (4 check trits, single correction); the perfect Golay code [11,6,5] for short fields that must survive 2 errors. The syndrome, read as a balanced number, names the wrong trit. Specified for hardware only, with a reference codec in `crates/ecc` tested on every error pattern | One check trit covers both error values (one level or two); SEC 14.8%, SEC-DED 22% (binary SEC-DED on the same 42.8 bits: 16%); Golay has no binary equal | Done (spec) |
 | Caches | Lines of 27 or 81 trytes; 3-way or 9-way sets; set counts a power of 3, indexed by address trits | The index is a trit field, never a modulo | Planned |
 | Disk layout | Sector = 1 block = 3^9 trytes; `tfs` with 81-tryte directory entries, 243 per block | The file system needs no binary sizes | Done |
 | Storage cell | A 3-level flash or resistive cell holding exactly one trit | Today's multi-level flash already stores levels; 3 levels give the widest margin per trit | Research |
 
 Decided 2026-10-06:
 
-- ECC is written down as a specification for future hardware. The emulator stays error-free and does not model check trits.
+- ECC is written down as a specification for future hardware. The emulator stays error-free and does not model check trits. **Done 2026-10-08:** [`ECC.md`](ECC.md) and `crates/ecc`; memory words use SEC-DED [33,27,4] rather than the [31,27] SEC planned first, because SEC turns some double errors into a third wrong trit.
 - `tfs` gets no checksums for now.
 
 ## 5. Data formats
@@ -264,7 +264,7 @@ flowchart TB
 | Phase | Work |
 |---|---|
 | A · Ternary idioms (done, 2026-10-07) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
-| **B · Formats, reliability** (next) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
+| B · Formats, reliability (done, 2026-10-08) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
 | C · Native networking | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
 | Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 

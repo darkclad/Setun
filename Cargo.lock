@@ -1198,6 +1198,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "setun-ecc"
+version = "0.1.0"
+
+[[package]]
 name = "setun-native"
 version = "0.1.0"
 dependencies = [

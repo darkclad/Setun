@@ -1,0 +1,9 @@
+[package]
+name = "setun-ecc"
+description = "Setun-11̅ error-correcting codes over GF(3): the reference encoders and decoders of docs/ECC.md"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
