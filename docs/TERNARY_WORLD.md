@@ -136,7 +136,7 @@ Formats are where a ternary world either stays ternary or quietly turns into bin
 | --- | --- | --- | --- |
 | Text | One Unicode code point per tryte; an overlined character is the negated code point | Fixed width, no UTF-8 decoding, overline for free | Done |
 | Text beyond U+2671 | A lead tryte (−2 plain, −3 overlined) followed by 2 trytes in −9841…−33 covers all of Unicode; built in tlibc, the UTF-8 border and the font path | CJK and emoji without giving up one tryte per common character | Done |
-| Floating point standard | real27 / real81 written up as a standalone standard: formats, exceptions, text conversion, a test suite | A ternary IEEE 754 that other ternary machines can adopt | Partial |
+| Floating point standard | real27 / real81 written up as a standalone standard ([`REAL.md`](REAL.md)): formats, rounding, operations, exceptions, text conversion; 14,000 conformance vectors from an independent exact reference, which the library and the FPU both pass | A ternary IEEE 754 that other ternary machines can adopt | Done |
 | Images | 27 levels per channel, 3^9 colours per tryte; a lossless file format whose prediction residuals are stored balanced | Residuals are signed by nature, so balanced storage needs no offset | Planned |
 | Audio | Balanced samples of one word (3 trytes, about 42.8 bits). A tryte (14.3 bits) falls short of 16-bit audio, and 2 trytes is not a power of 3 | Silence is 0 with no DC offset; the range is symmetric | Planned |
 | Compression and serialization | Entropy coding in base 3; varints in balanced base 27; type tags in trits | Signed varints need no zigzag trick | Planned |
@@ -145,7 +145,7 @@ Formats are where a ternary world either stays ternary or quietly turns into bin
 Decided 2026-10-06:
 
 - Code points beyond U+2671 (CJK, emoji) are implemented now: 3 trytes per character: a lead tryte (−2, or −3 for an overlined character; −1 is left alone because `fgetc` returns it for end of file) and 2 trytes of code point, each in −9841…−33.
-- A timestamp is one word of seconds around the 1970 epoch (±120,000 years, no 2038 problem). Sub-second time is a `long` (81 trits): seconds in the top word, a base-3 fraction of a second in the lower 54 trits.
+- A timestamp is one word of seconds around the 1970 epoch (±120,000 years, no 2038 problem). Sub-second time is a `long` (81 trits): seconds in the top word, a base-3 fraction of a second in the lower 54 trits. **Done 2026-10-08:** inodes keep atime, mtime and ctime (relatime), `utimensat`; `time.tri` has `gmtime`/`timegm` for any year and the `ltime_*` functions on `long`; `touch`, `ls -l -t -u -c`, `date -d -r %N`, `stat`, `find -newer -mtime -mmin`, `sleep 0.25` and `time` use them.
 
 ## 6. Interconnect, I/O and networking
 

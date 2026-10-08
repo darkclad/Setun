@@ -781,6 +781,8 @@ wait:   in    r2, [r3 + 2]     ; TX_READY
 
 ## 14. The floating-point unit
 
+The formats, rounding, operations and exceptions are specified on their own in [`REAL.md`](REAL.md), the real27/real81 standard, with its conformance vectors; this section gives the FPU that implements them.
+
 The i386 needed a separate 387 coprocessor; the 486DX built it in, and so does this machine. The FPU is part of the CPU and of this ISA, not an option: `CPUID` trit 1 is always +1. It owns the third of the opcode space whose first trit is −.
 
 ### 14.1 Formats
@@ -843,7 +845,7 @@ A floating-point value is **m · 3^E**, with E an integer and m a balanced fract
 | **IX** inexact | the result was rounded | the rounded result |
 
 - **NaN in, NaN out:** an operation with a NaN operand returns that NaN (the first one if both are) and raises nothing. Comparisons with NaN are *unordered*.
-- **An unmasked exception traps** to **vector −11 (floating-point exception)** before anything is written. EPC holds the instruction, the flag is set, and FCAUSE[1:9] holds the exception (1 IV, 2 DZ, 3 OF, 4 UF, 5 IX).
+- **An unmasked exception traps** to **vector −11 (floating-point exception)** before anything is written. EPC holds the instruction, the flag is set, and FCAUSE[1:18] holds the exception (1 IV, 2 DZ, 3 OF, 4 UF, 5 IX; the field a system call's number uses).
 
 ### 14.5 Encoding
 
@@ -890,11 +892,11 @@ FPU majors have `A[1] = −`. Then `A[2]` sets the length: 0 means 1 word, + mea
 | 6 | `FSCL fd, fa, rb` | fa · 3^rb (exact unless it overflows or underflows) |
 | 7 | `FMFS rd` | rd := FSR |
 | 8 | `FMTS ra` | FSR := ra (reserved trits ignored) |
-| 9 | `FCLASS rd, fa` | 0 zero, ±1 subnormal, ±2 normal, ±3 infinite, 4 NaN (signed like the value) |
+| 9 | `FCLASS rd, fa` | 0 zero, ±1 subnormal, ±2 normal, ±3 infinite (signed like the value), 4 NaN |
 | 10 | `FCONST fd, k` | a constant, k in the ra field: 0 zero, 1 one, 2 π, 3 e, 4 ln 3, 5 log₃ e, 6 log₃ 10 (each correctly rounded) |
 | 11 | `FMOV fd, fa` | fd := fa (a NaN keeps its payload) |
 
-**Assembler forms:** the mnemonic with operands in field order, e.g. `FADD f1, f2, f3`, `FLDD f4, 0(r13)` (a `q3` offset in units of the access size), `FLDD f4, 12(r2)` (2-word, tryte offset), `FLI f1, 2.5`, `FCONST f2, pi`. Directives: `.real27 x` emits a word, and `.real81 x` emits three, with x written as a decimal or base-27 number.
+**Assembler forms:** the mnemonic with operands in field order, e.g. `fadd f1, f2, f3`, `fldd f4, [r13]`, `fldd f4, [r2+12]` (the offset always in trytes; the assembler picks `FMEM` or `FMEMD`), `fli f1, 2.5`, `fconst f2, pi`. Directives: `.real27 x` emits a word, and `.real81 x` emits three, with x written as a decimal or base-27 number.
 
 **Trine:** the type `real` is a real81 (§ LANGUAGE.md).
 

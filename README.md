@@ -31,6 +31,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/CPU.md`](docs/CPU.md): **the CPU manual**: registers, every instruction, the MMU, traps, devices and ports, the assembler, the ABI
 - [`docs/TRINUX.md`](docs/TRINUX.md): **the Trinux manual**: the shell, every command, files, processes, signals, the window system, networking, system calls and libraries
 - [`docs/TRINE.md`](docs/TRINE.md): **the Trine manual**: a tutorial and the complete language reference, builtins, the standard library, the compilers and their optimization levels
+- [`docs/REAL.md`](docs/REAL.md): the real27/real81 floating-point standard, with its conformance vectors
 - [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the normative ISA specification (v0.7: integer, floating-point and vector instructions)
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the compact language reference
