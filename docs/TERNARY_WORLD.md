@@ -175,7 +175,7 @@ Cryptography is the one layer where "design our own" is dangerous: a cipher is t
 | --- | --- | --- | --- |
 | Border crypto | SHA-2, ChaCha20-Poly1305, AES-GCM, X25519, Ed25519, ECDSA, RSA, on the ISA v0.6 binary operations | Talks to the real internet today | Done |
 | Random numbers | `TRNG` device and `/dev/urandom`; converting bits to trits by rejection (8 bits below 243 give 5 trits) | Unbiased trits, which naive bits mod 3 is not | Partial |
-| Post-quantum public key | Lattice schemes whose secrets are small balanced numbers: NTRU uses exactly −1, 0, +1; ML-KEM and ML-DSA use small coefficients around 0. ML-KEM comes first; NTRU follows | Standard algorithms, and the native number format fits them | Planned |
+| Post-quantum public key | Lattice schemes whose secrets are small balanced numbers: NTRU uses exactly −1, 0, +1; ML-KEM and ML-DSA use small coefficients around 0. ML-KEM comes first; NTRU follows. **ML-KEM-768 done** (2026-10-09): `mlkem768x25519-sha256` in `ssh`/`sshd`, checked against OpenSSH and OpenSSL ([`TNET.md`](TNET.md) §6) | Standard algorithms, and the native number format fits them | ML-KEM done; NTRU next |
 | Symmetric cipher | A design over trits: add mod 3^27, trit rotations, `TMUL` and consensus as the non-linear layer. Research only, never for real secrets | No binary operations inside the ternary world | Research |
 | Hash | A sponge over trits | IOTA's ternary hash Curl-P was broken in 2017, a warning that a new design needs public review; research only | Research |
 

@@ -1,0 +1,185 @@
+// sha3.tri: SHA3-256, SHA3-512, SHAKE128 and SHAKE256 (FIPS 202) on octets
+// (one per tryte), for ML-KEM (mlkem.tri).
+//
+// Keccak-f[1600] works on 25 lanes of 64 bits. A lane does not fit a
+// 27-trit word, so each is a pair of 32-bit halves, as SHA-512's words
+// are (sha2.tri); rotations are exact divisions by powers of 2.
+
+import "bin32.tri";
+
+var _krc_hi: [24]int = {
+    0, 0, 2147483648, 2147483648, 0, 0, 2147483648, 2147483648, 0, 0, 0, 0,
+    0, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 0, 2147483648, 2147483648, 2147483648, 0, 2147483648
+};
+var _krc_lo: [24]int = {
+    1, 32898, 32906, 2147516416, 32907, 2147483649, 2147516545, 32777, 138, 136, 2147516425, 2147483658,
+    2147516555, 139, 32905, 32771, 32770, 128, 32778, 2147483658, 2147516545, 32896, 2147483649, 2147516424
+};
+// rotation of lane x + 5y (ρ)
+var _krot: [25]int = { 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
+
+struct keccak {
+    hi: [25]int;
+    lo: [25]int;
+    rate: int;                          // octets: 136, 72, 168
+    pad: int;                           // 6 for SHA-3, 31 for SHAKE
+    pos: int;                           // octets absorbed (or squeezed) in this block
+    squeezing: int;
+}
+
+var _krh: int;
+var _krl: int;
+
+// (hi, lo) rotated left by n (0..63), into (_krh, _krl).
+fn _krotl(hi: int, lo: int, n: int) {
+    if (n >= 32) {
+        var t: int = hi;
+        hi = lo;
+        lo = t;
+        n -= 32;
+    }
+    if (n == 0) { _krh = hi; _krl = lo; return; }
+    var p: int = _pow2[32 - n];         // rotating left by n is right by 32 - n in each half's split
+    var q: int = _pow2[n];
+    _krh = hi % p * q + lo / p;
+    _krl = lo % p * q + hi / p;
+}
+
+var _kbh: [25]int;
+var _kbl: [25]int;
+var _kch: [5]int;
+var _kcl: [5]int;
+
+fn keccak_f(c: *keccak) {
+    var round: int = 0;
+    while (round < 24) {
+        // θ
+        var x: int = 0;
+        while (x < 5) {
+            _kch[x] = bxor(bxor(bxor(c.hi[x], c.hi[x + 5]), bxor(c.hi[x + 10], c.hi[x + 15])), c.hi[x + 20]);
+            _kcl[x] = bxor(bxor(bxor(c.lo[x], c.lo[x + 5]), bxor(c.lo[x + 10], c.lo[x + 15])), c.lo[x + 20]);
+            x += 1;
+        }
+        x = 0;
+        while (x < 5) {
+            _krotl(_kch[(x + 1) % 5], _kcl[(x + 1) % 5], 1);
+            var dh: int = bxor(_kch[(x + 4) % 5], _krh);
+            var dl: int = bxor(_kcl[(x + 4) % 5], _krl);
+            var y: int = 0;
+            while (y < 25) {
+                c.hi[x + y] = bxor(c.hi[x + y], dh);
+                c.lo[x + y] = bxor(c.lo[x + y], dl);
+                y += 5;
+            }
+            x += 1;
+        }
+        // ρ and π: B[y, 2x + 3y] = rot(A[x, y])
+        var i: int = 0;
+        while (i < 25) {
+            var ax: int = i % 5;
+            var ay: int = i / 5;
+            _krotl(c.hi[i], c.lo[i], _krot[i]);
+            var j: int = ay + 5 * ((2 * ax + 3 * ay) % 5);
+            _kbh[j] = _krh;
+            _kbl[j] = _krl;
+            i += 1;
+        }
+        // χ
+        var yy: int = 0;
+        while (yy < 25) {
+            x = 0;
+            while (x < 5) {
+                var b1: int = yy + (x + 1) % 5;
+                var b2: int = yy + (x + 2) % 5;
+                c.hi[yy + x] = bxor(_kbh[yy + x], bandn(_kbh[b2], _kbh[b1]));
+                c.lo[yy + x] = bxor(_kbl[yy + x], bandn(_kbl[b2], _kbl[b1]));
+                x += 1;
+            }
+            yy += 5;
+        }
+        // ι
+        c.hi[0] = bxor(c.hi[0], _krc_hi[round]);
+        c.lo[0] = bxor(c.lo[0], _krc_lo[round]);
+        round += 1;
+    }
+}
+
+fn keccak_init(c: *keccak, rate: int, pad: int) {
+    bin32_init();
+    var k: int = 0;
+    while (k < 25) { c.hi[k] = 0; c.lo[k] = 0; k += 1; }
+    c.rate = rate;
+    c.pad = pad;
+    c.pos = 0;
+    c.squeezing = 0;
+}
+
+// XOR octet v into position at of the state (lanes little-endian).
+fn _kxor(c: *keccak, at: int, v: int) {
+    var lane: int = at / 8;
+    var b: int = at % 8;
+    if (b < 4) { c.lo[lane] = bxor(c.lo[lane], v * _pow2[8 * b]); }
+    else { c.hi[lane] = bxor(c.hi[lane], v * _pow2[8 * (b - 4)]); }
+}
+
+fn _kget(c: *keccak, at: int) -> int {
+    var lane: int = at / 8;
+    var b: int = at % 8;
+    if (b < 4) { return c.lo[lane] / _pow2[8 * b] % 256; }
+    return c.hi[lane] / _pow2[8 * (b - 4)] % 256;
+}
+
+fn keccak_absorb(c: *keccak, p: *tryte, n: int) {
+    var k: int = 0;
+    while (k < n) {
+        _kxor(c, c.pos, p[k]);
+        c.pos += 1;
+        if (c.pos == c.rate) { keccak_f(c); c.pos = 0; }
+        k += 1;
+    }
+}
+
+fn keccak_squeeze(c: *keccak, out: *tryte, n: int) {
+    if (!c.squeezing) {
+        _kxor(c, c.pos, c.pad);
+        _kxor(c, c.rate - 1, 128);
+        keccak_f(c);
+        c.pos = 0;
+        c.squeezing = 1;
+    }
+    var k: int = 0;
+    while (k < n) {
+        if (c.pos == c.rate) { keccak_f(c); c.pos = 0; }
+        out[k] = _kget(c, c.pos) as tryte;
+        c.pos += 1;
+        k += 1;
+    }
+}
+
+fn sha3_256(p: *tryte, n: int, out: *tryte) {
+    var c: keccak;
+    keccak_init(&c, 136, 6);
+    keccak_absorb(&c, p, n);
+    keccak_squeeze(&c, out, 32);
+}
+
+fn sha3_512(p: *tryte, n: int, out: *tryte) {
+    var c: keccak;
+    keccak_init(&c, 72, 6);
+    keccak_absorb(&c, p, n);
+    keccak_squeeze(&c, out, 64);
+}
+
+fn shake128(p: *tryte, n: int, out: *tryte, len: int) {
+    var c: keccak;
+    keccak_init(&c, 168, 31);
+    keccak_absorb(&c, p, n);
+    keccak_squeeze(&c, out, len);
+}
+
+fn shake256(p: *tryte, n: int, out: *tryte, len: int) {
+    var c: keccak;
+    keccak_init(&c, 136, 31);
+    keccak_absorb(&c, p, n);
+    keccak_squeeze(&c, out, len);
+}

@@ -1,0 +1,210 @@
+// /bin/pqtest: SHA-3, SHAKE and ML-KEM-768 against vectors from Python's
+// hashlib and tools/mlkem.py (itself checked against OpenSSL by
+// tools/check_mlkem.py), one line per check, with the time each took.
+
+import "../lib/tlibc.tri";
+import "../lib/sha3.tri";
+import "../lib/mlkem.tri";
+
+var failures: int;
+var t0: int;
+
+fn ms() -> int {
+    var ts: timespec;
+    clock_gettime(1, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+fn ok(what: *char, cond: int) {
+    puts("pqtest: ");
+    puts(what);
+    puts(cond ? " ok" : " FAILED");
+    puts(" (");
+    put_int(ms() - t0);
+    puts(" ms)\n");
+    if (!cond) { failures += 1; }
+    t0 = ms();
+}
+
+fn hexdigit(v: int) -> char { return (v < 10 ? '0' + v : 'a' + v - 10) as char; }
+
+// Do n octets at p print as the hex string s?
+fn is_hex(p: *tryte, n: int, s: *char) -> int {
+    var k: int = 0;
+    while (k < n) {
+        if (s[2 * k] != hexdigit(p[k] / 16) || s[2 * k + 1] != hexdigit(p[k] % 16)) { return 0; }
+        k += 1;
+    }
+    return s[2 * n] == 0;
+}
+
+fn msg(p: *tryte, n: int, seed: int) {
+    var k: int = 0;
+    while (k < n) { p[k] = ((k * 7 + seed) % 256) as tryte; k += 1; }
+}
+
+// ---- vectors (tools/gen_pqvectors.py) ----
+var sha3_lens: [13]int = { 0, 1, 3, 71, 72, 73, 135, 136, 137, 167, 168, 169, 300 };
+var sha3_256_want: [13]*char = {
+    "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+    "e3ed56bd086d8958483a12734fa0ae7f5c8bb160ef9092c67e82ed9b19e4c7b2",
+    "fffadd0ae913c0947143ac7c6bf1d512c1b265db8ac52100614bd022ae2412d4",
+    "254f2ac1df8eae4233c0c2fe74a03331b856518800936943cdbe57d7d224f224",
+    "f4bb95e698a2c13bd27f089f3762076daa40b629dc5d7ec53dbe163fca4a4bf3",
+    "c610c3522f9423c2c706b1e26e532b121b67eb06c897d478ac6bb80ddbc8ae1f",
+    "d9dcf1f98e49a79b0643a9e68fef48079ff8777c5e7e7f93469ded65f192ac71",
+    "743bd32e775ac7387a57d4d574c89ddef5ebcb08bb5cc6b88c55a27b5035cc45",
+    "01d47e8d6dce6e3dcbf1baa6f845b6ace4ef74bd17da8176ecc49bc35dbe5d21",
+    "684bf83317ea400f033de352516c168261086092de3a12b6478a20f870a18096",
+    "a5a267be792383677005e1628c1c16a64e0c4e2c9ce096287d389c58706a86d1",
+    "f7a2c4983e6cf26809daea869b625a0748da650270acad5d223be730bb700954",
+    "064af3405aacb53d5d77ee858fec1e6e225480de3f14f06444e2b33d92d61879",
+};
+var sha3_512_want: [13]*char = {
+    "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26",
+    "a63f9712aadceb0fe16f1881719a802294830fa1f7a0e58ff26a45a814309961c5007f43f4e224a82d3f538a6c8af7d87ec71fb6661bfac0dc0cd9367ddb04ce",
+    "f43b92b1b4647bb487400472178d83c784a8e4cee5a4d95e6aa4931b21cc2f7c5653fc4ce0130914c57aa8cde0516eb8e2d0015cbda1e4d4261e007b1db11411",
+    "a02d5795bffd44cb0ac3cc3401ae89056b8017242eaf7e802033e974672ce7945811760c3b0d9578bc51bf90c364636ac87cda9b4f3e45620ea9c030421e9d86",
+    "2ec0da5ff440c192d33033c4257eb39dcbd27edd7e41b5ac8db9daf13db501a2ef938151aaddd82f600335654f77512cbcc926ec5abb05b79282ec716d685618",
+    "d26d1f9fc91b1d6c31405cc4a546f246fa7777f698d956c26a15170bccdd696aab3ee2e0597ee6f33bc7ac0336b1e4bfa0cc4355ab9faf8111cf27312640fd65",
+    "9e9d81e346cf9a62dc4bda518e4096db553188368da1535eaa441982b98d399c0c8f0136f987886b94d1770387e07b276660317ccb66884cc7427550b7780cd4",
+    "62c81b78426786e5a5d431082d98857c7e6b1988fd721478386233be5c19731cea3944dc24e192fb976e422d8bd31524c35026e615ab54c31a58ab772abfe6d7",
+    "3fd9dc45a7cdc291153d7b714ad68d824184c4166d2c980d41d5eaf9266e03892f965346361f62cb34404cfea6ea165dcdd8c34be99abdc9c500a1fedc315402",
+    "f630f6e4fb09197b8d2503268c3fa8c5e637d7c991b7ee79d7e12ba5cc6e53f27f62f643df5fd6d254f515bcbe687b6ab9e442ffbad82288f026d6cf0645ffc6",
+    "460d5cc545a8c466031bb9002635167603da38b2496544508b5af2f123c33feb690a5b4c442ed89191687f0f1b9dddc7ff343f148f306f85c68e1ce3c8a68b8c",
+    "6168dfb98a5dc4257914b2af383012d4202cbcd77afa316c62e5495b394496bd2ff411fab81c081d8f41de1c7e0273fbb3cf9a38d0892235ac60e5090c4d5904",
+    "f85b76d4d2c98f6ec82f06651127d19643e2b1117420b700c42a8cdd55379152ca391df72e30886e70beb58cf28c05ae6bdb1197a91542e57fac331233246b93",
+};
+var shake128_want: [13]*char = {
+    "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef263cb1eea988004b93103cfb0aeefd2a686e01fa4a58e8a3639ca8a1e3f9ae57e235b8cc873c23dc62b8d260169afa2f75ab916a58d974918835d25e6a435085b2badfd6dfaac359a5efbb7bcc4b59d538df9a04302e10c8bc1cbf1a0b3a5120ea17cda7cfad765f5623474d368ccca8af0007cd9f5e4c849f167a580b14aabdefaee7eef47cb0fca9767be1fda69419dfb927e9df07348b196691abaeb580b32def58538b8d23f877",
+    "776915233d1e79097718e09db209efa466affa24d35c78e7a1f80cf4ebb6c28b25dfeba0eb3e63446a1a78662446cccd4e6f9ed823d621b05686c4dac5c954af2de5932764cafa0fa657bb5efc05efc762979d169457ab98988fd71af6d4a5e36a45a9aa0c39c0bf7127783416d88c49e1b28b8f4fb10d2fd8edacb64a84110cf0568c8ae4539013b7b12ba99b3eb64cb0fab0e11cdcc79a250bd2dc4cef459211e0a310952945a84bcfc0449d0b9af72144571c91c1a82ffcdf31a2d77b297e4f4e35b219b42767",
+    "cf0bd6b206ac4e35ebd4ccce5e014b95dfe78ae19e5cadcc89c725dea6998ae64b55fa061151576aae1f7a2bf6912a3ae98139c06437fa18258f30f6a4fee385665d50d1de3450d3d605fcb55a378f380d77fbd5881ff64f69627c5b63be87e349256d328de868f13f7f1cb2391c62e46849010117f31b40d4163dbf6a9c8a6f0d1b6ec42add675dffa2fad655b6c9555ae0e986c662c847b22d57b789fa35c6297340e9641dfc63e9e13b7df097b4fe1c27974c12105b0a2bc06a323e201c30d0035feb8e963ecd",
+    "4a7cb3f7fb0004e031fb6317d81da96993227b8e514f19a7e037e7541e5b15112a75a51c337e1143b2fb3273bbdc2ea686292b8648f96a769309abc759a0f7eb7d2cfed4025337f168cfb91072c020d96da7c497b14619712a0a127e07ba756fcf4c490c2bfb57992beae6493773c85fa327ceef850f12464a40f0e4b70046baac4a993484d520c1e3b92b881c538c04c641d5312b088aafe85d75ae7c4acd9d49059a3baea6f5bac8e4a117426930fbcfaaf918a62376809c4cd3564396785ac86a3f198a1f9153",
+    "4bbb1d27936a26de9c41ef1a7014be106ab9ad8f10dd68e8d693d00dbdb89f2b0b68b058fc5ff5b5cf1dd3ddb3e77bbebbca2496fc178ccc0e588d61cb2ec71e0609d59a0fca637a2722ad5cc21f06e8163c7ea97f60a6f3c66f8dd639539b887e8e2901c6036d6ea7a2afea98c7e463f415ca8ad82ca1c079cc26d3b633b31d97cff229249856da952aa0fba6ba78ef4fa3f07fdf7c202c5896190548498513f3b733311a268b447b741a550bbe3bf618e9c5225f29b5037084a5f2c5122e7a96d4fd7f0e9ffe27",
+    "d639407b276ee21fdcefe0e178d35b4901e19a0283879943e085d3a05c38f7575320f2341242d16712ffa209a8c637dd0ff1db630ec0905828dfbdab5180c2e58c88bfec93d6e586493132b96948ef336619956160b995892139ddae53bd80efcc35a822b079e7c38f51ae922e4d0726359cd98f35f13f216d2cae7b464d22137f30463e2d4138e0d69c7341a0bec6ea43744c5651e7003b86f44b68f83376dcbb5ba8ff1dce1d842c36a00f3fc50c8c470788261e5089010c6e3e5bb22625f2535ffda88b792557",
+    "c46af4f9a43a25a3f21d90f6a131ff3ed6944306e8c29a7c03f7e237e42c7e0cb50cb0717fe22ddf27084123f4b2baade0ebf44ce3c889729bee7ecfa0dbd959e020966e62c56caf2185db5243f246cf1b816868f986f3a23dea37051d94bca7a4a7b0464e641e799f703b979de98815921eb5bedc13e10c49049123033d97c1ae2398a462b63aaf4b38d2de3f2a25dd5a122dc2142cba1f6c7529a53f3eff73c0cb56031964f76f933d49dbf28cc82040ec86278d71a3ef3e6b37092587bb9576847c1e30d4e780",
+    "c9b065cf999862c0c15d02ffa9450e5bf9b57d8457e3a366700de35043f450b4824f8f71f320454fb83ead19fd35ca85995f35c3ac30389bc89348b91a02b3e6ed61b955b8a3a4f5444cdbb8563b04c340b94766e67831415bbb944dc9c09e4066fdeb41249ff1edd0b11327b9099fb524c433e7eece752b4a2b61336992cdc0888e9540567c3a1029b994d5985fdb8bade8d88c91ead9f0f3ebf4257858404dc7c358f11a2b24e951e1c18775e035ecaa6fe1ae4b22070ec2623ec7dcbba8ec83a33979af730713",
+    "4bd0a672017e58746a1d4c98e2474ce03edf72679bb40f9613070cff215ae1b7705d52cedab54f9f9085f9b16e826f9cb9581214bedba2baad96ff19160e0b42fcbb859e975cd9ef0d1b6934748b1880f15d53405cf838c3769af896c7b5ccf086cf0c2b0fe3b3789062a1ee0622d5382bb5e986903cb543fd0a290d155416bbf5a05cfa864487b832c781ed065d12f769fcc8a22ac67ba7f9a3b3f9e918384fa3376d6a28030db29752849b30ed5ef1c250797b22bfefb8958517bb01031482527a5bcca57bd3c0",
+    "bb961bb015521037905f9baf69ce60dd3ba73f6ead09a559c8d8a85e10753bca9a8a96b773b3dbae9936a462fac0abc1f2ef7559fbf82259220bab5778f2e6c68d49ef47d8e3de56a4e34a11569be00703fd116b5a9de52e96445028dc53422af0218260c316038a75a385b4aa1c266fe10f07d0e8b5cecebf96da2625768eee27bdbbe34f04c035b85c7589a1082a03deff3ee8679eda21a8abb8644890c95b7019249d5afe845862000fccdf47599721b7b6b518fb339613241cb66f0a3caf1254d9c082c432a1",
+    "d4f73f3b6c4b72d05f45ed1f80b5774409f9cf336fc202bffa42ac38a6d3fbee3d8bdcebc4fbd562270c9d829abb2fd1e0900e3d5e634d4a00d90cb3479128f21f380a7702704e0b74259af6cb5aea9c58c191792f847c801e4a282d2d3f37fd2bd9d4167854d54ae5bdf88a79ea0d15271a4d5dccd1b1572631d1077184a97fef7589e2f8cf6b75b503429287ec4a009f4e2476140ec81b67a033366f10294be1e2a8ecef7a52c1b11bd950157da4015f798dd682d12dcf9a15429f59f8157a224225da82355b65",
+    "30454dd0f630ab1bb8fada554060d54012efdbb8e782d013f83a16af1282ca8158bbd3cd16300be2c0433a1e7da75f049b033913c5a74ce6c648b1b25dbc72fc1cb715e0ccd4622617572cb4fde7636a4b1f72f9477d35addc18119ab656a552c8a30d20fe574794a7581b21e6bd6c095afd6ac5c1022fc3c6b70f0b8c01c227e6f44dd1ed119efaae5319676b7ce0356defe665ff228577b0e35a44e4536919b163c2784010bd09dc3d4efc576d9ce770a0387b7b9177ac6e82f4621b2ef2ebc0ab70e9acd6d6a0",
+    "e1fe170edec7f0d2283385445abd2568cda326428ff81c2a0aad59d2e25e5088ceec9655e15cde1d5ad914565e11b6020c7849fb6c2eaf62322e281c0d8d40ec85b2102953c841e4f0a8394be580b0db99f5019ee5e7ab29b1abadfb5baba8ad1aacf763d2cf5dd28b587fb4e4d817e997e5874f8166ac273007f8d4838ee52d28485b4dd039c9a95d0b84c4ce51c8fabc9c1bcc42cdb9a18932896d4eb76c8e08a31db2e2cd4b2d7152a5cf93f2f6d00813793fbabdfee8dc2f1ef3ff3bd99f88a11dffb8a3c5ea",
+};
+var shake256_want: [13]*char = {
+    "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762fd75dc4ddd8c0f200cb05019d67b592f6fc821c49479ab48640292eacb3b7c4be",
+    "db4252337900d8ab7f609d170135d459a6798945d5a574d4a9db7b623c754d078fb2239762994969a1f372801817bb304f5b549a6bb5cb7c69950c5f439caf19",
+    "43a0b197b976835b9874524272a43a8ecbf2891579772b66e9c32f767014a6d00b03c51dfb29e7799dc45dcce3b7bbf5e0bb3e5a986eb99f4af45599894ba90f",
+    "c5492c4e150f073fa316ab32f6752abf52914ee2a4207f09e35586b7205948df80ce444e94a78fb65907e0a741c2b1a6d1ab798de0b1afad83a9bee1b8c8f76e",
+    "f4771493e402a8aa4fc0251ee80b3f142481417b3dd942dcf72d96e26f75ad6a08db744812ddc576111fe99dc5bda94fa058af1cb5991da49bef07a4c5522ff7",
+    "8bae34cf4fcbba9c49fd2245431d94598e5596243104c0ec61ea3000cec0720882b8072183b1e65b2222cddca59757eabc6313d1d7a73bc110e4a5cee0106e9f",
+    "0213fc98352f009fafdf8ee1ea36391485a85aa6f6c07a5cd81266d21eb17f9af3e3a6aa4a5e03793be3a4da4ba01c438b689164fc6bebb290eb372bfecd569d",
+    "c00f43811e5b4a38e14e3c06d8a5ce34115a19cd604ce5bac6c3823b76046d5c6b149f173bef3089dbfe66774f9723bc344ecbaa7e9674df4ceb8558811423c5",
+    "3c983983487bcbe74feba53b35bb1e05812379cb4116d9761f78d2ce3177866edc88e750bfaf43bd31ccd052078d97406fbfca21145c09c8d9bd1e81cd443e31",
+    "89a2450c9785e8a01d1baca6b7023479d3a0de33c757a9a584ec84714894c3b774b2960a6ae3a2f5f6e277b9b01f5b1a3ec0499d93b7d76d0b856e0d53fc1ad0",
+    "8e824d0df5f99be40bd0c4ee530e2b409a7c7713aba1ee96c56fb7f35729504e05dc6f8adb84b7e89d9b7de9c8e87f491c4c35e7d16173e4a986d26992d9c196",
+    "e76eaecce9983b4be8a8b9cd8b5a457e9b6995449ad142af68a83a0e171e52bb638feadda7d5732e1596f07e6a05e58b8668c23733ebf58ae88f783f6bbef4eb",
+    "685d9873233fd4c7ce4bb15d7b947c9841f0e5cc18847a4ef07769ccb13022be75ab878b1c49a037276714755b87c8e553c98b24721f93b444598fb0d5826391",
+};
+var mlkem_cases: [16]*char = {
+    "11", "41", "71", "e5a86d2164b46374361d03cdb4e7df787084a71aa6c7bbc0c6524e8a9e69e55b",
+    "ef4d82935741bc9e10ed3319960fdd434176cfbbb7055bde88e5f8b106fc1651", "07625c3768bc9ef5b91b50215c1f9aac72cf82d309e48dea38915c9a7adee6ee",
+    "19fd49488d6cc1b3433fddc74c616cee6b4d5e357a1e77bd477d8604afa9849c", "a20bacadbc9c7d3d46f7881e257e59f71e51fdd80a3cfd99770cff845b3c44d9",
+    "12", "42", "72", "cc0d5b8326816e14ac38f6782c338d84d33f46a3944b20fb7a74d171ed646ce8",
+    "07651a40cd5367192fa651819c6599d8939f6856c050d3ababf20841c2269d11", "654f41a315e6386e436d86f908c93236720362008c3137ee047aee67400cd495",
+    "5c4a6f830f25f93ed6cfa90e4d9c0b79679c5f459eb94dc7de21a7702f623f8a", "94b5553860f59c46797022d0d1181c3bcb3525604d50cec22c671385143c5b97",
+};
+// ---- end of vectors ----
+
+
+var m: [300]tryte;
+var dgst: [200]tryte;
+var d: [32]tryte;
+var z: [32]tryte;
+var mm: [32]tryte;
+var ek: [1184]tryte;
+var dk: [2400]tryte;
+var ct: [1088]tryte;
+var key: [32]tryte;
+var key2: [32]tryte;
+var hh: [32]tryte;
+
+fn main(argc: int, argv: **char) -> int {
+    t0 = ms();
+    var all: int = 1;
+    var i: int = 0;
+    while (i < 13) {
+        msg(&m[0], sha3_lens[i], 3);
+        sha3_256(&m[0], sha3_lens[i], &dgst[0]);
+        if (!is_hex(&dgst[0], 32, sha3_256_want[i])) { all = 0; }
+        i += 1;
+    }
+    ok("SHA3-256 at every block edge", all);
+    all = 1;
+    i = 0;
+    while (i < 13) {
+        msg(&m[0], sha3_lens[i], 3);
+        sha3_512(&m[0], sha3_lens[i], &dgst[0]);
+        if (!is_hex(&dgst[0], 64, sha3_512_want[i])) { all = 0; }
+        i += 1;
+    }
+    ok("SHA3-512 at every block edge", all);
+    all = 1;
+    i = 0;
+    while (i < 13) {
+        msg(&m[0], sha3_lens[i], 3);
+        shake128(&m[0], sha3_lens[i], &dgst[0], 200);
+        if (!is_hex(&dgst[0], 200, shake128_want[i])) { all = 0; }
+        i += 1;
+    }
+    ok("SHAKE128, 200 octets out (two blocks)", all);
+    all = 1;
+    i = 0;
+    while (i < 13) {
+        msg(&m[0], sha3_lens[i], 3);
+        shake256(&m[0], sha3_lens[i], &dgst[0], 64);
+        if (!is_hex(&dgst[0], 64, shake256_want[i])) { all = 0; }
+        i += 1;
+    }
+    ok("SHAKE256", all);
+    var c: int = 0;
+    while (c < 2) {
+        var row: **char = &mlkem_cases[8 * c];
+        msg(&d[0], 32, atoi(row[0]));
+        msg(&z[0], 32, atoi(row[1]));
+        msg(&mm[0], 32, atoi(row[2]));
+        mlkem_keygen(&d[0], &z[0], &ek[0], &dk[0]);
+        sha3_256(&ek[0], 1184, &hh[0]);
+        var good: int = is_hex(&hh[0], 32, row[3]);
+        sha3_256(&dk[0], 2400, &hh[0]);
+        ok("ML-KEM-768 key generation from (d, z)", good && is_hex(&hh[0], 32, row[4]));
+        mlkem_encaps(&ek[0], &mm[0], &key[0], &ct[0]);
+        sha3_256(&ct[0], 1088, &hh[0]);
+        ok("ML-KEM-768 encapsulation", is_hex(&hh[0], 32, row[5]) && is_hex(&key[0], 32, row[6]));
+        mlkem_decaps(&dk[0], &ct[0], &key2[0]);
+        ok("ML-KEM-768 decapsulation gives the same key", is_hex(&key2[0], 32, row[6]));
+        ct[100] = (ct[100] / 8 * 8 + (ct[100] % 8 + 4) % 8) as tryte;     // flip bit 2
+        mlkem_decaps(&dk[0], &ct[0], &key2[0]);
+        ok("ML-KEM-768 rejects a changed ciphertext (implicitly)", is_hex(&key2[0], 32, row[7]));
+        c += 1;
+    }
+    // the encapsulation-key check (FIPS 203 §7.2): a 12-bit value of q or more
+    var good: int = mlkem_ek_ok(&ek[0]);
+    ek[0] = 1;                                  // first value: 3329 = 0x0d01
+    ek[1] = (ek[1] / 16 * 16 + 13) as tryte;
+    var bad1: int = mlkem_ek_ok(&ek[0]);
+    ek[0] = 255;                                // 4095
+    ek[1] = (ek[1] / 16 * 16 + 15) as tryte;
+    var bad2: int = mlkem_ek_ok(&ek[0]);
+    ek[0] = 0;                                  // 3328 = 0xd00
+    ek[1] = (ek[1] / 16 * 16 + 13) as tryte;
+    ek[0] = 0;
+    var edge: int = mlkem_ek_ok(&ek[0]);
+    ok("ML-KEM-768 encapsulation key check: q and above refused, q - 1 taken", good && !bad1 && !bad2 && edge);
+    ek[0] = 0;
+    ek[1] = (ek[1] / 16 * 16 + 13) as tryte;
+    ek[1150] = 255;                             // the last value, in the high 12 bits of its 3 octets
+    ek[1151] = 255;
+    ok("ML-KEM-768 encapsulation key check reaches the last value", !mlkem_ek_ok(&ek[0]));
+    puts(failures == 0 ? "pqtest: all passed\n" : "pqtest: some checks FAILED\n");
+    return failures != 0;
+}

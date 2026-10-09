@@ -343,6 +343,7 @@ fn gate_c_ssh_between_setun_machines() {
     assert!(out.contains("Trinux setun 0.1 #8 K8 balanced ternary setun11̅"), "{out}");
     let log = p.b("cat /var/log/sshd.log");
     assert!(log.contains("connection from 0.0.1\n"), "sshd saw a TNET peer: {log}");
+    assert!(log.contains("key exchange mlkem768x25519-sha256\n"), "post-quantum between the two: {log}");
     let known = p.a("cat /root/.ssh/known_hosts");
     assert!(known.contains("0.0.2 ssh-ed25519 "), "{known}");
     // the wire carried only TL frames with good checks, TNP inside

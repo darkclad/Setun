@@ -1,6 +1,6 @@
 # TNET: the native ternary network
 
-**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. The post-quantum key exchanges (C4, C5) are next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
+**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. C4 too: `ssh` makes a post-quantum key exchange (ML-KEM-768 with X25519), with OpenSSH and between Setun machines. sntrup761 (C5) is next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
 
 | Layer | Name | Section | Milestone |
 |---|---|---|---|
@@ -9,7 +9,7 @@
 | network | TNP: 27-trit host addresses | §3 | C2 ✅ |
 | transport | TSP streams, TDP datagrams | §4 | C2 ✅ |
 | sockets | `AF_TNP` beside `AF_INET` | §5 | C2–C3 ✅ |
-| key exchange | ML-KEM-768, then sntrup761, in `ssh` | §6 | C4–C5 |
+| key exchange | ML-KEM-768 ✅, then sntrup761, in `ssh` | §6 | C4 ✅, C5 |
 
 Sizes follow the power-of-3 rule throughout, since none of it has to meet a binary standard.
 
@@ -140,7 +140,14 @@ TSP runs on TCP's state machine (`kernel/net/tcp.tri`): `tcp_segment()` takes a 
 
 ## 6. Post-quantum key exchange
 
-*To be written with milestones C4 and C5.* `ssh` and `sshd` gain `mlkem768x25519-sha256` (ML-KEM-768, FIPS 203, with X25519) and then `sntrup761x25519-sha512` (Streamlined NTRU Prime, whose secrets are exactly −1, 0, +1), both checked against OpenSSH.
+**C4 (built).** `ssh` and `sshd` offer `mlkem768x25519-sha256` first, then `curve25519-sha256`; the client's order decides (RFC 4253 §7.1). The exchange is OpenSSH's: the client sends its ML-KEM-768 encapsulation key (1184 octets) and its X25519 key (32); the server checks the encapsulation key (FIPS 203 §7.2), encapsulates, and returns the ciphertext (1088) and its X25519 key; K = SHA-256(ML-KEM key ‖ X25519 key), encoded as a string. sshd logs which exchange it made.
+
+- `user/lib/sha3.tri`: SHA3-256, SHA3-512, SHAKE128 and SHAKE256 (FIPS 202). Keccak's 64-bit lanes are pairs of 32-bit halves, as SHA-512's words are.
+- `user/lib/mlkem.tri`: ML-KEM-768 (FIPS 203) with plain arithmetic modulo 3329 (no Montgomery tricks; a word holds every product). Each operation takes about a second of emulated time.
+- The reference is `tools/mlkem.py`, written from the standard; `tools/check_mlkem.py` checks it against OpenSSL 3.5 (key generation from the seed, and decapsulation of OpenSSL's ciphertexts), and `tools/gen_pqvectors.py` turns it into the vectors of `/bin/pqtest`.
+- Tests: `/bin/pqtest` (SHA-3 and SHAKE at every block edge, ML-KEM key generation, encapsulation, decapsulation, implicit rejection, the key check); the host's OpenSSH logs in to Trinux's sshd with the hybrid forced, with curve25519 forced, with its own default (it picks the hybrid) and with its order reversed (it gets curve25519); and Gate C's two Setun machines agree on the hybrid over TNET.
+
+**C5 (next):** `sntrup761x25519-sha512` (Streamlined NTRU Prime, whose secrets are exactly −1, 0, +1), also checked against OpenSSH.
 
 ## 7. Conformance
 

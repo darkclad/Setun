@@ -1,0 +1,384 @@
+// mlkem.tri: ML-KEM-768 (FIPS 203) on octets (one per tryte), for ssh's
+// mlkem768x25519-sha256. Polynomials are 256 coefficients modulo
+// q = 3329, small enough for plain words: no Montgomery tricks needed.
+// The reference is tools/mlkem.py, itself checked against OpenSSL.
+//
+//   mlkem_keygen(d, z, ek, dk)    d, z: 32 octets each; ek 1184, dk 2400
+//   mlkem_encaps(ek, m, key, ct)  m: 32 random octets; key 32, ct 1088
+//   mlkem_decaps(dk, ct, key)     key 32 (the implicit rejection key if ct
+//                                 is not one ek's owner would accept)
+
+import "sha3.tri";
+
+const MLKEM_Q: int = 3329;
+const MLKEM_K: int = 3;
+const MLKEM_EK: int = 1184;
+const MLKEM_DK: int = 2400;
+const MLKEM_CT: int = 1088;
+
+var _mlzeta: [128]int;                  // 17^bitrev7(i) mod q
+var _mlgamma: [128]int;                 // 17^(2·bitrev7(i) + 1) mod q
+var _mlready: int;
+
+fn _mlmod(v: int) -> int {
+    var r: int = v % MLKEM_Q;
+    return r < 0 ? r + MLKEM_Q : r;
+}
+
+fn _mlinit() {
+    if (_mlready) { return; }
+    var i: int = 0;
+    while (i < 128) {
+        var br: int = 0;
+        var b: int = 0;
+        while (b < 7) { br = br * 2 + i / _pow2[b] % 2; b += 1; }
+        var z: int = 1;
+        var k: int = 0;
+        while (k < br) { z = z * 17 % MLKEM_Q; k += 1; }
+        _mlzeta[i] = z;
+        _mlgamma[i] = z * z % MLKEM_Q * 17 % MLKEM_Q;
+        i += 1;
+    }
+    _mlready = 1;
+}
+
+// ---- encoding ----
+
+fn _mlencode(f: *int, d: int, out: *tryte) {
+    var acc: int = 0;
+    var nbits: int = 0;
+    var o: int = 0;
+    var i: int = 0;
+    while (i < 256) {
+        acc += f[i] * _pow2[nbits];
+        nbits += d;
+        while (nbits >= 8) {
+            out[o] = (acc % 256) as tryte;
+            acc /= 256;
+            nbits -= 8;
+            o += 1;
+        }
+        i += 1;
+    }
+}
+
+fn _mldecode(b: *tryte, d: int, f: *int) {
+    var acc: int = 0;
+    var nbits: int = 0;
+    var k: int = 0;
+    var i: int = 0;
+    var mask: int = _pow2[d];
+    while (i < 256) {
+        while (nbits < d) {
+            acc += b[k] * _pow2[nbits];
+            nbits += 8;
+            k += 1;
+        }
+        var v: int = acc % mask;
+        f[i] = d == 12 ? v % MLKEM_Q : v;
+        acc /= mask;
+        nbits -= d;
+        i += 1;
+    }
+}
+
+fn _mlcompress(x: int, d: int) -> int { return (x * _pow2[d] + MLKEM_Q / 2) / MLKEM_Q % _pow2[d]; }
+fn _mldecompress(y: int, d: int) -> int { return (y * MLKEM_Q + _pow2[d - 1]) / _pow2[d]; }
+
+// ---- sampling ----
+
+var _mlbuf: [840]tryte;                 // SHAKE output (5 blocks of 168)
+
+fn _mlsample_ntt(rho: *tryte, i: int, j: int, a: *int) {
+    var c: keccak;
+    keccak_init(&c, 168, 31);
+    keccak_absorb(&c, rho, 32);
+    var ij: [2]tryte;
+    ij[0] = i as tryte;
+    ij[1] = j as tryte;
+    keccak_absorb(&c, &ij[0], 2);
+    var n: int = 0;
+    var three: [3]tryte;
+    while (n < 256) {
+        keccak_squeeze(&c, &three[0], 3);
+        var d1: int = three[0] + 256 * (three[1] % 16);
+        var d2: int = three[1] / 16 + 16 * three[2];
+        if (d1 < MLKEM_Q) { a[n] = d1; n += 1; }
+        if (d2 < MLKEM_Q && n < 256) { a[n] = d2; n += 1; }
+    }
+}
+
+// CBD with eta = 2 from PRF(s, b) = SHAKE256(s || b), 128 octets
+fn _mlcbd(s: *tryte, b: int, f: *int) {
+    var c: keccak;
+    keccak_init(&c, 136, 31);
+    keccak_absorb(&c, s, 32);
+    var bb: [1]tryte;
+    bb[0] = b as tryte;
+    keccak_absorb(&c, &bb[0], 1);
+    keccak_squeeze(&c, &_mlbuf[0], 128);
+    var i: int = 0;
+    while (i < 256) {
+        var o: int = _mlbuf[i / 2];
+        var nib: int = i % 2 == 0 ? o % 16 : o / 16;    // 4 bits: x0 x1 y0 y1
+        var x: int = nib % 2 + nib / 2 % 2;
+        var y: int = nib / 4 % 2 + nib / 8;
+        f[i] = _mlmod(x - y);
+        i += 1;
+    }
+}
+
+// ---- NTT ----
+
+fn _mlntt(f: *int) {
+    var i: int = 1;
+    var len: int = 128;
+    while (len >= 2) {
+        var start: int = 0;
+        while (start < 256) {
+            var z: int = _mlzeta[i];
+            i += 1;
+            var j: int = start;
+            while (j < start + len) {
+                var t: int = z * f[j + len] % MLKEM_Q;
+                f[j + len] = _mlmod(f[j] - t);
+                f[j] = (f[j] + t) % MLKEM_Q;
+                j += 1;
+            }
+            start += 2 * len;
+        }
+        len /= 2;
+    }
+}
+
+fn _mlntt_inv(f: *int) {
+    var i: int = 127;
+    var len: int = 2;
+    while (len <= 128) {
+        var start: int = 0;
+        while (start < 256) {
+            var z: int = _mlzeta[i];
+            i -= 1;
+            var j: int = start;
+            while (j < start + len) {
+                var t: int = f[j];
+                f[j] = (t + f[j + len]) % MLKEM_Q;
+                f[j + len] = _mlmod(z * (f[j + len] - t));
+                j += 1;
+            }
+            start += 2 * len;
+        }
+        len *= 2;
+    }
+    var k: int = 0;
+    while (k < 256) { f[k] = f[k] * 3303 % MLKEM_Q; k += 1; }
+}
+
+// h += f · g (in the NTT domain)
+fn _mlmul_acc(f: *int, g: *int, h: *int) {
+    var i: int = 0;
+    while (i < 128) {
+        var a0: int = f[2 * i];
+        var a1: int = f[2 * i + 1];
+        var b0: int = g[2 * i];
+        var b1: int = g[2 * i + 1];
+        h[2 * i] = (h[2 * i] + a0 * b0 + a1 * b1 % MLKEM_Q * _mlgamma[i]) % MLKEM_Q;
+        h[2 * i + 1] = (h[2 * i + 1] + a0 * b1 + a1 * b0) % MLKEM_Q;
+        i += 1;
+    }
+}
+
+fn _mlzero(f: *int) {
+    var k: int = 0;
+    while (k < 256) { f[k] = 0; k += 1; }
+}
+
+// ---- K-PKE ----
+
+var _mlA: [2304]int;                    // the 3 × 3 matrix, NTT domain
+var _mlv1: [768]int;                    // three polynomials
+var _mlv2: [768]int;
+var _mlv3: [768]int;
+var _mlp: [256]int;
+var _mlq: [256]int;
+
+// A[i][j] (transposed: A[j][i]) for seed rho
+fn _mlmatrix(rho: *tryte) {
+    var i: int = 0;
+    while (i < 3) {
+        var j: int = 0;
+        while (j < 3) {
+            _mlsample_ntt(rho, j, i, &_mlA[(3 * i + j) * 256]);
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+fn _mlhash_g(p: *tryte, n: int, out: *tryte) { sha3_512(p, n, out); }
+
+fn _mlpke_keygen(d: *tryte, ek: *tryte, dkp: *tryte) {
+    var in: [33]tryte;
+    var k: int = 0;
+    while (k < 32) { in[k] = d[k]; k += 1; }
+    in[32] = 3;
+    var rs: [64]tryte;
+    _mlhash_g(&in[0], 33, &rs[0]);
+    _mlmatrix(&rs[0]);
+    var i: int = 0;
+    while (i < 3) {
+        _mlcbd(&rs[32], i, &_mlv1[256 * i]);            // s
+        _mlcbd(&rs[32], 3 + i, &_mlv2[256 * i]);        // e
+        i += 1;
+    }
+    i = 0;
+    while (i < 3) {
+        _mlntt(&_mlv1[256 * i]);
+        _mlntt(&_mlv2[256 * i]);
+        i += 1;
+    }
+    i = 0;
+    while (i < 3) {
+        _mlzero(&_mlp[0]);
+        var j: int = 0;
+        while (j < 3) { _mlmul_acc(&_mlA[(3 * i + j) * 256], &_mlv1[256 * j], &_mlp[0]); j += 1; }
+        k = 0;
+        while (k < 256) { _mlp[k] = (_mlp[k] + _mlv2[256 * i + k]) % MLKEM_Q; k += 1; }
+        _mlencode(&_mlp[0], 12, ek + 384 * i);
+        _mlencode(&_mlv1[256 * i], 12, dkp + 384 * i);
+        i += 1;
+    }
+    k = 0;
+    while (k < 32) { ek[1152 + k] = rs[k]; k += 1; }
+}
+
+fn _mlpke_encrypt(ek: *tryte, m: *tryte, r: *tryte, ct: *tryte) {
+    _mlmatrix(ek + 1152);
+    var i: int = 0;
+    while (i < 3) {
+        _mlcbd(r, i, &_mlv1[256 * i]);                  // y
+        _mlcbd(r, 3 + i, &_mlv2[256 * i]);              // e1
+        _mlntt(&_mlv1[256 * i]);
+        i += 1;
+    }
+    // u = NTT^-1(A^T y) + e1, compressed to 10 bits
+    i = 0;
+    while (i < 3) {
+        _mlzero(&_mlp[0]);
+        var j: int = 0;
+        while (j < 3) { _mlmul_acc(&_mlA[(3 * j + i) * 256], &_mlv1[256 * j], &_mlp[0]); j += 1; }
+        _mlntt_inv(&_mlp[0]);
+        var k: int = 0;
+        while (k < 256) { _mlp[k] = _mlcompress((_mlp[k] + _mlv2[256 * i + k]) % MLKEM_Q, 10); k += 1; }
+        _mlencode(&_mlp[0], 10, ct + 320 * i);
+        i += 1;
+    }
+    // v = NTT^-1(t · y) + e2 + Decompress1(m), compressed to 4 bits
+    _mlcbd(r, 6, &_mlq[0]);                             // e2
+    _mlzero(&_mlp[0]);
+    i = 0;
+    while (i < 3) {
+        _mldecode(ek + 384 * i, 12, &_mlv3[256 * i]);
+        _mlmul_acc(&_mlv3[256 * i], &_mlv1[256 * i], &_mlp[0]);
+        i += 1;
+    }
+    _mlntt_inv(&_mlp[0]);
+    var b: int = 0;
+    while (b < 256) {
+        var bit: int = m[b / 8] / _pow2[b % 8] % 2;
+        var v: int = (_mlp[b] + _mlq[b] + bit * 1665) % MLKEM_Q;
+        _mlp[b] = _mlcompress(v, 4);
+        b += 1;
+    }
+    _mlencode(&_mlp[0], 4, ct + 960);
+}
+
+fn _mlpke_decrypt(dkp: *tryte, ct: *tryte, m: *tryte) {
+    _mlzero(&_mlq[0]);
+    var i: int = 0;
+    while (i < 3) {
+        _mldecode(ct + 320 * i, 10, &_mlp[0]);
+        var k: int = 0;
+        while (k < 256) { _mlp[k] = _mldecompress(_mlp[k], 10); k += 1; }
+        _mlntt(&_mlp[0]);
+        _mldecode(dkp + 384 * i, 12, &_mlv1[0]);
+        _mlmul_acc(&_mlv1[0], &_mlp[0], &_mlq[0]);
+        i += 1;
+    }
+    _mlntt_inv(&_mlq[0]);
+    _mldecode(ct + 960, 4, &_mlp[0]);
+    var b: int = 0;
+    while (b < 32) { m[b] = 0; b += 1; }
+    b = 0;
+    while (b < 256) {
+        var w: int = _mlmod(_mldecompress(_mlp[b], 4) - _mlq[b]);
+        if (_mlcompress(w, 1) == 1) { m[b / 8] = (m[b / 8] + _pow2[b % 8]) as tryte; }
+        b += 1;
+    }
+}
+
+// ---- ML-KEM ----
+
+// The encapsulation-key check of FIPS 203 §7.2: every 12-bit value is
+// below q (decoding and encoding again gives the same octets).
+fn mlkem_ek_ok(ek: *tryte) -> int {
+    var i: int = 0;
+    while (i < 1152) {
+        var a: int = ek[i] + 256 * (ek[i + 1] % 16);
+        var b: int = ek[i + 1] / 16 + 16 * ek[i + 2];
+        if (a >= MLKEM_Q || b >= MLKEM_Q) { return 0; }
+        i += 3;
+    }
+    return 1;
+}
+
+fn mlkem_keygen(d: *tryte, z: *tryte, ek: *tryte, dk: *tryte) {
+    bin32_init();
+    _mlinit();
+    _mlpke_keygen(d, ek, dk);
+    var k: int = 0;
+    while (k < MLKEM_EK) { dk[1152 + k] = ek[k]; k += 1; }
+    sha3_256(ek, MLKEM_EK, dk + 2336);
+    k = 0;
+    while (k < 32) { dk[2368 + k] = z[k]; k += 1; }
+}
+
+fn mlkem_encaps(ek: *tryte, m: *tryte, key: *tryte, ct: *tryte) {
+    bin32_init();
+    _mlinit();
+    var in: [64]tryte;
+    var k: int = 0;
+    while (k < 32) { in[k] = m[k]; k += 1; }
+    sha3_256(ek, MLKEM_EK, &in[32]);
+    var kr: [64]tryte;
+    _mlhash_g(&in[0], 64, &kr[0]);
+    _mlpke_encrypt(ek, m, &kr[32], ct);
+    k = 0;
+    while (k < 32) { key[k] = kr[k]; k += 1; }
+}
+
+var _mlct2: [1088]tryte;
+
+fn mlkem_decaps(dk: *tryte, ct: *tryte, key: *tryte) {
+    bin32_init();
+    _mlinit();
+    var in: [64]tryte;
+    _mlpke_decrypt(dk, ct, &in[0]);
+    var k: int = 0;
+    while (k < 32) { in[32 + k] = dk[2336 + k]; k += 1; }
+    var kr: [64]tryte;
+    _mlhash_g(&in[0], 64, &kr[0]);
+    _mlpke_encrypt(dk + 1152, &in[0], &kr[32], &_mlct2[0]);
+    // the implicit rejection key J(z || c), used unless the ciphertexts match
+    var c: keccak;
+    keccak_init(&c, 136, 31);
+    keccak_absorb(&c, dk + 2368, 32);
+    keccak_absorb(&c, ct, MLKEM_CT);
+    var rej: [32]tryte;
+    keccak_squeeze(&c, &rej[0], 32);
+    var same: int = 1;
+    k = 0;
+    while (k < MLKEM_CT) { if (ct[k] != _mlct2[k]) { same = 0; } k += 1; }
+    k = 0;
+    while (k < 32) { key[k] = same ? kr[k] : rej[k]; k += 1; }
+}

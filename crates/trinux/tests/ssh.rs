@@ -119,6 +119,33 @@ fn openssh_logs_in_and_runs_commands() {
     has(&s.log("sshd"), &["accepted password for root", "failed password for user"]);
 }
 
+/// ML-KEM-768 with X25519 (docs/TNET.md §6) against OpenSSH, which also
+/// knows curve25519: forced each way, and OpenSSH's own report of what was
+/// agreed.
+#[test]
+fn post_quantum_key_exchange_with_openssh() {
+    let Some((mut s, port)) = booted() else { return };
+    let (code, out, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=mlkem768x25519-sha256"], "echo pq ok");
+    assert_eq!((code, out.as_str()), (0, "pq ok\n"), "stderr:\n{err}");
+    assert!(err.contains("kex: algorithm: mlkem768x25519-sha256"), "{err}");
+    let (code, out, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=curve25519-sha256"], "echo classic ok");
+    assert_eq!((code, out.as_str()), (0, "classic ok\n"), "stderr:\n{err}");
+    assert!(err.contains("kex: algorithm: curve25519-sha256"), "{err}");
+    // the client's order decides, not the server's
+    let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=curve25519-sha256,mlkem768x25519-sha256"], "true");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("kex: algorithm: curve25519-sha256"), "{err}");
+    has(&s.log("sshd"), &["key exchange mlkem768x25519-sha256", "key exchange curve25519-sha256"]);
+    // OpenSSH's default list puts the hybrid first: that is what it gets
+    let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v"], "true");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("kex: algorithm: mlkem768x25519-sha256"), "{err}");
+    // a key exchange the server does not have
+    let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=sntrup761x25519-sha512"], "true");
+    assert_eq!(code, 255, "{err}");
+    assert!(err.contains("no matching key exchange method found. Their offer: mlkem768x25519-sha256,curve25519-sha256,"), "{err}");
+}
+
 #[test]
 fn an_interactive_session_on_a_pty() {
     let Some((mut s, port)) = booted() else { return };

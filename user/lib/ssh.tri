@@ -1,6 +1,7 @@
 // ssh.tri: the SSH transport (RFC 4253) for sshd and the ssh client:
 // version lines, binary packets with chacha20-poly1305@openssh.com,
-// KEXINIT, curve25519-sha256 with strict KEX, key derivation.
+// KEXINIT, mlkem768x25519-sha256 (ML-KEM-768 with X25519, preferred) and
+// curve25519-sha256 with strict KEX, key derivation.
 //
 // One connection per process: the state is in globals. ssh_server says
 // which side this is (it picks the strict-KEX name, whose KEXINIT is I_C
@@ -13,6 +14,7 @@ import "socket.tri";
 import "c25519.tri";
 import "chacha.tri";
 import "base64.tri";
+import "mlkem.tri";
 
 const SSH_MSG_DISCONNECT: int = 1;
 const SSH_MSG_IGNORE: int = 2;
@@ -242,6 +244,20 @@ fn list_has(at: int, n: int, name: *char) -> int {
     return 0;
 }
 
+// The index of name in the name-list, or -1.
+fn list_pos(at: int, n: int, name: *char) -> int {
+    var k: int = 0;
+    var i: int = 0;
+    while (k <= n) {
+        var e: int = k;
+        while (e < n && pkt[at + e] != ',') { e += 1; }
+        if (is_text(at + k, e - k, name)) { return i; }
+        k = e + 1;
+        i += 1;
+    }
+    return -1;
+}
+
 // Is name the first entry of the name-list?
 fn list_first_is(at: int, n: int, name: *char) -> int {
     var e: int = 0;
@@ -372,6 +388,33 @@ fn read_packet() -> int {
 var kbuf: [40]tryte;                      // the shared secret as an mpint string (length first)
 var kbuf_len: int;
 var hash_h: [32]tryte;
+var kex_mlkem: int;                       // this exchange is mlkem768x25519-sha256
+
+const KEX_HYBRID_INIT_LEN: int = 1216;    // ML-KEM encapsulation key, then X25519 key
+const KEX_HYBRID_REPLY_LEN: int = 1120;   // ML-KEM ciphertext, then X25519 key
+
+// K for a hybrid exchange: SHA-256(ML-KEM key || X25519 key), as a string.
+fn hybrid_k(kpq: *tryte, kcl: *tryte) {
+    var both: [64]tryte;
+    var k: int = 0;
+    while (k < 32) { both[k] = kpq[k]; both[32 + k] = kcl[k]; k += 1; }
+    put_be32(&kbuf[0], 32);
+    sha256(&both[0], 64, &kbuf[4]);
+    kbuf_len = 36;
+}
+
+// K for curve25519-sha256: the 32 octets as an mpint.
+fn mpint_k(sh: *tryte) {
+    var lead: int = 0;
+    while (lead < 32 && sh[lead] == 0) { lead += 1; }
+    var mlen: int = 32 - lead + (sh[lead] >= 128);
+    put_be32(&kbuf[0], mlen);
+    var k: int = 4;
+    if (sh[lead] >= 128) { kbuf[4] = 0; k = 5; }
+    var j: int = lead;
+    while (j < 32) { kbuf[k] = sh[j]; k += 1; j += 1; }
+    kbuf_len = 4 + mlen;
+}
 
 fn hash_string(c: *sha256_ctx, p: *tryte, n: int) {
     var l: [4]tryte;
@@ -401,9 +444,9 @@ fn send_kexinit() {
     out_start(SSH_MSG_KEXINIT);
     getrandom(&outp[1], 16, 0);
     out_len = 17;
-    if (kexes > 0) { put_text("curve25519-sha256,curve25519-sha256@libssh.org"); }
-    else if (ssh_server) { put_text("curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-s-v00@openssh.com"); }
-    else { put_text("curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-c-v00@openssh.com"); }
+    if (kexes > 0) { put_text("mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org"); }
+    else if (ssh_server) { put_text("mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-s-v00@openssh.com"); }
+    else { put_text("mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-c-v00@openssh.com"); }
     put_text("ssh-ed25519");
     put_text("chacha20-poly1305@openssh.com");
     put_text("chacha20-poly1305@openssh.com");
@@ -438,8 +481,21 @@ fn take_kexinit() -> int {
     var guess: int = get_bool();
     get_u32();
     if (bad) { disconnect(DISCONNECT_PROTOCOL_ERROR, "bad KEXINIT"); }
-    if (!list_has(at[0], n[0], "curve25519-sha256") && !list_has(at[0], n[0], "curve25519-sha256@libssh.org")) {
-        disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common key exchange (curve25519-sha256 is needed)");
+    // the client's first choice that both have (RFC 4253 §7.1)
+    var curve: int = list_has(at[0], n[0], "curve25519-sha256") || list_has(at[0], n[0], "curve25519-sha256@libssh.org");
+    var hybrid: int = list_has(at[0], n[0], "mlkem768x25519-sha256");
+    if (!curve && !hybrid) {
+        disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common key exchange (mlkem768x25519-sha256 or curve25519-sha256 is needed)");
+    }
+    if (ssh_server) {
+        // the client's order decides: which of ours comes first in its list?
+        var ph: int = list_pos(at[0], n[0], "mlkem768x25519-sha256");
+        var pc: int = list_pos(at[0], n[0], "curve25519-sha256");
+        var pl: int = list_pos(at[0], n[0], "curve25519-sha256@libssh.org");
+        if (pc < 0 || (pl >= 0 && pl < pc)) { pc = pl; }
+        kex_mlkem = ph >= 0 && (pc < 0 || ph < pc);
+    } else {
+        kex_mlkem = hybrid;                       // ours lists it first, and the server goes by ours
     }
     if (!list_has(at[1], n[1], "ssh-ed25519")) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common host key type (ssh-ed25519 is needed)"); }
     if (!list_has(at[2], n[2], "chacha20-poly1305@openssh.com") || !list_has(at[3], n[3], "chacha20-poly1305@openssh.com")) {
@@ -447,22 +503,34 @@ fn take_kexinit() -> int {
     }
     if (!list_has(at[6], n[6], "none") || !list_has(at[7], n[7], "none")) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "no common compression"); }
     if (kexes == 0) { strict = list_has(at[0], n[0], ssh_server ? "kex-strict-c-v00@openssh.com" : "kex-strict-s-v00@openssh.com"); }
-    var first_ok: int = (list_first_is(at[0], n[0], "curve25519-sha256") || list_first_is(at[0], n[0], "curve25519-sha256@libssh.org"))
+    var first_ok: int = (kex_mlkem ? list_first_is(at[0], n[0], "mlkem768x25519-sha256")
+        : (list_first_is(at[0], n[0], "curve25519-sha256") || list_first_is(at[0], n[0], "curve25519-sha256@libssh.org")))
         && list_first_is(at[1], n[1], "ssh-ed25519");
     return guess && !first_ok;
 }
 
 // The rest of a key exchange after both KEXINITs, as the server.
 fn kex_server(drop_guess: int) {
+    log2("key exchange ", kex_mlkem ? "mlkem768x25519-sha256" : "curve25519-sha256");
     var t: int = read_packet();
     if (drop_guess) { t = read_packet(); }
     if (t != SSH_MSG_KEX_ECDH_INIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEX_ECDH_INIT"); }
     var qc_at: int = 0;
     var qc_len: int = get_string(&qc_at);
-    if (bad || qc_len != 32) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "bad client public key"); }
-    var qc: [32]tryte;
+    var want: int = kex_mlkem ? KEX_HYBRID_INIT_LEN : 32;
+    if (bad || qc_len != want) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "bad client public key"); }
+    var qc: [32]tryte;                          // the client's X25519 key
     var k: int = 0;
-    while (k < 32) { qc[k] = pkt[qc_at + k]; k += 1; }
+    while (k < 32) { qc[k] = pkt[qc_at + qc_len - 32 + k]; k += 1; }
+    var kpq: [32]tryte;
+    if (kex_mlkem) {
+        if (!mlkem_ek_ok(&pkt[qc_at])) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a malformed ML-KEM key"); }
+        var mrand: [32]tryte;
+        getrandom(&mrand[0], 32, 0);
+        mlkem_encaps(&pkt[qc_at], &mrand[0], &kpq[0], &hyb_reply[0]);
+        k = 0;
+        while (k < KEX_HYBRID_INIT_LEN) { hyb_init[k] = pkt[qc_at + k]; k += 1; }
+    }
     var e: [32]tryte;
     getrandom(&e[0], 32, 0);
     var qs: [32]tryte;
@@ -473,16 +541,13 @@ fn kex_server(drop_guess: int) {
     k = 0;
     while (k < 32) { if (sh[k] != 0) { zero = 0; } k += 1; }
     if (zero) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a degenerate shared secret"); }
-    // K as an mpint: the 32 octets read as a big-endian number
-    var lead: int = 0;
-    while (lead < 32 && sh[lead] == 0) { lead += 1; }
-    var mlen: int = 32 - lead + (sh[lead] >= 128);
-    put_be32(&kbuf[0], mlen);
-    k = 4;
-    if (sh[lead] >= 128) { kbuf[4] = 0; k = 5; }
-    var j: int = lead;
-    while (j < 32) { kbuf[k] = sh[j]; k += 1; j += 1; }
-    kbuf_len = 4 + mlen;
+    if (kex_mlkem) {
+        hybrid_k(&kpq[0], &sh[0]);
+        k = 0;
+        while (k < 32) { hyb_reply[1088 + k] = qs[k]; k += 1; }
+    } else {
+        mpint_k(&sh[0]);
+    }
     // the host key blob
     var blob: [51]tryte;
     put_be32(&blob[0], 11);
@@ -500,8 +565,13 @@ fn kex_server(drop_guess: int) {
     hash_string(&c, &i_c[0], i_c_len);
     hash_string(&c, &i_s[0], i_s_len);
     hash_string(&c, &blob[0], 51);
-    hash_string(&c, &qc[0], 32);
-    hash_string(&c, &qs[0], 32);
+    if (kex_mlkem) {
+        hash_string(&c, &hyb_init[0], KEX_HYBRID_INIT_LEN);
+        hash_string(&c, &hyb_reply[0], KEX_HYBRID_REPLY_LEN);
+    } else {
+        hash_string(&c, &qc[0], 32);
+        hash_string(&c, &qs[0], 32);
+    }
     sha256_update(&c, &kbuf[0], kbuf_len);
     sha256_final(&c, &hash_h[0]);
     if (kexes == 0) {
@@ -512,7 +582,7 @@ fn kex_server(drop_guess: int) {
     ed25519_sign(&sig[0], &hash_h[0], 32, &host_sk[0]);
     out_start(SSH_MSG_KEX_ECDH_REPLY);
     put_string(&blob[0], 51);
-    put_string(&qs[0], 32);
+    if (kex_mlkem) { put_string(&hyb_reply[0], KEX_HYBRID_REPLY_LEN); } else { put_string(&qs[0], 32); }
     put_u32(83);                                // the signature blob
     put_text("ssh-ed25519");
     put_string(&sig[0], 64);
@@ -529,9 +599,12 @@ fn kex_server(drop_guess: int) {
     if (strict) { seq_in = 0; }
     kexes += 1;
     k = 0;
-    while (k < 32) { sh[k] = 0; e[k] = 0; k += 1; }
+    while (k < 32) { sh[k] = 0; e[k] = 0; kpq[k] = 0; k += 1; }
 }
 
+var hyb_init: [1216]tryte;
+var hyb_reply: [1120]tryte;
+var hyb_dk: [2400]tryte;
 
 // ---- version lines -----------------------------------------------------------------------
 
@@ -598,7 +671,16 @@ fn kex_client() {
     var qc: [32]tryte;
     x25519_base(&qc[0], &e[0]);
     out_start(SSH_MSG_KEX_ECDH_INIT);
-    put_string(&qc[0], 32);
+    if (kex_mlkem) {
+        var dz: [64]tryte;
+        getrandom(&dz[0], 64, 0);
+        mlkem_keygen(&dz[0], &dz[32], &hyb_init[0], &hyb_dk[0]);
+        var q: int = 0;
+        while (q < 32) { hyb_init[1184 + q] = qc[q]; dz[q] = 0; dz[32 + q] = 0; q += 1; }
+        put_string(&hyb_init[0], KEX_HYBRID_INIT_LEN);
+    } else {
+        put_string(&qc[0], 32);
+    }
     send_packet();
     var t: int = read_packet();
     if (t != SSH_MSG_KEX_ECDH_REPLY) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEX_ECDH_REPLY"); }
@@ -608,7 +690,7 @@ fn kex_client() {
     var qs_n: int = get_string(&qs_at);
     var sig_at: int = 0;
     var sig_n: int = get_string(&sig_at);
-    if (bad || ks_n != 51 || qs_n != 32 || sig_n != 83) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a host key or signature this client does not take"); }
+    if (bad || ks_n != 51 || qs_n != (kex_mlkem ? KEX_HYBRID_REPLY_LEN : 32) || sig_n != 83) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a host key or signature this client does not take"); }
     // K_S: string "ssh-ed25519", string key (32)
     if (be32(&pkt[ks_at]) != 11 || !is_text(ks_at + 4, 11, "ssh-ed25519") || be32(&pkt[ks_at + 15]) != 32) {
         disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "not an ssh-ed25519 host key");
@@ -620,7 +702,13 @@ fn kex_client() {
     while (k < 51) { server_key[k] = pkt[ks_at + k]; k += 1; }
     var qs: [32]tryte;
     k = 0;
-    while (k < 32) { qs[k] = pkt[qs_at + k]; k += 1; }
+    while (k < 32) { qs[k] = pkt[qs_at + qs_n - 32 + k]; k += 1; }
+    var kpq: [32]tryte;
+    if (kex_mlkem) {
+        k = 0;
+        while (k < KEX_HYBRID_REPLY_LEN) { hyb_reply[k] = pkt[qs_at + k]; k += 1; }
+        mlkem_decaps(&hyb_dk[0], &hyb_reply[0], &kpq[0]);
+    }
     var sig: [64]tryte;
     k = 0;
     while (k < 64) { sig[k] = pkt[sig_at + 19 + k]; k += 1; }
@@ -630,15 +718,7 @@ fn kex_client() {
     k = 0;
     while (k < 32) { if (sh[k] != 0) { zero = 0; } k += 1; }
     if (zero) { disconnect(DISCONNECT_KEY_EXCHANGE_FAILED, "a degenerate shared secret"); }
-    var lead: int = 0;
-    while (lead < 32 && sh[lead] == 0) { lead += 1; }
-    var mlen: int = 32 - lead + (sh[lead] >= 128);
-    put_be32(&kbuf[0], mlen);
-    k = 4;
-    if (sh[lead] >= 128) { kbuf[4] = 0; k = 5; }
-    var j: int = lead;
-    while (j < 32) { kbuf[k] = sh[j]; k += 1; j += 1; }
-    kbuf_len = 4 + mlen;
+    if (kex_mlkem) { hybrid_k(&kpq[0], &sh[0]); } else { mpint_k(&sh[0]); }
     var c: sha256_ctx;
     sha256_init(&c);
     hash_string(&c, &v_c[0], v_c_len);
@@ -646,8 +726,13 @@ fn kex_client() {
     hash_string(&c, &i_c[0], i_c_len);
     hash_string(&c, &i_s[0], i_s_len);
     hash_string(&c, &server_key[0], 51);
-    hash_string(&c, &qc[0], 32);
-    hash_string(&c, &qs[0], 32);
+    if (kex_mlkem) {
+        hash_string(&c, &hyb_init[0], KEX_HYBRID_INIT_LEN);
+        hash_string(&c, &hyb_reply[0], KEX_HYBRID_REPLY_LEN);
+    } else {
+        hash_string(&c, &qc[0], 32);
+        hash_string(&c, &qs[0], 32);
+    }
     sha256_update(&c, &kbuf[0], kbuf_len);
     sha256_final(&c, &hash_h[0]);
     if (!ed25519_verify(&sig[0], &hash_h[0], 32, &server_key[19])) {
@@ -672,5 +757,7 @@ fn kex_client() {
     if (strict) { seq_in = 0; }
     kexes += 1;
     k = 0;
-    while (k < 32) { sh[k] = 0; e[k] = 0; k += 1; }
+    while (k < 32) { sh[k] = 0; e[k] = 0; kpq[k] = 0; k += 1; }
+    k = 0;
+    while (k < 2400) { hyb_dk[k] = 0; k += 1; }
 }

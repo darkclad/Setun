@@ -608,6 +608,7 @@ line per check.
 | `fmtvec [file]` | the format libraries against the conformance vectors in `/usr/share/fmtvectors.txt` (FORMATS.md §5) |
 | `nettest` | socket calls and their errors on loopback |
 | `cryptotest`, `pktest` | crypto against published vectors |
+| `pqtest` | SHA-3, SHAKE and ML-KEM-768 against vectors from a reference checked against OpenSSL |
 | `fdcheck` | exits with the number of open descriptors among 3..26 |
 | `k2_hello` | prints lines with busy work in between (timer interleaving) |
 | `/usr/lib/trwtest/{nocreate,unknown,huge,crash,bigwin}` | window clients that break the protocol on purpose |
@@ -1829,6 +1830,8 @@ and §14.
 | `sha2.tri` | `sha256`, `sha384`, `sha512` and their `_init`/`_update`/`_final`; a generic `hash_init`/`hash_update`/`hash_final`/`hash_octets` by id |
 | `md5.tri` | MD5: `md5_init`, `md5_put_chars`, `md5_final`, `md5_digest_hex`, `md5_hex(s, n, out)`; text is hashed as UTF-8 |
 | `hmac.tri` | `hmac(id, key, klen, m, mlen, out)`, `hkdf_extract`, `hkdf_expand`, `hkdf_expand_label` (TLS 1.3) |
+| `sha3.tri` | `sha3_256`, `sha3_512`, `shake128`, `shake256`; the sponge as `keccak_init`/`keccak_absorb`/`keccak_squeeze` and `keccak_f` |
+| `mlkem.tri` | ML-KEM-768 (FIPS 203): `mlkem_keygen(d, z, ek, dk)`, `mlkem_encaps(ek, m, key, ct)`, `mlkem_decaps(dk, ct, key)` (implicit rejection), `mlkem_ek_ok(ek)` |
 | `chacha.tri` | `chacha20_block`, `chacha20_xor` (64-bit nonce, as SSH), the `_ietf` forms (RFC 8439), `poly1305`, `aead_seal`, `aead_open` |
 | `aes.tri` | `aes_setkey`, `aes_encrypt` (AES-128/256), `gcm_setkey`, `gcm_seal`, `gcm_open` |
 | `c25519.tri` | `x25519`, `x25519_base`, `ed25519_keypair`, `ed25519_sign`, `ed25519_verify` (refuses S ≥ L) |

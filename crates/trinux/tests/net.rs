@@ -495,6 +495,14 @@ fn crypto_test_vectors() {
 }
 
 #[test]
+fn post_quantum_test_vectors() {
+    let mut s = Session::boot();
+    let o = s.cmd_max("pqtest", 60_000_000_000);
+    println!("{o}");
+    assert!(o.contains("pqtest: all passed") && !o.contains("FAIL"), "{o}");
+}
+
+#[test]
 fn public_key_test_vectors() {
     let mut s = Session::boot();
     let o = s.cmd_max("pktest", 200_000_000_000);
