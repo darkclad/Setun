@@ -235,20 +235,20 @@ word 2:                                                           [ imm27 ]
 | 2 | `SUB` | `rd := ra − b` |
 | 3 | `ADC` | `rd := ra + b + C` |
 | 4 | `SBC` | `rd := ra − b + C`, C = carry trit (C from the previous `SUB`/`SBC`: the difference's carry is added) |
-| 5 | `MUL` | low 27 trits of the product; C ≠ 0 on overflow |
+| 5 | `MUL` | low 27 trits of the product; C := the sign of the high 27 trits (so C ≠ 0 exactly on overflow) |
 | 6 | `MULH` | high 27 trits of the 54-trit product |
 | 7 | `DIV` | quotient truncated toward zero (C semantics) |
 | 8 | `MOD` | remainder of `DIV` |
 | 9 | `DIVR` | quotient rounded to nearest (the natural balanced-ternary division) |
-| 10 | `MODR` | balanced remainder, `\|r\| ≤ \|b\|/2` |
+| 10 | `MODR` | balanced remainder, `\|r\| ≤ \|b\|/2`; on a tie (even `b`, `\|r\|` = `\|b\|/2`) the remainder is +`\|b\|/2` |
 | 11 | `MIN` | tritwise minimum (ternary "AND") |
 | 12 | `MAX` | tritwise maximum (ternary "OR") |
 | 13 | `TMUL` | tritwise product (Setun-70 `SMT`) |
 | 14 | `TSAT` | tritwise threshold add, sign(a+b) (Setun-70 `SAT`) |
 | 15 | `CONS` | tritwise consensus: a if a = b, else 0 |
-| 16 | `SH` | `rd := ra · 3^b`: left for b > 0, right (dropping trits, which rounds) for b < 0 |
+| 16 | `SH` | `rd := ra · 3^b`: left for b > 0 (trits shifted out are lost), right (dropping trits, which rounds) for b < 0; `\|b\|` ≥ 27 gives 0 |
 | 17 | `CMP` | only `S := sign(ra − b)`, computed **exactly** (never fooled by overflow); `rd` is not written |
-| 18 | `TRIT` | `rd :=` trit number `b` (1..27) of `ra` |
+| 18 | `TRIT` | `rd :=` trit number `b` (1..27) of `ra`; 0 for any other `b` |
 | 19 | `NEG` | `rd := −ra`, which is also the tritwise NOT |
 | 20 | `SGN` | `rd := sign(ra)` |
 | 21 | `ABS` | `rd := \|ra\|` |
@@ -257,13 +257,13 @@ word 2:                                                           [ imm27 ]
 | 24 | `BOR` | binary OR |
 | 25 | `BXOR` | binary exclusive OR |
 | 26 | `BANDN` | `ra` AND NOT `b` |
-| 27 | `BSH` | `ra · 2^b` for b > 0, `⌊ra / 2^−b⌋` for b < 0 (b limited to ±81) |
+| 27 | `BSH` | `ra · 2^b` for b > 0, `⌊ra / 2^−b⌋` for b < 0; a `b` beyond ±81 acts as ±81 |
 | 28 | `MRG` | trit-mask merge: per trit i, `ra[i]` = 0 keeps `rd[i]`, +1 takes `b[i]`, −1 gives 0. **Reads `rd`.** |
 | 29 | `TCP` | number of +1 trits among the low `b` trits of `ra` (`b` = 0: all 27) |
 | 30 | `TCN` | number of −1 trits among the low `b` trits of `ra` (`b` = 0: all 27) |
 | 31 | `TREV` | the low `b` trits of `ra` in reverse order, the trits above them 0 (`b` = 0: all 27) |
 
-`B = 0` and negative values are reserved and raise `ILL`. `MOV rd, ra` is `ADD rd, ra, r0`.
+`B = 0` and negative values are reserved and raise `ILL`. `MOV rd, ra` is `ADD rd, ra, r0`. In every group a reserved function raises `ILL` before its operands are used, so no alignment or page check comes first (port I/O alone checks `IOPL` first, §3.7).
 
 - `MRG` replaces six ALU operations (`TMUL`, `SUB`, `MAX`, `TMUL`, `ADD` and a temporary): the merged trits are disjoint, so there are no carries. With an all-zero mask nothing changes, and S comes from the old value.
 - `TCP`, `TCN` and `TREV` raise `ILL` when `b` is outside 0…27. `TCP + TCN` counts the non-zero trits and `TCP − TCN` is the trit balance (the ternary popcount); `TREV` is the trit-reversal permutation of a radix-3 FFT.
@@ -277,7 +277,7 @@ word 2:                                                           [ imm27 ]
 | 3 | `BEXT` | `rd :=` bits `pos .. pos+len−1` of `ra` (bit 0 the lowest), as a number 0..2^len−1; 0 ≤ pos ≤ 80 |
 | 4 | `BROT` | `rd :=` the low `len` bits of `ra`, rotated left by `pos` within them; 0 ≤ pos < len |
 
-For `BEXT` and `BROT`, 1 ≤ len ≤ 41 (2^41 − 1 is the widest field a word holds); other fields raise `ILL`.
+For `EXT` and `INS`, the field must lie in the word: pos ≥ 1, len ≥ 1 and pos + len − 1 ≤ 27. For `BEXT` and `BROT`, 1 ≤ len ≤ 41 (2^41 − 1 is the widest field a word holds). Other fields raise `ILL`. All four set S from the value written to `rd` and leave C unchanged.
 
 #### 3.3.1 Binary operations
 
@@ -307,7 +307,7 @@ In the 1-word MEM form the offset is `q3` **elements**: `LDW r1, [r13 + 2]` read
 | 1 | `STWM rd, [ra], rb` | the word at `ra` := `MRG`(that word, mask `rb`, `rd`), as one atomic read-modify-write: per trit, `rb` = 0 keeps the memory trit, +1 takes `rd`'s, −1 clears it |
 | 2 | `CAS3 rd, [ra], rb` | `old` := the word at `ra`; **S := sign(`old` − `rd`)**, exact; if S = 0 the word := `rb`; then `rd` := `old`. Atomic. A `BR3` right after sees three outcomes: smaller than expected, equal (swapped), larger |
 
-- There is no offset (the R format holds three registers and no immediate): the address is computed first. It must be a multiple of 3 (vector −5), and the page must be writable (vector −4); a trap leaves memory and `rd` unchanged. `CAS3` needs a writable page even when the comparison fails (it is a write access either way, like x86's `CMPXCHG`).
+- There is no offset (the R format holds three registers and no immediate): the address is computed first. It must be a multiple of 3 (vector −5), and the page must be writable (vector −4). Both are write accesses, checked before anything is read: a trap leaves memory and `rd` unchanged, and `FCAUSE` reports a write. `STWM` leaves S unchanged. `CAS3` needs a writable page even when the comparison fails (it is a write access either way, like x86's `CMPXCHG`).
 - A mutex fits one trit: 0 free, +1 held, −1 held with waiters. Lock is `CAS3` from 0 to +1, else `SWAP` in −1 and sleep until the swap finds 0; unlock is `SWAP` in 0, waking a waiter if the old value was −1 (Trinux: `mtx_lock`, `mtx_unlock` in tlibc, over `futex`).
 - Uses: page-table entry flags (`V`, `AD`, `RING`) set or cleared in one store, device control registers, flag words shared between the kernel and drivers.
 - Other functions are reserved and raise `ILL`.
@@ -429,14 +429,14 @@ A **zero entry means "not present"**, so zeroed memory is a valid empty table.
 2. `E2 = word at 19683·E1.FRAME + 3·a[10:18]`.
 3. `PA = 19683·E2.FRAME + a[19:27]`.
 
-If `V = 0` at either level, a page fault (vector −3) is raised. The permissions checked are the **more restrictive of the two levels**:
+If `V = 0` at either level, a page fault (vector −3) is raised. The permissions checked are the **more restrictive of the two levels**. The levels are checked in order: `E1` completely (present, then permissions) before `E2` is read, so an `E1` that forbids the access raises −4 even when `E2` is absent.
 
 - a write needs `V = +1`;
 - an instruction fetch needs `X ≠ 0`;
 - a data read needs `X ≠ −1`;
 - `MODE.RING ≥ RING` must hold.
 
-A violation raises vector −4. `FADDR` receives the virtual address and `FCAUSE` the access type and ring. The hardware updates `AD` in E2.
+A violation raises vector −4. `FADDR` receives the virtual address and `FCAUSE` the access type and ring. The hardware updates `AD` in E2 after both levels pass: a write sets +1; a read or fetch sets −1 if it was 0. An instruction whose later access faults keeps the `AD` updates of its earlier accesses (a `SWAP` on a read-only page marks it accessed).
 
 ### 5.4 TLB
 
@@ -492,7 +492,7 @@ Faults are negative, the system call sits at the centre, and the outside world i
 
 ### 7.2 Entry
 
-1. `EMODE := MODE`, `EPC :=` the address from the table above, and `FADDR`/`FCAUSE` are set.
+1. `EMODE := MODE`, `EPC :=` the address from the table above, and `FADDR`/`FCAUSE` are set. `FCAUSE`'s vector and ring are always defined, and its info field for `SYS`; the access trit and `FADDR` only for the memory faults (−3, −4, −5, −10). For other traps their values are the implementation's (the reference emulator writes −1 and 0).
 2. If `MODE.RING < +1`: **swap `r13 ↔ KSP`** (switch to the kernel stack).
 3. `MODE.RING := +1; IE := 0; TF := 0`.
 4. `PC := word at ITB + 3·vector`.
@@ -947,3 +947,15 @@ Only the lane-wise ALU functions are valid in either range: `ADD`, `SUB`, `MIN`,
 **Assembler forms:** `vadd v1, v2, v3`, `vnegw v4, v5`, `vld v1, [r2+18]` (the offset in trytes, a multiple of 9 within ±117), `vget r1, v2, 8`. The disassembler prints the same.
 
 **Trine:** memory-to-memory builtins (LANGUAGE.md §8): `vadd(d, a, b)` and the rest, on `@align(9)` arrays.
+
+## 16. Conformance
+
+An implementation conforms when every **conformance vector** gives the stated state after one instruction.
+
+- **The vectors** are `crates/core/tests/isa_vectors.txt` (about 3,900), made by `tools/gen_isavectors.py`: a model of this document written in Python, sharing no code with the emulator. They cover every ALU function in all three forms (R, Q, I) with edge and random operands, the trit fields, every load and store in both address forms, `STWM` and `CAS3`, every branch condition against every S and C, `BR3`, `JAL`, `JALR`, `LEA`, `LI`, `LIQ`, the whole SYS group in each ring (with `MFC`/`MTC` on every control register, `IRET` to each ring, single step), port I/O against `IOPL`, reserved encodings, the vector unit, and the MMU: each combination of `V`, `X` and `RING` for loads, stores and fetches from both rings, the `AD` trit, and refusals at the first level.
+- **Every trap** is reached: vectors 0, −1 … −8, −10, −12, −13, with `EPC`, `EMODE`, the stack swap, `FCAUSE` (vector, ring, and for memory faults the access) and `FADDR`.
+- **Format**: one vector per line, `name | before | code | after`. The machine is described in the file's header: RAM of 27 frames, `PC` = 0, `ITB` = 14580 with a table whose entry for vector v is 30000 + 3v, and port p reading 3p + 1. A state lists registers (`rN=`, `vN=`), the MODE fields by name, control registers (`crN=`) and physical trytes (`tA=`); the state after lists only what changed, with `pc=`, and for a trap `trap=`, `fring=`, and where defined `facc=`, `faddr=`, `finfo=`.
+- **The runner** `crates/core/tests/isa_conformance.rs` runs each vector through the interpreter's single step and again through its block-decoded fast path, and compares every register, the MODE fields, the control registers and the memory around every tryte the vector names.
+- Floating-point arithmetic has its own vectors (`REAL.md` §8), run as FPU instructions; here only the "FPU off" trap.
+
+To regenerate: `python tools/gen_isavectors.py > crates/core/tests/isa_vectors.txt` (deterministic, under a second).

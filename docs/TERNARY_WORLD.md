@@ -99,10 +99,10 @@ The Setun-11̅ core is ternary-native already: one sign trit replaces the zero a
 | Carry | Carry trit `C`, non-zero exactly on overflow; `ADC`/`SBC` | Overflow detection and multi-word arithmetic from one trit | Done |
 | Privilege | 3 rings on one trit: user, drivers, kernel | Driver ring for free, without a binary 4-ring waste | Done |
 | Floating point | real27 and real81 sharing a 9-trit exponent; no sign trit, no −0; truncation rounds to nearest | No guard/sticky bits; reading the first word of a real81 gives the rounded real27 | Done |
-| Trit-mask merge | An ALU merge of a source into a register under a mask (0 keeps, +1 takes the source, −1 clears), plus a masked word store for device registers and shared flags | Sets, clears and keeps fields in one write; binary needs AND then OR | Planned |
-| Three-state atomics | Lock word free / held / contended; compare-and-swap that reports <, = or > | Futex-style locks without a second waiter flag | Planned |
-| Vectors | 27 new 81-trit vector registers, saved lazily like the FPU, as 9 tryte lanes or 3 word lanes, with `MIN`, `MAX`, `TMUL` per lane | Text, pixels and small integers in parallel | Planned |
-| Ternary-weight dot product | `TMUL` + add over lanes for weights in {−1, 0, +1} | Ternary neural networks (BitNet b1.58 style) run with no multiplier at all | Planned |
+| Trit-mask merge | An ALU merge of a source into a register under a mask (0 keeps, +1 takes the source, −1 clears), plus a masked word store for device registers and shared flags: `MRG` and `STWM` (§A2) | Sets, clears and keeps fields in one write; binary needs AND then OR | Done |
+| Three-state atomics | Lock word free / held / contended; compare-and-swap that reports <, = or >: `CAS3`, and tlibc's one-trit mutex (§A4) | Futex-style locks without a second waiter flag | Done |
+| Vectors | 27 new 81-trit vector registers, saved lazily like the FPU, as 9 tryte lanes or 3 word lanes, with `MIN`, `MAX`, `TMUL` per lane (ISA §15) | Text, pixels and small integers in parallel | Done |
+| Ternary-weight dot product | `VDOTW`: a sum over lanes with weights in {−1, 0, +1} | Ternary neural networks (BitNet b1.58 style) run with no multiplier at all | Done |
 
 Decided 2026-10-06:
 
@@ -228,7 +228,7 @@ The emulator's reference interpreter is the definition of the machine, and every
 | --- | --- | --- | --- |
 | Reference and fast paths | Golden state hashes; a fast-vs-reference fuzz test; directed tests, each shown to catch its bug | JIT and optimizer cannot drift from the spec | Done |
 | Negative tests | Every milestone ships tests of what must be refused: malformed literals, broken packets, bad syscalls | Bugs at the edges surface before users find them | Done |
-| Conformance suites | Separate suites for the ISA, the real27/real81 standard and each native protocol | A second implementation can be checked without reading the emulator | Planned |
+| Conformance suites | Separate suites, each from an independent model of its specification: the ISA (ISA §16, about 3,900 vectors), real27/real81 (REAL.md §8, about 14,000), the formats (FORMATS.md §5); each native protocol to follow | A second implementation can be checked without reading the emulator | Done (protocols with phase C) |
 | Fault injection | Flip trits on links and in packets to test checksums; memory faults wait for hardware ECC | Proves the error handling actually works | Planned |
 | Ternary EDA | A hardware description language with a balanced trit type; a gate-level simulator for ternary cells | Needed before any ternary silicon or FPGA work | Research |
 
@@ -238,7 +238,7 @@ Ternary idioms come first; hardware stays research. Phases run in order, and eac
 
 ```mermaid
 flowchart TB
-    D["Done, October 2026<br/>ISA v0.6, emulator with JIT, BIOS, Trinux,<br/>binary network stack to TLS 1.3, self-hosting S1–S3"]
+    D["Done, October 2026<br/>ISA v0.7, emulator with JIT, BIOS, Trinux,<br/>binary network stack to TLS 1.3, self-hosting S1–S3"]
     A["A · Ternary idioms<br/>sections 1, 3, 5, 8"]
     GA{{"Gate A: programs branch with BR3 and write<br/>with masks; negative tests pass"}}
     B["B · Formats, reliability<br/>sections 4, 5, 9, 10"]
@@ -256,7 +256,8 @@ flowchart TB
     classDef research fill:#fff,stroke:#777,color:#111,stroke-dasharray:4 3
     class D done
     class A done
-    class B next
+    class B done
+    class C next
     class GA,GB,GC gate
     class R research
 ```
@@ -264,8 +265,8 @@ flowchart TB
 | Phase | Work |
 |---|---|
 | A · Ternary idioms (done, 2026-10-07) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
-| B · Formats, reliability (done, 2026-10-08) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine |
-| C · Native networking | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
+| B · Formats, reliability (done, 2026-10-09: Gate B passed) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine; conformance suites for the ISA and the formats |
+| **C · Native networking** (next) | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
 | Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 
 Phase A comes first because it is software only and makes every later layer think in trits. There is no hardware phase: the emulator is the only machine, and devices, HDL and circuits stay ongoing research (decided 2026-10-06).

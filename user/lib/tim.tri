@@ -107,7 +107,7 @@ fn tim_write(t: *Tim, coding: int, out: *TtvBuf) {
 // Decode the TIM file of n trytes at p into t: 0, or -1 if it is not a
 // valid one (t.s is then not allocated, or freed).
 fn tim_read(p: *tryte, n: int, t: *Tim) -> int {
-    if (n < TIM_HEADER || tw_get(p) != TIM_MAGIC || tw_get(p + 3) != 1) { return -1; }
+    if (n < TIM_HEADER || tw_get(p) != TIM_MAGIC || tw_get(p + 3) != 1 || tw_get(p + 21) != 0) { return -1; }
     var coding: int = tw_get(p + 18);
     if (coding != TIM_RAW && coding != TIM_PREDICTED) { return -1; }
     if (tim_alloc(t, tw_get(p + 6), tw_get(p + 9), tw_get(p + 12), tw_get(p + 15)) < 0) { return -1; }

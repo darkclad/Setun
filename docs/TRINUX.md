@@ -604,6 +604,7 @@ line per check.
 | `chartest` | 3-tryte characters and UTF-8 at the border |
 | `dstest` | packed flags, Kleene vectors, the 3-ary heap, the B-tree |
 | `fmttest` | tvarints, TTV and TIM: round trips, known answers, and the malformed inputs each must refuse |
+| `fmtvec [file]` | the format libraries against the conformance vectors in `/usr/share/fmtvectors.txt` (FORMATS.md §5) |
 | `nettest` | socket calls and their errors on loopback |
 | `cryptotest`, `pktest` | crypto against published vectors |
 | `fdcheck` | exits with the number of open descriptors among 3..26 |
@@ -1872,6 +1873,7 @@ The formats are specified in [FORMATS.md](FORMATS.md).
 |---|---|
 | `tvarint.tri` | balanced varints, 8-trit groups least significant first with a control trit (+1 more follows, 0 the last, −1 free for containers): `tvar_put(buf, v) -> n`, `tvar_put_long`, `tvar_get(buf, n, *v) -> used` (−1 if cut short, not canonical or past a word), `tvar_get_long`, `tvar_control(t)`, `tvar_group(t)`; and a word as 3 trytes, most significant first: `tw_put(p, v)`, `tw_get(p)` |
 | `ttv.tri` | TTV tagged values. Writing into a growing `TtvBuf` (`ttv_init`; `p`, `n`, `err`): `ttv_null`, `ttv_truth`, `ttv_int`, `ttv_long`, `ttv_real`, `ttv_text`, `ttv_octets`, `ttv_list(b, count)`, `ttv_map(b, count)`. Reading with a `TtvReader` (`ttv_reader(r, p, n)`): `ttv_kind`, `ttv_read_null`, `ttv_read_truth` (−2 if invalid), `ttv_read_int`, `ttv_read_long`, `ttv_read_real`, `ttv_read_text`, `ttv_read_octets`, `ttv_read_count(r, TTV_LIST\|TTV_MAP)`, `ttv_skip`, `ttv_at_end`; a failure sets `r.err` and every later read fails |
+| `ttvtext.tri` | TTV's text notation (FORMATS.md §2.1): `ttv_format(r, out, cap) -> length` prints one value (−1 if invalid or too long), `ttv_parse(s, b)` reads one, with `ttv_parse_at` where it stopped |
 | `tau.tri` | TAU sound: `tau_header`, `tau_read_header` (checks magic, version, rate, channels 1–9, the length), `tau_sample`, `tau_set_sample` |
 | `tim.tri` | TIM pictures: `struct Tim` (`w`, `h`, `ch`, `depth`, `s`), `tim_alloc`, `tim_write(t, TIM_RAW\|TIM_PREDICTED, *TtvBuf)`, `tim_read(p, n, *Tim)` (−1 for anything malformed), `tim_predict` (the median edge predictor), `tim_limit(depth)` |
 

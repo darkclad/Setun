@@ -1683,7 +1683,7 @@ Imports `ports.tri` and `rt.tri`.
 | Function | Description |
 |---|---|
 | `rtoa(x: real, digits: int, buf: *char) -> *char` | `x` with up to `digits` (1…12) significant digits, like `%g`: `3.14159`, `1e+100`, `inf`, `nan`; `buf` holds 24 trytes |
-| `strtor(s: *char, end: **char) -> real` | parse `[-]d[.d][e[-]d]` after leading blanks; `*end` is set to the first character not used, if `end` is not null |
+| `strtor(s: *char, end: **char) -> real` | parse `[-+]d[.d][e[-+]d]` after leading blanks; `*end` is set to the first character not used, if `end` is not null |
 | `atof(s: *char) -> real` | `strtor(s, null)` |
 | `pow10(k: int) -> real` | 10^k for any integer `k` |
 | `floor(x: real) -> real` | rounded down to an integer |

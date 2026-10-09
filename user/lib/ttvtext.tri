@@ -1,0 +1,256 @@
+// ttvtext.tri: TTV's text notation (docs/FORMATS.md §2): null, true,
+// unknown, false, integers (any size up to a long), reals (with a point or
+// an exponent), "text" (with \" \\ \n), x"0a1f" (octets in hexadecimal),
+// [value, ...] and {key: value, ...}.
+//
+//   ttv_format(r, out, cap) -> length   one value from a reader as text
+//                                       (-1: not valid TTV, or no room)
+//   ttv_parse(s, b) -> 0 or -1          one value from text into a buffer;
+//                                       ttv_parse_at is where it stopped
+
+import "stdlib.tri";
+import "string.tri";
+import "ttv.tri";
+import "long.tri";
+import "real.tri";
+
+var tt_buf: [6561]char;               // one text or octet string
+
+// ---- printing ----
+
+var tt_out: *char;
+var tt_n: int;
+var tt_cap: int;
+
+fn tt_putc(c: int) {
+    if (tt_n < tt_cap) { tt_out[tt_n] = c as char; }
+    tt_n += 1;
+}
+
+fn tt_puts(s: *char) {
+    var k: int = 0;
+    while (s[k] != 0) { tt_putc(s[k]); k += 1; }
+}
+
+fn tt_hexdigit(v: int) -> int { return v < 10 ? '0' + v : 'a' + v - 10; }
+
+fn tt_value(r: *TtvReader) -> int {
+    var k: int = ttv_kind(r);
+    if (k == TTV_NULL) { ttv_read_null(r); tt_puts("null"); return 0; }
+    if (k == TTV_TRUTH) {
+        var t: int = ttv_read_truth(r);
+        if (t == -2) { return -1; }
+        tt_puts(t > 0 ? "true" : (t < 0 ? "false" : "unknown"));
+        return 0;
+    }
+    if (k == TTV_INT) {
+        var v: long;
+        if (ttv_read_long(r, &v) < 0) { return -1; }
+        var b: [41]char;
+        ltoa(v, &b[0]);
+        tt_puts(&b[0]);
+        return 0;
+    }
+    if (k == TTV_REAL) {
+        var x: real;
+        if (ttv_read_real(r, &x) < 0) { return -1; }
+        var rb: [81]char;
+        rtoa(x, 36, &rb[0]);
+        tt_puts(&rb[0]);
+        // a real always shows as one: with a point or an exponent
+        if (strchr(&rb[0], '.') == null && strchr(&rb[0], 'e') == null && strchr(&rb[0], 'n') == null) { tt_puts(".0"); }
+        return 0;
+    }
+    if (k == TTV_TEXT) {
+        var n: int = ttv_read_text(r, &tt_buf[0], 6560);
+        if (n < 0) { return -1; }
+        tt_putc('"');
+        var i: int = 0;
+        while (i < n) {
+            var c: int = tt_buf[i];
+            if (c == '"' || c == '\\') { tt_putc('\\'); tt_putc(c); }
+            else if (c == '\n') { tt_puts("\\n"); }
+            else { tt_putc(c); }
+            i += 1;
+        }
+        tt_putc('"');
+        return 0;
+    }
+    if (k == TTV_OCTETS) {
+        var n2: int = ttv_read_octets(r, &tt_buf[0] as *tryte, 6560);
+        if (n2 < 0) { return -1; }
+        tt_puts("x\"");
+        var j: int = 0;
+        while (j < n2) {
+            var o: int = tt_buf[j];
+            if (o < 0 || o > 255) { return -1; }
+            tt_putc(tt_hexdigit(o / 16));
+            tt_putc(tt_hexdigit(o % 16));
+            j += 1;
+        }
+        tt_putc('"');
+        return 0;
+    }
+    if (k == TTV_LIST || k == TTV_MAP) {
+        var cnt: int = ttv_read_count(r, k);
+        if (cnt < 0) { return -1; }
+        tt_putc(k == TTV_LIST ? '[' : '{');
+        var q: int = 0;
+        while (q < cnt) {
+            if (q > 0) { tt_puts(", "); }
+            if (tt_value(r) < 0) { return -1; }
+            if (k == TTV_MAP) {
+                tt_puts(": ");
+                if (tt_value(r) < 0) { return -1; }
+            }
+            q += 1;
+        }
+        tt_putc(k == TTV_LIST ? ']' : '}');
+        return 0;
+    }
+    return -1;
+}
+
+// One value from r as text into out (cap characters, with its NUL): the
+// length, or -1 if the input is not valid TTV or the text does not fit.
+fn ttv_format(r: *TtvReader, out: *char, cap: int) -> int {
+    tt_out = out;
+    tt_n = 0;
+    tt_cap = cap;
+    if (tt_value(r) < 0 || tt_n >= cap) { return -1; }
+    out[tt_n] = 0;
+    return tt_n;
+}
+
+// ---- parsing ----
+
+var tt_src: *char;
+var ttv_parse_at: int;
+
+fn tt_skip_ws() { while (tt_src[ttv_parse_at] == ' ' || tt_src[ttv_parse_at] == '\t' || tt_src[ttv_parse_at] == '\n') { ttv_parse_at += 1; } }
+
+fn tt_starts(s: *char) -> int {
+    var k: int = 0;
+    while (s[k] != 0) { if (tt_src[ttv_parse_at + k] != s[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+fn tt_hexval(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
+
+fn tt_parse(b: *TtvBuf) -> int {
+    tt_skip_ws();
+    if (tt_starts("null")) { ttv_parse_at += 4; ttv_null(b); return 0; }
+    if (tt_starts("true")) { ttv_parse_at += 4; ttv_truth(b, true); return 0; }
+    if (tt_starts("false")) { ttv_parse_at += 5; ttv_truth(b, false); return 0; }
+    if (tt_starts("unknown")) { ttv_parse_at += 7; ttv_truth(b, unknown); return 0; }
+    var c: int = tt_src[ttv_parse_at];
+    if (c == '"') {
+        ttv_parse_at += 1;
+        var n: int = 0;
+        while (tt_src[ttv_parse_at] != '"') {
+            if (tt_src[ttv_parse_at] == 0 || n >= 6560) { return -1; }
+            var ch: int = tt_src[ttv_parse_at];
+            if (ch == '\\') {
+                ttv_parse_at += 1;
+                ch = tt_src[ttv_parse_at] == 'n' ? '\n' : tt_src[ttv_parse_at];
+                if (ch == 0) { return -1; }
+            }
+            tt_buf[n] = ch as char;
+            n += 1;
+            ttv_parse_at += 1;
+        }
+        ttv_parse_at += 1;
+        tt_buf[n] = 0;
+        ttv_text(b, &tt_buf[0]);
+        return 0;
+    }
+    if (c == 'x' && tt_src[ttv_parse_at + 1] == '"') {
+        ttv_parse_at += 2;
+        var m: int = 0;
+        while (tt_src[ttv_parse_at] != '"') {
+            var hi: int = tt_hexval(tt_src[ttv_parse_at]);
+            var lo: int = tt_hexval(tt_src[ttv_parse_at + 1]);
+            if (hi < 0 || lo < 0 || m >= 6560) { return -1; }
+            tt_buf[m] = (hi * 16 + lo) as char;
+            m += 1;
+            ttv_parse_at += 2;
+        }
+        ttv_parse_at += 1;
+        ttv_octets(b, &tt_buf[0] as *tryte, m);
+        return 0;
+    }
+    if (c == '[' || c == '{') {
+        var map: int = c == '{';
+        ttv_parse_at += 1;
+        // the count goes first: write the items to a buffer of their own
+        var items: TtvBuf;
+        ttv_init(&items);
+        var count: int = 0;
+        tt_skip_ws();
+        if (tt_src[ttv_parse_at] != (map ? '}' : ']')) {
+            loop {
+                if (tt_parse(&items) < 0) { return -1; }
+                if (map) {
+                    tt_skip_ws();
+                    if (tt_src[ttv_parse_at] != ':') { return -1; }
+                    ttv_parse_at += 1;
+                    if (tt_parse(&items) < 0) { return -1; }
+                }
+                count += 1;
+                tt_skip_ws();
+                if (tt_src[ttv_parse_at] == ',') { ttv_parse_at += 1; continue; }
+                break;
+            }
+        }
+        tt_skip_ws();
+        if (tt_src[ttv_parse_at] != (map ? '}' : ']')) { return -1; }
+        ttv_parse_at += 1;
+        if (map) { ttv_map(b, count); } else { ttv_list(b, count); }
+        if (ttv_room(b, items.n)) {
+            var k: int = 0;
+            while (k < items.n) { b.p[b.n + k] = items.p[k]; k += 1; }
+            b.n += items.n;
+        }
+        free(items.p);
+        return 0;
+    }
+    if (c == '-' || c == '+' || (c >= '0' && c <= '9')) {
+        // a real has a point or an exponent; otherwise an integer
+        var e: int = ttv_parse_at + 1;
+        while (tt_src[e] >= '0' && tt_src[e] <= '9') { e += 1; }
+        if (tt_src[e] == '.' || tt_src[e] == 'e' || tt_src[e] == 'E') {
+            var end: *char;
+            var x: real = strtor(&tt_src[ttv_parse_at], &end);
+            if (end == &tt_src[ttv_parse_at]) { return -1; }
+            ttv_parse_at = (end - tt_src) as int;
+            ttv_real(b, x);
+            return 0;
+        }
+        var neg: int = c == '-';
+        if (c == '-' || c == '+') { ttv_parse_at += 1; }
+        if (tt_src[ttv_parse_at] < '0' || tt_src[ttv_parse_at] > '9') { return -1; }
+        var v: long = 0;
+        while (tt_src[ttv_parse_at] >= '0' && tt_src[ttv_parse_at] <= '9') {
+            v = v * 10 + (tt_src[ttv_parse_at] - '0');
+            ttv_parse_at += 1;
+        }
+        ttv_long(b, neg ? -v : v);
+        return 0;
+    }
+    return -1;
+}
+
+// One value from the text s into b: 0, or -1 (ttv_parse_at is where it went
+// wrong). ttv_parse_at is left after the value and any spaces after it.
+fn ttv_parse(s: *char, b: *TtvBuf) -> int {
+    tt_src = s;
+    ttv_parse_at = 0;
+    if (tt_parse(b) < 0) { return -1; }
+    tt_skip_ws();
+    return 0;
+}

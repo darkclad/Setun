@@ -97,6 +97,31 @@ fn the_libraries_check_themselves() {
     assert!(!out.contains("FAILED"), "{out}");
 }
 
+/// The published vectors (docs/FORMATS.md §5) against the libraries, and
+/// the checker against a vector made wrong on purpose.
+#[test]
+fn the_libraries_pass_the_conformance_vectors() {
+    let vectors = std::fs::read_to_string(trinux::user_dir().join("share/fmtvectors.txt")).unwrap();
+    let count = vectors.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).count();
+    assert!(count > 200, "{count}");
+    let broken = "tvar 7 = 8\ntvar! 7\nttv true = 1 0\nttv! 1 1\ntim! 0\n";
+    let d = disk(&[("/home/broken.txt", broken.as_bytes().to_vec())]);
+    let (out, _) = session(&d, &["fmtvec", "fmtvec /home/broken.txt; echo status $?", "fmtvec /nope; echo status $?"], 6_000_000_000);
+    assert_has(
+        &out,
+        &[
+            &format!("fmtvec: {count} vectors, all passed"),
+            "fmtvec: line 1: tvar_put_long gives other trytes\nfmtvec: line 1: tvar_get_long reads another value\nfmtvec: line 1: tvar_put gives other trytes\nfmtvec: line 1: tvar_get reads another value\n",
+            "fmtvec: line 2: tvar_get accepts it\nfmtvec: line 2: tvar_get_long accepts it\n",
+            "fmtvec: line 3: ttv_parse encodes it differently\nfmtvec: line 3: ttv_format prints other text\n",
+            "fmtvec: line 4: ttv_format accepts it\n",
+            "fmtvec: 5 vectors, ",
+            " failed\nstatus 1",
+            "fmtvec: /nope: No such file or directory\nstatus 2",
+        ],
+    );
+}
+
 #[test]
 fn sound_from_and_to_wav() {
     let s16: Vec<i32> = (0..100).map(|k| if k == 0 { -32768 } else if k == 1 { 32767 } else { (k * 977 % 65536) - 32768 }).collect();

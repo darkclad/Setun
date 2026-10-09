@@ -1,0 +1,258 @@
+// /bin/fmtvec [file]: check the format libraries against the conformance
+// vectors (docs/FORMATS.md §5; default /usr/share/fmtvectors.txt, made by
+// tools/gen_fmtvectors.py). One line per failure, then a summary.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/tvarint.tri";
+import "../lib/ttv.tri";
+import "../lib/ttvtext.tri";
+import "../lib/tim.tri";
+import "../lib/tau.tri";
+import "long.tri";
+
+var lineno: int;
+var failures: int;
+var checked: int;
+
+fn fail(what: *char) {
+    puts("fmtvec: line ");
+    put_int(lineno);
+    puts(": ");
+    puts(what);
+    puts("\n");
+    failures += 1;
+}
+
+// The numbers in s from position at up to a NUL or a mark (':' or '='):
+// up to max of them into out; the count. *at is left on the mark.
+fn numbers(s: *char, at: *int, out: *tryte, max: int) -> int {
+    var n: int = 0;
+    loop {
+        while (s[*at] == ' ') { *at += 1; }
+        var c: int = s[*at];
+        if (c == 0 || c == ':' || c == '=') { return n; }
+        var end: *char;
+        var v: int = strtol(&s[*at], &end, 10);
+        if (end == &s[*at] || n >= max) { return -1; }
+        out[n] = v as tryte;
+        n += 1;
+        *at = (end - s) as int;
+    }
+}
+
+fn same(a: *tryte, b: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < n) { if (a[k] != b[k]) { return 0; } k += 1; }
+    return 1;
+}
+
+var want: [59049]tryte;
+var got: [59049]tryte;
+var samples: [19683]tryte;
+var text: [59049]char;
+
+fn check_tvar(s: *char) {
+    // tvar V = T...
+    var at: int = 5;
+    var v: long = atol(&s[at]);
+    while (s[at] != '=') { at += 1; }
+    at += 1;
+    var n: int = numbers(s, &at, &want[0], 20);
+    var m: int = tvar_put_long(&got[0], v);
+    if (m != n || !same(&got[0], &want[0], n)) { fail("tvar_put_long gives other trytes"); }
+    var back: long;
+    if (tvar_get_long(&want[0], n, &back) != n || back != v) { fail("tvar_get_long reads another value"); }
+    var lim: long = 3812798742493;
+    if (v <= lim && v >= -lim) {
+        var w: int = v as int;
+        var r: int;
+        if (tvar_put(&got[0], w) != n || !same(&got[0], &want[0], n)) { fail("tvar_put gives other trytes"); }
+        if (tvar_get(&want[0], n, &r) != n || r != w) { fail("tvar_get reads another value"); }
+    }
+}
+
+fn check_tvar_refused(s: *char, as_long: int) {
+    var at: int = as_long ? 6 : 7;
+    var n: int = numbers(s, &at, &want[0], 20);
+    var v: long;
+    var w: int;
+    if (tvar_get(&want[0], n, &w) >= 0) { fail("tvar_get accepts it"); }
+    var l: int = tvar_get_long(&want[0], n, &v);
+    if (as_long && l >= 0) { fail("tvar_get_long accepts it"); }
+    if (!as_long && l != n) { fail("tvar_get_long refuses it"); }
+}
+
+fn check_ttv(s: *char, both: int) {
+    // ttv N = T...: the notation runs to the last " = "; ttv> N = T...
+    // checks the printing alone
+    var eq: int = strlen(s) - 1;
+    while (eq > 4 && !(s[eq] == '=' && s[eq - 1] == ' ' && s[eq + 1] == ' ')) { eq -= 1; }
+    var at: int = eq + 1;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    s[eq - 1] = 0;
+    var note: *char = &s[both ? 4 : 5];
+    if (both) {
+        var b: TtvBuf;
+        ttv_init(&b);
+        if (ttv_parse(note, &b) < 0 || note[ttv_parse_at] != 0) { fail("ttv_parse refuses the notation"); return; }
+        if (b.n != n || !same(b.p, &want[0], n)) { fail("ttv_parse encodes it differently"); }
+        free(b.p);
+    }
+    var r: TtvReader;
+    ttv_reader(&r, &want[0], n);
+    if (ttv_format(&r, &text[0], 59049) < 0) { fail("ttv_format refuses the trytes"); return; }
+    if (!ttv_at_end(&r)) { fail("ttv_format leaves trytes over"); }
+    if (!streq(&text[0], note)) { fail("ttv_format prints other text"); puts(&text[0]); puts("\n"); }
+    ttv_reader(&r, &want[0], n);
+    if (ttv_skip(&r) < 0 || !ttv_at_end(&r)) { fail("ttv_skip does not skip it"); }
+}
+
+fn check_ttv_refused(s: *char) {
+    var at: int = 5;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    var r: TtvReader;
+    ttv_reader(&r, &want[0], n);
+    if (ttv_format(&r, &text[0], 59049) >= 0 && ttv_at_end(&r)) { fail("ttv_format accepts it"); }
+    if (n > 0 && want[0] == TTV_OCTETS) {
+        // the reader itself refuses, not only the printer
+        ttv_reader(&r, &want[0], n);
+        if (ttv_read_octets(&r, &got[0], 59049) >= 0 && ttv_at_end(&r)) { fail("ttv_read_octets accepts it"); }
+    }
+}
+
+fn check_tim(s: *char) {
+    // tim W H C D K : S... = T...
+    var at: int = 4;
+    var hdr: [5]tryte;
+    if (numbers(s, &at, &hdr[0], 5) != 5) { fail("bad line"); return; }
+    at += 1;
+    var ns: int = numbers(s, &at, &samples[0], 19683);
+    at += 1;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    var t: Tim;
+    if (tim_alloc(&t, hdr[0] as int, hdr[1] as int, hdr[2] as int, hdr[3] as int) < 0) { fail("tim_alloc refuses the size"); return; }
+    var k: int = 0;
+    while (k < ns) { t.s[k] = samples[k]; k += 1; }
+    var b: TtvBuf;
+    ttv_init(&b);
+    tim_write(&t, hdr[4] as int, &b);
+    if (b.n != n || !same(b.p, &want[0], n)) { fail("tim_write encodes it differently"); }
+    free(b.p);
+    free(t.s);
+    var u: Tim;
+    if (tim_read(&want[0], n, &u) < 0) { fail("tim_read refuses it"); return; }
+    if (u.w != hdr[0] || u.h != hdr[1] || u.ch != hdr[2] || u.depth != hdr[3] || u.w * u.h * u.ch != ns || !same(u.s, &samples[0], ns)) {
+        fail("tim_read decodes it differently");
+    }
+    free(u.s);
+}
+
+fn check_tim_refused(s: *char) {
+    var at: int = 5;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    var u: Tim;
+    if (tim_read(&want[0], n, &u) >= 0) { fail("tim_read accepts it"); free(u.s); }
+}
+
+fn check_tau(s: *char) {
+    // tau R C F : S... = T...
+    var at: int = 4;
+    var hdr: [3]int;
+    var k: int = 0;
+    while (k < 3) {
+        while (s[at] == ' ') { at += 1; }
+        var end: *char;
+        hdr[k] = strtol(&s[at], &end, 10);
+        at = (end - s) as int;
+        k += 1;
+    }
+    while (s[at] != ':') { at += 1; }
+    at += 1;
+    // the samples are words: read them as text, one at a time
+    var p: *tryte = &got[0];
+    tau_header(p, hdr[0], hdr[1], hdr[2]);
+    var ns: int = 0;
+    loop {
+        while (s[at] == ' ') { at += 1; }
+        if (s[at] == '=') { break; }
+        var end2: *char;
+        var v: int = strtol(&s[at], &end2, 10);
+        at = (end2 - s) as int;
+        tau_set_sample(p, ns, v);
+        ns += 1;
+    }
+    at += 1;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    if (n != TAU_HEADER + 3 * ns || !same(p, &want[0], n)) { fail("tau_header and tau_set_sample write other trytes"); }
+    var rate: int;
+    var ch: int;
+    var frames: int;
+    if (tau_read_header(&want[0], n, &rate, &ch, &frames) < 0) { fail("tau_read_header refuses it"); return; }
+    if (rate != hdr[0] || ch != hdr[1] || frames != hdr[2]) { fail("tau_read_header reads another header"); }
+    k = 0;
+    while (k < ns) {
+        if (tau_sample(&want[0], k) != tau_sample(p, k)) { fail("tau_sample reads another sample"); }
+        k += 1;
+    }
+}
+
+fn check_tau_refused(s: *char) {
+    var at: int = 5;
+    var n: int = numbers(s, &at, &want[0], 59049);
+    var rate: int;
+    var ch: int;
+    var frames: int;
+    if (tau_read_header(&want[0], n, &rate, &ch, &frames) >= 0) { fail("tau_read_header accepts it"); }
+}
+
+fn starts_with(s: *char, p: *char) -> int { return strncmp(s, p, strlen(p)) == 0; }
+
+fn main(argc: int, argv: **char) -> int {
+    var path: *char = argc > 1 ? argv[1] : "/usr/share/fmtvectors.txt";
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { perror2("fmtvec", path); return 2; }
+    var size: int = 0;
+    var cap: int = 59049;
+    var all: *char = malloc(cap) as *char;
+    loop {
+        if (size + 6561 >= cap) {
+            cap *= 3;
+            all = realloc(all as *tryte, cap) as *char;
+        }
+        var got_n: int = read(fd, &all[size], 6561);
+        if (got_n <= 0) { break; }
+        size += got_n;
+    }
+    close(fd);
+    all[size] = 0;
+    var start: int = 0;
+    while (start < size) {
+        var end: int = start;
+        while (end < size && all[end] != '\n') { end += 1; }
+        all[end] = 0;
+        lineno += 1;
+        var s: *char = &all[start];
+        if (s[0] != '#' && s[0] != 0) {
+            checked += 1;
+            if (starts_with(s, "tvar! ")) { check_tvar_refused(s, 1); }
+            else if (starts_with(s, "tvari! ")) { check_tvar_refused(s, 0); }
+            else if (starts_with(s, "tvar ")) { check_tvar(s); }
+            else if (starts_with(s, "ttv! ")) { check_ttv_refused(s); }
+            else if (starts_with(s, "ttv ")) { check_ttv(s, 1); }
+            else if (starts_with(s, "ttv> ")) { check_ttv(s, 0); }
+            else if (starts_with(s, "tim! ")) { check_tim_refused(s); }
+            else if (starts_with(s, "tim ")) { check_tim(s); }
+            else if (starts_with(s, "tau! ")) { check_tau_refused(s); }
+            else if (starts_with(s, "tau ")) { check_tau(s); }
+            else { fail("unknown kind of vector"); }
+        }
+        start = end + 1;
+    }
+    puts("fmtvec: ");
+    put_int(checked);
+    puts(" vectors, ");
+    if (failures == 0) { puts("all passed\n"); } else { put_int(failures); puts(" failed\n"); }
+    return failures != 0;
+}

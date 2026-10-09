@@ -191,7 +191,7 @@ fn k6_initramfs_root_still_boots() {
     // is the most that fits beside the kernel in 729 pages of RAM. The
     // test programs, the network and crypto tools and the media tools no
     // longer fit in that, and are not needed to boot.
-    let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest", "/sbin/telnetd", "/bin/nc", "/bin/paint", "/bin/colors"];
+    let heavy = ["test", "/bin/ssh", "/bin/scp", "/bin/sftp", "/bin/wget", "/bin/x509", "/bin/certgen", "/bin/ntpdate", "/sbin/sshd", "/sbin/httpd", "/usr/lib/sftp-server", "/usr/lib/trwtest", "/sbin/telnetd", "/bin/nc", "/bin/paint", "/bin/colors", "fmtvec"];
     let files: Vec<_> = trinux::default_files().into_iter().filter(|(name, src)| !heavy.iter().any(|h| name.contains(h)) && !src.ends_with("media.tri")).collect();
     let disk = trinux::build_disk_root(&trinux::kernel_dir(), &files, &Root::Initramfs).unwrap_or_else(|e| panic!("{e}")).trytes;
     let (out, _) = session(&disk, &["echo ramfs root", "ls /proc/1", "exit"], 100_000_000);

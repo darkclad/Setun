@@ -20,7 +20,7 @@ fn tau_header(p: *tryte, rate: int, channels: int, frames: int) {
 // The header of a TAU file of n trytes at p: 0, or -1 if it is not one
 // (or is shorter than its samples).
 fn tau_read_header(p: *tryte, n: int, rate: *int, channels: *int, frames: *int) -> int {
-    if (n < TAU_HEADER || tw_get(p) != TAU_MAGIC || tw_get(p + 3) != 1) { return -1; }
+    if (n < TAU_HEADER || tw_get(p) != TAU_MAGIC || tw_get(p + 3) != 1 || tw_get(p + 15) != 0) { return -1; }
     *rate = tw_get(p + 6);
     *channels = tw_get(p + 9);
     *frames = tw_get(p + 12);

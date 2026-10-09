@@ -146,7 +146,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         "sh", "echo", "cat", "ls", "mkdir", "rm", "true", "false", "sleep", "ps", "mount", "umount", "sync", "mv", "touch",
         "df", "head", "tail", "wc", "grep", "sort", "uniq", "cp", "ln", "chmod", "k3test", "sigtest", "fstest", "libctest", "mtxtest", "vectest", "chartest", "dstest",
         "fdcheck", "trwm", "term", "clock", "colors", "paint", "k8test", "edit", "login", "su", "passwd", "fputest", "calc",
-        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "fmttest", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
+        "nc", "ping", "netstat", "nettest", "cryptotest", "pktest", "fmttest", "fmtvec", "x509", "certgen", "tas", "tric", "host", "wget", "ssh", "ssh-keygen", "scp", "sftp", "ntpdate",
     ] {
         v.push((format!("/bin/{prog}"), u.join(format!("bin/{prog}.tri"))));
     }
@@ -189,6 +189,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
         v.push((format!("/etc/{db}"), u.join(format!("etc/{db}"))));
     }
     v.push(("/etc/ssl/cert.pem".into(), u.join("etc/ssl/cert.pem")));
+    v.push(("/usr/share/fmtvectors.txt".into(), u.join("share/fmtvectors.txt")));
     v.push(("/usr/share/font8x8".into(), PathBuf::from(FONT_SOURCE)));
     v.push(("/usr/share/unifont".into(), PathBuf::from(UNIFONT_SOURCE)));
     v

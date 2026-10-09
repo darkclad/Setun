@@ -18,6 +18,7 @@ import "../lib/stdlib.tri";
 import "../lib/getopt.tri";
 import "../lib/tvarint.tri";
 import "../lib/ttv.tri";
+import "../lib/ttvtext.tri";
 import "../lib/tau.tri";
 import "../lib/tim.tri";
 import "long.tri";
@@ -79,233 +80,14 @@ fn write_whole(path: *char, p: *tryte, n: int) -> int {
     return close(fd);
 }
 
-// ---- ttv: printing ----
-
-fn put_long(v: long) {
-    var b: [41]char;
-    ltoa(v, &b[0]);
-    puts(&b[0]);
-}
-
-fn put_real(x: real) {
-    var b: [81]char;
-    rtoa(x, 36, &b[0]);
-    puts(&b[0]);
-    // a real always shows as one: with a point or an exponent
-    if (strchr(&b[0], '.') == null && strchr(&b[0], 'e') == null && strchr(&b[0], 'n') == null) { puts(".0"); }
-}
-
-fn hexdigit(v: int) -> char { return (v < 10 ? '0' + v : 'a' + v - 10) as char; }
-
-var text_buf: [6561]char;
-
-// One value: 0, or -1 if the input is not valid TTV.
-fn print_value(r: *TtvReader) -> int {
-    var k: int = ttv_kind(r);
-    if (k == TTV_NULL) { ttv_read_null(r); puts("null"); return 0; }
-    if (k == TTV_TRUTH) {
-        var t: int = ttv_read_truth(r);
-        if (t == -2) { return -1; }
-        puts(t > 0 ? "true" : (t < 0 ? "false" : "unknown"));
-        return 0;
-    }
-    if (k == TTV_INT) {
-        var v: long;
-        if (ttv_read_long(r, &v) < 0) { return -1; }
-        put_long(v);
-        return 0;
-    }
-    if (k == TTV_REAL) {
-        var x: real;
-        if (ttv_read_real(r, &x) < 0) { return -1; }
-        put_real(x);
-        return 0;
-    }
-    if (k == TTV_TEXT) {
-        var n: int = ttv_read_text(r, &text_buf[0], 6560);
-        if (n < 0) { return -1; }
-        puts("\"");
-        var i: int = 0;
-        while (i < n) {
-            var c: int = text_buf[i];
-            if (c == '"' || c == '\\') { puts("\\"); write(STDOUT_FILENO, &text_buf[i], 1); }
-            else if (c == '\n') { puts("\\n"); }
-            else { write(STDOUT_FILENO, &text_buf[i], 1); }
-            i += 1;
-        }
-        puts("\"");
-        return 0;
-    }
-    if (k == TTV_OCTETS) {
-        var n2: int = ttv_read_octets(r, &text_buf[0] as *tryte, 6560);
-        if (n2 < 0) { return -1; }
-        puts("x\"");
-        var j: int = 0;
-        while (j < n2) {
-            var o: int = text_buf[j];
-            if (o < 0 || o > 255) { return -1; }
-            var h: [2]char;
-            h[0] = hexdigit(o / 16);
-            h[1] = hexdigit(o % 16);
-            write(STDOUT_FILENO, &h[0], 2);
-            j += 1;
-        }
-        puts("\"");
-        return 0;
-    }
-    if (k == TTV_LIST || k == TTV_MAP) {
-        var c: int = ttv_read_count(r, k);
-        if (c < 0) { return -1; }
-        puts(k == TTV_LIST ? "[" : "{");
-        var q: int = 0;
-        while (q < c) {
-            if (q > 0) { puts(", "); }
-            if (print_value(r) < 0) { return -1; }
-            if (k == TTV_MAP) {
-                puts(": ");
-                if (print_value(r) < 0) { return -1; }
-            }
-            q += 1;
-        }
-        puts(k == TTV_LIST ? "]" : "}");
-        return 0;
-    }
-    return -1;
-}
-
-// ---- ttv: the notation ----
-
-var src: *char;
-var at: int;
-
-fn skip_ws() { while (src[at] == ' ' || src[at] == '\t' || src[at] == '\n') { at += 1; } }
-
-fn starts(s: *char) -> int {
-    var k: int = 0;
-    while (s[k] != 0) { if (src[at + k] != s[k]) { return 0; } k += 1; }
-    return 1;
-}
-
-fn hexval(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
-// One value from src[at..] into b: 0, or -1 (at is where it went wrong).
-fn parse_value(b: *TtvBuf) -> int {
-    skip_ws();
-    if (starts("null")) { at += 4; ttv_null(b); return 0; }
-    if (starts("true")) { at += 4; ttv_truth(b, true); return 0; }
-    if (starts("false")) { at += 5; ttv_truth(b, false); return 0; }
-    if (starts("unknown")) { at += 7; ttv_truth(b, unknown); return 0; }
-    var c: int = src[at];
-    if (c == '"') {
-        at += 1;
-        var n: int = 0;
-        while (src[at] != '"') {
-            if (src[at] == 0 || n >= 6560) { return -1; }
-            var ch: int = src[at];
-            if (ch == '\\') {
-                at += 1;
-                ch = src[at] == 'n' ? '\n' : src[at];
-                if (ch == 0) { return -1; }
-            }
-            text_buf[n] = ch as char;
-            n += 1;
-            at += 1;
-        }
-        at += 1;
-        text_buf[n] = 0;
-        ttv_text(b, &text_buf[0]);
-        return 0;
-    }
-    if (c == 'x' && src[at + 1] == '"') {
-        at += 2;
-        var m: int = 0;
-        while (src[at] != '"') {
-            var hi: int = hexval(src[at]);
-            var lo: int = hexval(src[at + 1]);
-            if (hi < 0 || lo < 0 || m >= 6560) { return -1; }
-            text_buf[m] = (hi * 16 + lo) as char;
-            m += 1;
-            at += 2;
-        }
-        at += 1;
-        ttv_octets(b, &text_buf[0] as *tryte, m);
-        return 0;
-    }
-    if (c == '[' || c == '{') {
-        var map: int = c == '{';
-        at += 1;
-        // the count goes first: write the items to a buffer of their own
-        var items: TtvBuf;
-        ttv_init(&items);
-        var count: int = 0;
-        skip_ws();
-        if (src[at] != (map ? '}' : ']')) {
-            loop {
-                if (parse_value(&items) < 0) { return -1; }
-                if (map) {
-                    skip_ws();
-                    if (src[at] != ':') { return -1; }
-                    at += 1;
-                    if (parse_value(&items) < 0) { return -1; }
-                }
-                count += 1;
-                skip_ws();
-                if (src[at] == ',') { at += 1; continue; }
-                break;
-            }
-        }
-        skip_ws();
-        if (src[at] != (map ? '}' : ']')) { return -1; }
-        at += 1;
-        if (map) { ttv_map(b, count); } else { ttv_list(b, count); }
-        if (ttv_room(b, items.n)) {
-            var k: int = 0;
-            while (k < items.n) { b.p[b.n + k] = items.p[k]; k += 1; }
-            b.n += items.n;
-        }
-        free(items.p);
-        return 0;
-    }
-    if (c == '-' || c == '+' || (c >= '0' && c <= '9')) {
-        // a real has a point or an exponent; otherwise an integer
-        var e: int = at + 1;
-        while (src[e] >= '0' && src[e] <= '9') { e += 1; }
-        if (src[e] == '.' || src[e] == 'e' || src[e] == 'E') {
-            var end: *char;
-            var x: real = strtor(&src[at], &end);
-            if (end == &src[at]) { return -1; }
-            at = (end - src) as int;
-            ttv_real(b, x);
-            return 0;
-        }
-        var neg: int = c == '-';
-        if (c == '-' || c == '+') { at += 1; }
-        if (src[at] < '0' || src[at] > '9') { return -1; }
-        var v: long = 0;
-        while (src[at] >= '0' && src[at] <= '9') {
-            v = v * 10 + (src[at] - '0');
-            at += 1;
-        }
-        ttv_long(b, neg ? -v : v);
-        return 0;
-    }
-    return -1;
-}
+// ---- ttv ----
 
 fn do_ttv(argc: int, argv: **char) -> int {
     if (argc == 4 && streq(argv[1], "-c")) {
-        src = argv[2];
-        at = 0;
         var b: TtvBuf;
         ttv_init(&b);
-        if (parse_value(&b) < 0) { return fail("ttv", "cannot read the notation at: ", &src[at]); }
-        skip_ws();
-        if (src[at] != 0) { return fail("ttv", "more after the value: ", &src[at]); }
+        if (ttv_parse(argv[2], &b) < 0) { return fail("ttv", "cannot read the notation at: ", &argv[2][ttv_parse_at]); }
+        if (argv[2][ttv_parse_at] != 0) { return fail("ttv", "more after the value: ", &argv[2][ttv_parse_at]); }
         if (b.err) { return fail("ttv", "out of memory", null); }
         if (write_whole(argv[3], b.p, b.n) < 0) { perror2("ttv", argv[3]); return 1; }
         return 0;
@@ -316,12 +98,14 @@ fn do_ttv(argc: int, argv: **char) -> int {
     if (n < 0) { perror2("ttv", argv[1]); return 1; }
     var r: TtvReader;
     ttv_reader(&r, p, n);
-    var status: int = 0;
+    var out: *char = malloc(59049);
+    if (out == null) { return fail("ttv", "out of memory", null); }
     while (!ttv_at_end(&r)) {
-        if (print_value(&r) < 0) { puts("\n"); return fail("ttv", "not valid TTV: ", argv[1]); }
+        if (ttv_format(&r, out, 59049) < 0) { return fail("ttv", "not valid TTV: ", argv[1]); }
+        puts(out);
         puts("\n");
     }
-    return status;
+    return 0;
 }
 
 // ---- sound ----

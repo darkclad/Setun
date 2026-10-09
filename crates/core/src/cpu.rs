@@ -1516,8 +1516,10 @@ impl Cpu {
             op::VALU | op::VMEM | op::VMOV => self.exec_vec(m, a, b, x, y, z)?,
             op::MEMR => match b {
                 memr::STWM => {
-                    // the word at ra := merge(old, rd, mask rb), all at once
+                    // the word at ra := merge(old, rd, mask rb), all at once;
+                    // a write access, checked before the read (as CAS3)
                     let va = self.reg(y).value();
+                    self.data_pa(m, va, Access::Write, true)?;
                     let old = self.load_word_as(m, va, Access::Read)?;
                     let new = old.tritwise_merge(self.reg(z), self.reg(x));
                     self.store_word(m, va, new)?;
@@ -1667,7 +1669,11 @@ impl Cpu {
                 _ => return Err(ill()),
             },
             op::VMEM => {
-                // 9 trytes whose first word is at ra + 9·q3, a multiple of 9
+                // 9 trytes whose first word is at ra + 9·q3, a multiple of 9;
+                // a reserved function is ILL whatever the address
+                if !matches!(b, vmem::VLD | vmem::VST) {
+                    return Err(ill());
+                }
                 let va = self.reg(y).value() + 9 * z;
                 if va.rem_euclid(9) != 0 {
                     return Err(Fault::mem(vector::MISALIGNED, va, if b == vmem::VST { Access::Write } else { Access::Read }));

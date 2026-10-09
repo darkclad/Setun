@@ -187,7 +187,11 @@ fn ttv_read_trytes(r: *TtvReader, tag: int, out: *tryte, max: int) -> int {
     if (len < 0 || len > r.n - r.at || len > max) { return ttv_fail(r); }
     var n: int = len as int;
     var k: int = 0;
-    while (k < n) { out[k] = r.p[r.at + k]; k += 1; }
+    while (k < n) {
+        out[k] = r.p[r.at + k];
+        if (tag == TTV_OCTETS && (out[k] < 0 || out[k] > 255)) { return ttv_fail(r); }
+        k += 1;
+    }
     if (tag == TTV_TEXT) { out[n] = 0; }
     r.at += n;
     return n;
