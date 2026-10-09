@@ -284,7 +284,7 @@ fn session(command: *char, want_pty: int) {
 }
 
 fn usage() -> int {
-    fputs(STDERR_FILENO, "usage: ssh [-p port] [-l user] [-i key] [-t | -T] [user@]host [command ...]\n");
+    fputs(STDERR_FILENO, "usage: ssh [-p port] [-l user] [-i key] [-o KexAlgorithms=list] [-t | -T] [user@]host [command ...]\n");
     return 255;
 }
 
@@ -294,7 +294,7 @@ fn main(argc: int, argv: **char) -> int {
     var force_pty: int = 0;
     var no_pty: int = 0;
     user[0] = 0;
-    var c: int = getopt(argc, argv, "p:l:i:tT");
+    var c: int = getopt(argc, argv, "p:l:i:o:tT");
     while (c != -1) {
         switch (c) {
             case 'p': { port = atoi(optarg); if (port <= 0 || port > 65535) { return usage(); } }
@@ -302,9 +302,14 @@ fn main(argc: int, argv: **char) -> int {
             case 'i': { strncpy(&identity[0], optarg, 290); identity[290] = 0; }
             case 't': force_pty = 1;
             case 'T': no_pty = 1;
+            case 'o': {
+                // only KexAlgorithms: the exchanges to offer, in order
+                if (strncmp(optarg, "KexAlgorithms=", 14) != 0 || strlen(optarg) > 14 + 700) { return usage(); }
+                strcpy(&kex_want[0], &optarg[14]);
+            }
             default: return usage();
         }
-        c = getopt(argc, argv, "p:l:i:tT");
+        c = getopt(argc, argv, "p:l:i:o:tT");
     }
     if (optind >= argc) { return usage(); }
     client_target(argv[optind]);

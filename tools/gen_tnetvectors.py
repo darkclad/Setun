@@ -101,12 +101,66 @@ def main():
             t[b] = m3(t[b] + e)
             g[k] = untrits(t)
             LINES.append('bad ' + ' '.join(map(str, g)))
+    # ---- exchanges with a station (0.0.1): an input frame, and every frame it
+    # must send back (none: the frame is dropped). The station listens on
+    # no port. Replies follow §2–§4 exactly.
+    ME, PEER = 1, 2
+    def tnp(dst, src, proto, payload, hops=27):
+        return word3(dst) + word3(src) + [proto, hops, len(payload)] + list(payload)
+    def tsp(sport, dport, seq, ack, ctl, wnd, data=()):
+        return [sport, dport] + word3(seq) + word3(ack) + [ctl, wnd] + list(data)
+    def wrap(v):
+        h = (3 ** 27 - 1) // 2
+        return (v + h) % (3 ** 27) - h
+    def ex(name, frame_in, frames_out):
+        LINES.append(f'ex {name} : ' + ' '.join(map(str, frame_in)) + ' => ' + ' ; '.join(' '.join(map(str, f)) for f in frames_out))
+    data = [0, 1, -1, 9841, -9841, 255, 256]
+    ex('link-echo', frame(ME, PEER, 2, data), [frame(PEER, ME, 3, data)])
+    ex('link-echo-broadcast', frame(0, PEER, 2, [7]), [frame(PEER, ME, 3, [7])])
+    ex('link-reply-ignored', frame(ME, PEER, 3, [7]), [])
+    ex('link-other-station', frame(5, PEER, 2, [7]), [])
+    ex('link-unknown-type', frame(ME, PEER, 4, [7]), [])
+    bad = frame(ME, PEER, 2, [7]); bad[3] = bad[3] + 1 if bad[3] < 9841 else bad[3] - 1
+    ex('link-bad-check', bad, [])
+    ex('link-short', frame(ME, PEER, 2, [])[:8], [])
+    echo = [1, 77, 5] + data
+    ex('tcmp-echo', frame(ME, PEER, 1, tnp(ME, PEER, 3, echo)), [frame(PEER, ME, 1, tnp(PEER, ME, 3, [2] + echo[1:]))])
+    ex('tcmp-echo-short', frame(ME, PEER, 1, tnp(ME, PEER, 3, [1, 77])), [])
+    ex('tnp-hop-limit-0', frame(ME, PEER, 1, tnp(ME, PEER, 3, echo, hops=0)), [])
+    ex('tnp-other-host', frame(ME, PEER, 1, tnp(9, PEER, 3, echo)), [])
+    ex('tnp-short', frame(ME, PEER, 1, tnp(ME, PEER, 3, [])[:8]), [])
+    longer = tnp(ME, PEER, 3, echo); longer[8] += 5
+    ex('tnp-length-past-frame', frame(ME, PEER, 1, longer), [])
+    unknown = tnp(ME, PEER, 9, [1, 2, 3])
+    ex('tnp-unknown-protocol', frame(ME, PEER, 1, unknown), [frame(PEER, ME, 1, tnp(PEER, ME, 3, [3, 1, 0] + unknown))])
+    big = tnp(ME, PEER, 9, list(range(100)))
+    ex('tnp-unreachable-quotes-36', frame(ME, PEER, 1, big), [frame(PEER, ME, 1, tnp(PEER, ME, 3, [3, 1, 0] + big[:36]))])
+    tdp = tnp(ME, PEER, 2, [200, 90, 1, 2, 3])
+    ex('tdp-closed-port', frame(ME, PEER, 1, tdp), [frame(PEER, ME, 1, tnp(PEER, ME, 3, [3, 2, 0] + tdp))])
+    ex('tdp-port-0', frame(ME, PEER, 1, tnp(ME, PEER, 2, [0, 90, 1])), [])
+    # TSP to a closed port: a reset (RST = 9, ACK = 3, opening +1, closing -1)
+    W = (3 ** 27 - 1) // 2
+    for seq in (5, W, -W, 123456789):
+        syn = tsp(200, 77, seq, 0, 1, 100)
+        ex(f'tsp-open-closed-port', frame(ME, PEER, 1, tnp(ME, PEER, 1, syn)),
+           [frame(PEER, ME, 1, tnp(PEER, ME, 1, tsp(77, 200, 0, wrap(seq + 1), 9 + 3, 0)))])
+    seg = tsp(200, 77, 50, 999, 3, 100, [104, 105])
+    ex('tsp-ack-closed-port', frame(ME, PEER, 1, tnp(ME, PEER, 1, seg)), [frame(PEER, ME, 1, tnp(PEER, ME, 1, tsp(77, 200, 999, 0, 9, 0)))])
+    seg = tsp(200, 77, 50, 0, -1, 100, [104, 105])
+    ex('tsp-fin-data-closed-port', frame(ME, PEER, 1, tnp(ME, PEER, 1, seg)), [frame(PEER, ME, 1, tnp(PEER, ME, 1, tsp(77, 200, 0, 50 + 2 + 1, 9 + 3, 0)))])
+    ex('tsp-rst-ignored', frame(ME, PEER, 1, tnp(ME, PEER, 1, tsp(200, 77, 50, 0, 9, 100))), [])
+    ex('tsp-bad-ack-trit', frame(ME, PEER, 1, tnp(ME, PEER, 1, tsp(200, 77, 50, 0, 1 - 3, 100))), [])
+    ex('tsp-other-trits', frame(ME, PEER, 1, tnp(ME, PEER, 1, tsp(200, 77, 50, 0, 1 + 27, 100))), [])
+    ex('tsp-port-0', frame(ME, PEER, 1, tnp(ME, PEER, 1, tsp(0, 77, 50, 0, 1, 100))), [])
+    ex('tsp-short', frame(ME, PEER, 1, tnp(ME, PEER, 1, tsp(200, 77, 50, 0, 1, 100)[:9])), [])
     sys.stdout.reconfigure(encoding='utf-8', newline='\n')
     print('# Setun-11̅ TNET conformance vectors (docs/TNET.md §7), made by')
     print('# tools/gen_tnetvectors.py from an independent model of the specification.')
     print('#   crc T... = C              TCRC-18 of the trytes T is the 18-trit number C')
     print('#   frame D S Y : P... = F... a TL frame to D from S of type Y with payload P')
     print('#   bad F...                  a frame whose check fails')
+    print('#   ex NAME : F => G ; H ...  station 0.0.1, listening on no port, given frame F,')
+    print('#                             sends exactly the frames G, H, ... (none after "=>": drops F)')
     for l in LINES:
         print(l)
     print(f'# {len(LINES)} vectors', file=sys.stderr)

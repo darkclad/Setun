@@ -140,10 +140,19 @@ fn post_quantum_key_exchange_with_openssh() {
     let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v"], "true");
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("kex: algorithm: mlkem768x25519-sha256"), "{err}");
+    // Streamlined NTRU Prime with X25519, hashed with SHA-512 (a 64-octet
+    // session id, which the public-key login signs over), by both names
+    for name in ["sntrup761x25519-sha512", "sntrup761x25519-sha512@openssh.com"] {
+        let opt = format!("-oKexAlgorithms={name}");
+        let (code, out, err) = run_ssh(&mut s, port, "root", "root", &["-v", &opt], "echo ntru ok");
+        assert_eq!((code, out.as_str()), (0, "ntru ok\n"), "stderr:\n{err}");
+        assert!(err.contains(&format!("kex: algorithm: {name}")), "{err}");
+    }
+    has(&s.log("sshd"), &["key exchange sntrup761x25519-sha512"]);
     // a key exchange the server does not have
-    let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=sntrup761x25519-sha512"], "true");
+    let (code, _, err) = run_ssh(&mut s, port, "root", "root", &["-v", "-oKexAlgorithms=diffie-hellman-group14-sha256"], "true");
     assert_eq!(code, 255, "{err}");
-    assert!(err.contains("no matching key exchange method found. Their offer: mlkem768x25519-sha256,curve25519-sha256,"), "{err}");
+    assert!(err.contains("no matching key exchange method found. Their offer: mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com,curve25519-sha256,"), "{err}");
 }
 
 #[test]
@@ -285,6 +294,11 @@ fn public_key_logins() {
     let (code, out, err) = run_ssh(&mut s, port, "root", "unused", &o, "echo by key; whoami");
     assert_eq!((code, out.as_str()), (0, "by key\nroot\n"), "{err}");
     has(&s.log("sshd"), &["accepted publickey for root"]);
+    // after sntrup761x25519-sha512 the session id the key signs is 64 octets
+    let mut o2 = vec!["-oKexAlgorithms=sntrup761x25519-sha512"];
+    o2.extend(o.iter());
+    let (code, out, err) = run_ssh(&mut s, port, "root", "unused", &o2, "echo by key after ntru");
+    assert_eq!((code, out.as_str()), (0, "by key after ntru\n"), "{err}");
     // a key that is not in the file
     let opts = with_key(&other);
     let o: Vec<&str> = opts.iter().map(|x| x.as_str()).collect();

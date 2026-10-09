@@ -10,6 +10,8 @@ import hashlib
 import sys
 sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
 from mlkem import keygen, encaps, decaps
+import sntrup761 as sn
+import random
 
 def msg(n, seed=3):
     return bytes((i * 7 + seed) % 256 for i in range(n))
@@ -44,6 +46,40 @@ for c in cases:
     out.append(f'    "{c[0]}", "{c[1]}", "{c[2]}", "{c[3]}",')
     out.append(f'    "{c[4]}", "{c[5]}",')
     out.append(f'    "{c[6]}", "{c[7]}",')
+out.append('};')
+# sntrup761: deterministic g, f, rho and r from a seeded generator; the
+# inputs as their encodings, the outputs as SHA3-256 hashes (and the keys)
+rnd = random.Random(761)
+def small():
+    return [rnd.choice((-1, 0, 1)) for _ in range(sn.P)]
+def short():
+    f = [1 if rnd.random() < 0.5 else -1 for _ in range(sn.W)] + [0] * (sn.P - sn.W)
+    rnd.shuffle(f)
+    return f
+sncases = []
+for k in range(2):
+    g = small()
+    while sn.poly_inverse(g, 3) is None:
+        g = small()
+    f, r = short(), short()
+    rho = bytes(rnd.randrange(256) for _ in range(sn.SMALL_BYTES))
+    pk, sk = sn.keygen(g, f, rho)
+    key, ct = sn.encaps(pk, r)
+    assert sn.decaps(sk, ct) == key
+    bad = bytearray(ct); bad[200] ^= 16
+    rej = sn.decaps(sk, bytes(bad))
+    if k == 0:
+        sn_pk0 = pk
+        sn_ginv0 = [sn.f3(x) for x in sn.poly_inverse(g, 3)]
+    sncases.append((sn.small_encode(g).hex(), sn.small_encode(f).hex(), rho.hex(), sn.small_encode(r).hex(), h(pk), h(sk), h(ct), key.hex(), rej.hex()))
+# the first public key itself, so the encodings and encapsulation can be
+# checked apart from key generation; and 1/g mod 3 of the first g
+out.append(f'var sntrup_pk0: [1]*char = {{ "{sn_pk0.hex()}" }};')
+out.append(f'var sntrup_ginv0: [1]*char = {{ "{sn.small_encode(sn_ginv0).hex()}" }};')
+out.append(f'var sntrup_cases: [{len(sncases) * 9}]*char = {{')
+for c in sncases:
+    for v in c:
+        out.append(f'    "{v}",')
 out.append('};')
 out.append('// ---- end of vectors ----')
 print('\n'.join(out))

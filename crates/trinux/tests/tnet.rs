@@ -344,6 +344,20 @@ fn gate_c_ssh_between_setun_machines() {
     let log = p.b("cat /var/log/sshd.log");
     assert!(log.contains("connection from 0.0.1\n"), "sshd saw a TNET peer: {log}");
     assert!(log.contains("key exchange mlkem768x25519-sha256\n"), "post-quantum between the two: {log}");
+    // the Trinux client can make the other exchanges too: its own key
+    // generation and decapsulation of sntrup761, and plain curve25519
+    let out = p.on(true, "ssh -o KexAlgorithms=sntrup761x25519-sha512 user@0.0.2 'echo ntru ok'", "password: ", 6_000_000_000);
+    let out = out + &p.on(true, "user", "$ ", 6_000_000_000);
+    assert!(out.contains("ntru ok\n"), "{out}");
+    let out = p.on(true, "ssh -o KexAlgorithms=curve25519-sha256 user@0.0.2 'echo curve ok'", "password: ", 3_000_000_000);
+    let out = out + &p.on(true, "user", "$ ", 3_000_000_000);
+    assert!(out.contains("curve ok\n"), "{out}");
+    let log = p.b("cat /var/log/sshd.log");
+    assert!(log.contains("key exchange sntrup761x25519-sha512\n") && log.contains("key exchange curve25519-sha256\n"), "{log}");
+    let out = p.a("ssh -o KexAlgorithms=diffie-hellman-group1-sha1 user@0.0.2 true; echo status $?");
+    assert!(out.contains("no common key exchange") && out.contains("status 1"), "{out}");
+    let out = p.a("ssh -o Cipher=aes user@0.0.2 true; echo status $?");
+    assert!(out.contains("usage: ssh") && out.contains("status 255"), "only KexAlgorithms: {out}");
     let known = p.a("cat /root/.ssh/known_hosts");
     assert!(known.contains("0.0.2 ssh-ed25519 "), "{known}");
     // the wire carried only TL frames with good checks, TNP inside
@@ -421,4 +435,24 @@ fn tdp_datagrams_through_nc() {
     assert!(out.contains("status 0"), "{out}");
     let out = p.b("sleep 1; kill %1; cat /tmp/d");
     assert!(out.contains("датаграмма через TDP 0t1̅01\n"), "{out}");
+}
+
+/// The exchange vectors of docs/TNET.md §7: each frame given to a station
+/// (0.0.1, listening on no port), and exactly the frames it must send back.
+#[test]
+fn the_exchange_vectors() {
+    let text = include_str!("../../net/tests/tnet_vectors.txt");
+    let nums = |s: &str| -> Vec<i16> { s.split_whitespace().map(|t| t.parse().unwrap()).collect() };
+    let mut m = boot(ME);
+    login(&mut m);
+    let mut n = 0;
+    for line in text.lines().filter_map(|l| l.strip_prefix("ex ")) {
+        let (name, rest) = line.split_once(" : ").unwrap();
+        let (input, output) = rest.split_once(" =>").unwrap();
+        let want: Vec<Vec<i16>> = output.split(" ; ").map(nums).filter(|f| !f.is_empty()).collect();
+        let got = exchange(&mut m, &nums(input));
+        assert_eq!(got, want, "vector {name}");
+        n += 1;
+    }
+    assert!(n >= 25, "{n} vectors");
 }

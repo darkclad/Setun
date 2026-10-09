@@ -111,13 +111,14 @@ fn try_key(path: *char) -> int {
     put_text("ssh-ed25519");
     put_string(&blob[0], 51);
     // the signature covers the session id and this request so far
-    put_be32(&sign_buf[0], 32);
+    put_be32(&sign_buf[0], session_id_len);
     var k: int = 0;
-    while (k < 32) { sign_buf[4 + k] = session_id[k]; k += 1; }
+    while (k < session_id_len) { sign_buf[4 + k] = session_id[k]; k += 1; }
+    var h: int = 4 + session_id_len;
     k = 0;
-    while (k < out_len) { sign_buf[36 + k] = outp[k]; k += 1; }
+    while (k < out_len) { sign_buf[h + k] = outp[k]; k += 1; }
     var sig: [64]tryte;
-    ed25519_sign(&sig[0], &sign_buf[0], 36 + out_len, &sk[0]);
+    ed25519_sign(&sig[0], &sign_buf[0], h + out_len, &sk[0]);
     put_u32(83);
     put_text("ssh-ed25519");
     put_string(&sig[0], 64);

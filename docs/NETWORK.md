@@ -284,7 +284,7 @@ When `eth0` is up at boot, init starts `/sbin/sshd` next to `telnetd`. Without `
 
 | | |
 |---|---|
-| Key exchange | `mlkem768x25519-sha256` (ML-KEM-768 with X25519, post-quantum, preferred; TNET.md §6) and `curve25519-sha256` (also `@libssh.org`), RFC 8731; strict KEX (`kex-strict-s-v00@openssh.com`, the Terrapin fix): sequence numbers restart after NEWKEYS and nothing else may come during the first exchange; re-keying when the client asks |
+| Key exchange | `mlkem768x25519-sha256` (ML-KEM-768 with X25519, post-quantum, preferred), `sntrup761x25519-sha512` (Streamlined NTRU Prime with X25519; SHA-512 and a 64-octet session id) (TNET.md §6) and `curve25519-sha256` (also `@libssh.org`), RFC 8731; strict KEX (`kex-strict-s-v00@openssh.com`, the Terrapin fix): sequence numbers restart after NEWKEYS and nothing else may come during the first exchange; re-keying when the client asks |
 | Host key | `ssh-ed25519`, made on first start: `/etc/ssh/ssh_host_ed25519_key` (the 32-octet seed in hex, mode 0600) and `.pub` in OpenSSH's format; `/var/log/sshd.log` shows its `SHA256:` fingerprint |
 | Cipher | `chacha20-poly1305@openssh.com`. The tag is checked before anything is decrypted; a bad tag ends the connection |
 | Login | `publickey`: `ssh-ed25519` keys listed in `~/.ssh/authorized_keys` (one `ssh-ed25519 BASE64 comment` per line; the file is ignored if group or others may write it), with the PK_OK query and the RFC 4252 §7 signature over the session id and the request. `password`, checked against `/etc/shadow` like `login(1)`; empty passwords are never accepted. An unknown user is refused the same way as a wrong password or key; after 6 failures the server disconnects |

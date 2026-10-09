@@ -550,7 +550,7 @@ quits.
 | `netstat` | `netstat [-tualn]` | sockets from `/proc/net/tcp` and `/proc/net/udp`; `-a` all, `-l` listening only; addresses are always numeric |
 | `host` | `host [-s server] name` | DNS A records only (`/etc/hosts` is not read). Status 0 found, 1 not, 2 usage |
 | `wget` | `wget [-q] [-b] [-S] [-O file] [--max-redirect=n] [--no-check-certificate] [--ca-certificate=file] URL` | HTTP/1.1 and HTTPS (TLS 1.3); follows up to 20 redirects; chunked bodies; `-O -` writes to standard output; `-b` keeps octets; `-S` prints headers. Exit status as GNU wget: 4 network or TLS trouble, 5 certificate not verified, 7 malformed answer, 8 error answer or too many redirects |
-| `ssh` | `ssh [-p port] [-l user] [-i key] [-t \| -T] [user@]host [command ...]` | SSH client; `~.` at the start of a line disconnects; exit status is the remote one, or 255 |
+| `ssh` | `ssh [-p port] [-l user] [-i key] [-o KexAlgorithms=list] [-t \| -T] [user@]host [command ...]` | SSH client, over IPv4 or TNET; `~.` at the start of a line disconnects; `-o KexAlgorithms` picks the key exchanges to offer (default: the two post-quantum hybrids, then curve25519); exit status is the remote one, or 255 |
 | `ssh-keygen` | `ssh-keygen [-f file] [-C comment]`, `ssh-keygen -l -f file` | make an ssh-ed25519 key (default `~/.ssh/id_ed25519`), or show a fingerprint |
 | `scp` | `scp [-P port] [-i key] [-q] [-r] source ... target` | copy over SFTP; one side is `[user@]host:path`; several sources need a directory target. Status 0, 1 if any copy failed, 255 if the connection failed |
 | `sftp` | `sftp [-P port] [-i key] [-b batchfile] [user@]host` | commands `ls cd pwd get [-r] put [-r] mkdir rmdir rm rename lcd lpwd lls help bye quit exit`; with `-b` the first failure ends the session with status 1 unless the line starts with `-` |
@@ -608,7 +608,7 @@ line per check.
 | `fmtvec [file]` | the format libraries against the conformance vectors in `/usr/share/fmtvectors.txt` (FORMATS.md §5) |
 | `nettest` | socket calls and their errors on loopback |
 | `cryptotest`, `pktest` | crypto against published vectors |
-| `pqtest` | SHA-3, SHAKE and ML-KEM-768 against vectors from a reference checked against OpenSSL |
+| `pqtest` | SHA-3, SHAKE, ML-KEM-768 (against a reference checked against OpenSSL) and sntrup761 (against a reference whose ring inverses use another algorithm) |
 | `fdcheck` | exits with the number of open descriptors among 3..26 |
 | `k2_hello` | prints lines with busy work in between (timer interleaving) |
 | `/usr/lib/trwtest/{nocreate,unknown,huge,crash,bigwin}` | window clients that break the protocol on purpose |
@@ -1831,6 +1831,7 @@ and §14.
 | `md5.tri` | MD5: `md5_init`, `md5_put_chars`, `md5_final`, `md5_digest_hex`, `md5_hex(s, n, out)`; text is hashed as UTF-8 |
 | `hmac.tri` | `hmac(id, key, klen, m, mlen, out)`, `hkdf_extract`, `hkdf_expand`, `hkdf_expand_label` (TLS 1.3) |
 | `sha3.tri` | `sha3_256`, `sha3_512`, `shake128`, `shake256`; the sponge as `keccak_init`/`keccak_absorb`/`keccak_squeeze` and `keccak_f` |
+| `sntrup.tri` | sntrup761: `sntrup_keygen(pk, sk)`, `sntrup_encaps(pk, key, ct)`, `sntrup_decaps(sk, ct, key)`, and the deterministic `sntrup_keygen_from`, `sntrup_encaps_with` |
 | `mlkem.tri` | ML-KEM-768 (FIPS 203): `mlkem_keygen(d, z, ek, dk)`, `mlkem_encaps(ek, m, key, ct)`, `mlkem_decaps(dk, ct, key)` (implicit rejection), `mlkem_ek_ok(ek)` |
 | `chacha.tri` | `chacha20_block`, `chacha20_xor` (64-bit nonce, as SSH), the `_ietf` forms (RFC 8439), `poly1305`, `aead_seal`, `aead_open` |
 | `aes.tri` | `aes_setkey`, `aes_encrypt` (AES-128/256), `gcm_setkey`, `gcm_seal`, `gcm_open` |

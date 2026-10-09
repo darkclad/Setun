@@ -31,6 +31,8 @@ fn the_conformance_vectors() {
         } else if let Some(rest) = line.strip_prefix("bad ") {
             assert_eq!(parse(&trytes(rest)), None, "{line}");
             bad += 1;
+        } else if line.starts_with("ex ") {
+            // exchanges with a booted station: crates/trinux/tests/tnet.rs
         } else {
             panic!("unknown vector {line}");
         }

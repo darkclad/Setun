@@ -1,6 +1,6 @@
 # TNET: the native ternary network
 
-**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. C4 too: `ssh` makes a post-quantum key exchange (ML-KEM-768 with X25519), with OpenSSH and between Setun machines. sntrup761 (C5) is next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
+**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. C4 and C5 too: `ssh` makes post-quantum key exchanges (ML-KEM-768, and Streamlined NTRU Prime, each with X25519), with OpenSSH and between Setun machines. Conformance vectors cover TCRC-18, TL frames and the station's exchanges for TNP, TCMP, TDP and TSP (§7). Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
 
 | Layer | Name | Section | Milestone |
 |---|---|---|---|
@@ -9,7 +9,7 @@
 | network | TNP: 27-trit host addresses | §3 | C2 ✅ |
 | transport | TSP streams, TDP datagrams | §4 | C2 ✅ |
 | sockets | `AF_TNP` beside `AF_INET` | §5 | C2–C3 ✅ |
-| key exchange | ML-KEM-768 ✅, then sntrup761, in `ssh` | §6 | C4 ✅, C5 |
+| key exchange | ML-KEM-768 and sntrup761 in `ssh` | §6 | C4–C5 ✅ |
 
 Sizes follow the power-of-3 rule throughout, since none of it has to meet a binary standard.
 
@@ -147,9 +147,14 @@ TSP runs on TCP's state machine (`kernel/net/tcp.tri`): `tcp_segment()` takes a 
 - The reference is `tools/mlkem.py`, written from the standard; `tools/check_mlkem.py` checks it against OpenSSL 3.5 (key generation from the seed, and decapsulation of OpenSSL's ciphertexts), and `tools/gen_pqvectors.py` turns it into the vectors of `/bin/pqtest`.
 - Tests: `/bin/pqtest` (SHA-3 and SHAKE at every block edge, ML-KEM key generation, encapsulation, decapsulation, implicit rejection, the key check); the host's OpenSSH logs in to Trinux's sshd with the hybrid forced, with curve25519 forced, with its own default (it picks the hybrid) and with its order reversed (it gets curve25519); and Gate C's two Setun machines agree on the hybrid over TNET.
 
-**C5 (next):** `sntrup761x25519-sha512` (Streamlined NTRU Prime, whose secrets are exactly −1, 0, +1), also checked against OpenSSH.
+**C5 (built).** `sntrup761x25519-sha512` (also under its `@openssh.com` name) comes second in the list. Its client sends an sntrup761 public key (1158 octets) and an X25519 key; the server encapsulates and returns the ciphertext (1039) and its X25519 key; K = SHA-512(sntrup key ‖ X25519 key), and the exchange hash and the key derivation are SHA-512 too, so the session id is 64 octets (and a public-key login signs over all 64).
+
+- `user/lib/sntrup.tri`: Streamlined NTRU Prime in the ring Z[x]/(x^761 − x − 1), q = 4591. Its small polynomials are balanced trits: coefficients −1, 0, +1, exactly 286 of them non-zero in a short one. Key generation inverts g modulo 3 and 3f modulo q with the reference code's divstep iteration (about 15 s emulated); encapsulation takes about 2 s, decapsulation about 4.
+- `tools/sntrup761.py` is the reference, written from the specification; its inverses use the extended Euclidean algorithm instead, so the vectors of `/bin/pqtest` check two methods against each other. OpenSSL has no sntrup761, so the check against another implementation is the handshake with OpenSSH: forced under both names, and with a public-key login over the 64-octet session id. `tools/check_sntrup761.py` checks the reference's own round trips.
+- `ssh -o KexAlgorithms=LIST` chooses what the Trinux client offers; between the two Setun machines of Gate C the client makes all three exchanges, so its sntrup761 key generation and decapsulation are tested too.
 
 ## 7. Conformance
 
 - **The vectors** are `crates/net/tests/tnet_vectors.txt`, made by `tools/gen_tnetvectors.py` from a model of this document (polynomial long division over GF(3), a trit at a time, sharing no code with any implementation): TCRC-18 of edge and random messages, whole TL frames, and corrupted frames that must fail the check. Lines: `crc T… = C`, `frame D S Y : P… = F…`, `bad F…`.
-- They are checked against the host's implementation (`setun-net`) and, through frames sent to a booted machine, against Trinux's.
+- **Exchanges** (`ex NAME : F => G ; H …`): a frame given to a station (0.0.1, listening on no port) and exactly the frames it must send back, or none. They cover link echoes (to the station and to broadcast), TCMP echo, "unreachable" for an unknown protocol and for a closed TDP port (quoting the TNP header and 27 trytes), TSP's resets to a closed port (for an opening, with sequence numbers at both ends of the word's range; for an acknowledgement; for data with a closing), and the frames that must be dropped silently: a reply, another station, an unknown type, a bad check, a short frame, hop limit 0, another host, a TNP length past the frame, a short TNP, TCMP or TSP header, a reset, an acknowledgement trit of −1, control trits beyond the third, and port 0.
+- They are checked against the host's implementation (`setun-net`, the `crc`, `frame` and `bad` lines), and the exchanges against a booted Trinux (`crates/trinux/tests/tnet.rs`).
