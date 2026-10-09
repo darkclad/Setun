@@ -399,3 +399,25 @@ fn a_tsp_opening_is_not_taken_by_a_tcp_listener() {
     let out = p.a("nc 0.0.2 81; echo status $?");
     assert!(out.contains("Connection refused") && out.contains("status 1"), "only TCP listens on 81: {out}");
 }
+
+#[test]
+fn tdp_to_a_closed_port_is_unreachable() {
+    let mut m = boot(ME);
+    login(&mut m);
+    let out = exchange(&mut m, &tnp_frame(2, &[200, 90, 1, 2, 3]));
+    let got = tnp_of(&out);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].2, got[0].3[0], got[0].3[1]), (3, 3, 2), "TCMP port unreachable: {got:?}");
+    assert!(exchange(&mut m, &tnp_frame(2, &[200])).is_empty(), "shorter than a TDP header");
+    assert!(exchange(&mut m, &tnp_frame(2, &[0, 90, 1])).is_empty(), "port 0");
+}
+
+#[test]
+fn tdp_datagrams_through_nc() {
+    let mut p = Pair::new();
+    p.b("nc -t -u -l 90 < /dev/null > /tmp/d &");
+    let out = p.a("echo 'датаграмма через TDP 0t1̅01' | nc -u -w 1 0.0.2 90; echo status $?");
+    assert!(out.contains("status 0"), "{out}");
+    let out = p.b("sleep 1; kill %1; cat /tmp/d");
+    assert!(out.contains("датаграмма через TDP 0t1̅01\n"), "{out}");
+}

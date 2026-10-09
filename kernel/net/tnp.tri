@@ -88,6 +88,7 @@ fn tnp_input(station: int, pkt: *tryte, total: int) {
     var p: *tryte = &pkt[TNP_HLEN];
     if (proto == TNP_TCMP) { tcmp_input(src, p, n, pkt, total); return; }
     if (proto == TNP_TSP) { tsp_input(src, p, n); return; }
+    if (proto == TNP_TDP) { tdp_input(src, p, n, pkt, total); return; }
     tnp_rx_unknown += 1;
     tcmp_unreachable(src, TCMP_NO_PROTO, pkt, total);
 }

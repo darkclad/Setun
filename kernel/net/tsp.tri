@@ -1,7 +1,7 @@
 // tsp: TSP, TNET's stream protocol (docs/TNET.md §4.1), on the same state
 // machine as TCP (tcp.tri): only the header, the sequence arithmetic (the
 // machine's own word arithmetic, which wraps modulo 3^27) and the way out
-// (TNP) differ. Raw TCMP sockets live here too.
+// (TNP) differ. TDP datagrams (§4.2) and raw TCMP sockets live here too.
 
 import "net.tri";
 import "socket.tri";
@@ -98,4 +98,49 @@ fn tn_raw_deliver(src: int, p: *tryte, n: int) {
         }
         s += 1;
     }
+}
+
+// ---- TDP datagrams ------------------------------------------------------------------------------
+
+const TDP_HLEN: int = 2;
+const TDP_MAXDATA: int = 2167;            // TNP_MAXDATA - TDP_HLEN
+
+var tdp_no_port: int;
+var tdp_rcvbuf: int;
+
+fn tdp_sendmsg(s: int, p: *tryte, n: int, dst: int, port: int) -> int {
+    if (n > TDP_MAXDATA) { return -EMSGSIZE; }
+    if (!tl_up) { return -ENETUNREACH; }
+    var r: int = autobind(s);
+    if (r < 0) { return r; }
+    var t: *tryte = &tl_txbuf[TNP_OFF];
+    t[0] = socks[s].lport as tryte;
+    t[1] = port as tryte;
+    copy_trytes(t + TDP_HLEN, p, n);
+    r = tnp_send(TNP_TDP, dst, TDP_HLEN + n);
+    return r < 0 ? r : n;
+}
+
+// A datagram from host src: to the socket bound to its port (a connected
+// one first), else "port unreachable".
+fn tdp_input(src: int, p: *tryte, n: int, pkt: *tryte, total: int) {
+    if (n < TDP_HLEN || p[0] <= 0 || p[1] <= 0) { tsp_rx_bad += 1; return; }
+    var sport: int = p[0];
+    var dport: int = p[1];
+    var best: int = -1;
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var k: *Socket = &socks[s];
+        if (k.used && k.family == AF_TNP && k.type == SOCK_DGRAM && k.lport == dport && !k.shut_rd
+                && (k.raddr == 0 || (k.raddr == src && k.rport == sport))) {
+            if (best < 0 || k.raddr != 0) { best = s; }
+        }
+        s += 1;
+    }
+    if (best < 0) {
+        tdp_no_port += 1;
+        tcmp_unreachable(src, TCMP_NO_PORT, pkt, total);
+        return;
+    }
+    if (!dgram_queue(best, src, sport, p + TDP_HLEN, n - TDP_HLEN)) { tdp_rcvbuf += 1; }
 }

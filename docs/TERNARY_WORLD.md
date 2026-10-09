@@ -159,7 +159,7 @@ Today every Setun-11̅ network packet is binary: `TNIC` carries one octet per tr
 | Chip-to-chip links | Balanced 3-level signalling, one trit per symbol | Industry PAM3 (GDDR7, 100BASE-T1) maps 3 bits onto 2 symbols; native trits need no mapping | Research |
 | Peripheral bus | A ternary serial bus with balanced line coding; the 0 symbol doubles as idle and frame marker | DC-free by construction; framing without bit stuffing | Planned |
 | Link layer | Ternary frames, 27-trit station addresses, ternary checksums: TL frames on the `TLINK` card with TCRC-18, a CRC over GF(3) ([`TNET.md`](TNET.md) §1–2) | No octet packing inside the ternary network; one check trit covers both error values | Done |
-| Network and transport | TNP with 27-trit host addresses; TSP streams with word sequence numbers (wrapping as the machine's arithmetic does) and a control trit that holds both opening and closing; TCMP echo; sockets of both families on one state machine ([`TNET.md`](TNET.md) §3–5). Datagrams (TDP) are next | 3^27 ≈ 7.6×10¹² addresses in one word, about 1,800 times as many as IPv4 | Done (TDP planned) |
+| Network and transport | TNP with 27-trit host addresses; TSP streams with word sequence numbers (wrapping as the machine's arithmetic does) and a control trit that holds both opening and closing; TCMP echo; TDP datagrams; sockets of both families on one state machine ([`TNET.md`](TNET.md) §3–5) | 3^27 ≈ 7.6×10¹² addresses in one word, about 1,800 times as many as IPv4 | Done |
 | Binary networking | IPv4, TCP, UDP, DNS, SSH, TLS 1.3 and HTTP through the `setun-net` gateway | Reaches the binary internet today | Done |
 
 Decided 2026-10-06:

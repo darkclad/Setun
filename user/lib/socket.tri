@@ -184,6 +184,7 @@ fn resolve_host(name: *char, out: *int) -> int {
 
 const AF_TNP: int = 27;
 const TNP_TSP: int = 1;
+const TNP_TDP: int = 2;
 const TNP_TCMP: int = 3;
 
 // "a.b.c", three trytes in decimal (each may be negative): 1 and the

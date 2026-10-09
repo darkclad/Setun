@@ -391,7 +391,17 @@ fn interfaces() {
 // that need no peer, and each refusal.
 fn tnet() {
     ok("tnp: socket(AF_TNP, SOCK_STREAM)", socket(AF_TNP, SOCK_STREAM, 0) >= 0);
-    ok("tnp: TDP is not yet: EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_DGRAM, 0), EPROTONOSUPPORT));
+    ok("tnp: socket(AF_TNP, SOCK_DGRAM)", socket(AF_TNP, SOCK_DGRAM, 0) >= 0);
+    ok("tnp: a datagram over TSP is EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_DGRAM, TNP_TSP), EPROTONOSUPPORT));
+    var dg: int = socket(AF_TNP, SOCK_DGRAM, 0);
+    var to: sockaddr_in;
+    sockaddr_set_family(&to, AF_TNP, 5, 90);
+    var one_tryte: [1]tryte;
+    one_tryte[0] = 9000;
+    ok("tnp: a datagram with no link is ENETUNREACH", fails(sendto(dg, &one_tryte[0], 1, 0, &to, sizeof(sockaddr_in)), ENETUNREACH));
+    sockaddr_set_family(&to, AF_TNP, 5, 0);
+    ok("tnp: a datagram to port 0 is EINVAL", fails(sendto(dg, &one_tryte[0], 1, 0, &to, sizeof(sockaddr_in)), EINVAL));
+    close(dg);
     ok("tnp: a stream over TCMP is EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_STREAM, TNP_TCMP), EPROTONOSUPPORT));
     ok("tnp: raw TSP is EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_RAW, TNP_TSP), EPROTONOSUPPORT));
     var s: int = socket(AF_TNP, SOCK_STREAM, 0);

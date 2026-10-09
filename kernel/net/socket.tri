@@ -1,6 +1,7 @@
 // Sockets (docs/NETWORK.md §4, docs/TNET.md §5): AF_INET stream (TCP),
-// datagram (UDP) and raw ICMP sockets, and AF_TNP stream (TSP) and raw
-// TCMP sockets, behind file descriptors, with Linux's system calls.
+// datagram (UDP) and raw ICMP sockets, and AF_TNP stream (TSP), datagram
+// (TDP) and raw TCMP sockets, behind file descriptors, with Linux's system
+// calls.
 //
 // A socket is one of 27 slots plus an anonymous inode of type I_SOCK whose
 // rdev is the slot. Each socket has a one-page receive ring; a stream
@@ -363,7 +364,8 @@ fn sys_socket(domain: int, type: int, proto: int) -> int {
             if (proto != TNP_TCMP) { return -EPROTONOSUPPORT; }
             if (current_task().euid != 0) { return -EPERM; }
         } else if (base == SOCK_DGRAM) {
-            return -EPROTONOSUPPORT;              // TDP: not yet (TNET.md §4.2)
+            if (proto != 0 && proto != TNP_TDP) { return -EPROTONOSUPPORT; }
+            proto = TNP_TDP;
         } else {
             return base < 0 || base > 10 ? -EINVAL : -ESOCKTNOSUPPORT;
         }
@@ -547,6 +549,7 @@ fn sock_send(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, alen: int
     if (dst == INADDR_BROADCAST && !k.broadcast) { return -EACCES; }
     if (k.type == SOCK_DGRAM) {
         if (port == 0) { return -EINVAL; }
+        if (k.family == AF_TNP) { return tdp_sendmsg(s, p, n, dst, port); }
         return udp_sendmsg(s, p, n, dst, port);
     }
     if (k.family == AF_TNP) { return tn_raw_sendmsg(s, p, n, dst); }

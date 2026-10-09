@@ -1,13 +1,13 @@
 # TNET: the native ternary network
 
-**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. Datagrams (TDP) and the post-quantum key exchanges (C4, C5) are next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
+**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. The post-quantum key exchanges (C4, C5) are next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
 
 | Layer | Name | Section | Milestone |
 |---|---|---|---|
 | card | `TLINK`, block 12 | §1 | C1 ✅ |
 | link | TL frames with a TCRC-18 check | §2 | C1 ✅ |
 | network | TNP: 27-trit host addresses | §3 | C2 ✅ |
-| transport | TSP streams ✅, TDP datagrams (next) | §4 | C2 |
+| transport | TSP streams, TDP datagrams | §4 | C2 ✅ |
 | sockets | `AF_TNP` beside `AF_INET` | §5 | C2–C3 ✅ |
 | key exchange | ML-KEM-768, then sntrup761, in `ssh` | §6 | C4–C5 |
 
@@ -124,7 +124,7 @@ The control tryte's trits, counted from the least significant:
 
 ### 4.2 TDP: datagrams
 
-*Not built yet: `socket(AF_TNP, SOCK_DGRAM)` gives `EPROTONOSUPPORT`.* A TDP header is the source and destination ports (2 trytes); the payload follows, at most 2167 trytes.
+A TDP header is the source and destination ports (2 trytes); the payload follows, at most 2167 trytes. A datagram for a port nobody has bound is answered with TCMP "port unreachable".
 
 ## 5. Sockets
 
