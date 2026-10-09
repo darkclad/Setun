@@ -387,9 +387,77 @@ fn interfaces() {
     close(s);
 }
 
+// AF_TNP (docs/TNET.md §5) on a machine with no ternary link: the calls
+// that need no peer, and each refusal.
+fn tnet() {
+    ok("tnp: socket(AF_TNP, SOCK_STREAM)", socket(AF_TNP, SOCK_STREAM, 0) >= 0);
+    ok("tnp: TDP is not yet: EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_DGRAM, 0), EPROTONOSUPPORT));
+    ok("tnp: a stream over TCMP is EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_STREAM, TNP_TCMP), EPROTONOSUPPORT));
+    ok("tnp: raw TSP is EPROTONOSUPPORT", fails(socket(AF_TNP, SOCK_RAW, TNP_TSP), EPROTONOSUPPORT));
+    var s: int = socket(AF_TNP, SOCK_STREAM, 0);
+    var a: sockaddr_in;
+    sockaddr_set_family(&a, AF_TNP, 0, 9842);
+    ok("tnp: port 9842 is EINVAL", fails(bind(s, &a, sizeof(sockaddr_in)), EINVAL));
+    sockaddr_set(&a, INADDR_ANY, 300);
+    ok("tnp: an AF_INET address is EAFNOSUPPORT", fails(bind(s, &a, sizeof(sockaddr_in)), EAFNOSUPPORT));
+    sockaddr_set_family(&a, AF_TNP, 7, 300);
+    ok("tnp: an address not ours is EADDRNOTAVAIL", fails(bind(s, &a, sizeof(sockaddr_in)), EADDRNOTAVAIL));
+    sockaddr_set_family(&a, AF_TNP, 0, 300);
+    ok("tnp: bind port 300", bind(s, &a, sizeof(sockaddr_in)) == 0 && local_port(s) == 300);
+    var g: sockaddr_in;
+    var glen: int = sizeof(sockaddr_in);
+    getsockname(s, &g, &glen);
+    ok("tnp: getsockname says AF_TNP", g.sin_family == AF_TNP && glen == sizeof(sockaddr_in));
+    var t: int = socket(AF_TNP, SOCK_STREAM, 0);
+    ok("tnp: the same port is EADDRINUSE", fails(bind(t, &a, sizeof(sockaddr_in)), EADDRINUSE));
+    var i: int = tcp();
+    ok("tnp: TCP has its own port 300", bind_to(i, INADDR_ANY, 300) == 0);
+    var u: int = tcp();
+    sockaddr_set_family(&a, AF_TNP, 0, 301);
+    ok("tnp: an AF_TNP address on a TCP socket is EAFNOSUPPORT", fails(bind(u, &a, sizeof(sockaddr_in)), EAFNOSUPPORT));
+    ok("tnp: listen", listen(s, 3) == 0);
+    sockaddr_set_family(&a, AF_TNP, 0, 0);
+    ok("tnp: port 0 picks one in 6561..9841", bind(t, &a, sizeof(sockaddr_in)) == 0 && local_port(t) >= 6561 && local_port(t) <= 9841);
+    var c: int = socket(AF_TNP, SOCK_STREAM, 0);
+    sockaddr_set_family(&a, AF_TNP, 5, 22);
+    ok("tnp: connect with no link is ENETUNREACH", fails(connect(c, &a, sizeof(sockaddr_in)), ENETUNREACH));
+    var r: int = socket(AF_TNP, SOCK_RAW, TNP_TCMP);
+    var ping: [3]tryte;
+    ping[0] = 1;
+    ping[1] = 0;
+    ping[2] = 0;
+    ok("tnp: a raw send with no link is ENETUNREACH", fails(sendto(r, &ping[0], 3, 0, &a, sizeof(sockaddr_in)), ENETUNREACH));
+    ok("tnp: an empty raw send is EINVAL", fails(sendto(r, &ping[0], 0, 0, &a, sizeof(sockaddr_in)), EINVAL));
+    close(s);
+    close(t);
+    close(i);
+    close(u);
+    close(c);
+    close(r);
+    var pid: int = fork();
+    if (pid == 0) {
+        setuid(1000);
+        var e: int = 0;
+        var x: int = socket(AF_TNP, SOCK_STREAM, 0);
+        var b2: sockaddr_in;
+        sockaddr_set_family(&b2, AF_TNP, 0, 242);
+        if (fails(bind(x, &b2, sizeof(sockaddr_in)), EACCES)) { e += 1; }
+        sockaddr_set_family(&b2, AF_TNP, 0, 243);
+        if (bind(x, &b2, sizeof(sockaddr_in)) == 0) { e += 2; }
+        if (fails(socket(AF_TNP, SOCK_RAW, TNP_TCMP), EPERM)) { e += 4; }
+        _exit(e);
+    }
+    var status: int = 0;
+    waitpid(pid, &status, 0);
+    ok("tnp: a user may not take port 242 (EACCES)", WEXITSTATUS(status) / 1 % 2 == 1);
+    ok("tnp: a user may take port 243", WEXITSTATUS(status) / 2 % 2 == 1);
+    ok("tnp: raw TCMP sockets are root's (EPERM)", WEXITSTATUS(status) / 4 % 2 == 1);
+}
+
 fn main(argc: int, argv: **char) -> int {
     creation();
     binding();
+    tnet();
     streams();
     datagrams();
     limits();

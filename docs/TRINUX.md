@@ -545,7 +545,8 @@ quits.
 |---|---|---|
 | `ifconfig` | `ifconfig [iface [addr] [netmask m] [gw g] [up\|down]]` | `/sbin`; show the interfaces, or set one (root) |
 | `ping` | `ping [-c count] [-s size] [-W timeout] host` | set-user-ID root (raw ICMP), drops root once its socket is open; `size` at most 1472 |
-| `nc` | `nc [-lubzv] [-p port] [-w secs] [host] port` | connect, or `-l` listen for one connection; `-u` UDP; `-b` octets as they are (otherwise text goes out as UTF-8 and UTF-8 comes in as characters); `-z` only test the port; `-v` verbose; `-w` connect timeout |
+| `tping` | `tping [-c count] [-s size] [-W timeout] host` | TCMP echo over TNET (TNET.md §3.1): data of `size` trytes over the whole tryte range (default 27, at most 2166), each checked on return; set-user-ID root like `ping` |
+| `nc` | `nc [-lubtzv] [-p port] [-w secs] [host] port` | connect, or `-l` listen for one connection; `-u` UDP; `-t` listen on TNET (a host with a TNET address connects over it); over TNET any tryte goes as it is, text included; `-b` octets as they are (otherwise text goes out as UTF-8 and UTF-8 comes in as characters); `-z` only test the port; `-v` verbose; `-w` connect timeout |
 | `netstat` | `netstat [-tualn]` | sockets from `/proc/net/tcp` and `/proc/net/udp`; `-a` all, `-l` listening only; addresses are always numeric |
 | `host` | `host [-s server] name` | DNS A records only (`/etc/hosts` is not read). Status 0 found, 1 not, 2 usage |
 | `wget` | `wget [-q] [-b] [-S] [-O file] [--max-redirect=n] [--no-check-certificate] [--ca-certificate=file] URL` | HTTP/1.1 and HTTPS (TLS 1.3); follows up to 20 redirects; chunked bodies; `-O -` writes to standard output; `-b` keeps octets; `-S` prints headers. Exit status as GNU wget: 4 network or TLS trouble, 5 certificate not verified, 7 malformed answer, 8 error answer or too many redirects |

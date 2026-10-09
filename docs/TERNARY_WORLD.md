@@ -158,8 +158,8 @@ Today every Setun-11̅ network packet is binary: `TNIC` carries one octet per tr
 | On-chip buses | 27 lines per word instead of 43 | About 37% fewer wires, where most delay and power go | Research |
 | Chip-to-chip links | Balanced 3-level signalling, one trit per symbol | Industry PAM3 (GDDR7, 100BASE-T1) maps 3 bits onto 2 symbols; native trits need no mapping | Research |
 | Peripheral bus | A ternary serial bus with balanced line coding; the 0 symbol doubles as idle and frame marker | DC-free by construction; framing without bit stuffing | Planned |
-| Link layer | Ternary frames, 27-trit station addresses, ternary checksums | No octet packing inside the ternary network | Planned |
-| Network and transport | A native protocol: 27-trit or 81-trit host addresses, word-sized sequence numbers and windows | 3^27 ≈ 7.6×10¹² addresses in one word, about 1,800 times as many as IPv4 | Planned |
+| Link layer | Ternary frames, 27-trit station addresses, ternary checksums: TL frames on the `TLINK` card with TCRC-18, a CRC over GF(3) ([`TNET.md`](TNET.md) §1–2) | No octet packing inside the ternary network; one check trit covers both error values | Done |
+| Network and transport | TNP with 27-trit host addresses; TSP streams with word sequence numbers (wrapping as the machine's arithmetic does) and a control trit that holds both opening and closing; TCMP echo; sockets of both families on one state machine ([`TNET.md`](TNET.md) §3–5). Datagrams (TDP) are next | 3^27 ≈ 7.6×10¹² addresses in one word, about 1,800 times as many as IPv4 | Done (TDP planned) |
 | Binary networking | IPv4, TCP, UDP, DNS, SSH, TLS 1.3 and HTTP through the `setun-net` gateway | Reaches the binary internet today | Done |
 
 Decided 2026-10-06:
@@ -258,6 +258,7 @@ flowchart TB
     class A done
     class B done
     class C next
+    class GC done
     class GA,GB,GC gate
     class R research
 ```
@@ -266,7 +267,7 @@ flowchart TB
 |---|---|
 | A · Ternary idioms (done, 2026-10-07) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
 | B · Formats, reliability (done, 2026-10-09: Gate B passed) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine; conformance suites for the ISA and the formats |
-| **C · Native networking** (in progress: C1, the card and link layer, done 2026-10-09; [`TNET.md`](TNET.md)) | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
+| **C · Native networking** (in progress, [`TNET.md`](TNET.md): C1 card and link layer, C2 TNP/TSP and sockets, C3 ssh: **Gate C passed 2026-10-09**; post-quantum key exchange next) | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
 | Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 
 Phase A comes first because it is software only and makes every later layer think in trits. There is no hardware phase: the emulator is the only machine, and devices, HDL and circuits stay ongoing research (decided 2026-10-06).

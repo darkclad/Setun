@@ -244,16 +244,17 @@ fn client_connect(identity: *char) {
     }
     strcat(&known_path[0], "/known_hosts");
     var addr: int = 0;
-    if (!resolve_host(&host[0], &addr)) {
+    var family: int = resolve_any(&host[0], &addr);
+    if (family == 0) {
         fputs(STDERR_FILENO, ssh_prog);
         fputs(STDERR_FILENO, ": Could not resolve hostname ");
         fputs(STDERR_FILENO, &host[0]);
         fputs(STDERR_FILENO, ": Name or service not known\n");
         _exit(255);
     }
-    sock = socket(AF_INET, SOCK_STREAM, 0);
+    sock = socket(family, SOCK_STREAM, 0);
     var a: sockaddr_in;
-    sockaddr_set(&a, addr, port);
+    sockaddr_set_family(&a, family, addr, port);
     if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
         var num: [15]char;
         fputs(STDERR_FILENO, ssh_prog);
@@ -266,7 +267,7 @@ fn client_connect(identity: *char) {
         fputs(STDERR_FILENO, "\n");
         _exit(255);
     }
-    strcpy(&peer[0], inet_ntoa(addr));
+    strcpy(&peer[0], addr_ntoa(family, addr));
     ssh_server = 0;
     ssh_host_key_ok = &check_host_key;
     version_exchange();

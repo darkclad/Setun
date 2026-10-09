@@ -1,4 +1,7 @@
-// TCP (RFC 9293), with retransmission timing from RFC 6298.
+// TCP (RFC 9293), with retransmission timing from RFC 6298. The same state
+// machine serves TNET's TSP (tsp.tri): tcp_segment() takes a segment of
+// either family, and the family decides the header, the sequence
+// arithmetic and the way out.
 //
 // Kept simple where the virtual link allows it, and said so:
 //   - segments are accepted in order only; anything ahead of rcv_nxt is
@@ -50,10 +53,16 @@ fn tcp_new_iss() -> int {
 
 fn is_tcp_flag(flags: int, f: int) -> int { return flags / f % 2 != 0; }
 
+// Sequence arithmetic for socket s: modulo 2^32 for TCP; for TSP the
+// machine's own word arithmetic, which wraps modulo 3^27 (TNET.md §4.1).
+fn ssa(s: int, a: int, n: int) -> int { return socks[s].family == AF_TNP ? a + n : seq_add(a, n); }
+fn ssd(s: int, a: int, b: int) -> int { return socks[s].family == AF_TNP ? a - b : seq_diff(a, b); }
+
 // The window we can offer: free room in the receive ring.
 fn tcp_rcv_wnd(s: int) -> int {
     var w: int = rx_free(s);
-    return w > 65535 ? 65535 : w;
+    var cap: int = socks[s].family == AF_TNP ? 9841 : 65535;
+    return w > cap ? cap : w;
 }
 
 // ---- sending -----------------------------------------------------------------------------------------
@@ -61,6 +70,7 @@ fn tcp_rcv_wnd(s: int) -> int {
 // Send one segment: `n` octets of the send ring from offset `off`, with
 // `flags` and sequence number `seq`; an MSS option on SYNs.
 fn tcp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
+    if (socks[s].family == AF_TNP) { tsp_send_seg(s, seq, flags, off, n); return; }
     var k: *Socket = &socks[s];
     var t: *tryte = &txbuf[L4_OFF];
     var hl: int = is_tcp_flag(flags, TH_SYN) ? 24 : TCP_HLEN;
@@ -82,7 +92,7 @@ fn tcp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
     if (n > 0) { ring_read(k.txf, k.tx_head, off, t + hl, n); }
     var src: int = k.laddr;
     put16(t, 16, csum_fold(csum_add(csum_pseudo(src, k.raddr, IPPROTO_TCP, hl + n), t, 0, hl + n)));
-    if (is_tcp_flag(flags, TH_ACK)) { k.adv_edge = seq_add(k.rcv_nxt, wnd); }
+    if (is_tcp_flag(flags, TH_ACK)) { k.adv_edge = ssa(s, k.rcv_nxt, wnd); }
     ip_send(IPPROTO_TCP, src, k.raddr, hl + n);
 }
 
@@ -100,7 +110,7 @@ fn tcp_arm_rtx(s: int) {
 // Has the FIN gone out (snd_nxt is past the data)?
 fn tcp_fin_sent(s: int) -> int {
     var k: *Socket = &socks[s];
-    return k.fin_out && seq_diff(k.snd_nxt, k.snd_una) > k.tx_count;
+    return k.fin_out && ssd(s, k.snd_nxt, k.snd_una) > k.tx_count;
 }
 
 // Send what the window allows, then the FIN if one is due.
@@ -111,7 +121,7 @@ fn tcp_output(s: int) {
         return;
     }
     loop {
-        var off: int = seq_diff(k.snd_nxt, k.snd_una);
+        var off: int = ssd(s, k.snd_nxt, k.snd_una);
         if (off >= k.tx_count) { break; }
         var room: int = k.snd_wnd - off;
         if (room <= 0) { break; }
@@ -121,16 +131,16 @@ fn tcp_output(s: int) {
         var flags: int = TH_ACK + (off + n == k.tx_count ? TH_PSH : 0);
         tcp_send_seg(s, k.snd_nxt, flags, off, n);
         if (k.rtt_seq == 0) {
-            k.rtt_seq = seq_add(k.snd_nxt, n);
+            k.rtt_seq = ssa(s, k.snd_nxt, n);
             k.rtt_at = jiffies;
         }
-        k.snd_nxt = seq_add(k.snd_nxt, n);
+        k.snd_nxt = ssa(s, k.snd_nxt, n);
         tcp_arm_rtx(s);
     }
-    var sent: int = seq_diff(k.snd_nxt, k.snd_una);
+    var sent: int = ssd(s, k.snd_nxt, k.snd_una);
     if (k.fin_out && !k.fin_acked && sent == k.tx_count) {
         tcp_send_seg(s, k.snd_nxt, TH_FIN + TH_ACK, 0, 0);
-        k.snd_nxt = seq_add(k.snd_nxt, 1);
+        k.snd_nxt = ssa(s, k.snd_nxt, 1);
         tcp_arm_rtx(s);
     }
     // data waiting, a zero window and nothing in flight: probe it later
@@ -140,22 +150,19 @@ fn tcp_output(s: int) {
 }
 
 // A reset for a segment that has no connection (RFC 9293 §3.10.7.1).
-fn tcp_reset_reply(p: *tryte, hl: int, src: int, dst: int, seg_len: int) {
-    var th: *tryte = p + hl;
-    var flags: int = th[13];
+fn tcp_reset_to(fam: int, src: int, dst: int, sport: int, dport: int, seq: int, ack: int, flags: int, seg_len: int) {
     if (is_tcp_flag(flags, TH_RST)) { return; }
+    if (fam == AF_TNP) { tsp_reset_to(src, sport, dport, seq, ack, flags, seg_len); return; }
     var t: *tryte = &txbuf[L4_OFF];
-    var sport: int = get16(th, 0);
-    var dport: int = get16(th, 2);
     put16(t, 0, dport);
     put16(t, 2, sport);
     if (is_tcp_flag(flags, TH_ACK)) {
-        put32(t, 4, get32(th, 8));
+        put32(t, 4, ack);
         put32(t, 8, 0);
         t[13] = TH_RST;
     } else {
         put32(t, 4, 0);
-        put32(t, 8, seq_add(get32(th, 4), seg_len));
+        put32(t, 8, seq_add(seq, seg_len));
         t[13] = (TH_RST + TH_ACK) as tryte;
     }
     t[12] = 80;                                   // 5 words
@@ -211,7 +218,10 @@ fn tcp_time_wait(s: int) {
 // Active open.
 fn tcp_connect(s: int, dst: int, port: int) -> int {
     var k: *Socket = &socks[s];
-    if (k.laddr == 0) {
+    if (k.family == AF_TNP) {
+        if (!tl_up) { return -ENETUNREACH; }
+        k.laddr = tl_addr;
+    } else if (k.laddr == 0) {
         if (!is_local_addr(dst)) {
             if (!netifs[NETIF_ETH].up || netifs[NETIF_ETH].addr == 0) { return -ENETUNREACH; }
             var e: *Netif = &netifs[NETIF_ETH];
@@ -228,7 +238,7 @@ fn tcp_connect(s: int, dst: int, port: int) -> int {
     }
     k.iss = tcp_new_iss();
     k.snd_una = k.iss;
-    k.snd_nxt = seq_add(k.iss, 1);
+    k.snd_nxt = ssa(s, k.iss, 1);
     k.snd_wnd = 0;
     k.state = TCP_SYN_SENT;
     k.was_connected = 1;
@@ -343,12 +353,12 @@ fn tcp_parse_mss(th: *tryte, doff: int) -> int {
 }
 
 // Find the socket for a segment: the connection, else a listener.
-fn tcp_lookup(src: int, sport: int, dst: int, dport: int) -> int {
+fn tcp_lookup(fam: int, src: int, sport: int, dst: int, dport: int) -> int {
     var listener: int = -1;
     var s: int = 0;
     while (s < NSOCKS) {
         var k: *Socket = &socks[s];
-        if (k.used && k.type == SOCK_STREAM && k.lport == dport) {
+        if (k.used && k.type == SOCK_STREAM && k.family == fam && k.lport == dport) {
             if (k.state == TCP_LISTEN) {
                 if (k.laddr == 0 || k.laddr == dst) { listener = s; }
             } else if (k.state != TCP_CLOSE && k.raddr == src && k.rport == sport && k.laddr == dst) {
@@ -376,11 +386,17 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
     var flags: int = th[13];
     var wnd: int = get16(th, 14);
     var dlen: int = n - doff;
+    tcp_segment(AF_INET, src, dst, sport, dport, seq, ack, flags, wnd, th + doff, dlen, tcp_parse_mss(th, doff));
+}
+
+// A segment of either family, its header already read: the state machine
+// (RFC 9293). data: the dlen payload trytes; mss: the peer's (from a SYN).
+fn tcp_segment(fam: int, src: int, dst: int, sport: int, dport: int, seq: int, ack: int, flags: int, wnd: int, data: *tryte, dlen: int, mss: int) {
     var seg_len: int = dlen + (is_tcp_flag(flags, TH_SYN) ? 1 : 0) + (is_tcp_flag(flags, TH_FIN) ? 1 : 0);
-    var s: int = tcp_lookup(src, sport, dst, dport);
+    var s: int = tcp_lookup(fam, src, sport, dst, dport);
     if (s < 0) {
         net_count(NS_TCP_DROPPED);
-        tcp_reset_reply(p, hl, src, dst, seg_len);
+        tcp_reset_to(fam, src, dst, sport, dport, seq, ack, flags, seg_len);
         return;
     }
     var k: *Socket = &socks[s];
@@ -391,12 +407,13 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
 
     if (k.state == TCP_LISTEN) {
         if (rst) { return; }
-        if (has_ack) { tcp_reset_reply(p, hl, src, dst, seg_len); return; }
+        if (has_ack) { tcp_reset_to(fam, src, dst, sport, dport, seq, ack, flags, seg_len); return; }
         if (!syn) { return; }
         if (tcp_children(s) >= k.backlog) { net_count(NS_TCP_DROPPED); return; }
-        var c: int = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+        var c: int = sock_alloc(SOCK_STREAM, k.proto);
         if (c < 0) { net_count(NS_TCP_DROPPED); return; }
         var ck: *Socket = &socks[c];
+        ck.family = fam;
         ck.parent = s;
         ck.reuse = k.reuse;
         ck.uid = k.uid;
@@ -405,12 +422,12 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
         ck.raddr = src;
         ck.rport = sport;
         ck.irs = seq;
-        ck.rcv_nxt = seq_add(seq, 1);
+        ck.rcv_nxt = ssa(s, seq, 1);
         ck.iss = tcp_new_iss();
         ck.snd_una = ck.iss;
-        ck.snd_nxt = seq_add(ck.iss, 1);
+        ck.snd_nxt = ssa(s, ck.iss, 1);
         ck.snd_wnd = wnd;
-        ck.mss = tcp_parse_mss(th, doff);
+        ck.mss = mss;
         ck.state = TCP_SYN_RECV;
         ck.was_connected = 1;
         net_count(NS_TCP_PASSIVE);
@@ -422,7 +439,7 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
     if (k.state == TCP_SYN_SENT) {
         var ack_ok: int = has_ack && ack == k.snd_nxt;
         if (has_ack && !ack_ok) {
-            if (!rst) { tcp_reset_reply(p, hl, src, dst, seg_len); }
+            if (!rst) { tcp_reset_to(fam, src, dst, sport, dport, seq, ack, flags, seg_len); }
             return;
         }
         if (rst) {
@@ -431,8 +448,8 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
         }
         if (!syn) { return; }
         k.irs = seq;
-        k.rcv_nxt = seq_add(seq, 1);
-        k.mss = tcp_parse_mss(th, doff);
+        k.rcv_nxt = ssa(s, seq, 1);
+        k.mss = mss;
         k.snd_wnd = wnd;
         if (ack_ok) {
             k.snd_una = ack;
@@ -450,7 +467,7 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
 
     // ---- synchronized states: acceptability (RFC 9293 §3.10.7.4) ----
     var rwnd: int = rx_free(s);
-    var dseq: int = seq_diff(seq, k.rcv_nxt);
+    var dseq: int = ssd(s, seq, k.rcv_nxt);
     var acceptable: int;
     if (seg_len == 0) {
         acceptable = rwnd == 0 ? dseq == 0 : dseq >= 0 && dseq < rwnd;
@@ -484,7 +501,7 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
 
     // ---- ACK ----
     if (k.state == TCP_SYN_RECV) {
-        if (ack != k.snd_nxt) { tcp_reset_reply(p, hl, src, dst, seg_len); return; }
+        if (ack != k.snd_nxt) { tcp_reset_to(fam, src, dst, sport, dport, seq, ack, flags, seg_len); return; }
         k.snd_una = ack;
         k.snd_wnd = wnd;
         k.state = TCP_ESTABLISHED;
@@ -493,8 +510,8 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
         if (k.parent >= 0) { sock_wake(k.parent); }
         sock_wake(s);
     }
-    var acked: int = seq_diff(ack, k.snd_una);
-    var outstanding: int = seq_diff(k.snd_nxt, k.snd_una);
+    var acked: int = ssd(s, ack, k.snd_una);
+    var outstanding: int = ssd(s, k.snd_nxt, k.snd_una);
     if (acked > outstanding) { tcp_send_ack(s); return; }       // acknowledges what we never sent
     if (acked > 0) {
         var data: int = acked > k.tx_count ? k.tx_count : acked;
@@ -502,7 +519,7 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
         k.tx_count -= data;
         if (acked > data && k.fin_out) { k.fin_acked = 1; }
         k.snd_una = ack;
-        if (k.rtt_seq != 0 && seq_diff(ack, k.rtt_seq) >= 0) {
+        if (k.rtt_seq != 0 && ssd(s, ack, k.rtt_seq) >= 0) {
             tcp_rtt_sample(s, jiffies - k.rtt_at);
             k.rtt_seq = 0;
         }
@@ -548,8 +565,8 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
         var take: int = dlen - skip;
         if (take > rwnd) { take = rwnd; }
         if (take > 0) {
-            rx_put(s, th + doff + skip, take);
-            k.rcv_nxt = seq_add(k.rcv_nxt, take);
+            rx_put(s, data + skip, take);
+            k.rcv_nxt = ssa(s, k.rcv_nxt, take);
             sock_wake(s);
         }
         need_ack = 1;
@@ -559,8 +576,8 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
     }
 
     // ---- FIN ----
-    if (fin && seq_diff(seq_add(seq, dlen), k.rcv_nxt) == 0 && !k.peer_fin) {
-        k.rcv_nxt = seq_add(k.rcv_nxt, 1);
+    if (fin && ssd(s, ssa(s, seq, dlen), k.rcv_nxt) == 0 && !k.peer_fin) {
+        k.rcv_nxt = ssa(s, k.rcv_nxt, 1);
         k.peer_fin = 1;
         need_ack = 1;
         if (k.state == TCP_ESTABLISHED || k.state == TCP_SYN_RECV) { k.state = TCP_CLOSE_WAIT; }
@@ -606,7 +623,7 @@ fn tcp_persist(s: int) {
     var k: *Socket = &socks[s];
     k.persist_at = 0;
     if (k.snd_wnd > 0 || k.tx_count == 0) { return; }
-    var off: int = seq_diff(k.snd_nxt, k.snd_una);
+    var off: int = ssd(s, k.snd_nxt, k.snd_una);
     if (off < k.tx_count) { tcp_send_seg(s, k.snd_nxt, TH_ACK, off, 1); }
     k.rto *= 2;
     if (k.rto > RTO_MAX) { k.rto = RTO_MAX; }
@@ -707,8 +724,8 @@ fn tcp_recvmsg(s: int, f: int, p: *tryte, n: int, flags: int) -> int {
 fn tcp_window_update(s: int) {
     var k: *Socket = &socks[s];
     if (k.state != TCP_ESTABLISHED && k.state != TCP_FIN_WAIT1 && k.state != TCP_FIN_WAIT2) { return; }
-    var edge: int = seq_add(k.rcv_nxt, tcp_rcv_wnd(s));
-    if (seq_diff(edge, k.adv_edge) >= k.mss || seq_diff(k.adv_edge, k.rcv_nxt) == 0) { tcp_send_ack(s); }
+    var edge: int = ssa(s, k.rcv_nxt, tcp_rcv_wnd(s));
+    if (ssd(s, edge, k.adv_edge) >= k.mss || ssd(s, k.adv_edge, k.rcv_nxt) == 0) { tcp_send_ack(s); }
 }
 
 fn tcp_poll(s: int) -> int {

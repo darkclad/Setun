@@ -383,7 +383,12 @@ fn proc_net(k: int) {
         ps("bad_type "); pi(tl_bad_type); pc('\n');
         ps("tx_dropped "); pi(tl_tx_dropped); pc('\n');
         ps("echo_replies "); pi(tl_echoes); pc('\n');
+        ps("tnp_rx "); pi(tnp_rx_packets); pc('\n');
+        ps("tnp_tx "); pi(tnp_tx_packets); pc('\n');
         ps("tnp_dropped "); pi(tnp_rx_dropped); pc('\n');
+        ps("tnp_unknown "); pi(tnp_rx_unknown); pc('\n');
+        ps("tcmp_echoes "); pi(tcmp_echoes_answered); pc('\n');
+        ps("tsp_bad "); pi(tsp_rx_bad); pc('\n');
         return;
     }
     if (k == PROC_NET_STAT) {

@@ -1,0 +1,101 @@
+// tsp: TSP, TNET's stream protocol (docs/TNET.md §4.1), on the same state
+// machine as TCP (tcp.tri): only the header, the sequence arithmetic (the
+// machine's own word arithmetic, which wraps modulo 3^27) and the way out
+// (TNP) differ. Raw TCMP sockets live here too.
+
+import "net.tri";
+import "socket.tri";
+import "tcp.tri";
+import "tnp.tri";
+
+const TSP_HLEN: int = 10;
+const TSP_MSS: int = 2159;                // TNP_MAXDATA - TSP_HLEN
+const TSP_WINDOW_MAX: int = 9841;
+const TSP_EPHEMERAL_LOW: int = 6561;
+const TSP_EPHEMERAL_HIGH: int = 9841;
+const TSP_PRIVILEGED: int = 243;
+
+// The control tryte: connection trit (+1 opening, -1 closing), then ACK,
+// then RST, from the least significant trit.
+fn tsp_ctl(flags: int) -> int {
+    var conn: int = is_tcp_flag(flags, TH_SYN) ? 1 : (is_tcp_flag(flags, TH_FIN) ? -1 : 0);
+    return conn + 3 * is_tcp_flag(flags, TH_ACK) + 9 * is_tcp_flag(flags, TH_RST);
+}
+
+// The TH_* flags of a control tryte, or -1 if it is not a valid one.
+fn tsp_flags(ctl: int) -> int {
+    var conn: int = trit(ctl, 27);
+    var ack: int = trit(ctl, 26);
+    var rst: int = trit(ctl, 25);
+    if (ctl != conn + 3 * ack + 9 * rst || ack < 0 || rst < 0) { return -1; }
+    return (conn == 1 ? TH_SYN : 0) + (conn == -1 ? TH_FIN : 0) + (ack ? TH_ACK : 0) + (rst ? TH_RST : 0);
+}
+
+fn tsp_header(t: *tryte, sport: int, dport: int, seq: int, ack: int, flags: int, wnd: int) {
+    t[0] = sport as tryte;
+    t[1] = dport as tryte;
+    tl_put_word(t, 2, seq);
+    tl_put_word(t, 5, ack);
+    t[8] = tsp_ctl(flags) as tryte;
+    t[9] = wnd as tryte;
+}
+
+// tcp_send_seg for a TNP socket: n trytes of the send ring from `off`.
+fn tsp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
+    var k: *Socket = &socks[s];
+    var t: *tryte = &tl_txbuf[TNP_OFF];
+    var wnd: int = tcp_rcv_wnd(s);
+    tsp_header(t, k.lport, k.rport, seq, is_tcp_flag(flags, TH_ACK) ? k.rcv_nxt : 0, flags, wnd);
+    if (n > 0) { ring_read(k.txf, k.tx_head, off, t + TSP_HLEN, n); }
+    if (is_tcp_flag(flags, TH_ACK)) { k.adv_edge = k.rcv_nxt + wnd; }
+    tnp_send(TNP_TSP, k.raddr, TSP_HLEN + n);
+}
+
+// A reset for a segment that has no connection.
+fn tsp_reset_to(src: int, sport: int, dport: int, seq: int, ack: int, flags: int, seg_len: int) {
+    var t: *tryte = &tl_txbuf[TNP_OFF];
+    if (is_tcp_flag(flags, TH_ACK)) {
+        tsp_header(t, dport, sport, ack, 0, TH_RST, 0);
+    } else {
+        tsp_header(t, dport, sport, 0, seq + seg_len, TH_RST + TH_ACK, 0);
+    }
+    net_count(NS_TCP_RST_OUT);
+    tnp_send(TNP_TSP, src, TSP_HLEN);
+}
+
+var tsp_rx_bad: int;
+
+// A TSP segment from host src (n trytes at p).
+fn tsp_input(src: int, p: *tryte, n: int) {
+    if (n < TSP_HLEN) { tsp_rx_bad += 1; return; }
+    var sport: int = p[0];
+    var dport: int = p[1];
+    var flags: int = tsp_flags(p[8]);
+    var wnd: int = p[9];
+    if (sport <= 0 || dport <= 0 || flags < 0 || wnd < 0) { tsp_rx_bad += 1; return; }
+    tcp_segment(AF_TNP, src, tl_addr, sport, dport, tl_word(p, 2), tl_word(p, 5), flags, wnd, p + TSP_HLEN, n - TSP_HLEN, TSP_MSS);
+}
+
+// ---- raw TCMP sockets -------------------------------------------------------------------------
+
+fn tn_raw_sendmsg(s: int, p: *tryte, n: int, dst: int) -> int {
+    if (n > TNP_MAXDATA) { return -EMSGSIZE; }
+    if (n < 1) { return -EINVAL; }
+    if (!tl_up) { return -ENETUNREACH; }
+    copy_trytes(&tl_txbuf[TNP_OFF], p, n);
+    var r: int = tnp_send(TNP_TCMP, dst, n);
+    return r < 0 ? r : n;
+}
+
+// Every raw TCMP socket gets a copy of each TCMP message that is not an
+// echo request (those the kernel answers).
+fn tn_raw_deliver(src: int, p: *tryte, n: int) {
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var k: *Socket = &socks[s];
+        if (k.used && k.family == AF_TNP && k.type == SOCK_RAW && !k.shut_rd && (k.raddr == 0 || k.raddr == src)) {
+            dgram_queue(s, src, 0, p, n);
+        }
+        s += 1;
+    }
+}

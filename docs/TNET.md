@@ -1,14 +1,14 @@
 # TNET: the native ternary network
 
-**Status: C1 built (2026-10-09): the card, the wire and the link layer; C2 onward in progress. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
+**Status (2026-10-09): C1–C3 built, so Gate C has passed: `ssh` runs between two Setun machines over TNET. Datagrams (TDP) and the post-quantum key exchanges (C4, C5) are next. Phase C of [`TERNARY_WORLD.md`](TERNARY_WORLD.md).** Setun-11̅ machines talk to binary networks through `TNIC`, one octet per tryte ([`NETWORK.md`](NETWORK.md)). TNET is how two Setun machines talk to each other with nothing binary in between: frames of trytes, ternary addresses and checksums, a stream protocol with word-sized sequence numbers, and the same BSD sockets over both. Gate C: **`ssh` from one Setun machine to another over TNET**.
 
 | Layer | Name | Section | Milestone |
 |---|---|---|---|
 | card | `TLINK`, block 12 | §1 | C1 ✅ |
 | link | TL frames with a TCRC-18 check | §2 | C1 ✅ |
-| network | TNP: 27-trit host addresses | §3 | C2 |
-| transport | TSP streams, TDP datagrams | §4 | C2 |
-| sockets | `AF_TNP` beside `AF_INET` | §5 | C2–C3 |
+| network | TNP: 27-trit host addresses | §3 | C2 ✅ |
+| transport | TSP streams ✅, TDP datagrams (next) | §4 | C2 |
+| sockets | `AF_TNP` beside `AF_INET` | §5 | C2–C3 ✅ |
 | key exchange | ML-KEM-768, then sntrup761, in `ssh` | §6 | C4–C5 |
 
 Sizes follow the power-of-3 rule throughout, since none of it has to meet a binary standard.
@@ -124,7 +124,7 @@ The control tryte's trits, counted from the least significant:
 
 ### 4.2 TDP: datagrams
 
-A TDP header is the source and destination ports (2 trytes); the payload follows, at most 2167 trytes.
+*Not built yet: `socket(AF_TNP, SOCK_DGRAM)` gives `EPROTONOSUPPORT`.* A TDP header is the source and destination ports (2 trytes); the payload follows, at most 2167 trytes.
 
 ## 5. Sockets
 
@@ -132,7 +132,11 @@ A TDP header is the source and destination ports (2 trytes); the payload follows
 - `struct sockaddr_tn { tn_family; tn_port; tn_addr; }`, one word each: the same size as `sockaddr_in`, so code that handles both checks the family.
 - Every call works as for `AF_INET` (NETWORK.md §4), with the same errors; `read` and `write` move trytes of any value.
 - **Names**: `/etc/hosts` holds TNP addresses next to IPv4 ones; a line's address decides its family (`0.0.2 setun-b`). The resolver in tlibc (`tn_aton`, `tn_ntoa`, and `host_lookup` returning the family) gives TNP addresses first when a name has both.
-- `ssh`, `sshd`, `nc` and `tping` use either family; `sshd` listens on both.
+- `ssh`, `scp`, `sftp`, `nc` and `tping` use either family; `sshd` listens on both, and `init` starts it when only the ternary link is up.
+
+### 5.1 How it is built
+
+TSP runs on TCP's state machine (`kernel/net/tcp.tri`): `tcp_segment()` takes a segment of either family once its header is read, and each socket's family decides the header (`tsp.tri` builds and parses TSP's), the sequence arithmetic (for TSP plain word arithmetic, which wraps modulo 3^27 by itself) and the way out (`tnp_send`). Ports are separate per family, so TCP and TSP can each use port 22.
 
 ## 6. Post-quantum key exchange
 

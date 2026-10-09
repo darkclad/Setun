@@ -1,0 +1,147 @@
+// tping [-c COUNT] [-s SIZE] [-W SECONDS] HOST: TCMP echo requests over
+// TNET (docs/TNET.md §3.1). The data are trytes of any value, and the
+// reply must bring every one back. Raw TCMP sockets need root, so tping
+// is set-user-ID root and gives that up once its socket is open.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+const TCMP_ECHO: int = 1;
+const TCMP_ECHO_REPLY: int = 2;
+const TCMP_UNREACH: int = 3;
+
+var pkt: [2169]tryte;
+var reply: [2169]tryte;
+
+fn now_us() -> int {
+    var ts: timespec;
+    clock_gettime(1, &ts);
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+fn put_ms(us: int) {
+    put_int(us / 1000);
+    puts(".");
+    var frac: int = us % 1000 / 10;
+    if (frac < 10) { puts("0"); }
+    put_int(frac);
+}
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: tping [-c count] [-s size] [-W timeout] host\n");
+    return 2;
+}
+
+// The data of request seq: trytes over the whole range, negative included.
+fn data_tryte(seq: int, k: int) -> int { return (k * 7919 + seq * 131 + 9841) % 19683 - 9841; }
+
+fn main(argc: int, argv: **char) -> int {
+    var count: int = -1;
+    var size: int = 27;
+    var wait_s: int = 1;
+    var c: int = getopt(argc, argv, "c:s:W:");
+    while (c != -1) {
+        var end: *char;
+        if (c == 'c') { count = strtol(optarg, &end, 10); if (count <= 0 || end[0] != 0) { return usage(); } }
+        else if (c == 's') { size = strtol(optarg, &end, 10); if (size < 0 || size > 2166 || end[0] != 0) { return usage(); } }
+        else if (c == 'W') { wait_s = strtol(optarg, &end, 10); if (wait_s <= 0 || end[0] != 0) { return usage(); } }
+        else { return usage(); }
+        c = getopt(argc, argv, "c:s:W:");
+    }
+    if (optind != argc - 1) { return usage(); }
+    var host: *char = argv[optind];
+    var dst: int = 0;
+    if (resolve_any(host, &dst) != AF_TNP) {
+        fputs(STDERR_FILENO, "tping: ");
+        fputs(STDERR_FILENO, host);
+        fputs(STDERR_FILENO, ": no TNET address\n");
+        return 2;
+    }
+    var fd: int = socket(AF_TNP, SOCK_RAW, TNP_TCMP);
+    var e: int = errno;
+    setuid(getuid());                          // done with root
+    if (fd < 0) { errno = e; perror2("tping", "socket"); return 2; }
+    var to: sockaddr_in;
+    sockaddr_set_family(&to, AF_TNP, dst, 0);
+    var ident: int = getpid() % 9841;
+    puts("TPING ");
+    puts(host);
+    puts(" (");
+    puts(tn_ntoa(dst));
+    puts(") ");
+    put_int(size);
+    puts(" trytes of data.\n");
+    var sent: int = 0;
+    var got: int = 0;
+    var seq: int = 1;
+    while (count < 0 || sent < count) {
+        pkt[0] = TCMP_ECHO;
+        pkt[1] = ident as tryte;
+        pkt[2] = (seq % 9841) as tryte;
+        var k: int = 0;
+        while (k < size) { pkt[3 + k] = data_tryte(seq, k) as tryte; k += 1; }
+        var t0: int = now_us();
+        if (sendto(fd, &pkt[0], 3 + size, 0, &to, sizeof(sockaddr_in)) < 0) {
+            perror2("tping", "sendto");
+            return 2;
+        }
+        sent += 1;
+        var deadline: int = t0 + wait_s * 1000000;
+        loop {
+            var left: int = (deadline - now_us()) / 1000;
+            if (left <= 0) { break; }
+            var p: pollfd;
+            p.fd = fd;
+            p.events = POLLIN;
+            if (poll(&p, 1, left) <= 0) { break; }
+            var from: sockaddr_in;
+            var flen: int = sizeof(sockaddr_in);
+            var n: int = recvfrom(fd, &reply[0], 2169, 0, &from, &flen);
+            if (n >= 2 && reply[0] == TCMP_UNREACH && from.sin_addr == dst) {
+                puts("From ");
+                puts(tn_ntoa(from.sin_addr));
+                puts(" seq=");
+                put_int(seq);
+                puts(reply[1] == 1 ? " Protocol unreachable\n" : " Port unreachable\n");
+                break;
+            }
+            if (n < 3 || reply[0] != TCMP_ECHO_REPLY || reply[1] != ident || reply[2] != seq % 9841 || from.sin_addr != dst) { continue; }
+            var same: int = n == 3 + size;
+            k = 0;
+            while (same && k < size) { if (reply[3 + k] != data_tryte(seq, k)) { same = 0; } k += 1; }
+            var dt: int = now_us() - t0;
+            got += 1;
+            put_int(n - 3);
+            puts(" trytes from ");
+            puts(tn_ntoa(from.sin_addr));
+            puts(": seq=");
+            put_int(seq);
+            puts(" time=");
+            put_ms(dt);
+            puts(same ? " ms\n" : " ms (DATA DIFFER)\n");
+            break;
+        }
+        seq += 1;
+        if (count < 0 || sent < count) {
+            var rest: int = t0 + 1000000 - now_us();
+            if (rest > 0) {
+                var ts: timespec;
+                ts.tv_sec = rest / 1000000;
+                ts.tv_nsec = rest % 1000000 * 1000;
+                nanosleep(&ts, null);
+            }
+        }
+    }
+    puts("\n--- ");
+    puts(host);
+    puts(" tping statistics ---\n");
+    put_int(sent);
+    puts(" packets transmitted, ");
+    put_int(got);
+    puts(" received, ");
+    put_int((sent - got) * 100 / sent);
+    puts("% packet loss\n");
+    return got > 0 ? 0 : 1;
+}

@@ -1,5 +1,6 @@
-// Sockets (docs/NETWORK.md §4): AF_INET stream (TCP), datagram (UDP) and
-// raw ICMP sockets behind file descriptors, with Linux's system calls.
+// Sockets (docs/NETWORK.md §4, docs/TNET.md §5): AF_INET stream (TCP),
+// datagram (UDP) and raw ICMP sockets, and AF_TNP stream (TSP) and raw
+// TCMP sockets, behind file descriptors, with Linux's system calls.
 //
 // A socket is one of 27 slots plus an anonymous inode of type I_SOCK whose
 // rdev is the slot. Each socket has a one-page receive ring; a stream
@@ -8,14 +9,16 @@
 // record header (length, the sender's four address octets, its port as two
 // octets) and the data. A raw socket's datagrams are whole IP packets.
 //
-// Data in and out of a socket are octets: a tryte outside 0..255 makes a
-// send fail with EINVAL before anything is sent.
+// Data in and out of an AF_INET socket are octets: a tryte outside 0..255
+// makes a send fail with EINVAL before anything is sent. An AF_TNP socket
+// carries any tryte.
 
 import "net.tri";
 import "ip.tri";
 
 const AF_UNSPEC: int = 0;
 const AF_INET: int = 2;
+const AF_TNP: int = 27;
 const SOCK_STREAM: int = 1;
 const SOCK_DGRAM: int = 2;
 const SOCK_RAW: int = 3;
@@ -118,6 +121,7 @@ struct Socket {
     rttvar: int;
     persist_at: int;
     timer_at: int;                        // TIME-WAIT or FIN-WAIT-2 deadline
+    family: int;                          // AF_INET or AF_TNP
 }
 
 var socks: [27]Socket;
@@ -147,6 +151,7 @@ fn sock_alloc(type: int, proto: int) -> int {
         if (k.txf < 0) { free_pages(k.rxf, 0); return -ENOBUFS; }
     }
     k.used = 1;
+    k.family = AF_INET;
     k.type = type;
     k.proto = proto;
     k.parent = -1;
@@ -214,7 +219,7 @@ fn port_in_use(s: int, addr: int, port: int) -> int {
     var j: int = 0;
     while (j < NSOCKS) {
         var o: *Socket = &socks[j];
-        if (j != s && o.used && o.type == socks[s].type && o.lport == port && o.parent < 0
+        if (j != s && o.used && o.type == socks[s].type && o.family == socks[s].family && o.lport == port && o.parent < 0
                 && (o.laddr == 0 || addr == 0 || o.laddr == addr)) {
             var lingers: int = o.reuse || o.state == TCP_TIME_WAIT || o.files == 0;
             if (!(socks[s].type == SOCK_STREAM && socks[s].reuse && lingers && o.state != TCP_LISTEN)) { return 1; }
@@ -224,7 +229,19 @@ fn port_in_use(s: int, addr: int, port: int) -> int {
     return 0;
 }
 
+var next_tn_ephemeral: int = TSP_EPHEMERAL_LOW;
+
 fn ephemeral_port(s: int, addr: int) -> int {
+    if (socks[s].family == AF_TNP) {
+        var t: int = 0;
+        while (t <= TSP_EPHEMERAL_HIGH - TSP_EPHEMERAL_LOW) {
+            var q: int = next_tn_ephemeral;
+            next_tn_ephemeral = q == TSP_EPHEMERAL_HIGH ? TSP_EPHEMERAL_LOW : q + 1;
+            if (!port_in_use(s, addr, q)) { return q; }
+            t += 1;
+        }
+        return -EADDRINUSE;
+    }
     var tries: int = 0;
     while (tries <= EPHEMERAL_HIGH - EPHEMERAL_LOW) {
         var p: int = next_ephemeral;
@@ -298,13 +315,14 @@ fn get_sockaddr(addr: int, len: int) -> int {
     sa_family = a.family;
     sa_port = a.port;
     sa_addr = a.addr;
+    if (sa_family == AF_TNP) { return sa_port < 0 || sa_port > 9841 ? -EINVAL : 0; }
     if (sa_family != AF_INET) { return sa_family == AF_UNSPEC ? 0 : -EAFNOSUPPORT; }
     if (sa_port < 0 || sa_port > 65535 || sa_addr < 0 || sa_addr >= TWO32) { return -EINVAL; }
     return 0;
 }
 
 // Write an address to user memory: `lenp` points to the room, and gets the size.
-fn put_sockaddr(addr: int, lenp: int, ip: int, port: int) -> int {
+fn put_sockaddr(addr: int, lenp: int, fam: int, ip: int, port: int) -> int {
     if (addr == 0) { return 0; }
     if (!user_range_ok(lenp - 1, 3)) { return -EFAULT; }
     var room: *int = lenp as *int;
@@ -312,7 +330,7 @@ fn put_sockaddr(addr: int, lenp: int, ip: int, port: int) -> int {
     if (*room >= SOCKADDR_LEN) {
         if (!user_range_ok(addr - 1, SOCKADDR_LEN)) { return -EFAULT; }
         var a: *SockaddrIn = addr as *SockaddrIn;
-        a.family = AF_INET;
+        a.family = fam;
         a.port = port;
         a.addr = ip;
     }
@@ -337,6 +355,23 @@ fn sys_socket(domain: int, type: int, proto: int) -> int {
     if (has(type, SOCK_NONBLOCK)) { flags += SOCK_NONBLOCK; }
     if (has(type, SOCK_CLOEXEC)) { flags += SOCK_CLOEXEC; }
     var base: int = type - flags;
+    if (domain == AF_TNP) {
+        if (base == SOCK_STREAM) {
+            if (proto != 0 && proto != TNP_TSP) { return -EPROTONOSUPPORT; }
+            proto = TNP_TSP;
+        } else if (base == SOCK_RAW) {
+            if (proto != TNP_TCMP) { return -EPROTONOSUPPORT; }
+            if (current_task().euid != 0) { return -EPERM; }
+        } else if (base == SOCK_DGRAM) {
+            return -EPROTONOSUPPORT;              // TDP: not yet (TNET.md §4.2)
+        } else {
+            return base < 0 || base > 10 ? -EINVAL : -ESOCKTNOSUPPORT;
+        }
+        var t: int = sock_alloc(base, proto);
+        if (t < 0) { return t; }
+        socks[t].family = AF_TNP;
+        return sock_install(t, flags);
+    }
     if (domain != AF_INET) { return -EAFNOSUPPORT; }
     if (base == SOCK_STREAM) {
         if (proto != 0 && proto != IPPROTO_TCP) { return -EPROTONOSUPPORT; }
@@ -360,11 +395,16 @@ fn sys_bind(fd: int, addr: int, len: int) -> int {
     if (s < 0) { return s; }
     var r: int = get_sockaddr(addr, len);
     if (r < 0) { return r; }
-    if (sa_family != AF_INET) { return -EAFNOSUPPORT; }
     var k: *Socket = &socks[s];
+    if (sa_family != k.family) { return -EAFNOSUPPORT; }
     if (k.lport != 0 || (k.type == SOCK_RAW && k.laddr != 0)) { return -EINVAL; }
-    if (sa_addr != 0 && sa_addr != INADDR_BROADCAST && !is_local_addr(sa_addr)) { return -EADDRNOTAVAIL; }
-    if (sa_port != 0 && sa_port < 1024 && k.type != SOCK_RAW && current_task().euid != 0) { return -EACCES; }
+    if (k.family == AF_TNP) {
+        if (sa_addr != 0 && sa_addr != tl_addr) { return -EADDRNOTAVAIL; }
+        if (sa_port != 0 && sa_port < TSP_PRIVILEGED && k.type != SOCK_RAW && current_task().euid != 0) { return -EACCES; }
+    } else {
+        if (sa_addr != 0 && sa_addr != INADDR_BROADCAST && !is_local_addr(sa_addr)) { return -EADDRNOTAVAIL; }
+        if (sa_port != 0 && sa_port < 1024 && k.type != SOCK_RAW && current_task().euid != 0) { return -EACCES; }
+    }
     if (k.type != SOCK_RAW) {
         if (sa_port == 0) {
             sa_port = ephemeral_port(s, sa_addr);
@@ -407,7 +447,7 @@ fn sys_accept4(fd: int, addr: int, lenp: int, flags: int) -> int {
         var c: int = tcp_ready_child(s);
         if (c >= 0) {
             socks[c].parent = -1;
-            var r: int = put_sockaddr(addr, lenp, socks[c].raddr, socks[c].rport);
+            var r: int = put_sockaddr(addr, lenp, socks[c].family, socks[c].raddr, socks[c].rport);
             if (r < 0) { tcp_abort(c, 0); return r; }
             return sock_install(c, flags);
         }
@@ -423,6 +463,7 @@ fn sys_connect(fd: int, addr: int, len: int) -> int {
     var r: int = get_sockaddr(addr, len);
     if (r < 0) { return r; }
     var k: *Socket = &socks[s];
+    if (sa_family != AF_UNSPEC && sa_family != k.family) { return -EAFNOSUPPORT; }
     if (k.type != SOCK_STREAM) {
         if (sa_family == AF_UNSPEC) { k.raddr = 0; k.rport = 0; return 0; }   // dissolve
         if (k.type == SOCK_DGRAM && sa_port == 0) { return -EINVAL; }
@@ -433,7 +474,7 @@ fn sys_connect(fd: int, addr: int, len: int) -> int {
         k.rport = sa_port;
         return 0;
     }
-    if (sa_family != AF_INET) { return -EAFNOSUPPORT; }
+    if (sa_family == AF_UNSPEC) { return -EAFNOSUPPORT; }
     switch (k.state) {
         case TCP_SYN_SENT: return -EALREADY;
         case TCP_LISTEN: return -EISCONN;
@@ -441,7 +482,7 @@ fn sys_connect(fd: int, addr: int, len: int) -> int {
         default: return -EISCONN;
     }
     if (k.was_connected) { return -EISCONN; }      // a stream connects once
-    if (sa_port == 0 || sa_addr == 0 || sa_addr == INADDR_BROADCAST) { return sa_port == 0 ? -ECONNREFUSED : -ENETUNREACH; }
+    if (sa_port == 0 || sa_addr == 0 || (k.family == AF_INET && sa_addr == INADDR_BROADCAST)) { return sa_port == 0 ? -ECONNREFUSED : -ENETUNREACH; }
     r = tcp_connect(s, sa_addr, sa_port);
     if (r < 0) { return r; }
     if (nonblocking(f)) { net_bh(); return -EINPROGRESS; }
@@ -458,9 +499,9 @@ fn sys_getsockname(fd: int, addr: int, lenp: int) -> int {
     var s: int = sock_of_fd(fd);
     if (s < 0) { return s; }
     var a: int = socks[s].laddr;
-    if (a == 0 && socks[s].raddr != 0) { a = ip_source_for(socks[s].raddr); }
+    if (a == 0 && socks[s].raddr != 0) { a = socks[s].family == AF_TNP ? tl_addr : ip_source_for(socks[s].raddr); }
     if (addr == 0) { return -EFAULT; }
-    return put_sockaddr(addr, lenp, a, socks[s].lport);
+    return put_sockaddr(addr, lenp, socks[s].family, a, socks[s].lport);
 }
 
 fn sys_getpeername(fd: int, addr: int, lenp: int) -> int {
@@ -469,7 +510,7 @@ fn sys_getpeername(fd: int, addr: int, lenp: int) -> int {
     var k: *Socket = &socks[s];
     if (k.raddr == 0 || (k.type == SOCK_STREAM && k.state != TCP_ESTABLISHED && k.state != TCP_CLOSE_WAIT)) { return -ENOTCONN; }
     if (addr == 0) { return -EFAULT; }
-    return put_sockaddr(addr, lenp, k.raddr, k.rport);
+    return put_sockaddr(addr, lenp, k.family, k.raddr, k.rport);
 }
 
 fn sys_sendto(fd: int, buf: int, n: int, flags: int, addr: int, alen: int) -> int {
@@ -477,7 +518,7 @@ fn sys_sendto(fd: int, buf: int, n: int, flags: int, addr: int, alen: int) -> in
     if (s < 0) { return s; }
     var f: int = sock_file;
     if (n < 0 || !user_range_ok(buf, n)) { return -EFAULT; }
-    if (!octets_ok(buf as *tryte, n)) { return -EINVAL; }
+    if (socks[s].family == AF_INET && !octets_ok(buf as *tryte, n)) { return -EINVAL; }
     var r: int = sock_send(s, f, buf as *tryte, n, flags, addr, alen);
     net_bh();
     return r;
@@ -494,7 +535,7 @@ fn sock_send(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, alen: int
     if (addr != 0) {
         var r: int = get_sockaddr(addr, alen);
         if (r < 0) { return r; }
-        if (sa_family != AF_INET) { return -EAFNOSUPPORT; }
+        if (sa_family != k.family) { return -EAFNOSUPPORT; }
         dst = sa_addr;
         port = sa_port;
     }
@@ -508,6 +549,7 @@ fn sock_send(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, alen: int
         if (port == 0) { return -EINVAL; }
         return udp_sendmsg(s, p, n, dst, port);
     }
+    if (k.family == AF_TNP) { return tn_raw_sendmsg(s, p, n, dst); }
     return raw_sendmsg(s, p, n, dst);
 }
 
@@ -526,7 +568,7 @@ fn sock_recv(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, lenp: int
     var k: *Socket = &socks[s];
     if (k.type == SOCK_STREAM) {
         var r: int = tcp_recvmsg(s, f, p, n, flags);
-        if (r > 0 && addr != 0) { put_sockaddr(addr, lenp, k.raddr, k.rport); }
+        if (r > 0 && addr != 0) { put_sockaddr(addr, lenp, k.family, k.raddr, k.rport); }
         return r;
     }
     while (k.rx_msgs == 0) {
@@ -540,13 +582,17 @@ fn sock_recv(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, lenp: int
     var len: int = hdr[0];
     var from: int = ip_addr(hdr[1], hdr[2], hdr[3], hdr[4]);
     var port: int = hdr[5] * 256 + hdr[6];
+    if (k.family == AF_TNP) {
+        from = tl_word(&hdr[1], 0);
+        port = hdr[5];
+    }
     var take: int = len < n ? len : n;
     ring_read(k.rxf, k.rx_head, DGRAM_HDR, p, take);
     if (!has(flags, MSG_PEEK)) {
         rx_take(s, null, DGRAM_HDR + len);
         k.rx_msgs -= 1;
     }
-    var r: int = put_sockaddr(addr, lenp, from, port);
+    var r: int = put_sockaddr(addr, lenp, k.family, from, port);
     if (r < 0) { return r; }
     return has(flags, MSG_TRUNC) ? len : take;
 }
@@ -556,12 +602,19 @@ fn dgram_queue(s: int, from: int, port: int, p: *tryte, n: int) -> int {
     if (rx_free(s) < DGRAM_HDR + n) { return 0; }
     var hdr: [7]tryte;
     hdr[0] = n as tryte;
-    hdr[1] = (from / 16777216) as tryte;
-    hdr[2] = (from / 65536 % 256) as tryte;
-    hdr[3] = (from / 256 % 256) as tryte;
-    hdr[4] = (from % 256) as tryte;
-    hdr[5] = (port / 256) as tryte;
-    hdr[6] = (port % 256) as tryte;
+    if (socks[s].family == AF_TNP) {
+        tl_put_word(&hdr[1], 0, from);            // a word, then the port's tryte
+        hdr[4] = 0;
+        hdr[5] = port as tryte;
+        hdr[6] = 0;
+    } else {
+        hdr[1] = (from / 16777216) as tryte;
+        hdr[2] = (from / 65536 % 256) as tryte;
+        hdr[3] = (from / 256 % 256) as tryte;
+        hdr[4] = (from % 256) as tryte;
+        hdr[5] = (port / 256) as tryte;
+        hdr[6] = (port % 256) as tryte;
+    }
     rx_put(s, &hdr[0], DGRAM_HDR);
     rx_put(s, p, n);
     socks[s].rx_msgs += 1;
@@ -655,7 +708,7 @@ fn sock_read(s: int, f: int, buf: *tryte, n: int) -> int {
 }
 
 fn sock_write(s: int, f: int, buf: *tryte, n: int) -> int {
-    if (!octets_ok(buf, n)) { return -EINVAL; }
+    if (socks[s].family == AF_INET && !octets_ok(buf, n)) { return -EINVAL; }
     var r: int = sock_send(s, f, buf, n, 0, 0, 0);
     net_bh();
     return r;
@@ -760,7 +813,7 @@ fn raw_deliver(p: *tryte, total: int, src: int) {
     var s: int = 0;
     while (s < NSOCKS) {
         var k: *Socket = &socks[s];
-        if (k.used && k.type == SOCK_RAW && !k.shut_rd && (k.raddr == 0 || k.raddr == src)) {
+        if (k.used && k.family == AF_INET && k.type == SOCK_RAW && !k.shut_rd && (k.raddr == 0 || k.raddr == src)) {
             dgram_queue(s, src, 0, p, total);
         }
         s += 1;
@@ -804,7 +857,7 @@ fn udp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
     var s: int = 0;
     while (s < NSOCKS) {
         var k: *Socket = &socks[s];
-        if (k.used && k.type == SOCK_DGRAM && k.lport == dport && !k.shut_rd
+        if (k.used && k.family == AF_INET && k.type == SOCK_DGRAM && k.lport == dport && !k.shut_rd
                 && (k.laddr == 0 || k.laddr == dst || dst == INADDR_BROADCAST)
                 && (k.raddr == 0 || (k.raddr == src && k.rport == sport))) {
             if (best < 0 || k.raddr != 0) { best = s; }      // a connected socket wins

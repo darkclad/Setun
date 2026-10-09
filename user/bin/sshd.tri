@@ -731,6 +731,13 @@ fn main(argc: int, argv: **char) -> int {
     sockaddr_set(&a, INADDR_ANY, port);
     if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("sshd", "bind"); return 1; }
     if (listen(l, 9) < 0) { perror2("sshd", "listen"); return 1; }
+    // and on TNET, when the port fits in a tryte (docs/TNET.md §5)
+    var lt: int = port <= 9841 ? socket(AF_TNP, SOCK_STREAM, 0) : -1;
+    if (lt >= 0) {
+        setsockopt(lt, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+        sockaddr_set_family(&a, AF_TNP, 0, port);
+        if (bind(lt, &a, sizeof(sockaddr_in)) < 0 || listen(lt, 9) < 0) { close(lt); lt = -1; }
+    }
     fputs(STDERR_FILENO, "sshd: listening on port ");
     var tmp: [15]char;
     fputs(STDERR_FILENO, itoa(port, &tmp[0]));
@@ -738,7 +745,21 @@ fn main(argc: int, argv: **char) -> int {
     loop {
         var from: sockaddr_in;
         var flen: int = sizeof(sockaddr_in);
-        var s: int = accept(l, &from, &flen);
+        var which: int = l;
+        if (lt >= 0) {
+            var ps: [2]pollfd;
+            ps[0].fd = l;
+            ps[0].events = POLLIN;
+            ps[1].fd = lt;
+            ps[1].events = POLLIN;
+            if (poll(&ps[0], 2, -1) < 0) {
+                if (errno == EINTR) { continue; }
+                perror2("sshd", "poll");
+                return 1;
+            }
+            if (ps[0].revents == 0) { which = lt; }
+        }
+        var s: int = accept(which, &from, &flen);
         if (s < 0) {
             if (errno == EINTR) { continue; }
             perror2("sshd", "accept");
@@ -746,9 +767,10 @@ fn main(argc: int, argv: **char) -> int {
         }
         var st: int = 0;
         while (waitpid(-1, &st, WNOHANG) > 0) {}
-        strcpy(&peer[0], inet_ntoa(from.sin_addr));
+        strcpy(&peer[0], addr_ntoa(from.sin_family, from.sin_addr));
         if (once) {
             close(l);
+            if (lt >= 0) { close(lt); }
             sock = s;
             log2("connection from ", &peer[0]);
             serve();
@@ -757,6 +779,7 @@ fn main(argc: int, argv: **char) -> int {
         var pid: int = fork();
         if (pid == 0) {
             close(l);
+            if (lt >= 0) { close(lt); }
             sock = s;
             log2("connection from ", &peer[0]);
             serve();

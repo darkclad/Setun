@@ -7,6 +7,7 @@
 import "../params.tri";
 import "../printk.tri";
 import "tnp.tri";
+import "tsp.tri";
 
 const TL_HLEN: int = 7;                   // 3 + 3 + 1
 const TL_CLEN: int = 2;                   // the check

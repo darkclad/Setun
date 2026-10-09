@@ -180,6 +180,120 @@ fn resolve_host(name: *char, out: *int) -> int {
     return 0;
 }
 
+// ---- TNET addresses (docs/TNET.md §3, §5) ----------------------------------------------------
+
+const AF_TNP: int = 27;
+const TNP_TSP: int = 1;
+const TNP_TCMP: int = 3;
+
+// "a.b.c", three trytes in decimal (each may be negative): 1 and the
+// address in *out, or 0. Exactly three parts, so an IPv4 address (four)
+// is never taken for one.
+fn tn_aton(s: *char, out: *int) -> int {
+    var v: int = 0;
+    var part: int = 0;
+    var k: int = 0;
+    while (part < 3) {
+        var neg: int = 0;
+        if (s[k] == '-') { neg = 1; k += 1; }
+        if (s[k] < '0' || s[k] > '9') { return 0; }
+        var t: int = 0;
+        while (s[k] >= '0' && s[k] <= '9') {
+            t = t * 10 + (s[k] - '0');
+            if (t > 9841) { return 0; }
+            k += 1;
+        }
+        v = v * 19683 + (neg ? -t : t);
+        part += 1;
+        if (part < 3) {
+            if (s[k] != '.') { return 0; }
+            k += 1;
+        }
+    }
+    if (s[k] != 0) { return 0; }
+    *out = v;
+    return 1;
+}
+
+var _tn_buf: [40]char;
+
+// The dotted form of a TNP address (in a static buffer).
+fn tn_ntoa(a: int) -> *char {
+    var n: int = 0;
+    var parts: [3]int;
+    parts[0] = ext(a, 1, 9);
+    parts[1] = ext(a, 10, 9);
+    parts[2] = ext(a, 19, 9);
+    var k: int = 0;
+    while (k < 3) {
+        var tmp: [12]char;
+        var s: *char = itoa(parts[k], &tmp[0]);
+        var j: int = 0;
+        while (s[j] != 0) { _tn_buf[n] = s[j]; n += 1; j += 1; }
+        if (k < 2) { _tn_buf[n] = '.'; n += 1; }
+        k += 1;
+    }
+    _tn_buf[n] = 0;
+    return &_tn_buf[0];
+}
+
+// The address and family for `name`: a TNP address or a dotted quad as
+// written, else /etc/hosts (a name with both kinds of line gives its TNP
+// address), "localhost", then DNS. The family, or 0 if not found.
+fn resolve_any(name: *char, out: *int) -> int {
+    if (tn_aton(name, out)) { return AF_TNP; }
+    if (inet_aton(name, out)) { return AF_INET; }
+    var fd: int = open("/etc/hosts", O_RDONLY, 0);
+    if (fd >= 0) {
+        var n: int = read(fd, &_hosts_buf[0], 2186);
+        close(fd);
+        if (n < 0) { n = 0; }
+        _hosts_buf[n] = 0;
+        var found_inet: int = 0;
+        var inet_addr_found: int = 0;
+        var k: int = 0;
+        while (k < n) {
+            var line: int = k;
+            while (k < n && _hosts_buf[k] != '\n') { k += 1; }
+            var end: int = k;
+            k += 1;
+            if (_hosts_buf[line] == '#') { continue; }
+            var j: int = line;
+            while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
+            var saved: char = _hosts_buf[j];
+            _hosts_buf[j] = 0;
+            var addr: int = 0;
+            var fam: int = tn_aton(&_hosts_buf[line], &addr) ? AF_TNP : (inet_aton(&_hosts_buf[line], &addr) ? AF_INET : 0);
+            _hosts_buf[j] = saved;
+            if (fam == 0) { continue; }
+            while (j < end) {
+                while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
+                var w: int = j;
+                while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
+                if (j > w && _name_is(&_hosts_buf[w], j - w, name)) {
+                    if (fam == AF_TNP) { *out = addr; return AF_TNP; }
+                    if (!found_inet) { found_inet = 1; inet_addr_found = addr; }
+                }
+            }
+        }
+        if (found_inet) { *out = inet_addr_found; return AF_INET; }
+    }
+    if (_name_is("localhost", 9, name)) { *out = INADDR_LOOPBACK; return AF_INET; }
+    var addrs: [1]int;
+    if (dns_lookup(name, dns_server(), &addrs[0], 1) > 0) { *out = addrs[0]; return AF_INET; }
+    return 0;
+}
+
+// A socket address of either family.
+fn sockaddr_set_family(a: *sockaddr_in, family: int, addr: int, port: int) {
+    a.sin_family = family;
+    a.sin_port = port;
+    a.sin_addr = addr;
+}
+
+// The dotted form of an address of either family.
+fn addr_ntoa(family: int, a: int) -> *char { return family == AF_TNP ? tn_ntoa(a) : inet_ntoa(a); }
+
 // ---- DNS (RFC 1035): A records over UDP ------------------------------------------------------
 
 const DNS_TIMEOUT: int = -2;          // dns_lookup: no answer from the server

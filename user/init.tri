@@ -34,6 +34,20 @@ fn spawn_logged(path: *char, name: *char, log: *char) -> int {
     return pid;
 }
 
+// Is the ternary link up? The first line of /proc/net/tlink says.
+fn tl0_up() -> int {
+    var fd: int = open("/proc/net/tlink", O_RDONLY, 0);
+    if (fd < 0) { return 0; }
+    var buf: [81]char;
+    var n: int = read(fd, &buf[0], 80);
+    close(fd);
+    if (n <= 0) { return 0; }
+    buf[n] = 0;
+    var k: int = 0;
+    while (k < n && buf[k] != '\n') { k += 1; }
+    return k >= 3 && buf[k - 3] == ' ' && buf[k - 2] == 'u' && buf[k - 1] == 'p';
+}
+
 // With a network attached, logins over telnet are served too.
 fn eth0_up() -> int {
     var s: int = socket(AF_INET, SOCK_DGRAM, 0);
@@ -55,6 +69,9 @@ fn main(argc: int, argv: **char) -> int {
         spawn_logged("/sbin/telnetd", "telnetd", "/var/log/telnetd.log");
         spawn_logged("/sbin/sshd", "sshd", "/var/log/sshd.log");
         spawn_logged("/sbin/httpd", "httpd", "/var/log/httpd.log");
+    } else if (tl0_up()) {
+        puts("init: tl0 is up, starting /sbin/sshd (logs in /var/log)\n");
+        spawn_logged("/sbin/sshd", "sshd", "/var/log/sshd.log");
     }
     var quick_failures: int = 0;
     loop {
