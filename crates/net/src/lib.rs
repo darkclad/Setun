@@ -17,6 +17,7 @@
 
 mod nat;
 pub use nat::DNS;
+pub mod tnet;
 
 use setun_core::Machine;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};

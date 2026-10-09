@@ -10,6 +10,7 @@ import "vec.tri";
 import "drivers/tty.tri";
 import "drivers/input.tri";
 import "drivers/tnic.tri";
+import "drivers/tlink.tri";
 
 // ---- trap frame ---------------------------------------------------------------
 //
@@ -204,6 +205,7 @@ fn trap_handler(f: *int) {
             if (irq == IRQ_KEYBOARD || irq == IRQ_SERIAL) { tty_poll(); }
             if (irq == IRQ_MOUSE) { mouse_poll(); }
             if (irq == IRQ_NIC) { tnic_poll(); }
+            if (irq == IRQ_TLINK) { tlink_poll(); }
             if (irq == IRQ_TIMER) {
                 jiffies += 1;
                 tty_poll();

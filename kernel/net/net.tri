@@ -329,5 +329,6 @@ fn net_init() {
     netifs[NETIF_LO].mask = ip_addr(255, 0, 0, 0);
     arp_init();
     tnic_init();
+    tlink_init();
     socket_init();
 }

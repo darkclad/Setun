@@ -90,6 +90,20 @@ const NIC_DROPS: int = 282;
 const RNG_DATA: int = 297;            // read: the next random octet
 const RNG_SOURCE: int = 298;          // +1 seeded from the host's entropy, 0 a fixed seed
 
+// Ternary link card (block 12, docs/TNET.md §1)
+const TLINK_CMD: int = 324;           // +1 send, -1 receive into RX_ADDR, 0 drop
+const TLINK_STATUS: int = 325;
+const TLINK_TX_ADDR: int = 326;
+const TLINK_TX_LEN: int = 327;
+const TLINK_RX_ADDR: int = 328;
+const TLINK_RX_LEN: int = 329;
+const TLINK_RX_COUNT: int = 330;
+const TLINK_CTRL: int = 331;          // +1 IRQ on receive
+const TLINK_LINK: int = 332;
+const TLINK_ERROR: int = 333;
+const TLINK_DROPS: int = 334;
+const TLINK_ADDR: int = 335;          // the station address
+
 // IRQ lines (vector = IRQ + 1)
 const IRQ_TIMER: int = 0;
 const IRQ_KEYBOARD: int = 1;
@@ -100,6 +114,7 @@ const IRQ_RTC: int = 5;
 const IRQ_DISPLAY: int = 6;
 const IRQ_DISK1: int = 7;
 const IRQ_NIC: int = 8;
+const IRQ_TLINK: int = 9;
 
 // Memory
 const FB_BASE: int = -1604164;        // first framebuffer tryte

@@ -108,7 +108,7 @@ impl Drop for Raw {
     }
 }
 
-pub fn run(mut m: Machine, mut net: Option<setun_net::Network>) {
+pub fn run(mut m: Machine, mut links: crate::Links) {
     // emulated speed far above what the host reaches: a busy guest is
     // limited by the host, an idle one by the clock
     m.ns_per_instruction = 1;
@@ -135,14 +135,10 @@ pub fn run(mut m: Machine, mut net: Option<setun_net::Network>) {
     let wait = |d: Duration| {
         let _ = event::poll(d);
     };
-    // with a network, a wait is at most a millisecond, so traffic flows
-    let networked = net.is_some();
+    // with a network or a link, a wait is at most a millisecond, so traffic flows
+    let networked = links.active();
     let wait = |d: Duration| wait(if networked { d.min(Duration::from_millis(1)) } else { d });
-    let poll = |m: &mut Machine| {
-        if let Some(n) = net.as_mut() {
-            n.poll(m);
-        }
-    };
+    let poll = |m: &mut Machine| links.poll(m);
     run_loop(&mut m, input, &mut stdout, || start.elapsed().as_micros() as i64, wait, poll);
     eprint!("\r\nsetun: left the console\r\n");
 }

@@ -41,6 +41,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/TERNARY_WORLD.md`](docs/TERNARY_WORLD.md): the plan for a more ternary system, phase by phase
 - [`docs/BOOT.md`](docs/BOOT.md): the boot protocol
 - [`docs/KERNEL.md`](docs/KERNEL.md): Trinux's kernel, milestone by milestone (K1–K8, users, the FPU, networking, shared memory, the vector unit)
+- [`docs/TNET.md`](docs/TNET.md): the native ternary network between Setun machines: the `TLINK` card, TL frames with a TCRC-18 check over GF(3), TNP addresses, TSP streams
 - [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet and SSH logins, TLS for `wget`, a web server
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)

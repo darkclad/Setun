@@ -1,0 +1,8 @@
+// tnp: TNP, the network layer of TNET (docs/TNET.md §3). Milestone C2;
+// until then a TNP packet is counted and dropped.
+
+var tnp_rx_dropped: int;
+
+fn tnp_input(src: int, p: *tryte, n: int) {
+    tnp_rx_dropped += 1;
+}

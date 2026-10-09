@@ -629,7 +629,7 @@ line per check.
 | `/mnt` | an empty mount point |
 | `/var/log` | daemon logs |
 | `/var/www` | `httpd`'s files (`index.html`) |
-| `/usr/share` | `font8x8`, `unifont` |
+| `/usr/share` | `font8x8`, `unifont`, `fmtvectors.txt` (FORMATS.md §5) |
 | `/usr/lib` | `sftp-server`, `trwtest/`, and `trine/` (the Trine standard library: `ports.tri rt.tri console.tri keymap.tri real.tri math.tri long.tri`, and `long.s`, the runtime `tric` appends for `long`) |
 | `/usr/src` | `hello.tri`, `lib/` (tlibc and every library module as source), `bin/tric.tri` and `bin/tric/` (the compiler's own source) |
 
@@ -737,6 +737,7 @@ writing.
 | `/proc/<pid>/cmdline` | the arguments, NUL-separated (at most 80 trytes) |
 | `/proc/net/dev`, `arp`, `tcp`, `udp` | Linux's layouts (`tcp` and `udp` add the owner's uid) |
 | `/proc/net/stat` | one network counter per line |
+| `/proc/net/tlink` | the ternary link (TNET.md §2): the station address and whether it is up, then one counter per line (frames and trytes each way, bad checks, short frames, frames for other stations, unknown types, dropped sends, echo replies) |
 
 ### 5.7 Mounting
 

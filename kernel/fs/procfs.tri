@@ -15,6 +15,7 @@ import "vfs.tri";
 import "bcache.tri";
 import "../sched.tri";
 import "../net/tcp.tri";
+import "../net/tl.tri";
 
 const PROC_ROOT: int = 1;
 const PROC_MEMINFO: int = 2;
@@ -30,6 +31,7 @@ const PROC_NET_ARP: int = 11;
 const PROC_NET_TCP: int = 12;
 const PROC_NET_UDP: int = 13;
 const PROC_NET_STAT: int = 14;
+const PROC_NET_TLINK: int = 15;
 const ESRCH_: int = 3;
 
 var proc_mnt: int = -1;
@@ -89,6 +91,7 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "tcp")) { return iget(FS_PROC, m, PROC_NET_TCP); }
         if (proc_name_eq(s, len, "udp")) { return iget(FS_PROC, m, PROC_NET_UDP); }
         if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, PROC_NET_STAT); }
+        if (proc_name_eq(s, len, "tlink")) { return iget(FS_PROC, m, PROC_NET_TLINK); }
         return -ENOENT_;
     }
     if (proc_name_eq(s, len, "net")) { return iget(FS_PROC, m, PROC_NET); }
@@ -120,6 +123,7 @@ fn proc_name_of(i: int, buf: *char) -> int {
         case PROC_NET_TCP: copy_str(buf, "tcp", 4);
         case PROC_NET_UDP: copy_str(buf, "udp", 4);
         case PROC_NET_STAT: copy_str(buf, "stat", 5);
+        case PROC_NET_TLINK: copy_str(buf, "tlink", 6);
         case PROC_PID: itoa(proc_pid(i), buf);
         default: copy_str(buf, "proc", 5);
     }
@@ -137,7 +141,8 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
         if (pos == 3) { copy_str(name, "dev", 4); info[0] = PROC_NET_DEV; return 4; }
         if (pos == 4) { copy_str(name, "stat", 5); info[0] = PROC_NET_STAT; return 5; }
         if (pos == 5) { copy_str(name, "tcp", 4); info[0] = PROC_NET_TCP; return 6; }
-        if (pos == 6) { copy_str(name, "udp", 4); info[0] = PROC_NET_UDP; return 7; }
+        if (pos == 6) { copy_str(name, "tlink", 6); info[0] = PROC_NET_TLINK; return 7; }
+        if (pos == 7) { copy_str(name, "udp", 4); info[0] = PROC_NET_UDP; return 8; }
         return 0;
     }
     if (k == PROC_PID) {
@@ -247,7 +252,7 @@ fn proc_generate(i: int) -> int {
         }
         return 0;
     }
-    if (k >= PROC_NET_DEV && k <= PROC_NET_STAT) { proc_net(k); return 0; }
+    if (k >= PROC_NET_DEV && k <= PROC_NET_TLINK) { proc_net(k); return 0; }
     var ti: int = live_task(proc_pid(i));
     if (ti < 0) { return -ESRCH_; }
     var t: *Task = &tasks[ti];
@@ -361,6 +366,24 @@ fn proc_net(k: int) {
             }
             a += 1;
         }
+        return;
+    }
+    if (k == PROC_NET_TLINK) {
+        // the link layer's counters (docs/TNET.md §2), one per line
+        var buf: [40]char;
+        tl_addr_str(tl_addr, &buf[0]);
+        ps("station "); ps(&buf[0]); ps(tl_up ? " up\n" : " down\n");
+        ps("rx_frames "); pi(tl_rx_frames); pc('\n');
+        ps("rx_trytes "); pi(tl_rx_trytes); pc('\n');
+        ps("tx_frames "); pi(tl_tx_frames); pc('\n');
+        ps("tx_trytes "); pi(tl_tx_trytes); pc('\n');
+        ps("bad_check "); pi(tl_bad_check); pc('\n');
+        ps("short "); pi(tl_short); pc('\n');
+        ps("not_ours "); pi(tl_not_ours); pc('\n');
+        ps("bad_type "); pi(tl_bad_type); pc('\n');
+        ps("tx_dropped "); pi(tl_tx_dropped); pc('\n');
+        ps("echo_replies "); pi(tl_echoes); pc('\n');
+        ps("tnp_dropped "); pi(tnp_rx_dropped); pc('\n');
         return;
     }
     if (k == PROC_NET_STAT) {

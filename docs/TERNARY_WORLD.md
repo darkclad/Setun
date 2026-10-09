@@ -266,7 +266,7 @@ flowchart TB
 |---|---|
 | A · Ternary idioms (done, 2026-10-07) | `true`/`unknown`/`false` as +1/0/−1 and `if` on a trit refused in Trine; trit-mask merge and masked store; trit counts, packed flags, 3-ary heaps, wide B-trees; `tric` optimizer; vector registers, three-state atomics; text past U+2671 in 3 trytes |
 | B · Formats, reliability (done, 2026-10-09: Gate B passed) | real27/real81 standard with a conformance suite; ECC as a hardware spec; balanced varints, word audio, image formats; `long` and timestamps in Trine; conformance suites for the ISA and the formats |
-| **C · Native networking** (next) | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
+| **C · Native networking** (in progress: C1, the card and link layer, done 2026-10-09; [`TNET.md`](TNET.md)) | Two emulators linked trit to trit; ternary link layer and protocol; BSD sockets over both stacks; ML-KEM first, then NTRU |
 | Ongoing research | Ternary cipher and hash (study only), logic minimization; devices (CNTFET, multi-threshold CMOS), ternary HDL, gate simulator |
 
 Phase A comes first because it is software only and makes every later layer think in trits. There is no hardware phase: the emulator is the only machine, and devices, HDL and circuits stay ongoing research (decided 2026-10-06).

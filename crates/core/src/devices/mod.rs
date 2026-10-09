@@ -9,6 +9,7 @@ mod display;
 mod font;
 mod input;
 mod nic;
+mod tlink;
 mod rng;
 mod pic;
 mod timer;
@@ -21,6 +22,8 @@ pub use font::{glyph8x8, overlined, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
 pub use input::{Keyboard, Mouse, Serial};
 pub use nic::{Nic, DEFAULT_MAC, MAX_FRAME, MIN_FRAME, NIC_QUEUE};
 pub use nic::error as nic_error;
+pub use tlink::{Tlink, TLINK_MAX_FRAME, TLINK_QUEUE};
+pub use tlink::error as tlink_error;
 pub use rng::Rng;
 #[cfg(not(target_arch = "wasm32"))]
 pub use rng::host_entropy;
@@ -45,6 +48,7 @@ pub mod block {
     pub const DISPLAY: i64 = 9;
     pub const NIC: i64 = 10;
     pub const RNG: i64 = 11;
+    pub const TLINK: i64 = 12;
 }
 
 /// IRQ line numbers (ISA §8.1).
@@ -58,6 +62,7 @@ pub mod irq {
     pub const DISPLAY: usize = 6;
     pub const DISK1: usize = 7;
     pub const NIC: usize = 8;
+    pub const TLINK: usize = 9;
 }
 
 /// Value of `SYSCTL.SYSID`: the machine number.
@@ -85,6 +90,7 @@ pub struct Devices {
     pub disks: [Disk; 2],
     pub display: Display,
     pub nic: Nic,
+    pub tlink: Tlink,
     pub rng: Rng,
     /// Trytes written to `SYSCTL.DEBUG`, for the host log.
     pub debug_log: Vec<i64>,
@@ -107,6 +113,7 @@ impl Devices {
             disks: [Disk::default(), Disk::default()],
             display: Display::new(),
             nic: Nic::default(),
+            tlink: Tlink::default(),
             rng: Rng::default(),
             debug_log: Vec::new(),
             ram_frames,
@@ -125,6 +132,7 @@ impl Devices {
             d.reset();
         }
         self.nic.reset();
+        self.tlink.reset();
     }
 
     /// Emulated microseconds since power-on.
@@ -193,6 +201,7 @@ impl Devices {
             }
         }
         self.nic.service(mem);
+        self.tlink.service(mem);
     }
 
     // ---- host-side input -------------------------------------------------
@@ -254,6 +263,19 @@ impl Devices {
         self.nic.take_tx()
     }
 
+    /// A frame from the ternary link for `TLINK` (dropped if there is no
+    /// link, it has a bad length, or the receive queue is full).
+    pub fn tlink_receive(&mut self, frame: &[i16]) {
+        if self.tlink.receive(frame) {
+            self.pic.raise(irq::TLINK);
+        }
+    }
+
+    /// Frames `TLINK` has sent since the last call.
+    pub fn tlink_take_tx(&mut self) -> Vec<Vec<i16>> {
+        self.tlink.take_tx()
+    }
+
     // ---- ports -----------------------------------------------------------
 
     fn sysctl_in(&self, r: i64) -> i64 {
@@ -295,6 +317,7 @@ impl Io for Devices {
             block::DISK1 => self.disks[1].read(r),
             block::DISPLAY => self.display.read(r),
             block::NIC => self.nic.read(r),
+            block::TLINK => self.tlink.read(r),
             block::RNG => self.rng.read(r),
             _ => 0,
         };
@@ -316,6 +339,7 @@ impl Io for Devices {
             block::DISK1 => self.disks[1].write(r, v),
             block::DISPLAY => self.display.write(r, v),
             block::NIC => self.nic.write(r, v),
+            block::TLINK => self.tlink.write(r, v),
             _ => {}
         }
     }

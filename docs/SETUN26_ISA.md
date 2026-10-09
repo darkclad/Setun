@@ -529,6 +529,7 @@ A kernel must save `EPC`/`EMODE` before re-enabling interrupts if it wants neste
 | 9 | 243 | display controller | 6 |
 | 10 | 270 | network card (`TNIC`) | 8 |
 | 11 | 297 | random-number generator (`TRNG`) | – |
+| 12 | 324 | ternary link (`TLINK`) | 9 |
 
 ### 8.2 Registers (offset from the block base)
 
@@ -652,6 +653,21 @@ Control values are ternary wherever that is natural.
 | 10 | `LINK` (read-only): +1 a network is attached |
 | 11 | `ERROR`: 0 none, 1 no link, 2 bad length, 3 a tryte outside 0..255, 4 bus error during DMA, 5 nothing received, 6 bad command, 7 transmit queue (27 frames) full |
 | 12 | `DROPS` (read-only): received frames lost to a full queue |
+
+**Ternary link (324), `TLINK`.** Frames of 1..2187 (3^7) trytes of **any value**, to and from a point-to-point link to another Setun machine; the card checks nothing (the link layer's TCRC-18 does). DMA and commands work as for `TNIC`. Details: [`TNET.md`](TNET.md) §1.
+
+| Offset | Register |
+|---|---|
+| 0 | `CMD`: +1 send `TX_LEN` trytes from `TX_ADDR`; −1 copy the oldest received frame to `RX_ADDR` and drop it; 0 drop it without copying |
+| 1 | `STATUS`: 0 ok, −1 the last command failed |
+| 2–4 | `TX_ADDR`, `TX_LEN`, `RX_ADDR` |
+| 5 | `RX_LEN` (read-only) |
+| 6 | `RX_COUNT` (read-only, at most 27) |
+| 7 | `CTRL`: +1 IRQ 9 when a frame arrives |
+| 8 | `LINK` (read-only): +1 a link is attached |
+| 9 | `ERROR`: 0 none, 1 no link, 2 bad length, 4 bus error during DMA, 5 nothing received, 6 bad command, 7 transmit queue full |
+| 10 | `DROPS` (read-only) |
+| 11 | `ADDR` (read-only): the station address the front end gave the card |
 
 **Random-number generator (297), `TRNG`.** A ChaCha20 key stream (RFC 8439 block function) under a 256-bit seed from the front end; with none, the seed is zero and every run gives the same numbers. Details: [`NETWORK.md`](NETWORK.md) §8.
 

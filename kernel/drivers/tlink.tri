@@ -1,0 +1,51 @@
+// tlink: the driver for the TLINK ternary link card (docs/TNET.md §1).
+//
+// Like tnic, but frames are trytes of any value and the card checks
+// nothing: tl.tri checks each frame's TCRC-18.
+
+import "../params.tri";
+import "../printk.tri";
+import "../net/tl.tri";
+
+var tlink_rxbuf: [2187]tryte;
+var tlink_present: int;
+
+fn tlink_init() {
+    tl_addr = in(TLINK_ADDR);
+    tlink_present = 1;
+    out(TLINK_CTRL, 1);
+    out(TPIC_UNMASK, IRQ_TLINK);
+    printk("tl0: TLINK at port 324, IRQ 9, station ");
+    var buf: [40]char;
+    tl_addr_str(tl_addr, &buf[0]);
+    pr(&buf[0]);
+    if (in(TLINK_LINK) == 1 && tl_addr != 0) {
+        tl_up = 1;
+        pr(", link up\n");
+    } else {
+        pr(", no link\n");
+    }
+}
+
+// Send len trytes from p. 0 or -1.
+fn tlink_xmit(p: *tryte, len: int) -> int {
+    out(TLINK_TX_ADDR, p as int);
+    out(TLINK_TX_LEN, len);
+    out(TLINK_CMD, 1);
+    return in(TLINK_STATUS) == 0 ? 0 : -1;
+}
+
+// IRQ 9: every queued frame up the stack.
+fn tlink_poll() {
+    while (in(TLINK_RX_COUNT) > 0) {
+        var len: int = in(TLINK_RX_LEN);
+        out(TLINK_RX_ADDR, &tlink_rxbuf[0] as int);
+        out(TLINK_CMD, -1);
+        if (in(TLINK_STATUS) != 0) {
+            out(TLINK_CMD, 0);
+            tl_short += 1;
+            continue;
+        }
+        tl_input(&tlink_rxbuf[0], len);
+    }
+}

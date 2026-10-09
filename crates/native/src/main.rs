@@ -36,6 +36,32 @@ struct Args {
     console: bool,
     /// `--net`: attach a network, with these port forwards (host, guest).
     net: Option<Vec<(std::net::SocketAddr, u16)>>,
+    /// `--tlink`: a ternary link to another setun over UDP, and
+    /// `--tlink-addr`: this station's address (docs/TNET.md §1).
+    tlink: Option<String>,
+    tlink_addr: i64,
+}
+
+/// What the machine is connected to, polled after every slice of time.
+pub struct Links {
+    net: Option<setun_net::Network>,
+    tlink: Option<setun_net::tnet::UdpLink>,
+}
+
+impl Links {
+    /// Is anything attached (so waits are kept short and traffic flows)?
+    pub fn active(&self) -> bool {
+        self.net.is_some() || self.tlink.is_some()
+    }
+
+    pub fn poll(&mut self, m: &mut Machine) {
+        if let Some(n) = self.net.as_mut() {
+            n.poll(m);
+        }
+        if let Some(t) = self.tlink.as_mut() {
+            t.poll(m);
+        }
+    }
 }
 
 fn usage() -> ! {
@@ -51,7 +77,10 @@ fn usage() -> ! {
          --press A,B,..   (headless) press these USB HID keys after booting\n\
          --screenshot F   (headless) save the final screen as a PNG\n\
          --console        no window: this terminal is the serial console (Ctrl-] leaves);\n\
-         \x20                without --disk, a Trinux disk built from the source tree"
+         \x20                without --disk, a Trinux disk built from the source tree\n\
+         --net [ADDR:]HOST:GUEST  attach the user-mode network, forwarding a host port (repeatable; 'on': none)\n\
+         --tlink listen:PORT | connect:HOST:PORT  a ternary link to another setun over UDP\n\
+         --tlink-addr A.B.C   this station's TNET address, three trytes (default 0.0.1)"
     );
     std::process::exit(2)
 }
@@ -70,6 +99,8 @@ fn parse_args() -> Args {
         screenshot: None,
         console: false,
         net: None,
+        tlink: None,
+        tlink_addr: 1,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -95,6 +126,8 @@ fn parse_args() -> Args {
                     fwds.push(parse_forward(&spec).unwrap_or_else(|| usage()));
                 }
             }
+            "--tlink" => a.tlink = Some(val()),
+            "--tlink-addr" => a.tlink_addr = setun_net::tnet::parse_addr(&val()).unwrap_or_else(|| usage()),
             _ => usage(),
         }
     }
@@ -107,6 +140,23 @@ fn parse_forward(spec: &str) -> Option<(std::net::SocketAddr, u16)> {
     let guest: u16 = guest.parse().ok()?;
     let host = if host.contains(':') { host.parse().ok()? } else { format!("127.0.0.1:{host}").parse().ok()? };
     Some((host, guest))
+}
+
+/// Attach what `--net` and `--tlink` asked for.
+fn attach_links(m: &mut Machine, args: &Args) -> Links {
+    let tlink = args.tlink.as_ref().map(|spec| match setun_net::tnet::UdpLink::open(spec) {
+        Ok(l) => {
+            m.dev.tlink.link = true;
+            m.dev.tlink.addr = args.tlink_addr;
+            eprintln!("setun: ternary link {spec}, station {}", setun_net::tnet::addr_str(args.tlink_addr));
+            l
+        }
+        Err(e) => {
+            eprintln!("setun: --tlink {spec}: {e}");
+            std::process::exit(1)
+        }
+    });
+    Links { net: attach_net(m, args), tlink }
 }
 
 /// Attach the network `--net` asked for, if any.
@@ -264,13 +314,13 @@ fn main() {
         });
         let mut m = build_machine(&args);
         m.dev.disks[0].attach(Box::new(setun_core::devices::MemDisk::from_trytes(&disk.trytes)));
-        let net = attach_net(&mut m, &args);
-        return console::run(m, net);
+        let links = attach_links(&mut m, &args);
+        return console::run(m, links);
     }
     let mut m = build_machine(&args);
-    let mut net = attach_net(&mut m, &args);
+    let mut links = attach_links(&mut m, &args);
     if args.console {
-        return console::run(m, net);
+        return console::run(m, links);
     }
     if let Some(n) = args.headless {
         return headless(m, n, &args);
@@ -348,9 +398,7 @@ fn main() {
 
         // Emulate one video frame's worth of instructions.
         m.run(per_frame);
-        if let Some(n) = net.as_mut() {
-            n.poll(&mut m);
-        }
+        links.poll(&mut m);
 
         let out = m.dev.serial.take_output();
         if !out.is_empty() {
