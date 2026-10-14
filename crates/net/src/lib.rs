@@ -13,9 +13,14 @@
 //! - **outbound connections** from the guest reach the outside world through
 //!   host sockets (a NAT), and 10.0.2.3 answers DNS (`nat.rs`).
 //!
+//! It is also the guest's IPv6 router at fd00::2 on fd00::/64, advertising
+//! the prefix (docs/IPV6.md §5, `ip6.rs`).
+//!
 //! Time is the emulator's clock. A loss filter can drop chosen frames.
 
+pub mod ip6;
 mod nat;
+pub use ip6::{DNS6, GATEWAY6, GATEWAY6_LL, GUEST6};
 pub use nat::DNS;
 pub mod tnet;
 
@@ -168,6 +173,13 @@ pub struct Network {
     udp_ports: Vec<u16>,
     dns: SocketHandle,
     outbound: bool,
+    /// Frames from the guest kept for a test instead of reaching the gateway.
+    capture: Option<Vec<Vec<u8>>>,
+    /// A Router Solicitation came in: advertise at once.
+    ra_due: bool,
+    /// When the last Router Advertisement went out (µs), None before the
+    /// first: the gateway advertises once the guest has solicited.
+    last_ra_us: Option<i64>,
     pub stats: Stats,
 }
 
@@ -186,6 +198,9 @@ impl Network {
         iface.update_ip_addrs(|a| {
             a.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24)).unwrap();
             a.push(IpCidr::new(IpAddress::Ipv4(DNS), 24)).unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv6(GATEWAY6), 64)).unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv6(DNS6), 64)).unwrap();
+            a.push(IpCidr::new(IpAddress::Ipv6(GATEWAY6_LL), 64)).unwrap();
         });
         let mut sockets = SocketSet::new(Vec::new());
         let icmp = sockets.add(icmp::Socket::new(
@@ -216,8 +231,28 @@ impl Network {
             udp_ports: Vec::new(),
             dns,
             outbound: true,
+            capture: None,
+            ra_due: false,
+            last_ra_us: None,
             stats: Stats::default(),
         }
+    }
+
+    /// Put a frame in the card's receive queue as if it came from the link.
+    pub fn inject(&mut self, m: &mut Machine, frame: &[u8]) {
+        m.dev.net_receive(frame);
+    }
+
+    /// Keep every frame the guest sends for [`Network::captured`] instead of
+    /// handing it to the gateway (on), or go back to normal (off). While
+    /// capturing, the gateway sends no Router Advertisements either.
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture = on.then(Vec::new);
+    }
+
+    /// The frames captured since the last call.
+    pub fn captured(&mut self) -> Vec<Vec<u8>> {
+        self.capture.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Let the guest connect out through host sockets (on by default).
@@ -283,6 +318,13 @@ impl Network {
                 continue;
             }
             self.stats.frames_from_guest += 1;
+            if let Some(c) = self.capture.as_mut() {
+                c.push(f);
+                continue;
+            }
+            if ip6::is_router_solicitation(&f) {
+                self.ra_due = true;
+            }
             if let Some(f) = self.nat_in(f) {
                 self.wire.inbound.push_back(f);
             }
@@ -290,6 +332,12 @@ impl Network {
         self.nat_connects();
         self.accept_forwards();
         let t = now(m);
+        let us = m.dev.now_us();
+        if self.capture.is_none() && (self.ra_due || self.last_ra_us.is_some_and(|l| us - l >= ip6::RA_INTERVAL_S * 1_000_000)) {
+            self.ra_due = false;
+            self.last_ra_us = Some(us);
+            self.wire.outbound.push_back(ip6::router_advertisement(GATEWAY_MAC));
+        }
         self.iface.poll(t, &mut self.wire, &mut self.sockets);
         self.pump();
         self.dns_poll();

@@ -9,7 +9,7 @@ There are four layers, and each one gets tested on its own:
 
 1. **The network card (`TNIC`)**, an emulated device in `setun-core` (§1)
 2. **The host side (`setun-net`)**, a user-mode network behind the card, the way QEMU's "slirp" works (§2)
-3. **The kernel stack**: Ethernet, ARP, IPv4, ICMP, UDP and TCP, with sockets (§3, §4)
+3. **The kernel stack**: Ethernet, ARP, IPv4, ICMP, UDP and TCP, with sockets (§3, §4); IPv6 beside it in [`IPV6.md`](IPV6.md)
 4. **User space**: tlibc socket calls and the `ifconfig`, `ping`, `nc`, `netstat` and `telnetd` programs (§5)
 
 ## 0. Octets on a ternary machine

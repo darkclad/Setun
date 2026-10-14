@@ -213,5 +213,6 @@ fn eth_input(p: *tryte, len: int) {
     var type: int = get16(p, 12);
     if (type == ETH_P_ARP) { arp_input(p + ETH_HLEN, len - ETH_HLEN); return; }
     if (type == ETH_P_IP) { ip_input(p + ETH_HLEN, len - ETH_HLEN, NETIF_ETH); return; }
+    if (type == ETH_P_IPV6) { ip6_input(p + ETH_HLEN, len - ETH_HLEN, NETIF_ETH); return; }
     netifs[NETIF_ETH].rx_dropped += 1;           // not a protocol we speak
 }

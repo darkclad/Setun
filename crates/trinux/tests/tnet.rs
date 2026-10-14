@@ -61,7 +61,7 @@ fn the_link_comes_up_with_its_station_address() {
     let c = counters(&mut m);
     assert!(c.contains("station 4.-3.7 up\nrx_frames 0\n"), "{c}");
     let ls = shell(&mut m, "ls /proc/net");
-    assert!(ls.contains("arp\ndev\nstat\ntcp\ntlink\nudp\n"), "{ls}");
+    assert!(ls.contains("arp\ndev\nif_inet6\nneigh6\nstat\nstat6\ntcp\ntlink\nudp\n"), "{ls}");
 }
 
 #[test]

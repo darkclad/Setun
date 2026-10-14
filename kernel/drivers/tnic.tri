@@ -32,6 +32,7 @@ fn tnic_init() {
         netifs[NETIF_ETH].mask = ip_addr(255, 255, 255, 0);
         netifs[NETIF_ETH].gw = ip_addr(10, 0, 2, 2);
         netifs[NETIF_ETH].up = 1;
+        ip6_pending = 1;                          // IPv6 autoconfigures from the first tick
         pr(", link up, ");
         pr_ip(netifs[NETIF_ETH].addr);
         pr("/24 via ");

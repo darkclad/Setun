@@ -1,0 +1,1164 @@
+// IPv6 (RFC 8200), ICMPv6 (RFC 4443), Neighbor Discovery (RFC 4861) and
+// stateless address autoconfiguration (RFC 4862) on eth0 and lo
+// (docs/IPV6.md §1–§3).
+//
+// An address is 16 octets, one per tryte. Everywhere else in the stack an
+// IPv6 address travels as a handle into a table of 81 interned addresses
+// (§1): the same address always has the same handle, and handle 0 is ::.
+// So sockets and TCP keep the IPv4 address fields and compare with ==.
+//
+// Packets are built in txbuf like IPv4's, with the transport header at
+// L6_OFF; ip6_send() fills in the rest.
+
+import "net.tri";
+import "arp.tri";
+
+const ETH_P_IPV6: int = 34525;            // 0x86DD
+const IP6_HLEN: int = 40;
+const L6_OFF: int = 54;                   // ETH_HLEN + IP6_HLEN
+const NH_HOPOPT: int = 0;
+const NH_TCP: int = 6;
+const NH_UDP: int = 17;
+const NH_ROUTING: int = 43;
+const NH_FRAG: int = 44;
+const NH_ICMP6: int = 58;
+const NH_NONE: int = 59;
+const NH_DSTOPT: int = 60;
+const IPPROTO_ICMPV6: int = 58;
+
+const ICMP6_UNREACH: int = 1;
+const ICMP6_TOO_BIG: int = 2;
+const ICMP6_PARAM: int = 4;
+const ICMP6_ECHO: int = 128;
+const ICMP6_ECHO_REPLY: int = 129;
+const ND_RS: int = 133;
+const ND_RA: int = 134;
+const ND_NS: int = 135;
+const ND_NA: int = 136;
+const ND_REDIRECT: int = 137;
+
+const SRC_UNSPEC: int = -1;               // ip6_send: send from :: (DAD)
+const FOREVER: int = -1;                  // a lifetime that never ends
+const INFINITE_LIFETIME: int = 4294967295;
+
+// ---- counters (/proc/net/stat6) --------------------------------------------------------------
+
+const S6_IN: int = 0;
+const S6_HDR_ERR: int = 1;
+const S6_NOT_OURS: int = 2;
+const S6_MARTIAN: int = 3;
+const S6_BAD_OPT: int = 4;
+const S6_FRAG_DROP: int = 5;
+const S6_UNKNOWN_NEXT: int = 6;
+const S6_OUT: int = 7;
+const S6_NO_ROUTE: int = 8;
+const S6_TABLE_FULL: int = 9;
+const S6_ICMP_IN: int = 10;
+const S6_ICMP_BAD: int = 11;
+const S6_ECHO_REPLIES: int = 12;
+const S6_ERRORS_SENT: int = 13;
+const S6_RATE_LIMITED: int = 14;
+const S6_ND_IN: int = 15;
+const S6_ND_BAD: int = 16;
+const S6_RA_IN: int = 17;
+const S6_REDIRECTS: int = 18;
+const S6_RESOLVE_FAILED: int = 19;
+const S6_DAD_FAILED: int = 20;
+const S6_TOO_BIG: int = 21;
+const S6_UDP_IN: int = 22;
+const S6_UDP_ERR: int = 23;
+const S6_TCP_IN: int = 24;
+const S6_TCP_ERR: int = 25;
+const S6_UNREACH_IN: int = 26;
+const NSTATS6: int = 27;
+
+var ip6_stats: [27]int;
+
+fn c6(k: int) { ip6_stats[k] += 1; }
+
+fn ip6_stat_name(k: int) -> *char {
+    switch (k) {
+        case S6_IN: return "ip6_in";
+        case S6_HDR_ERR: return "ip6_hdr_errors";
+        case S6_NOT_OURS: return "ip6_not_ours";
+        case S6_MARTIAN: return "ip6_martians";
+        case S6_BAD_OPT: return "ip6_bad_options";
+        case S6_FRAG_DROP: return "ip6_frag_dropped";
+        case S6_UNKNOWN_NEXT: return "ip6_unknown_next";
+        case S6_OUT: return "ip6_out";
+        case S6_NO_ROUTE: return "ip6_no_route";
+        case S6_TABLE_FULL: return "ip6_table_full";
+        case S6_ICMP_IN: return "icmp6_in";
+        case S6_ICMP_BAD: return "icmp6_bad";
+        case S6_ECHO_REPLIES: return "icmp6_echo_replies_sent";
+        case S6_ERRORS_SENT: return "icmp6_errors_sent";
+        case S6_RATE_LIMITED: return "icmp6_rate_limited";
+        case S6_ND_IN: return "nd_in";
+        case S6_ND_BAD: return "nd_bad";
+        case S6_RA_IN: return "nd_ra_in";
+        case S6_REDIRECTS: return "nd_redirects_ignored";
+        case S6_RESOLVE_FAILED: return "nd_resolve_failed";
+        case S6_DAD_FAILED: return "dad_failed";
+        case S6_TOO_BIG: return "icmp6_too_big";
+        case S6_UDP_IN: return "udp6_in";
+        case S6_UDP_ERR: return "udp6_errors";
+        case S6_TCP_IN: return "tcp6_in";
+        case S6_TCP_ERR: return "tcp6_errors";
+        case S6_UNREACH_IN: return "icmp6_unreach_in";
+    }
+    return "?";
+}
+
+// ---- addresses as octets ----------------------------------------------------------------------
+
+fn in6_eq(a: *tryte, b: *tryte) -> int {
+    var k: int = 0;
+    while (k < 16) {
+        if (a[k] != b[k]) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+fn in6_copy(d: *tryte, s: *tryte) {
+    var k: int = 0;
+    while (k < 16) { d[k] = s[k]; k += 1; }
+}
+
+fn in6_is_zero(a: *tryte) -> int {
+    var k: int = 0;
+    while (k < 16) {
+        if (a[k] != 0) { return 0; }
+        k += 1;
+    }
+    return 1;
+}
+
+fn in6_is_loop(a: *tryte) -> int {
+    var k: int = 0;
+    while (k < 15) {
+        if (a[k] != 0) { return 0; }
+        k += 1;
+    }
+    return a[15] == 1;
+}
+
+fn in6_is_mcast(a: *tryte) -> int { return a[0] == 255; }
+fn in6_is_ll(a: *tryte) -> int { return a[0] == 254 && a[1] >= 128 && a[1] < 192; }    // fe80::/10
+
+// ff02::1:ffXX:XXXX
+fn in6_is_solicited(a: *tryte) -> int {
+    if (a[0] != 255 || a[1] != 2) { return 0; }
+    var k: int = 2;
+    while (k < 11) {
+        if (a[k] != 0) { return 0; }
+        k += 1;
+    }
+    return a[11] == 1 && a[12] == 255;
+}
+
+// The solicited-node group of address a, into d.
+fn in6_solicited(d: *tryte, a: *tryte) {
+    var k: int = 0;
+    while (k < 16) { d[k] = 0; k += 1; }
+    d[0] = 255;
+    d[1] = 2;
+    d[11] = 1;
+    d[12] = 255;
+    d[13] = a[13];
+    d[14] = a[14];
+    d[15] = a[15];
+}
+
+// The interface identifier from the card's MAC (modified EUI-64, RFC 4291
+// Appendix A): the universal/local bit (2 in the first octet) flipped, and
+// ff:fe in the middle.
+fn in6_iid(d: *tryte) {
+    var o0: int = mac_octet(eth_mac_hi, eth_mac_lo, 0);
+    d[8] = (o0 / 2 % 2 == 1 ? o0 - 2 : o0 + 2) as tryte;
+    d[9] = mac_octet(eth_mac_hi, eth_mac_lo, 1) as tryte;
+    d[10] = mac_octet(eth_mac_hi, eth_mac_lo, 2) as tryte;
+    d[11] = 255;
+    d[12] = 254;
+    d[13] = mac_octet(eth_mac_hi, eth_mac_lo, 3) as tryte;
+    d[14] = mac_octet(eth_mac_hi, eth_mac_lo, 4) as tryte;
+    d[15] = mac_octet(eth_mac_hi, eth_mac_lo, 5) as tryte;
+}
+
+// RFC 5952 text into buf; the length.
+fn in6_to_str(a: *tryte, buf: *char) -> int {
+    // the longest run of two or more zero groups, the first on a tie
+    var best: int = -1;
+    var blen: int = 1;
+    var g: int = 0;
+    while (g < 8) {
+        var e: int = g;
+        while (e < 8 && a[2 * e] == 0 && a[2 * e + 1] == 0) { e += 1; }
+        if (e - g > blen) { best = g; blen = e - g; }
+        g = e > g ? e : g + 1;
+    }
+    var digits: *char = "0123456789abcdef";
+    var n: int = 0;
+    g = 0;
+    while (g < 8) {
+        if (g == best) {
+            buf[n] = ':';
+            n += 1;
+            if (g == 0) { buf[n] = ':'; n += 1; }
+            g += blen;
+            continue;
+        }
+        var v: int = a[2 * g] * 256 + a[2 * g + 1];
+        var started: int = 0;
+        var sh: int = 4096;
+        while (sh > 0) {
+            var d: int = v / sh % 16;
+            if (d != 0 || started || sh == 1) { buf[n] = digits[d]; n += 1; started = 1; }
+            sh /= 16;
+        }
+        if (g < 7) { buf[n] = ':'; n += 1; }
+        g += 1;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+fn pr_ip6(a: *tryte) {
+    var buf: [40]char;
+    in6_to_str(a, &buf[0]);
+    pr(&buf[0]);
+}
+
+// ---- the interned table (§1) -------------------------------------------------------------------
+
+const NADDR6: int = 81;
+var a6tab: [1296]tryte;                   // 81 × 16 octets
+var a6_used: [81]int;
+var a6_mark: [81]int;
+var a6_epoch: [81]int;                    // the packet or call that last took it
+var a6_now: int;                          // bumped per received packet and per system call
+
+fn a6(h: int) -> *tryte { return &a6tab[16 * h]; }
+
+fn a6_find(a: *tryte) -> int {
+    if (in6_is_zero(a)) { return 0; }
+    var h: int = 1;
+    while (h < NADDR6) {
+        if (a6_used[h] && in6_eq(a6(h), a)) { return h; }
+        h += 1;
+    }
+    return -1;
+}
+
+// The handle of address a, taking a free one if it is new; -1 if the
+// table is full of handles still in use.
+fn in6_intern(a: *tryte) -> int {
+    var h: int = a6_find(a);
+    if (h >= 0) { a6_epoch[h] = a6_now; return h; }
+    h = a6_free();
+    if (h < 0) {
+        a6_gc();
+        h = a6_free();
+        if (h < 0) { c6(S6_TABLE_FULL); return -1; }
+    }
+    in6_copy(a6(h), a);
+    a6_used[h] = 1;
+    a6_epoch[h] = a6_now;
+    return h;
+}
+
+fn a6_free() -> int {
+    var h: int = 1;
+    while (h < NADDR6) {
+        if (!a6_used[h]) { return h; }
+        h += 1;
+    }
+    return -1;
+}
+
+fn a6_keep(h: int) { if (h > 0 && h < NADDR6) { a6_mark[h] = 1; } }
+
+// Free every handle nothing refers to: not the interface, the router, the
+// neighbour cache, a socket, or the packet or call under way.
+fn a6_gc() {
+    var h: int = 0;
+    while (h < NADDR6) { a6_mark[h] = 0; h += 1; }
+    a6_keep(lo6_h);
+    a6_keep(allnodes_h);
+    a6_keep(allrouters_h);
+    a6_keep(router_h);
+    var i: int = 0;
+    while (i < NIF6) {
+        if (if6[i].state != A6_FREE) { a6_keep(if6[i].h); }
+        i += 1;
+    }
+    i = 0;
+    while (i < NNEIGH) {
+        if (nc[i].state != NC_FREE) { a6_keep(nc[i].h); }
+        i += 1;
+    }
+    i = 0;
+    while (i < ND_WAIT_SLOTS) { a6_keep(nd_wait_h[i]); i += 1; }
+    i = 0;
+    while (i < NSOCKS) {
+        if (socks[i].used && socks[i].family == AF_INET6) { a6_keep(socks[i].laddr); a6_keep(socks[i].raddr); }
+        i += 1;
+    }
+    h = 1;
+    while (h < NADDR6) {
+        if (a6_used[h] && !a6_mark[h] && a6_epoch[h] != a6_now) { a6_used[h] = 0; }
+        h += 1;
+    }
+}
+
+// ---- the interface's addresses ------------------------------------------------------------------
+
+const A6_FREE: int = 0;
+const A6_TENTATIVE: int = 1;
+const A6_PREFERRED: int = 2;
+const A6_DEPRECATED: int = 3;
+const A6_DADFAILED: int = 4;
+const NIF6: int = 4;                      // the link-local address, then up to 3 global ones
+
+struct If6 {
+    state: int;
+    h: int;
+    onlink: int;                          // its /64 is on the link (the prefix's L flag)
+    valid_until: int;                     // jiffies, or FOREVER
+    pref_until: int;
+    dad_at: int;
+}
+
+var if6: [4]If6;
+var lo6_h: int;
+var allnodes_h: int;
+var allrouters_h: int;
+var ip6_on: int;                          // eth0 is configuring or configured
+var ip6_pending: int;                     // start on the next tick
+var router_h: int;                        // the default router, 0 = none
+var router_until: int;
+var ra_seen: int;
+var rs_sent: int;
+var rs_at: int;
+var link_mtu6: int = 1500;
+var rdnss: [16]tryte;
+var rdnss_until: int;
+var icmp6_tokens: int = 9;
+
+fn if6_usable(i: int) -> int { return if6[i].state == A6_PREFERRED || if6[i].state == A6_DEPRECATED; }
+
+// The slot holding address a (any state but free), or -1.
+fn if6_slot(a: *tryte) -> int {
+    var i: int = 0;
+    while (i < NIF6) {
+        if (if6[i].state != A6_FREE && in6_eq(a6(if6[i].h), a)) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Is handle h one of our usable addresses, or ::1?
+fn my6(h: int) -> int {
+    if (h == lo6_h) { return 1; }
+    var i: int = 0;
+    while (i < NIF6) {
+        if (if6_usable(i) && if6[i].h == h) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+// Is destination a for us on eth0? 0 no, 1 yes, 2 a tentative address of
+// ours (only Neighbor Discovery may use it).
+fn ip6_dst_ours(a: *tryte) -> int {
+    if (in6_is_mcast(a)) {
+        if (in6_eq(a, a6(allnodes_h))) { return 1; }
+        if (!in6_is_solicited(a)) { return 0; }
+        var i: int = 0;
+        while (i < NIF6) {
+            var s: int = if6[i].state;
+            if (s != A6_FREE && s != A6_DADFAILED) {
+                var m: *tryte = a6(if6[i].h);
+                if (m[13] == a[13] && m[14] == a[14] && m[15] == a[15]) { return 1; }
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    var j: int = if6_slot(a);
+    if (j < 0 || if6[j].state == A6_DADFAILED) { return 0; }
+    return if6[j].state == A6_TENTATIVE ? 2 : 1;
+}
+
+// On the link: link-local, or inside an advertised on-link /64.
+fn onlink6(a: *tryte) -> int {
+    if (in6_is_ll(a) || in6_is_mcast(a)) { return 1; }
+    var i: int = 1;
+    while (i < NIF6) {
+        if (if6[i].state != A6_FREE && if6[i].onlink) {
+            var m: *tryte = a6(if6[i].h);
+            var k: int = 0;
+            while (k < 8 && m[k] == a[k]) { k += 1; }
+            if (k == 8) { return 1; }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// The source address for destination handle d (§2), 0 if there is none.
+fn ip6_source_for(d: int) -> int {
+    var a: *tryte = a6(d);
+    if (in6_is_loop(a)) { return lo6_h; }
+    if (my6(d)) { return d; }
+    if (in6_is_ll(a) || in6_is_mcast(a)) {
+        return if6[0].state == A6_PREFERRED ? if6[0].h : 0;
+    }
+    var i: int = 1;
+    while (i < NIF6) {
+        if (if6[i].state == A6_PREFERRED) { return if6[i].h; }
+        i += 1;
+    }
+    return 0;
+}
+
+// ---- checksums ------------------------------------------------------------------------------------
+
+// The upper-layer checksum (RFC 8200 §8.1) of n octets at q, between the
+// addresses at s and d.
+fn csum6(s: *tryte, d: *tryte, nh: int, q: *tryte, n: int) -> int {
+    var sum: int = csum_add(0, s, 0, 16);
+    sum = csum_add(sum, d, 0, 16);
+    sum += n / 65536 + n % 65536 + nh;
+    return csum_fold(csum_add(sum, q, 0, n));
+}
+
+// ---- sending ---------------------------------------------------------------------------------------
+
+// Send the upper-layer payload at txbuf[L6_OFF] (len octets, next header
+// nh) from handle src (0: choose, SRC_UNSPEC: ::) to handle dst, with hop
+// limit hop. The upper layer's checksum is already in place. 0 or -errno.
+fn ip6_send(nh: int, src: int, dst: int, len: int, hop: int) -> int {
+    if (len > link_mtu6 - IP6_HLEN) { return -EMSGSIZE; }
+    var d: *tryte = a6(dst);
+    var local: int = in6_is_loop(d) || my6(dst);
+    if (src == 0) {
+        src = ip6_source_for(dst);
+        if (src == 0) { c6(S6_NO_ROUTE); return -ENETUNREACH; }
+    }
+    var next: int = dst;
+    if (!local) {
+        if (!ip6_on || !netifs[NETIF_ETH].up) { c6(S6_NO_ROUTE); return -ENETUNREACH; }
+        if (!onlink6(d)) {
+            if (router_h == 0) { c6(S6_NO_ROUTE); return -ENETUNREACH; }
+            next = router_h;
+        }
+    }
+    var p: *tryte = &txbuf[ETH_HLEN];
+    p[0] = 96;                                // version 6
+    p[1] = 0;
+    p[2] = 0;
+    p[3] = 0;
+    put16(p, 4, len);
+    p[6] = nh as tryte;
+    p[7] = hop as tryte;
+    if (src == SRC_UNSPEC) {
+        var k: int = 0;
+        while (k < 16) { p[8 + k] = 0; k += 1; }
+    } else {
+        in6_copy(p + 8, a6(src));
+    }
+    in6_copy(p + 24, d);
+    c6(S6_OUT);
+    if (local) { return lo_xmit(p, IP6_HLEN + len); }
+    if (in6_is_mcast(d)) {
+        // 33:33 and the group's last 32 bits (RFC 2464 §7)
+        eth_header(&txbuf[0], 51 * 65536 + 51 * 256 + d[12], (d[13] * 256 + d[14]) * 256 + d[15], ETH_P_IPV6);
+        return tnic_xmit(&txbuf[0], ETH_HLEN + IP6_HLEN + len);
+    }
+    return nd_send(next, IP6_HLEN + len);
+}
+
+// The checksum of the ICMPv6 message at txbuf[L6_OFF] (n octets), then send it.
+fn icmp6_send(src: int, dst: int, n: int, hop: int) -> int {
+    var q: *tryte = &txbuf[L6_OFF];
+    if (src == 0) {
+        src = ip6_source_for(dst);
+        if (src == 0) { c6(S6_NO_ROUTE); return -ENETUNREACH; }
+    }
+    put16(q, 2, 0);
+    var zero: [16]tryte;
+    var k: int = 0;
+    while (k < 16) { zero[k] = 0; k += 1; }
+    put16(q, 2, csum6(src == SRC_UNSPEC ? &zero[0] : a6(src), a6(dst), NH_ICMP6, q, n));
+    return ip6_send(NH_ICMP6, src, dst, n, hop);
+}
+
+// ---- receiving -----------------------------------------------------------------------------------
+
+// An IPv6 packet of len octets at p, from interface ifx.
+fn ip6_input(p: *tryte, len: int, ifx: int) {
+    a6_now += 1;
+    c6(S6_IN);
+    if (len < IP6_HLEN || p[0] / 16 != 6) { c6(S6_HDR_ERR); return; }
+    var total: int = IP6_HLEN + get16(p, 4);
+    if (total > len) { c6(S6_HDR_ERR); return; }
+    var src: *tryte = p + 8;
+    var dst: *tryte = p + 24;
+    var ours: int = 1;
+    if (ifx == NETIF_ETH) {
+        if (!ip6_on) { c6(S6_NOT_OURS); return; }
+        ours = ip6_dst_ours(dst);
+        if (ours == 0) { c6(S6_NOT_OURS); return; }
+        if (in6_is_mcast(src) || in6_is_loop(src)) { c6(S6_MARTIAN); return; }
+    } else if (in6_is_mcast(src)) {
+        c6(S6_MARTIAN);
+        return;
+    }
+    // the extension headers (§2)
+    var nh: int = p[6];
+    var nh_at: int = 6;                           // where the field naming nh is
+    var off: int = IP6_HLEN;
+    loop {
+        if (nh == NH_ICMP6 || nh == NH_UDP || nh == NH_TCP) { break; }
+        if (nh == NH_NONE) { return; }
+        if (nh == NH_FRAG) { c6(S6_FRAG_DROP); return; }
+        if (nh != NH_HOPOPT && nh != NH_DSTOPT && nh != NH_ROUTING) {
+            c6(S6_UNKNOWN_NEXT);
+            icmp6_error(p, total, ICMP6_PARAM, 1, nh_at);
+            return;
+        }
+        if (nh == NH_HOPOPT && off != IP6_HLEN) {
+            c6(S6_UNKNOWN_NEXT);
+            icmp6_error(p, total, ICMP6_PARAM, 1, nh_at);
+            return;
+        }
+        if (off + 8 > total) { c6(S6_HDR_ERR); return; }
+        var size: int = (p[off + 1] + 1) * 8;
+        if (off + size > total) { c6(S6_HDR_ERR); return; }
+        if (nh == NH_ROUTING) {
+            if (p[off + 3] != 0) {                // segments left
+                c6(S6_BAD_OPT);
+                icmp6_error(p, total, ICMP6_PARAM, 0, off + 2);
+                return;
+            }
+        } else if (!ip6_options(p, total, off + 2, off + size)) {
+            return;
+        }
+        nh = p[off];
+        nh_at = off;
+        off += size;
+    }
+    var sh: int = in6_intern(src);
+    var dh: int = in6_intern(dst);
+    if (sh < 0 || dh < 0) { return; }
+    if (ours == 2 && nh != NH_ICMP6) { c6(S6_NOT_OURS); return; }
+    if (nh == NH_ICMP6) { icmp6_input(p, off, total, sh, dh, ours == 2); }
+    else if (nh == NH_UDP) { udp6_input(p, off, total, sh, dh); }
+    else { tcp6_input(p, off, total, sh, dh); }
+}
+
+// The options from p[i] to p[end] of a Hop-by-Hop or Destination Options
+// header: true to go on, false if the packet was dropped.
+fn ip6_options(p: *tryte, total: int, i: int, end: int) -> int {
+    while (i < end) {
+        var t: int = p[i];
+        if (t == 0) { i += 1; continue; }          // Pad1
+        if (i + 2 > end || i + 2 + p[i + 1] > end) { c6(S6_HDR_ERR); return 0; }
+        if (t != 1) {                             // not PadN: an option we don't know
+            var act: int = t / 64;
+            if (act != 0) {
+                c6(S6_BAD_OPT);
+                if (act == 2 || (act == 3 && !in6_is_mcast(p + 24))) { icmp6_error(p, total, ICMP6_PARAM, 2, i); }
+                return 0;
+            }
+        }
+        i += 2 + p[i + 1];
+    }
+    return 1;
+}
+
+// ---- ICMPv6 -----------------------------------------------------------------------------------------
+
+fn icmp6_input(p: *tryte, off: int, total: int, sh: int, dh: int, tentative: int) {
+    c6(S6_ICMP_IN);
+    var q: *tryte = p + off;
+    var n: int = total - off;
+    if (n < 4 || csum6(p + 8, p + 24, NH_ICMP6, q, n) != 0) { c6(S6_ICMP_BAD); return; }
+    var type: int = q[0];
+    if (tentative && type != ND_NS && type != ND_NA) { c6(S6_NOT_OURS); return; }
+    raw6_deliver(q, n, p + 8);
+    var hop: int = p[7];
+    switch (type) {
+        case ICMP6_ECHO: {
+            if (n < 8 || sh == 0) { return; }
+            var r: *tryte = &txbuf[L6_OFF];
+            copy_trytes(r, q, n);
+            r[0] = ICMP6_ECHO_REPLY;
+            c6(S6_ECHO_REPLIES);
+            icmp6_send(my6(dh) ? dh : 0, sh, n, 64);
+        }
+        case ICMP6_UNREACH: { c6(S6_UNREACH_IN); icmp6_to_tcp(q, n, ICMP6_UNREACH); }
+        case ICMP6_PARAM: { c6(S6_UNREACH_IN); icmp6_to_tcp(q, n, ICMP6_PARAM); }
+        case ICMP6_TOO_BIG: c6(S6_TOO_BIG);
+        case ND_RA: nd_ra_input(p, q, n, sh, hop);
+        case ND_NS: nd_ns_input(p, q, n, sh, hop);
+        case ND_NA: nd_na_input(p, q, n, hop);
+        case ND_REDIRECT: c6(S6_REDIRECTS);
+        default: {}
+    }
+}
+
+// An error about a TCP segment we sent aborts a connection still opening
+// (§2): q is the ICMPv6 message, quoting our packet from q[8].
+fn icmp6_to_tcp(q: *tryte, n: int, type: int) {
+    if (n < 8 + IP6_HLEN + 4 || q[8 + 6] != NH_TCP) { return; }
+    var code: int = q[1];
+    var err: int = 0;
+    if (type == ICMP6_PARAM) { err = EPROTO_; }
+    else if (code == 1) { err = EACCES; }
+    else if (code == 3) { err = EHOSTUNREACH; }
+    else if (code == 4) { err = ECONNREFUSED; }
+    else { return; }
+    var dh: int = a6_find(q + 8 + 24);
+    if (dh <= 0) { return; }
+    var t: *tryte = q + 8 + IP6_HLEN;
+    tcp6_icmp_abort(dh, get16(t, 0), get16(t, 2), err);
+}
+
+const EPROTO_: int = 71;
+
+// Report a problem with the received packet p (total octets) to its
+// sender (§2), unless the rules forbid it.
+fn icmp6_error(p: *tryte, total: int, type: int, code: int, ptr: int) {
+    var src: *tryte = p + 8;
+    var dst: *tryte = p + 24;
+    if (in6_is_zero(src) || in6_is_mcast(src)) { return; }
+    if (in6_is_mcast(dst) && !(type == ICMP6_PARAM && code == 2)) { return; }
+    if (p[6] == NH_ICMP6 && total > IP6_HLEN && p[IP6_HLEN] < 128) { return; }    // never about an error
+    if (icmp6_tokens == 0) { c6(S6_RATE_LIMITED); return; }
+    icmp6_tokens -= 1;
+    var keep: int = total;
+    if (keep > 1280 - IP6_HLEN - 8) { keep = 1280 - IP6_HLEN - 8; }
+    var sh: int = in6_intern(src);
+    var dh: int = in6_intern(dst);
+    if (sh < 0 || dh < 0) { return; }
+    var q: *tryte = &txbuf[L6_OFF];
+    q[0] = type as tryte;
+    q[1] = code as tryte;
+    put32(q, 4, type == ICMP6_PARAM ? ptr : 0);
+    copy_trytes(q + 8, p, keep);
+    c6(S6_ERRORS_SENT);
+    icmp6_send(my6(dh) ? dh : 0, sh, 8 + keep, 64);
+}
+
+// ---- Neighbor Discovery (§3) ------------------------------------------------------------------------
+
+const NC_FREE: int = 0;
+const NC_INCOMPLETE: int = 1;
+const NC_REACHABLE: int = 2;
+const NC_STALE: int = 3;
+const NC_DELAY: int = 4;
+const NC_PROBE: int = 5;
+const NNEIGH: int = 27;
+const ND_TRIES: int = 3;
+const REACHABLE_TICKS: int = 3000;        // 30 s
+const DELAY_TICKS: int = 500;             // 5 s
+
+struct Neigh {
+    state: int;
+    h: int;
+    mac_hi: int;
+    mac_lo: int;
+    at: int;                              // the state's deadline (jiffies); STALE: when it became stale
+    tries: int;
+    router: int;
+}
+
+var nc: [27]Neigh;
+
+// One packet waits per unresolved neighbour, in a page of 9 slots of 3^7.
+const ND_WAIT_SLOTS: int = 9;
+const ND_WAIT_SLOT: int = 2187;
+var nd_wait_frame: int;
+var nd_wait_h: [9]int;
+
+fn nd_wait_slot(k: int) -> *tryte { return (frame_start(nd_wait_frame) + k * ND_WAIT_SLOT) as *tryte; }
+
+fn nc_find(h: int) -> int {
+    var k: int = 0;
+    while (k < NNEIGH) {
+        if (nc[k].state != NC_FREE && nc[k].h == h) { return k; }
+        k += 1;
+    }
+    return -1;
+}
+
+// A free entry, else the stale one longest unused, else the oldest.
+fn nc_new(h: int) -> int {
+    var best: int = -1;
+    var k: int = 0;
+    while (k < NNEIGH) {
+        if (nc[k].state == NC_FREE) { best = k; break; }
+        if (nc[k].state == NC_STALE && (best < 0 || nc[k].at < nc[best].at)) { best = k; }
+        k += 1;
+    }
+    if (best < 0) {
+        best = 0;
+        k = 1;
+        while (k < NNEIGH) {
+            if (nc[k].at < nc[best].at) { best = k; }
+            k += 1;
+        }
+    }
+    if (nc[best].state != NC_FREE) { nd_drop_waiting(nc[best].h); }     // evicting a live entry
+    nc[best].state = NC_INCOMPLETE;
+    nc[best].h = h;
+    nc[best].mac_hi = 0;
+    nc[best].mac_lo = 0;
+    nc[best].tries = 0;
+    nc[best].router = 0;
+    nc[best].at = jiffies;
+    return best;
+}
+
+// Send the frame in txbuf (an IPv6 packet of len octets at 14) to neighbour
+// handle nh, resolving it first if need be.
+fn nd_send(nh: int, len: int) -> int {
+    var k: int = nc_find(nh);
+    if (k >= 0 && nc[k].state != NC_INCOMPLETE) {
+        if (nc[k].state == NC_STALE) {
+            nc[k].state = NC_DELAY;
+            nc[k].at = jiffies + DELAY_TICKS;
+        }
+        eth_header(&txbuf[0], nc[k].mac_hi, nc[k].mac_lo, ETH_P_IPV6);
+        return tnic_xmit(&txbuf[0], ETH_HLEN + len);
+    }
+    // park the packet (a newer one replaces an older for the same neighbour)
+    var w: int = 0;
+    while (w < ND_WAIT_SLOTS && nd_wait_h[w] != nh) { w += 1; }
+    if (w == ND_WAIT_SLOTS) {
+        w = 0;
+        while (w < ND_WAIT_SLOTS && nd_wait_h[w] != 0) { w += 1; }
+    }
+    if (w == ND_WAIT_SLOTS || nd_wait_frame == 0) {
+        netifs[NETIF_ETH].tx_dropped += 1;
+        return -ENOBUFS;
+    }
+    var s: *tryte = nd_wait_slot(w);
+    s[0] = len as tryte;
+    copy_trytes(s + 1, &txbuf[ETH_HLEN], len);
+    nd_wait_h[w] = nh;
+    if (k < 0) {
+        k = nc_new(nh);
+        nc[k].tries = 1;
+        nc[k].at = jiffies + HZ;
+        nd_solicit(k, 0);                         // builds in txbuf: the packet is safe in its slot
+    }
+    return 0;
+}
+
+// Send the packet waiting for entry k's neighbour.
+fn nd_flush(k: int) {
+    var w: int = 0;
+    while (w < ND_WAIT_SLOTS) {
+        if (nd_wait_h[w] == nc[k].h && nd_wait_h[w] != 0) {
+            var s: *tryte = nd_wait_slot(w);
+            var len: int = s[0];
+            copy_trytes(&txbuf[ETH_HLEN], s + 1, len);
+            nd_wait_h[w] = 0;
+            eth_header(&txbuf[0], nc[k].mac_hi, nc[k].mac_lo, ETH_P_IPV6);
+            tnic_xmit(&txbuf[0], ETH_HLEN + len);
+        }
+        w += 1;
+    }
+}
+
+fn nd_drop_waiting(h: int) {
+    if (h == 0) { return; }
+    var w: int = 0;
+    while (w < ND_WAIT_SLOTS) {
+        if (nd_wait_h[w] == h) {
+            nd_wait_h[w] = 0;
+            netifs[NETIF_ETH].tx_dropped += 1;
+        }
+        w += 1;
+    }
+}
+
+// Resolution failed: forget the neighbour, and connections still opening
+// to it learn EHOSTUNREACH.
+fn nd_fail(k: int) {
+    c6(S6_RESOLVE_FAILED);
+    var h: int = nc[k].h;
+    nd_drop_waiting(h);
+    nc[k].state = NC_FREE;
+    if (router_h == h) { router_h = 0; }
+    tcp6_icmp_abort(h, -1, -1, EHOSTUNREACH);
+}
+
+// The source link-layer option (type 1) or target one (type 2) at q[o], 8 octets.
+fn nd_put_lla(q: *tryte, o: int, type: int) {
+    q[o] = type as tryte;
+    q[o + 1] = 1;
+    var k: int = 0;
+    while (k < 6) {
+        q[o + 2 + k] = mac_octet(eth_mac_hi, eth_mac_lo, k) as tryte;
+        k += 1;
+    }
+}
+
+// A Neighbor Solicitation for entry k: to its solicited-node group, or
+// (unicast) straight to it.
+fn nd_solicit(k: int, unicast: int) {
+    var t: *tryte = a6(nc[k].h);
+    var dst: int = nc[k].h;
+    if (!unicast) {
+        var g: [16]tryte;
+        in6_solicited(&g[0], t);
+        dst = in6_intern(&g[0]);
+        if (dst < 0) { return; }
+    }
+    var src: int = ip6_source_for(nc[k].h);
+    if (src == 0) { return; }
+    var q: *tryte = &txbuf[L6_OFF];
+    q[0] = ND_NS;
+    q[1] = 0;
+    put32(q, 4, 0);
+    in6_copy(q + 8, t);
+    nd_put_lla(q, 24, 1);
+    icmp6_send(src, dst, 32, 255);
+}
+
+// A Neighbor Advertisement for our address handle th, to handle dst.
+fn nd_advertise(th: int, dst: int, solicited: int) {
+    var q: *tryte = &txbuf[L6_OFF];
+    q[0] = ND_NA;
+    q[1] = 0;
+    q[4] = (solicited ? 96 : 32) as tryte;        // S and O, or O alone; never R
+    q[5] = 0;
+    q[6] = 0;
+    q[7] = 0;
+    in6_copy(q + 8, a6(th));
+    nd_put_lla(q, 24, 2);
+    icmp6_send(th, dst, 32, 255);
+}
+
+// Options from q[o] to q[n]: each a type, a length in 8-octet units (never
+// 0) and its octets, inside the message.
+fn nd_opts_ok(q: *tryte, o: int, n: int) -> int {
+    while (o < n) {
+        if (o + 2 > n || q[o + 1] == 0 || o + 8 * q[o + 1] > n) { return 0; }
+        o += 8 * q[o + 1];
+    }
+    return 1;
+}
+
+// The first option of `type`, its offset or -1.
+fn nd_opt(q: *tryte, o: int, n: int, type: int) -> int {
+    while (o < n) {
+        if (q[o] == type) { return o; }
+        o += 8 * q[o + 1];
+    }
+    return -1;
+}
+
+fn lla_hi(q: *tryte, o: int) -> int { return (q[o + 2] * 256 + q[o + 3]) * 256 + q[o + 4]; }
+fn lla_lo(q: *tryte, o: int) -> int { return (q[o + 5] * 256 + q[o + 6]) * 256 + q[o + 7]; }
+
+// A link-layer address learned from a solicitation, an advertisement from
+// a router, or a redirect (RFC 4861 §7.2.3): new entries and changed
+// addresses are STALE.
+fn nc_learn(h: int, hi: int, lo: int, router: int) {
+    var k: int = nc_find(h);
+    if (k < 0) {
+        k = nc_new(h);
+        nc[k].state = NC_STALE;
+        nc[k].mac_hi = hi;
+        nc[k].mac_lo = lo;
+        nc[k].at = jiffies;
+    } else if (nc[k].state == NC_INCOMPLETE || nc[k].mac_hi != hi || nc[k].mac_lo != lo) {
+        var was: int = nc[k].state;
+        nc[k].state = NC_STALE;
+        nc[k].mac_hi = hi;
+        nc[k].mac_lo = lo;
+        nc[k].at = jiffies;
+        if (was == NC_INCOMPLETE) { nd_flush(k); }
+    }
+    if (router) { nc[k].router = 1; }
+}
+
+fn nd_bad() { c6(S6_ND_BAD); }
+
+fn nd_ns_input(p: *tryte, q: *tryte, n: int, sh: int, hop: int) {
+    c6(S6_ND_IN);
+    if (hop != 255 || q[1] != 0 || n < 24 || !nd_opts_ok(q, 24, n) || in6_is_mcast(q + 8)) { nd_bad(); return; }
+    var slla: int = nd_opt(q, 24, n, 1);
+    if (sh == 0 && (!in6_is_solicited(p + 24) || slla >= 0)) { nd_bad(); return; }
+    var i: int = if6_slot(q + 8);
+    if (i < 0) { return; }                        // not one of ours
+    if (if6[i].state == A6_TENTATIVE) {
+        if (sh == 0) { dad_fail(i); }             // someone else is claiming it too
+        return;
+    }
+    if (if6[i].state == A6_DADFAILED) { return; }
+    if (sh != 0 && slla >= 0) { nc_learn(sh, lla_hi(q, slla), lla_lo(q, slla), 0); }
+    nd_advertise(if6[i].h, sh != 0 ? sh : allnodes_h, sh != 0);
+}
+
+fn nd_na_input(p: *tryte, q: *tryte, n: int, hop: int) {
+    c6(S6_ND_IN);
+    if (hop != 255 || q[1] != 0 || n < 24 || !nd_opts_ok(q, 24, n) || in6_is_mcast(q + 8)) { nd_bad(); return; }
+    var r: int = q[4] / 128 % 2;
+    var sol: int = q[4] / 64 % 2;
+    var ovr: int = q[4] / 32 % 2;
+    if (sol && in6_is_mcast(p + 24)) { nd_bad(); return; }
+    var i: int = if6_slot(q + 8);
+    if (i >= 0) {
+        if (if6[i].state == A6_TENTATIVE) { dad_fail(i); }
+        return;
+    }
+    var th: int = a6_find(q + 8);
+    if (th <= 0) { return; }
+    var k: int = nc_find(th);
+    if (k < 0) { return; }
+    var tl: int = nd_opt(q, 24, n, 2);
+    var e: *Neigh = &nc[k];
+    if (e.state == NC_INCOMPLETE) {
+        if (tl < 0) { return; }
+        e.mac_hi = lla_hi(q, tl);
+        e.mac_lo = lla_lo(q, tl);
+        e.state = sol ? NC_REACHABLE : NC_STALE;
+        e.at = sol ? jiffies + REACHABLE_TICKS : jiffies;
+        e.router = r;
+        e.tries = 0;
+        nd_flush(k);
+        return;
+    }
+    var differs: int = tl >= 0 && (lla_hi(q, tl) != e.mac_hi || lla_lo(q, tl) != e.mac_lo);
+    if (!ovr && differs) {
+        if (e.state == NC_REACHABLE) { e.state = NC_STALE; e.at = jiffies; }
+        return;
+    }
+    if (tl >= 0) {
+        e.mac_hi = lla_hi(q, tl);
+        e.mac_lo = lla_lo(q, tl);
+    }
+    if (sol) {
+        e.state = NC_REACHABLE;
+        e.at = jiffies + REACHABLE_TICKS;
+        e.tries = 0;
+    } else if (differs) {
+        e.state = NC_STALE;
+        e.at = jiffies;
+    }
+    if (e.router && !r && router_h == th) { router_h = 0; }
+    e.router = r;
+}
+
+fn nd_ra_input(p: *tryte, q: *tryte, n: int, sh: int, hop: int) {
+    c6(S6_ND_IN);
+    if (hop != 255 || q[1] != 0 || n < 16 || !in6_is_ll(p + 8) || !nd_opts_ok(q, 16, n)) { nd_bad(); return; }
+    c6(S6_RA_IN);
+    ra_seen = 1;
+    var slla: int = nd_opt(q, 16, n, 1);
+    if (slla >= 0) { nc_learn(sh, lla_hi(q, slla), lla_lo(q, slla), 1); }
+    var life: int = get16(q, 6);
+    if (life > 0) {
+        router_h = sh;
+        router_until = jiffies + life * HZ;
+        var k: int = nc_find(sh);
+        if (k >= 0) { nc[k].router = 1; }
+    } else if (router_h == sh) {
+        router_h = 0;
+    }
+    var o: int = 16;
+    while (o < n) {
+        var t: int = q[o];
+        var l: int = q[o + 1];
+        if (t == 3 && l == 4) { nd_prefix(q, o); }
+        if (t == 5 && l == 1) {
+            var mtu: int = get32(q, o + 4);
+            if (mtu >= 1280 && mtu <= 1500) { link_mtu6 = mtu; }
+        }
+        if (t == 25 && l >= 3) {
+            var dl: int = get32(q, o + 4);
+            in6_copy(&rdnss[0], q + o + 8);
+            rdnss_until = dl == INFINITE_LIFETIME ? FOREVER : jiffies + dl * HZ;
+            if (dl == 0) { rdnss_until = 0; }
+        }
+        o += 8 * l;
+    }
+}
+
+fn until_of(sec: int) -> int { return sec == INFINITE_LIFETIME ? FOREVER : jiffies + sec * HZ; }
+
+// A Prefix Information option at q[o] (RFC 4862 §5.5.3).
+fn nd_prefix(q: *tryte, o: int) {
+    var plen: int = q[o + 2];
+    var onl: int = q[o + 3] / 128 % 2;
+    var auton: int = q[o + 3] / 64 % 2;
+    var valid: int = get32(q, o + 4);
+    var pref: int = get32(q, o + 8);
+    var pfx: *tryte = q + o + 16;
+    if (in6_is_ll(pfx) || pref > valid || plen != 64) { return; }
+    var a: [16]tryte;
+    var k: int = 0;
+    while (k < 8) { a[k] = pfx[k]; k += 1; }
+    in6_iid(&a[0]);
+    var i: int = if6_slot(&a[0]);
+    if (i > 0) {
+        var s: *If6 = &if6[i];
+        s.onlink = onl;
+        if (!auton || s.state == A6_DADFAILED) { return; }
+        // the two-hour rule against shortening the valid lifetime (e)
+        var remaining: int = s.valid_until == FOREVER ? INFINITE_LIFETIME : (s.valid_until - jiffies) / HZ;
+        if (valid > 7200 || valid > remaining) { s.valid_until = until_of(valid); }
+        else if (remaining > 7200) { s.valid_until = until_of(7200); }
+        s.pref_until = until_of(pref);
+        if (pref == 0 && s.state == A6_PREFERRED) { s.state = A6_DEPRECATED; }
+        if (pref > 0 && s.state == A6_DEPRECATED) { s.state = A6_PREFERRED; }
+        return;
+    }
+    if (!auton || valid == 0) { return; }
+    i = 1;
+    while (i < NIF6 && if6[i].state != A6_FREE) { i += 1; }
+    if (i == NIF6) { return; }
+    var h: int = in6_intern(&a[0]);
+    if (h < 0) { return; }
+    if6[i].h = h;
+    if6[i].onlink = onl;
+    if6[i].valid_until = until_of(valid);
+    if6[i].pref_until = until_of(pref);
+    dad_start(i);
+}
+
+// ---- duplicate address detection and router solicitation ----------------------------------------
+
+fn dad_start(i: int) {
+    if6[i].state = A6_TENTATIVE;
+    if6[i].dad_at = jiffies + HZ;
+    var g: [16]tryte;
+    in6_solicited(&g[0], a6(if6[i].h));
+    var dst: int = in6_intern(&g[0]);
+    if (dst < 0) { return; }
+    var q: *tryte = &txbuf[L6_OFF];
+    q[0] = ND_NS;
+    q[1] = 0;
+    put32(q, 4, 0);
+    in6_copy(q + 8, a6(if6[i].h));
+    icmp6_send(SRC_UNSPEC, dst, 24, 255);
+}
+
+fn dad_fail(i: int) {
+    if6[i].state = A6_DADFAILED;
+    c6(S6_DAD_FAILED);
+    printk("eth0: duplicate address ");
+    pr_ip6(a6(if6[i].h));
+    pr_nl();
+}
+
+fn rs_send() {
+    var q: *tryte = &txbuf[L6_OFF];
+    q[0] = ND_RS;
+    q[1] = 0;
+    put32(q, 4, 0);
+    nd_put_lla(q, 8, 1);
+    icmp6_send(if6[0].h, allrouters_h, 16, 255);
+}
+
+// ---- time -------------------------------------------------------------------------------------------
+
+fn ip6_tick() {
+    if (jiffies % 10 == 0 && icmp6_tokens < 9) { icmp6_tokens += 1; }
+    if (ip6_pending && netifs[NETIF_ETH].up) { ip6_pending = 0; ip6_start(); }
+    if (!ip6_on) { return; }
+    var i: int = 0;
+    while (i < NIF6) {
+        var s: *If6 = &if6[i];
+        if (s.state == A6_TENTATIVE && jiffies >= s.dad_at) {
+            s.state = A6_PREFERRED;
+            printk("eth0: inet6 ");
+            pr_ip6(a6(s.h));
+            pr(i == 0 ? " scope link\n" : " scope global\n");
+            if (i == 0) { rs_at = jiffies; }
+        }
+        if (s.state == A6_PREFERRED && s.pref_until != FOREVER && jiffies >= s.pref_until) { s.state = A6_DEPRECATED; }
+        if (i > 0 && (s.state == A6_PREFERRED || s.state == A6_DEPRECATED) && s.valid_until != FOREVER && jiffies >= s.valid_until) {
+            s.state = A6_FREE;
+        }
+        i += 1;
+    }
+    if (if6[0].state == A6_PREFERRED && !ra_seen && rs_sent < 3 && jiffies >= rs_at) {
+        rs_sent += 1;
+        rs_at = jiffies + 4 * HZ;
+        rs_send();
+    }
+    if (router_h != 0 && jiffies >= router_until) { router_h = 0; }
+    if (rdnss_until != FOREVER && rdnss_until != 0 && jiffies >= rdnss_until) { rdnss_until = 0; }
+    var k: int = 0;
+    while (k < NNEIGH) {
+        var e: *Neigh = &nc[k];
+        if (e.state == NC_INCOMPLETE && jiffies >= e.at) {
+            if (e.tries >= ND_TRIES) { nd_fail(k); }
+            else { e.tries += 1; e.at = jiffies + HZ; nd_solicit(k, 0); }
+        } else if (e.state == NC_REACHABLE && jiffies >= e.at) {
+            e.state = NC_STALE;
+            e.at = jiffies;
+        } else if (e.state == NC_DELAY && jiffies >= e.at) {
+            e.state = NC_PROBE;
+            e.tries = 1;
+            e.at = jiffies + HZ;
+            nd_solicit(k, 1);
+        } else if (e.state == NC_PROBE && jiffies >= e.at) {
+            if (e.tries >= ND_TRIES) { nd_fail(k); }
+            else { e.tries += 1; e.at = jiffies + HZ; nd_solicit(k, 1); }
+        }
+        k += 1;
+    }
+}
+
+// A neighbour confirmed by the upper layer (a TCP segment that acknowledges ours).
+fn nd_confirm(h: int) {
+    var k: int = nc_find(h);
+    if (k >= 0 && nc[k].state != NC_INCOMPLETE) {
+        nc[k].state = NC_REACHABLE;
+        nc[k].at = jiffies + REACHABLE_TICKS;
+        nc[k].tries = 0;
+    }
+}
+
+// ---- starting --------------------------------------------------------------------------------------
+
+fn ip6_init() {
+    nd_wait_frame = alloc_pages(0);
+    if (nd_wait_frame < 0) { nd_wait_frame = 0; }
+    var a: [16]tryte;
+    var k: int = 0;
+    while (k < 16) { a[k] = 0; k += 1; }
+    a[15] = 1;
+    lo6_h = in6_intern(&a[0]);                    // ::1
+    a[0] = 255;
+    a[1] = 2;
+    allnodes_h = in6_intern(&a[0]);               // ff02::1
+    a[15] = 2;
+    allrouters_h = in6_intern(&a[0]);             // ff02::2
+}
+
+// eth0 has a link: form the link-local address and check it (§3).
+fn ip6_start() {
+    var a: [16]tryte;
+    var k: int = 0;
+    while (k < 8) { a[k] = 0; k += 1; }
+    a[0] = 254;
+    a[1] = 128;
+    in6_iid(&a[0]);
+    var h: int = in6_intern(&a[0]);
+    if (h < 0) { return; }
+    if6[0].h = h;
+    if6[0].onlink = 1;
+    if6[0].valid_until = FOREVER;
+    if6[0].pref_until = FOREVER;
+    ip6_on = 1;
+    dad_start(0);
+}

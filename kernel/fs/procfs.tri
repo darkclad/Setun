@@ -5,8 +5,9 @@
 //   /proc/<pid>/status   Name, State, Pid, PPid, PGid, Sid
 //   /proc/<pid>/cmdline  the arguments, NUL-separated
 //   /proc/net/{dev,arp,tcp,udp,stat}  the network (kernel/net/)
+//   /proc/net/{if_inet6,neigh6,stat6} IPv6 (kernel/net/ip6.tri)
 //
-// An inode's ino_no says what it shows: kind + 16 * pid.
+// An inode's ino_no says what it shows: kind + 27 * pid.
 
 import "../params.tri";
 import "../printk.tri";
@@ -32,12 +33,17 @@ const PROC_NET_TCP: int = 12;
 const PROC_NET_UDP: int = 13;
 const PROC_NET_STAT: int = 14;
 const PROC_NET_TLINK: int = 15;
+const PROC_NET_IF_INET6: int = 16;
+const PROC_NET_NEIGH6: int = 17;
+const PROC_NET_STAT6: int = 18;
+const PROC_NET_LAST: int = 18;
+const PROC_KINDS: int = 27;
 const ESRCH_: int = 3;
 
 var proc_mnt: int = -1;
 
-fn proc_kind(i: int) -> int { return inodes[i].ino_no % 16; }
-fn proc_pid(i: int) -> int { return inodes[i].ino_no / 16; }
+fn proc_kind(i: int) -> int { return inodes[i].ino_no % PROC_KINDS; }
+fn proc_pid(i: int) -> int { return inodes[i].ino_no / PROC_KINDS; }
 
 fn proc_root(mnt: int) -> int {
     proc_mnt = mnt;
@@ -78,7 +84,7 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
     var k: int = proc_kind(dir);
     if (k == PROC_PID) {
         if (len == 2 && s[0] == '.' && s[1] == '.') { return iget(FS_PROC, m, PROC_ROOT); }
-        var base: int = 16 * proc_pid(dir);
+        var base: int = PROC_KINDS * proc_pid(dir);
         if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, base + PROC_STAT); }
         if (proc_name_eq(s, len, "status")) { return iget(FS_PROC, m, base + PROC_STATUS); }
         if (proc_name_eq(s, len, "cmdline")) { return iget(FS_PROC, m, base + PROC_CMDLINE); }
@@ -92,6 +98,9 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "udp")) { return iget(FS_PROC, m, PROC_NET_UDP); }
         if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, PROC_NET_STAT); }
         if (proc_name_eq(s, len, "tlink")) { return iget(FS_PROC, m, PROC_NET_TLINK); }
+        if (proc_name_eq(s, len, "if_inet6")) { return iget(FS_PROC, m, PROC_NET_IF_INET6); }
+        if (proc_name_eq(s, len, "neigh6")) { return iget(FS_PROC, m, PROC_NET_NEIGH6); }
+        if (proc_name_eq(s, len, "stat6")) { return iget(FS_PROC, m, PROC_NET_STAT6); }
         return -ENOENT_;
     }
     if (proc_name_eq(s, len, "net")) { return iget(FS_PROC, m, PROC_NET); }
@@ -106,7 +115,7 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         j += 1;
     }
     if (len == 0 || live_task(pid) < 0) { return -ENOENT_; }
-    return iget(FS_PROC, m, 16 * pid + PROC_PID);
+    return iget(FS_PROC, m, PROC_KINDS * pid + PROC_PID);
 }
 
 fn proc_name_of(i: int, buf: *char) -> int {
@@ -124,6 +133,9 @@ fn proc_name_of(i: int, buf: *char) -> int {
         case PROC_NET_UDP: copy_str(buf, "udp", 4);
         case PROC_NET_STAT: copy_str(buf, "stat", 5);
         case PROC_NET_TLINK: copy_str(buf, "tlink", 6);
+        case PROC_NET_IF_INET6: copy_str(buf, "if_inet6", 9);
+        case PROC_NET_NEIGH6: copy_str(buf, "neigh6", 7);
+        case PROC_NET_STAT6: copy_str(buf, "stat6", 6);
         case PROC_PID: itoa(proc_pid(i), buf);
         default: copy_str(buf, "proc", 5);
     }
@@ -137,16 +149,14 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
     if (pos == 0) { copy_str(name, ".", 2); info[0] = inodes[dir].ino_no; info[1] = DT_DIR; return 1; }
     if (pos == 1) { copy_str(name, "..", 3); info[0] = PROC_ROOT; info[1] = DT_DIR; return 2; }
     if (k == PROC_NET) {
-        if (pos == 2) { copy_str(name, "arp", 4); info[0] = PROC_NET_ARP; return 3; }
-        if (pos == 3) { copy_str(name, "dev", 4); info[0] = PROC_NET_DEV; return 4; }
-        if (pos == 4) { copy_str(name, "stat", 5); info[0] = PROC_NET_STAT; return 5; }
-        if (pos == 5) { copy_str(name, "tcp", 4); info[0] = PROC_NET_TCP; return 6; }
-        if (pos == 6) { copy_str(name, "tlink", 6); info[0] = PROC_NET_TLINK; return 7; }
-        if (pos == 7) { copy_str(name, "udp", 4); info[0] = PROC_NET_UDP; return 8; }
-        return 0;
+        // in name order
+        if (pos - 2 >= 9) { return 0; }
+        info[0] = proc_net_kinds[pos - 2];
+        inodes_name_of_kind(info[0], name);
+        return pos + 1;
     }
     if (k == PROC_PID) {
-        var base: int = 16 * proc_pid(dir);
+        var base: int = PROC_KINDS * proc_pid(dir);
         if (pos == 2) { copy_str(name, "cmdline", 8); info[0] = base + PROC_CMDLINE; return 3; }
         if (pos == 3) { copy_str(name, "stat", 5); info[0] = base + PROC_STAT; return 4; }
         if (pos == 4) { copy_str(name, "status", 7); info[0] = base + PROC_STATUS; return 5; }
@@ -160,7 +170,7 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
     while (t < NTASKS) {
         if (tasks[t].state != TASK_UNUSED) {
             itoa(tasks[t].pid, name);
-            info[0] = 16 * tasks[t].pid + PROC_PID;
+            info[0] = PROC_KINDS * tasks[t].pid + PROC_PID;
             info[1] = DT_DIR;
             return t + 6;
         }
@@ -252,7 +262,7 @@ fn proc_generate(i: int) -> int {
         }
         return 0;
     }
-    if (k >= PROC_NET_DEV && k <= PROC_NET_TLINK) { proc_net(k); return 0; }
+    if (k >= PROC_NET_DEV && k <= PROC_NET_LAST) { proc_net(k); return 0; }
     var ti: int = live_task(proc_pid(i));
     if (ti < 0) { return -ESRCH_; }
     var t: *Task = &tasks[ti];
@@ -391,6 +401,7 @@ fn proc_net(k: int) {
         ps("tsp_bad "); pi(tsp_rx_bad); pc('\n');
         return;
     }
+    if (k == PROC_NET_IF_INET6 || k == PROC_NET_NEIGH6 || k == PROC_NET_STAT6) { proc_net6(k); return; }
     if (k == PROC_NET_STAT) {
         var n: int = 0;
         while (n < NSTATS) {
@@ -405,11 +416,12 @@ fn proc_net(k: int) {
     // tcp, udp: Linux's first columns, then the owner's uid
     ps("  sl  local_address rem_address   st tx_queue rx_queue uid\n");
     var want: int = k == PROC_NET_TCP ? SOCK_STREAM : SOCK_DGRAM;
+    // (IPv6 sockets are not listed here)
     var sl: int = 0;
     var s: int = 0;
     while (s < NSOCKS) {
         var q: *Socket = &socks[s];
-        if (q.used && q.type == want) {
+        if (q.used && q.type == want && q.family != AF_INET6) {
             pcol(2);
             if (sl < 10) { pc(' '); }
             pi(sl);
@@ -440,4 +452,108 @@ fn proc_read(i: int, pos: int, buf: *tryte, n: int) -> int {
     if (n > plen - pos) { n = plen - pos; }
     copy_trytes(buf, &pbuf[pos] as *tryte, n);
     return n;
+}
+
+var proc_net_kinds: [9]int = { PROC_NET_ARP, PROC_NET_DEV, PROC_NET_IF_INET6, PROC_NET_NEIGH6, PROC_NET_STAT,
+                               PROC_NET_STAT6, PROC_NET_TCP, PROC_NET_TLINK, PROC_NET_UDP };
+
+// The name of a /proc/net file kind.
+fn inodes_name_of_kind(k: int, name: *char) {
+    switch (k) {
+        case PROC_NET_ARP: copy_str(name, "arp", 4);
+        case PROC_NET_DEV: copy_str(name, "dev", 4);
+        case PROC_NET_IF_INET6: copy_str(name, "if_inet6", 9);
+        case PROC_NET_NEIGH6: copy_str(name, "neigh6", 7);
+        case PROC_NET_STAT: copy_str(name, "stat", 5);
+        case PROC_NET_STAT6: copy_str(name, "stat6", 6);
+        case PROC_NET_TCP: copy_str(name, "tcp", 4);
+        case PROC_NET_TLINK: copy_str(name, "tlink", 6);
+        default: copy_str(name, "udp", 4);
+    }
+}
+
+// Two lowercase hex digits, as Linux writes /proc/net/if_inet6.
+fn phx2(v: int) {
+    var d: *char = "0123456789abcdef";
+    pc(d[v / 16 % 16]);
+    pc(d[v % 16]);
+}
+
+// 32 hex digits of an address.
+fn pa6hex(a: *tryte) {
+    var k: int = 0;
+    while (k < 16) { phx2(a[k]); k += 1; }
+}
+
+// /proc/net/if_inet6 (Linux's columns: address, interface index, prefix
+// length, scope, flags, name), /proc/net/neigh6 and /proc/net/stat6.
+fn proc_net6(k: int) {
+    if (k == PROC_NET_IF_INET6) {
+        pa6hex(a6(lo6_h));
+        ps(" 01 80 10 80       lo\n");
+        var i: int = 0;
+        while (i < NIF6) {
+            var f: *If6 = &if6[i];
+            if (f.state != A6_FREE) {
+                pa6hex(a6(f.h));
+                ps(" 02 40 ");
+                ps(i == 0 ? "20 " : "00 ");
+                // IFA_F_PERMANENT 80 for the link-local one, TENTATIVE 40, DEPRECATED 20, DADFAILED 08
+                var fl: int = i == 0 ? 128 : 0;
+                if (f.state == A6_TENTATIVE) { fl += 64; }
+                if (f.state == A6_DEPRECATED) { fl += 32; }
+                if (f.state == A6_DADFAILED) { fl += 8 + 64; }
+                phx2(fl);
+                ps("     eth0\n");
+            }
+            i += 1;
+        }
+        return;
+    }
+    if (k == PROC_NET_NEIGH6) {
+        ps("address                                  lladdr            state      router\n");
+        var j: int = 0;
+        while (j < NNEIGH) {
+            var e: *Neigh = &nc[j];
+            if (e.state != NC_FREE) {
+                var buf: [40]char;
+                in6_to_str(a6(e.h), &buf[0]);
+                ps(&buf[0]);
+                pcol(41);
+                pmac(e.mac_hi, e.mac_lo);
+                pcol(59);
+                switch (e.state) {
+                    case NC_INCOMPLETE: ps("INCOMPLETE");
+                    case NC_REACHABLE: ps("REACHABLE");
+                    case NC_STALE: ps("STALE");
+                    case NC_DELAY: ps("DELAY");
+                    default: ps("PROBE");
+                }
+                pcol(70);
+                ps(e.router ? "yes" : "no");
+                if (router_h == e.h) { ps(" default"); }
+                pc('\n');
+            }
+            j += 1;
+        }
+        return;
+    }
+    var n: int = 0;
+    while (n < NSTATS6) {
+        ps(ip6_stat_name(n));
+        pc(' ');
+        pi(ip6_stats[n]);
+        pc('\n');
+        n += 1;
+    }
+    if (rdnss_until != 0) {
+        var b: [40]char;
+        in6_to_str(&rdnss[0], &b[0]);
+        ps("rdnss ");
+        ps(&b[0]);
+        pc('\n');
+    }
+    ps("mtu ");
+    pi(link_mtu6);
+    pc('\n');
 }

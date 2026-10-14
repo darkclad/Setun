@@ -1,0 +1,138 @@
+// ping6 [-c COUNT] [-s SIZE] [-W SECONDS] HOST: ICMPv6 echo requests
+// (docs/IPV6.md §6), printed as iputils prints them, without the hop limit
+// (a raw ICMPv6 socket does not see it). HOST is an IPv6 address; a
+// link-local one is on eth0. Raw sockets need root, so ping6 is
+// set-user-ID root and gives that up once its socket is open.
+
+import "../lib/tlibc.tri";
+import "../lib/stdlib.tri";
+import "../lib/getopt.tri";
+import "../lib/socket.tri";
+
+var pkt: [1500]tryte;
+var reply: [1600]tryte;
+
+fn now_us() -> int {
+    var ts: timespec;
+    clock_gettime(1, &ts);
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+fn put_ms(us: int) {
+    put_int(us / 1000);
+    puts(".");
+    var frac: int = us % 1000 / 10;
+    if (frac < 10) { puts("0"); }
+    put_int(frac);
+}
+
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: ping6 [-c count] [-s size] [-W timeout] host\n");
+    return 2;
+}
+
+fn main(argc: int, argv: **char) -> int {
+    var count: int = -1;
+    var size: int = 56;
+    var wait_s: int = 1;
+    var c: int = getopt(argc, argv, "c:s:W:");
+    while (c != -1) {
+        var end: *char;
+        if (c == 'c') { count = strtol(optarg, &end, 10); if (count <= 0 || end[0] != 0) { return usage(); } }
+        else if (c == 's') { size = strtol(optarg, &end, 10); if (size < 0 || size > 1452 || end[0] != 0) { return usage(); } }
+        else if (c == 'W') { wait_s = strtol(optarg, &end, 10); if (wait_s <= 0 || end[0] != 0) { return usage(); } }
+        else { return usage(); }
+        c = getopt(argc, argv, "c:s:W:");
+    }
+    if (optind != argc - 1) { return usage(); }
+    var host: *char = argv[optind];
+    var dst: [16]int;
+    if (!inet_pton6(host, &dst[0])) {
+        fputs(STDERR_FILENO, "ping6: ");
+        fputs(STDERR_FILENO, host);
+        fputs(STDERR_FILENO, ": Name or service not known\n");
+        return 2;
+    }
+    var fd: int = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    var e: int = errno;
+    setuid(getuid());                          // done with root
+    if (fd < 0) { errno = e; perror2("ping6", "socket"); return 2; }
+    var to: sockaddr_in6;
+    sockaddr6_set(&to, &dst[0], 0);
+    var shown: [46]char;
+    strcpy(&shown[0], inet_ntop6(&dst[0]));
+    var ident: int = getpid() % 65536;
+    puts("PING ");
+    puts(host);
+    puts("(");
+    puts(&shown[0]);
+    puts(") ");
+    put_int(size);
+    puts(" data bytes\n");
+    var sent: int = 0;
+    var got: int = 0;
+    var seq: int = 1;
+    while (count < 0 || sent < count) {
+        pkt[0] = 128;                          // echo request; the kernel fills in the checksum
+        pkt[1] = 0;
+        pkt[2] = 0;
+        pkt[3] = 0;
+        pkt[4] = (ident / 256) as tryte;
+        pkt[5] = (ident % 256) as tryte;
+        pkt[6] = (seq / 256 % 256) as tryte;
+        pkt[7] = (seq % 256) as tryte;
+        var k: int = 0;
+        while (k < size) { pkt[8 + k] = (k % 256) as tryte; k += 1; }
+        var t0: int = now_us();
+        if (sendto(fd, &pkt[0], 8 + size, 0, &to as *sockaddr_in, sizeof(sockaddr_in6)) < 0) {
+            perror2("ping6", "sendto");
+            return 2;
+        }
+        sent += 1;
+        var deadline: int = t0 + wait_s * 1000000;
+        loop {
+            var left: int = (deadline - now_us()) / 1000;
+            if (left <= 0) { break; }
+            var p: pollfd;
+            p.fd = fd;
+            p.events = POLLIN;
+            if (poll(&p, 1, left) <= 0) { break; }
+            var from: sockaddr_in6;
+            var flen: int = sizeof(sockaddr_in6);
+            var n: int = recvfrom(fd, &reply[0], 1600, 0, &from as *sockaddr_in, &flen);
+            if (n < 8) { continue; }
+            if (reply[0] != 129 || reply[4] * 256 + reply[5] != ident || reply[6] * 256 + reply[7] != seq % 65536) { continue; }
+            var dt: int = now_us() - t0;
+            got += 1;
+            put_int(n);
+            puts(" bytes from ");
+            puts(inet_ntop6(&from.sin6_addr[0]));
+            puts(": icmp_seq=");
+            put_int(seq);
+            puts(" time=");
+            put_ms(dt);
+            puts(" ms\n");
+            break;
+        }
+        seq += 1;
+        if (count < 0 || sent < count) {
+            var rest: int = t0 + 1000000 - now_us();
+            if (rest > 0) {
+                var ts: timespec;
+                ts.tv_sec = rest / 1000000;
+                ts.tv_nsec = rest % 1000000 * 1000;
+                nanosleep(&ts, null);
+            }
+        }
+    }
+    puts("\n--- ");
+    puts(host);
+    puts(" ping statistics ---\n");
+    put_int(sent);
+    puts(" packets transmitted, ");
+    put_int(got);
+    puts(" received, ");
+    put_int((sent - got) * 100 / sent);
+    puts("% packet loss\n");
+    return got > 0 ? 0 : 1;
+}

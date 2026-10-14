@@ -5,6 +5,6 @@ edition = "2021"
 description = "A user-mode network behind the Setun-26 network card (gateway, port forwards, test connections)"
 
 [dependencies]
-smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-icmp", "socket-udp", "auto-icmp-echo-reply"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "iface-max-addr-count-8", "socket-tcp", "socket-icmp", "socket-udp", "auto-icmp-echo-reply"] }
 setun-core = { path = "../core" }
 ternary = { path = "../ternary" }

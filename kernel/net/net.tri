@@ -299,7 +299,8 @@ fn net_bh() -> int {
         lo_count -= 1;
         netifs[NETIF_LO].rx_packets += 1;
         netifs[NETIF_LO].rx_bytes += len;
-        ip_input(&lo_buf[0], len, NETIF_LO);
+        if (lo_buf[0] / 16 == 6) { ip6_input(&lo_buf[0], len, NETIF_LO); }
+        else { ip_input(&lo_buf[0], len, NETIF_LO); }
         n += 1;
     }
     in_bh = 0;
@@ -317,6 +318,7 @@ fn net_sleep(chan: int) -> int {
 // Called on every timer tick.
 fn net_tick() {
     arp_tick();
+    ip6_tick();
     tcp_tick();
     net_bh();
 }
@@ -328,6 +330,7 @@ fn net_init() {
     netifs[NETIF_LO].addr = INADDR_LOOPBACK;
     netifs[NETIF_LO].mask = ip_addr(255, 0, 0, 0);
     arp_init();
+    ip6_init();
     tnic_init();
     tlink_init();
     socket_init();

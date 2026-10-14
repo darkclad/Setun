@@ -1,0 +1,91 @@
+// /bin/ip6vec [file]: check inet_pton6 and inet_ntop6 against the text
+// lines of the IPv6 conformance vectors (docs/IPV6.md §7; default
+// /usr/share/ipv6vectors.txt, made by tools/gen_ipv6vectors.py). The
+// exchange lines are for the kernel and are skipped. One line per failure,
+// then a summary.
+
+import "../lib/tlibc.tri";
+import "../lib/string.tri";
+import "../lib/stdlib.tri";
+import "../lib/socket.tri";
+
+var lineno: int;
+var failures: int;
+var checked: int;
+
+fn fail(what: *char, input: *char) {
+    puts("ip6vec: line ");
+    put_int(lineno);
+    puts(": ");
+    puts(what);
+    puts(" '");
+    puts(input);
+    puts("'\n");
+    failures += 1;
+}
+
+fn check(line: *char) {
+    var a: [16]int;
+    if (strncmp(line, "text ", 5) == 0) {
+        var eq: int = 5;
+        while (line[eq] != 0 && !(line[eq] == ' ' && line[eq + 1] == '=' && line[eq + 2] == ' ')) { eq += 1; }
+        if (line[eq] == 0) { fail("malformed", line); return; }
+        line[eq] = 0;
+        var input: *char = &line[5];
+        var want: *char = &line[eq + 3];
+        checked += 1;
+        if (!inet_pton6(input, &a[0])) { fail("refused", input); return; }
+        if (strcmp(inet_ntop6(&a[0]), want) != 0) { fail("formatted wrong", input); }
+        // and the canonical form reads back to the same octets
+        var b: [16]int;
+        if (!inet_pton6(want, &b[0])) { fail("canonical form refused", want); return; }
+        var k: int = 0;
+        while (k < 16) {
+            if (a[k] != b[k]) { fail("canonical form differs", want); return; }
+            k += 1;
+        }
+    } else if (strncmp(line, "bad", 3) == 0 && (line[3] == ' ' || line[3] == 0)) {
+        checked += 1;
+        var input: *char = line[3] == 0 ? &line[3] : &line[4];
+        if (inet_pton6(input, &a[0])) { fail("accepted", input); }
+    }
+}
+
+var buf: [2187]char;
+var line: [256]char;
+
+fn main(argc: int, argv: **char) -> int {
+    var path: *char = argc > 1 ? argv[1] : "/usr/share/ipv6vectors.txt";
+    var fd: int = open(path, O_RDONLY, 0);
+    if (fd < 0) { perror2("ip6vec", path); return 2; }
+    var n: int = 0;                        // characters in line
+    var toolong: int = 0;                  // the line outgrew the buffer: an exchange line
+    loop {
+        var got: int = read(fd, &buf[0] as *tryte, 2187);
+        if (got <= 0) { break; }
+        var i: int = 0;
+        while (i < got) {
+            var c: int = buf[i];
+            i += 1;
+            if (c == '\n') {
+                line[n] = 0;
+                lineno += 1;
+                if (!toolong) { check(&line[0]); }
+                n = 0;
+                toolong = 0;
+            } else if (n < 255) {
+                line[n] = c as char;
+                n += 1;
+            } else {
+                toolong = 1;
+            }
+        }
+    }
+    close(fd);
+    puts("ip6vec: ");
+    put_int(checked);
+    puts(" checked, ");
+    put_int(failures);
+    puts(" failed\n");
+    return failures != 0;
+}

@@ -83,8 +83,8 @@ On the default disk (`mkdisk`):
   a calculator on the FPU;
 - a window system (`trwm`) with a terminal, a clock, a colour chart and a
   paint program;
-- networking: `ping`, `nc`, `host`, `wget` (HTTP and HTTPS over TLS 1.3),
-  `ssh`, `scp`, `sftp`, `ntpdate`;
+- networking: `ping`, `ping6`, `nc`, `host`, `wget` (HTTP and HTTPS over TLS 1.3),
+  `ssh`, `scp`, `sftp`, `ntpdate`; IPv6 beside IPv4 ([`IPV6.md`](IPV6.md));
 - a Trine compiler (`tric`) and an assembler (`tas`) that rebuild every
   program, the compiler included, on Trinux itself;
 - test programs that the host's test suites run inside the system.
@@ -545,6 +545,8 @@ quits.
 |---|---|---|
 | `ifconfig` | `ifconfig [iface [addr] [netmask m] [gw g] [up\|down]]` | `/sbin`; show the interfaces, or set one (root) |
 | `ping` | `ping [-c count] [-s size] [-W timeout] host` | set-user-ID root (raw ICMP), drops root once its socket is open; `size` at most 1472 |
+| `ping6` | `ping6 [-c count] [-s size] [-W timeout] host` | ICMPv6 echo (IPV6.md §6): `host` an IPv6 address (a link-local one is on eth0); set-user-ID root like `ping`; `size` at most 1452; no `ttl=` |
+| `ip6vec` | `ip6vec [file]` | checks `inet_pton6`/`inet_ntop6` against `/usr/share/ipv6vectors.txt` (IPV6.md §7) |
 | `tping` | `tping [-c count] [-s size] [-W timeout] host` | TCMP echo over TNET (TNET.md §3.1): data of `size` trytes over the whole tryte range (default 27, at most 2166), each checked on return; set-user-ID root like `ping` |
 | `nc` | `nc [-lubtzv] [-p port] [-w secs] [host] port` | connect, or `-l` listen for one connection; `-u` UDP; `-t` listen on TNET (a host with a TNET address connects over it); over TNET any tryte goes as it is, text included; `-b` octets as they are (otherwise text goes out as UTF-8 and UTF-8 comes in as characters); `-z` only test the port; `-v` verbose; `-w` connect timeout |
 | `netstat` | `netstat [-tualn]` | sockets from `/proc/net/tcp` and `/proc/net/udp`; `-a` all, `-l` listening only; addresses are always numeric |
@@ -636,8 +638,8 @@ line per check.
 | `/usr/src` | `hello.tri`, `lib/` (tlibc and every library module as source), `bin/tric.tri` and `bin/tric/` (the compiler's own source) |
 
 `mkdisk` makes programs 0755 and other files 0644, owned by root, with
-these exceptions: `/etc/shadow` 0600, `/bin/su`, `/bin/passwd` and
-`/bin/ping` 04755, `/root` 0700, and `/home/user` owned by `user`.
+these exceptions: `/etc/shadow` 0600, `/bin/su`, `/bin/passwd`, `/bin/ping`,
+`/bin/ping6` and `/bin/tping` 04755, `/root` 0700, and `/home/user` owned by `user`.
 
 ### 5.2 The VFS
 
