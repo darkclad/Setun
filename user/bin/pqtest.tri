@@ -116,6 +116,7 @@ var mlkem_cases: [16]*char = {
 };
 var sntrup_pk0: [1]*char = { "fbc356e50ea3a585137e8a59df0f099d99ed248bac18a55c8cb4a0c391ecb0c23729922fa7c7000121125059a418e3d4e77b8d0a21ab6ff0a6022e921ade4aea73f53cf7d61e6a51dd62b4c51b84bd2cc56fbd191ef072980374e8195545236f3fc995306b7eb0e7e89f0a31dfc4accdf2dc8b6eae700bf060bfce7324fd01eb799f21ed663c5bd1f993d11f6c5505a39ec6893736cae7479d4dd4affbf082ad9eac3bbd644c235d2d47b843e19bdb563c2b94d400f34d708789059039279e2bf5f660dcf6b9fe7c848bcbb4cab165b50fed824e666a72113b7480e13c2ef7731e0c4f1ab2f3c46da8eac6b32ebf8d4c405b0a9789d0c92f1db791ebd2af959b0ea98b138d2c3b5c804c062f111e98cc133ef80f697da7a6377cd1bb50b594c92d3dda6b0066cd104e9c85370e1c0538bde28236b138be18fdc6609c525fe4b26e73ff753d878f108f4a1f1dca943f055134074d6c391b52437cde430aa04a0b2606e6a4994f9e801f22d92a31cc47f8159b9688060219bd00e66ea9c2fa3cf0f0c36f257e5e3bad0a7e968a1278237e0676a81bb26f4e40b33328f8fb8715addff4a95dfb28681a9166e7b8fa68434fddec5ed470db49e098c2b50a49de05847c0b57fda2563495d524305c84e0b03170b8281b2a79cfeaaf2825b98325100088b5f44c989f3ac21b5e2873209b04eb0f3d8f66f7f335bc44541f99563a4ca51df876c83e0c754d09f146d53546f6c813e2a98c4aaff372ad311982dcfc786b91b3b5865c73a9161872451789f7da082bd635594b929bf7c0568284934c716ce4fd08b5060ba0a1811f39103ef99fef374d4033caac0b399d12191adbe4876c9650a6efa7f8f638310a8a0d5f1bb2a89cd206feed35a0f518eb29efee1a1ccfdd6dbb3f89c80f3bb58a5ea4eb77ba0d11677849656edf978b0f981fa11b88af565ca86df9ad621f6bd2c8ea7e61f6105be9a1ddedfe1ea6bf825dfe5f20f853ab8adde9e4ca56f134f772359592aac8c8e6341c5f76d639efb563919f86fddc8567a1f2b47adc67785a7bc8af18f4671b2e4d27e212f22e5462f6137047e01170b7376ff9e773e07e8e84823c4e138e65f94634b4a6b65f83f1db33ae2f9da9b597fb9b053a85756ca77ece37e63c069649fa387b5e31cd07c886f7579a759ea517c404de1a666dbe90c783cd60429125ffcb235e9351929e334b6f68c41dd7e11fd2dbe41b22cb899921dad46bd14f84b99b92369f81fae05f65a0bca58f5fb6513d45efb53632221693b4972143181d1aa1ad8941c26a664aa04f20ddf053e093662d52f549ae2164b820a07f0f867911009e69866a9e45db5a1f13e0f4beae5ac6bc1acd7340439758ae4e624ce748c344516a1c056acb66011a2e7e157725ae47ce2b3230b82e68350694faf5578c62bbf09def133e917a4ee0b16876be483d0b6e3c2f97e30c521c7d061003d7b8d0de2018072de2a56f342e8bfec85d7e09a665220859000299325faeb3f7e2affcfca7c42eee7772eabb514d8f63df4419e92ea2c0ab3022a48f605421665e459b5486ef515d5094fdf102a81d365a1f0a853e0829e17cbc30d264514d2f38b1e46c72af1dfe208811d6d83f2d4013eb327f585403" };
 var sntrup_ginv0: [1]*char = { "9100a05a66820a526905219660861891654a46269209a428a58894155a1968295545081218920094698455a81845662912a06a652541499452212a5a4a6168a82225414862080612640620454452918418296116222a8844262111986a6525a09a5a4a9256066912a8929821a56a45589655289828916851a59858101aa81a92219514052566a264854a515056998520a251aa618565a00211192406aa586158550a88582114661a20561081854915985589002aa51a90a892222a920a4902" };
+var sntrup_f1: [2]*char = { "151598455525551695655561595a6951155a5521455155565125415695554645995515155205516111155492595561112595561455029a495698455556241989454645914554555815961448529a45991805550669585056a958a85544555916655668655666a9426555565555a956424501184451955a5844564a99998551165562544155a869659666511496555629556525954151555655554619515552954456551a1a5554955654549054a1555a65551a84559501559554a549559800", "11f046a98b64025547d4d39754f58c05709c3b4fae0e2dd3bd76b9ee7e136b31" };
 var sntrup_cases: [18]*char = {
     "286618a066244162160984848a5444a10465284086a9452a48a12015a15084a4a84966185192590911a6a88a5a656240a682561881604600948211815688a4086202665296a4561492459240a00a44551055a15944852a6024241a966110a4aa0195a2a5549a6516a1a4968a45809492195141194102662a1010586a6156805841505162919a2260985a2924a40a015856695a268514a91858a4555420248284095a491a40969a1a1264490554a6811202211a9192a6998aa2622898189402",
     "55228860564055255155549454554a2294455511111569415641655a45521a4455a49151545585a2459144691115259654956619455999640541515164559954554095454018165556561115695415511456554559555155a54446165695525555655959495191152546694508166955545555595559442444952509558955685901965a565a4545555125481655555461a45664444156556661555154115895641959951a495141555400a455845555511585591565510152910459140501",
@@ -155,9 +156,24 @@ var srho: [191]tryte;
 var sg: [761]int;
 var sf: [761]int;
 var sr: [761]int;
-var spk: [1158]tryte;
-var ssk: [1763]tryte;
-var sct: [1039]tryte;
+// each with nine trytes of guard after it: the encoders must write
+// exactly their length (an Rq encoding once ran 119 trytes past a
+// ciphertext buffer, into the heap)
+var spk: [1167]tryte;
+var ssk: [1772]tryte;
+var sct: [1048]tryte;
+var srq: [1167]tryte;                  // an Rq encoding: longer than a ciphertext
+
+fn guard_set(p: *tryte, n: int) {
+    var k: int = 0;
+    while (k < 9) { p[n + k] = (77 + k) as tryte; k += 1; }
+}
+
+fn guard_ok(p: *tryte, n: int) -> int {
+    var k: int = 0;
+    while (k < 9) { if (p[n + k] != 77 + k) { return 0; } k += 1; }
+    return 1;
+}
 
 fn hexval(ch: int) -> int { return ch <= '9' ? ch - '0' : ch - 'a' + 10; }
 
@@ -250,21 +266,30 @@ fn main(argc: int, argv: **char) -> int {
     // sntrup761: the pieces apart, then the whole
     var npk: int = unhex(sntrup_pk0[0], &spk[0]);
     _snrq_decode(&spk[0], &sg[0]);
-    _snrq_encode(&sg[0], &sct[0]);
-    var rq_same: int = npk == 1158;
+    guard_set(&srq[0], 1158);
+    _snrq_encode(&sg[0], &srq[0]);
+    var rq_same: int = npk == 1158 && guard_ok(&srq[0], 1158);
     var q: int = 0;
-    while (q < 1158) { if (sct[q] != spk[q]) { rq_same = 0; } q += 1; }
+    while (q < 1158) { if (srq[q] != spk[q]) { rq_same = 0; } q += 1; }
     ok("sntrup761 Rq decoding and encoding of the reference's key", rq_same);
     unhex(sntrup_cases[0], &sbuf[0]);
     _snsmall_decode(&sbuf[0], &sg[0]);
     _snrecip(&sf[0], &sg[0], 1);
     _snsmall_encode(&sf[0], &sbuf[0]);
     ok("sntrup761 1/g modulo 3", is_hex(&sbuf[0], 191, sntrup_ginv0[0]));
+    unhex(sntrup_f1[0], &sbuf[0]);
+    _snsmall_decode(&sbuf[0], &sf[0]);
+    _snrecip(&sg[0], &sf[0], 0);
+    _snrq_encode(&sg[0], &srq[0]);
+    sha3_256(&srq[0], 1158, &hh[0]);
+    ok("sntrup761 1/(3f) modulo q, its bounds exact", is_hex(&hh[0], 32, sntrup_f1[1]));
     unhex(sntrup_cases[3], &sbuf[0]);
     _snsmall_decode(&sbuf[0], &sr[0]);
+    guard_set(&sct[0], 1039);
     sntrup_encaps_with(&spk[0], &sr[0], &key[0], &sct[0]);
     sha3_256(&sct[0], 1039, &hh[0]);
     ok("sntrup761 encapsulation with the reference's key", is_hex(&hh[0], 32, sntrup_cases[6]) && is_hex(&key[0], 32, sntrup_cases[7]));
+    ok("sntrup761 encapsulation writes exactly 1039 trytes", guard_ok(&sct[0], 1039));
     c = 0;
     while (c < 2) {
         var srow: **char = &sntrup_cases[9 * c];
@@ -275,11 +300,14 @@ fn main(argc: int, argv: **char) -> int {
         unhex(srow[2], &srho[0]);
         unhex(srow[3], &sbuf[0]);
         _snsmall_decode(&sbuf[0], &sr[0]);
+        guard_set(&spk[0], 1158);
+        guard_set(&ssk[0], 1763);
         var made: int = sntrup_keygen_from(&sg[0], &sf[0], &srho[0], &spk[0], &ssk[0]);
         sha3_256(&spk[0], 1158, &hh[0]);
         var pk_ok: int = is_hex(&hh[0], 32, srow[4]);
         sha3_256(&ssk[0], 1763, &hh[0]);
-        ok("sntrup761 key generation (1/g mod 3, 1/(3f) mod q)", made == 0 && pk_ok && is_hex(&hh[0], 32, srow[5]));
+        ok("sntrup761 key generation (1/g mod 3, 1/(3f) mod q)", made == 0 && pk_ok && is_hex(&hh[0], 32, srow[5])
+           && guard_ok(&spk[0], 1158) && guard_ok(&ssk[0], 1763));
         sntrup_encaps_with(&spk[0], &sr[0], &key[0], &sct[0]);
         sha3_256(&sct[0], 1039, &hh[0]);
         ok("sntrup761 encapsulation", is_hex(&hh[0], 32, srow[6]) && is_hex(&key[0], 32, srow[7]));
