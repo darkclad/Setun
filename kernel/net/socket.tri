@@ -1,6 +1,7 @@
 // Sockets (docs/NETWORK.md §4, docs/TNET.md §5, docs/IPV6.md §4): AF_INET
-// stream (TCP), datagram (UDP) and raw ICMP sockets, AF_INET6 raw ICMPv6
-// sockets, and AF_TNP stream (TSP), datagram (TDP) and raw TCMP sockets,
+// stream (TCP), datagram (UDP) and raw ICMP sockets, AF_INET6 TCP, UDP and raw ICMPv6
+// sockets (and stream and datagram ones, IPv6-only), and AF_TNP stream
+// (TSP), datagram (TDP) and raw TCMP sockets,
 // behind file descriptors, with Linux's system calls. An AF_INET6
 // socket's addresses are handles into ip6.tri's interned table.
 //
@@ -37,6 +38,8 @@ const SOCKADDR6_LEN: int = 60;            // struct sockaddr_in6: 20 words
 const DGRAM_HDR: int = 7;
 const DGRAM_HDR6: int = 19;
 const IFINDEX_ETH: int = 2;               // lo is 1, as in Linux
+const IPPROTO_IPV6: int = 41;
+const IPV6_V6ONLY: int = 26;
 const MSG_PEEK: int = 2;
 const MSG_TRUNC: int = 32;
 const MSG_DONTWAIT: int = 64;
@@ -438,8 +441,12 @@ fn sys_socket(domain: int, type: int, proto: int) -> int {
         if (base == SOCK_RAW) {
             if (proto != IPPROTO_ICMPV6) { return -EPROTONOSUPPORT; }
             if (current_task().euid != 0) { return -EPERM; }
-        } else if (base == SOCK_STREAM || base == SOCK_DGRAM) {
-            return -EPROTONOSUPPORT;
+        } else if (base == SOCK_STREAM) {
+            if (proto != 0 && proto != IPPROTO_TCP) { return -EPROTONOSUPPORT; }
+            proto = IPPROTO_TCP;
+        } else if (base == SOCK_DGRAM) {
+            if (proto != 0 && proto != IPPROTO_UDP) { return -EPROTONOSUPPORT; }
+            proto = IPPROTO_UDP;
         } else {
             return base < 0 || base > 10 ? -EINVAL : -ESOCKTNOSUPPORT;
         }
@@ -630,6 +637,7 @@ fn sock_send(s: int, f: int, p: *tryte, n: int, flags: int, addr: int, alen: int
     if (k.type == SOCK_DGRAM) {
         if (port == 0) { return -EINVAL; }
         if (k.family == AF_TNP) { return tdp_sendmsg(s, p, n, dst, port); }
+        if (k.family == AF_INET6) { return udp6_sendmsg(s, p, n, dst, port); }
         return udp_sendmsg(s, p, n, dst, port);
     }
     if (k.family == AF_TNP) { return tn_raw_sendmsg(s, p, n, dst); }
@@ -784,6 +792,8 @@ fn sys_setsockopt(fd: int, level: int, opt: int, val: int, len: int) -> int {
         return 0;
     }
     if (level == IPPROTO_TCP && k.type == SOCK_STREAM && opt == TCP_NODELAY) { return 0; }   // always on
+    // IPv6 sockets are IPv6-only (docs/IPV6.md §4): setting it is a no-op, clearing it is refused
+    if (level == IPPROTO_IPV6 && k.family == AF_INET6 && opt == IPV6_V6ONLY && v != 0) { return 0; }
     return -ENOPROTOOPT;
 }
 
@@ -808,6 +818,8 @@ fn sys_getsockopt(fd: int, level: int, opt: int, val: int, lenp: int) -> int {
             default: return -ENOPROTOOPT;
         }
     } else if (level == IPPROTO_TCP && k.type == SOCK_STREAM && opt == TCP_NODELAY) {
+        v = 1;
+    } else if (level == IPPROTO_IPV6 && k.family == AF_INET6 && opt == IPV6_V6ONLY) {
         v = 1;
     } else {
         return -ENOPROTOOPT;
@@ -961,9 +973,56 @@ fn raw6_deliver(q: *tryte, n: int, src: *tryte) {
     }
 }
 
-// UDP and TCP over IPv6 come with V2 (docs/IPV6.md §8).
-fn udp6_input(p: *tryte, off: int, total: int, sh: int, dh: int) { c6(S6_UDP_IN); }
-fn tcp6_input(p: *tryte, off: int, total: int, sh: int, dh: int) { c6(S6_TCP_IN); }
+// ---- UDP over IPv6 (docs/IPV6.md §4) ----------------------------------------------------------------
+
+// The checksum is mandatory: one that comes out 0 goes as 0xFFFF.
+fn udp6_sendmsg(s: int, p: *tryte, n: int, dst: int, port: int) -> int {
+    if (n > link_mtu6 - IP6_HLEN - 8) { return -EMSGSIZE; }
+    var r: int = autobind(s);
+    if (r < 0) { return r; }
+    var k: *Socket = &socks[s];
+    var src: int = k.laddr != 0 ? k.laddr : ip6_source_for(dst);
+    if (src == 0) { return -ENETUNREACH; }
+    var u: *tryte = &txbuf[L6_OFF];
+    put16(u, 0, k.lport);
+    put16(u, 2, port);
+    put16(u, 4, 8 + n);
+    put16(u, 6, 0);
+    copy_trytes(u + 8, p, n);
+    var c: int = csum6(a6(src), a6(dst), NH_UDP, u, 8 + n);
+    put16(u, 6, c == 0 ? 65535 : c);
+    r = ip6_send(NH_UDP, src, dst, 8 + n, 64);
+    return r < 0 ? r : n;
+}
+
+fn udp6_input(p: *tryte, off: int, total: int, sh: int, dh: int) {
+    c6(S6_UDP_IN);
+    var u: *tryte = p + off;
+    var n: int = total - off;
+    if (n < 8) { c6(S6_UDP_ERR); return; }
+    var ulen: int = get16(u, 4);
+    if (ulen < 8 || ulen > n || get16(u, 6) == 0) { c6(S6_UDP_ERR); return; }
+    if (csum6(p + 8, p + 24, NH_UDP, u, ulen) != 0) { c6(S6_UDP_ERR); return; }
+    var sport: int = get16(u, 0);
+    var dport: int = get16(u, 2);
+    var best: int = -1;
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var k: *Socket = &socks[s];
+        if (k.used && k.family == AF_INET6 && k.type == SOCK_DGRAM && k.lport == dport && !k.shut_rd
+                && (k.laddr == 0 || k.laddr == dh)
+                && (k.raddr == 0 || (k.raddr == sh && k.rport == sport))) {
+            if (best < 0 || k.raddr != 0) { best = s; }      // a connected socket wins
+        }
+        s += 1;
+    }
+    if (best < 0) {
+        c6(S6_UDP_ERR);
+        icmp6_error(p, total, ICMP6_UNREACH, 4, 0);          // port unreachable
+        return;
+    }
+    if (!dgram_queue6(best, p + 8, sport, u + 8, ulen - 8)) { c6(S6_UDP_ERR); }
+}
 
 // An ICMPv6 error, or failed neighbour resolution (sport -1), ends a TCP
 // connection to handle h that is still opening.

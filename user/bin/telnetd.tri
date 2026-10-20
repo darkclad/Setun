@@ -177,18 +177,17 @@ fn main(argc: int, argv: **char) -> int {
         }
         c = getopt(argc, argv, "p:1");
     }
-    var l: int = socket(AF_INET, SOCK_STREAM, 0);
-    if (l < 0) { perror2("telnetd", "socket"); return 1; }
-    var one: int = 1;
-    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
-    var a: sockaddr_in;
-    sockaddr_set(&a, INADDR_ANY, port);
-    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("telnetd", "bind"); return 1; }
-    if (listen(l, 9) < 0) { perror2("telnetd", "listen"); return 1; }
+    // IPv4 and IPv6 (docs/IPV6.md §6)
+    var fams: [2]int;
+    fams[0] = AF_INET;
+    fams[1] = AF_INET6;
+    var ls: [2]int;
+    var nl: int = listen_on(&fams[0], 2, port, &ls[0]);
+    if (nl < 0) { perror2("telnetd", "bind"); return 1; }
     loop {
-        var from: sockaddr_in;
-        var flen: int = sizeof(sockaddr_in);
-        var s: int = accept(l, &from, &flen);
+        var from: sockaddr_in6;
+        var flen: int = 0;
+        var s: int = accept_any(&ls[0], nl, &from, &flen);
         if (s < 0) {
             if (errno == EINTR) { continue; }
             perror2("telnetd", "accept");
@@ -198,16 +197,16 @@ fn main(argc: int, argv: **char) -> int {
         var st: int = 0;
         while (waitpid(-1, &st, WNOHANG) > 0) {}
         fputs(STDERR_FILENO, "telnetd: connection from ");
-        fputs(STDERR_FILENO, inet_ntoa(from.sin_addr));
+        fputs(STDERR_FILENO, sa_ntoa(&from));
         fputs(STDERR_FILENO, "\n");
         if (once) {
-            close(l);
+            close_all(&ls[0], nl);
             serve(s);
             return 0;
         }
         var pid: int = fork();
         if (pid == 0) {
-            close(l);
+            close_all(&ls[0], nl);
             serve(s);
             _exit(0);
         }

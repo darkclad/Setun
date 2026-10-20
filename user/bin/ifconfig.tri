@@ -69,6 +69,49 @@ fn counters(name: *char, c: *int) {
     }
 }
 
+var if6buf: [2187]char;
+
+fn hexdig(c: int) -> int { return c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10; }
+
+// "        inet6 fe80::5054:ff:fe12:3456  prefixlen 64  scopeid 0x20<link>"
+// for each of the interface's lines in /proc/net/if_inet6 (docs/IPV6.md
+// §6), with its state when it is not usable.
+fn inet6_lines(name: *char) {
+    var fd: int = open("/proc/net/if_inet6", O_RDONLY, 0);
+    if (fd < 0) { return; }
+    var n: int = read(fd, &if6buf[0], 2186);
+    close(fd);
+    if (n <= 0) { return; }
+    if6buf[n] = 0;
+    var i: int = 0;
+    while (i < n) {
+        // "AAAA…(32) II PP SS FF     NAME"
+        var line: int = i;
+        while (i < n && if6buf[i] != '\n') { i += 1; }
+        if6buf[i] = 0;
+        i += 1;
+        if (i - line < 45) { continue; }
+        var nm: int = line + 44;
+        while (if6buf[nm] == ' ') { nm += 1; }
+        if (strcmp(&if6buf[nm], name) != 0) { continue; }
+        var a: [16]int;
+        var k: int = 0;
+        while (k < 16) { a[k] = hexdig(if6buf[line + 2 * k]) * 16 + hexdig(if6buf[line + 2 * k + 1]); k += 1; }
+        var plen: int = hexdig(if6buf[line + 36]) * 16 + hexdig(if6buf[line + 37]);
+        var scope: int = hexdig(if6buf[line + 39]) * 16 + hexdig(if6buf[line + 40]);
+        var fl: int = hexdig(if6buf[line + 42]) * 16 + hexdig(if6buf[line + 43]);
+        puts("        inet6 ");
+        puts(inet_ntop6(&a[0]));
+        puts("  prefixlen ");
+        put_int(plen);
+        puts(scope == 32 ? "  scopeid 0x20<link>" : scope == 16 ? "  scopeid 0x10<host>" : "  scopeid 0x0<global>");
+        if (fl / 8 % 2 != 0) { puts("  dadfailed"); }
+        else if (fl / 64 % 2 != 0) { puts("  tentative"); }
+        else if (fl / 32 % 2 != 0) { puts("  deprecated"); }
+        puts("\n");
+    }
+}
+
 fn show(name: *char) -> int {
     var r: ifreq;
     if (get(name, SIOCGIFFLAGS, &r) < 0) {
@@ -100,6 +143,7 @@ fn show(name: *char) -> int {
         puts(inet_ntoa(r.ifr_value));
     }
     puts("\n");
+    inet6_lines(name);
     if (flags / IFF_LOOPBACK % 2 == 0) {
         get(name, SIOCGIFHWADDR, &r);
         puts("        ether ");

@@ -405,10 +405,18 @@ impl Network {
 
     /// Start a TCP connection from the gateway to `guest_port` on the guest.
     pub fn connect(&mut self, guest_port: u16) -> ConnId {
+        self.connect_to(IpAddress::Ipv4(GUEST), guest_port)
+    }
+
+    /// The same over IPv6, from fd00::2 to the guest's fd00::5054:ff:fe12:3456.
+    pub fn connect6(&mut self, guest_port: u16) -> ConnId {
+        self.connect_to(IpAddress::Ipv6(GUEST6), guest_port)
+    }
+
+    fn connect_to(&mut self, guest: IpAddress, guest_port: u16) -> ConnId {
         let mut s = Self::tcp_socket();
         let local = self.ephemeral_port();
-        s.connect(self.iface.context(), IpEndpoint::new(IpAddress::Ipv4(GUEST), guest_port), local)
-            .expect("connect");
+        s.connect(self.iface.context(), IpEndpoint::new(guest, guest_port), local).expect("connect");
         let h = self.sockets.add(s);
         self.add_conn(h, None)
     }
@@ -518,11 +526,24 @@ impl Network {
 
     /// Send a datagram to the guest's `port`.
     pub fn udp_send(&mut self, u: UdpId, guest_port: u16, data: &[u8]) {
+        self.udp_send_to(u, IpAddress::Ipv4(GUEST), guest_port, data);
+    }
+
+    /// The same over IPv6, to the guest's fd00::5054:ff:fe12:3456.
+    pub fn udp_send6(&mut self, u: UdpId, guest_port: u16, data: &[u8]) {
+        self.udp_send_to(u, IpAddress::Ipv6(GUEST6), guest_port, data);
+    }
+
+    fn udp_send_to(&mut self, u: UdpId, guest: IpAddress, guest_port: u16, data: &[u8]) {
         let h = self.udps[u.0];
-        self.sockets
-            .get_mut::<udp::Socket>(h)
-            .send_slice(data, IpEndpoint::new(IpAddress::Ipv4(GUEST), guest_port))
-            .expect("udp send");
+        self.sockets.get_mut::<udp::Socket>(h).send_slice(data, IpEndpoint::new(guest, guest_port)).expect("udp send");
+    }
+
+    /// A datagram on a gateway port, with the address and port it came from.
+    pub fn udp_recv_from(&mut self, u: UdpId) -> Option<(IpAddr, u16, Vec<u8>)> {
+        let h = self.udps[u.0];
+        let s = self.sockets.get_mut::<udp::Socket>(h);
+        s.recv().ok().map(|(d, meta)| (IpAddr::from(meta.endpoint.addr), meta.endpoint.port, d.to_vec()))
     }
 
     /// The next datagram received, with the sender's port.

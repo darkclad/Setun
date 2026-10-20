@@ -49,7 +49,7 @@ Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole t
     - N14 ✅ TLS for more servers: AES-128/256-GCM, P-256/P-384 key exchange after a HelloRetryRequest (cookies too); public-key crypto 2.4–4× faster (product-scanning Montgomery)
     - N15 ✅ `wget` speaks HTTP/1.1: redirects, chunked bodies, `-S`, `--max-redirect`
     - N16 ✅ `httpd`: static files over HTTP/1.1 and HTTPS (TLS 1.3 server side, ECDSA signing with RFC 6979 nonces, `certgen` self-signed certificates)
-    - IPv6 ([`IPV6.md`](IPV6.md)): V1 ✅ autoconfiguration, Neighbor Discovery, ICMPv6, `ping6`, conformance vectors; V2 UDP/TCP and `AF_INET6` sockets; V3 the gateway's NAT and AAAA; V4 names and brackets in the programs
+    - IPv6 ([`IPV6.md`](IPV6.md)): V1 ✅ autoconfiguration, Neighbor Discovery, ICMPv6, `ping6`, conformance vectors; V2 ✅ UDP/TCP and `AF_INET6` sockets, the servers on both families; V3 the gateway's NAT and AAAA; V4 names and brackets in the programs
     - next ideas: `curl`-like POST
 
 12. **Self-hosting** ([`SELFHOST.md`](SELFHOST.md)): Trinux builds its own programs

@@ -15,8 +15,9 @@ fn eth0_comes_up_and_pings_work() {
     has(
         &o,
         &[
-            "eth0: flags=67<UP,BROADCAST,RUNNING>  mtu 1500\n        inet 10.0.2.15  netmask 255.255.255.0  gateway 10.0.2.2\n        ether 52:54:00:12:34:56\n",
-            "lo: flags=73<UP,LOOPBACK,RUNNING>  mtu 19683\n        inet 127.0.0.1  netmask 255.0.0.0\n",
+            "eth0: flags=67<UP,BROADCAST,RUNNING>  mtu 1500\n        inet 10.0.2.15  netmask 255.255.255.0  gateway 10.0.2.2\n",
+            "        ether 52:54:00:12:34:56\n",
+            "lo: flags=73<UP,LOOPBACK,RUNNING>  mtu 19683\n        inet 127.0.0.1  netmask 255.0.0.0\n        inet6 ::1  prefixlen 128  scopeid 0x10<host>\n",
         ],
     );
     let o = s.cmd("ping -c 3 10.0.2.2");

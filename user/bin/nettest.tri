@@ -389,6 +389,106 @@ fn interfaces() {
 
 // AF_TNP (docs/TNET.md §5) on a machine with no ternary link: the calls
 // that need no peer, and each refusal.
+// An IPv6 address from text into a sockaddr_in6 (docs/IPV6.md §4).
+fn set6(a: *sockaddr_in6, text: *char, port: int) {
+    var o: [16]int;
+    inet_pton6(text, &o[0]);
+    sockaddr6_set(a, &o[0], port);
+}
+
+fn bind6(fd: int, text: *char, port: int) -> int {
+    var a: sockaddr_in6;
+    set6(&a, text, port);
+    return bind(fd, &a as *sockaddr_in, sizeof(sockaddr_in6));
+}
+
+fn ipv6() {
+    var s: int = socket(AF_INET6, SOCK_STREAM, 0);
+    ok("ipv6: socket(AF_INET6, SOCK_STREAM)", s >= 0);
+    ok("ipv6: socket(AF_INET6, SOCK_DGRAM)", socket(AF_INET6, SOCK_DGRAM, 0) >= 0);
+    ok("ipv6: a stream over UDP is EPROTONOSUPPORT", fails(socket(AF_INET6, SOCK_STREAM, IPPROTO_UDP), EPROTONOSUPPORT));
+    ok("ipv6: raw TCP is EPROTONOSUPPORT", fails(socket(AF_INET6, SOCK_RAW, IPPROTO_TCP), EPROTONOSUPPORT));
+    var a: sockaddr_in6;
+    set6(&a, "::", 4100);
+    ok("ipv6: a sockaddr_in6 too short is EINVAL", fails(bind(s, &a as *sockaddr_in, sizeof(sockaddr_in)), EINVAL));
+    ok("ipv6: an AF_INET address is EAFNOSUPPORT", fails(bind_to(s, INADDR_ANY, 4100), EAFNOSUPPORT));
+    a.sin6_addr[5] = 256;
+    ok("ipv6: an octet over 255 is EINVAL", fails(bind(s, &a as *sockaddr_in, sizeof(sockaddr_in6)), EINVAL));
+    ok("ipv6: an address not ours is EADDRNOTAVAIL", fails(bind6(s, "fd00::99", 4100), EADDRNOTAVAIL));
+    set6(&a, "fe80::5054:ff:fe12:3456", 4100);
+    a.sin6_scope_id = 0;
+    ok("ipv6: link-local without a scope is EINVAL", fails(bind(s, &a as *sockaddr_in, sizeof(sockaddr_in6)), EINVAL));
+    ok("ipv6: port 70000 is EINVAL", fails(bind6(s, "::", 70000), EINVAL));
+    var v: int = 0;
+    var vlen: int = 3;
+    ok("ipv6: IPV6_V6ONLY reads 1", getsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v, &vlen) == 0 && v == 1);
+    v = 1;
+    ok("ipv6: IPV6_V6ONLY can be set", setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v, 3) == 0);
+    v = 0;
+    ok("ipv6: IPV6_V6ONLY cannot be cleared (ENOPROTOOPT)", fails(setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v, 3), ENOPROTOOPT));
+    var t4: int = tcp();
+    ok("ipv6: IPV6_V6ONLY on an AF_INET socket is ENOPROTOOPT", fails(getsockopt(t4, IPPROTO_IPV6, IPV6_V6ONLY, &v, &vlen), ENOPROTOOPT));
+    // the families have their own ports
+    ok("ipv6: bind [::]:4100", bind6(s, "::", 4100) == 0);
+    ok("ipv6: and 0.0.0.0:4100 too", bind_to(t4, INADDR_ANY, 4100) == 0);
+    var s2: int = socket(AF_INET6, SOCK_STREAM, 0);
+    ok("ipv6: [::1]:4100 again is EADDRINUSE", fails(bind6(s2, "::1", 4100), EADDRINUSE));
+    var g: sockaddr_in6;
+    var glen: int = sizeof(sockaddr_in6);
+    getsockname(s, &g as *sockaddr_in, &glen);
+    ok("ipv6: getsockname says AF_INET6, 60 trytes", g.sin6_family == AF_INET6 && glen == sizeof(sockaddr_in6) && g.sin6_port == 4100);
+    // a stream over ::1
+    ok("ipv6: listen", listen(s, 3) == 0);
+    var c: int = socket(AF_INET6, SOCK_STREAM, 0);
+    set6(&a, "::1", 4100);
+    ok("ipv6: connect to [::1]:4100", connect(c, &a as *sockaddr_in, sizeof(sockaddr_in6)) == 0);
+    var from: sockaddr_in6;
+    var flen: int = sizeof(sockaddr_in6);
+    var d: int = accept(s, &from as *sockaddr_in, &flen);
+    ok("ipv6: accept says ::1", d >= 0 && from.sin6_family == AF_INET6 && strcmp(inet_ntop6(&from.sin6_addr[0]), "::1") == 0);
+    put_text(c, "over ::1");
+    var n: int = read_n(d, &buf[0], 8);
+    ok("ipv6: data over ::1", n == 8 && same(&buf[0], "over ::1"));
+    flen = sizeof(sockaddr_in6);
+    ok("ipv6: getpeername", getpeername(c, &from as *sockaddr_in, &flen) == 0 && from.sin6_port == 4100);
+    close(c);
+    close(d);
+    close(s);
+    close(s2);
+    close(t4);
+    // a connection to a closed port is refused
+    c = socket(AF_INET6, SOCK_STREAM, 0);
+    set6(&a, "::1", 4199);
+    ok("ipv6: a closed port is ECONNREFUSED", fails(connect(c, &a as *sockaddr_in, sizeof(sockaddr_in6)), ECONNREFUSED));
+    close(c);
+    // datagrams over ::1
+    var u: int = socket(AF_INET6, SOCK_DGRAM, 0);
+    var w: int = socket(AF_INET6, SOCK_DGRAM, 0);
+    ok("ipv6: bind a datagram socket", bind6(u, "::1", 4101) == 0);
+    set6(&a, "::1", 4101);
+    put_text(w, "x");
+    ok("ipv6: send without an address is EDESTADDRREQ", fails(send(w, &buf[0], 1, 0), EDESTADDRREQ));
+    buf[0] = 'd';
+    buf[1] = 'g';
+    ok("ipv6: sendto [::1]:4101", sendto(w, &buf[0], 2, 0, &a as *sockaddr_in, sizeof(sockaddr_in6)) == 2);
+    flen = sizeof(sockaddr_in6);
+    n = recvfrom(u, &buf[100], 10, 0, &from as *sockaddr_in, &flen);
+    ok("ipv6: recvfrom gets it, from ::1 and the sender's port", n == 2 && buf[100] == 'd' && flen == sizeof(sockaddr_in6)
+        && strcmp(inet_ntop6(&from.sin6_addr[0]), "::1") == 0 && from.sin6_port == local_port6(w));
+    buf[0] = 300;
+    ok("ipv6: a tryte over 255 is EINVAL", fails(sendto(w, &buf[0], 1, 0, &a as *sockaddr_in, sizeof(sockaddr_in6)), EINVAL));
+    buf[0] = 0;                                  // the checks after this send buf
+    close(u);
+    close(w);
+}
+
+fn local_port6(fd: int) -> int {
+    var a: sockaddr_in6;
+    var len: int = sizeof(sockaddr_in6);
+    if (getsockname(fd, &a as *sockaddr_in, &len) < 0) { return -1; }
+    return a.sin6_port;
+}
+
 fn tnet() {
     ok("tnp: socket(AF_TNP, SOCK_STREAM)", socket(AF_TNP, SOCK_STREAM, 0) >= 0);
     ok("tnp: socket(AF_TNP, SOCK_DGRAM)", socket(AF_TNP, SOCK_DGRAM, 0) >= 0);
@@ -468,6 +568,7 @@ fn main(argc: int, argv: **char) -> int {
     creation();
     binding();
     tnet();
+    ipv6();
     streams();
     datagrams();
     limits();

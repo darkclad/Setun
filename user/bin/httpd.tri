@@ -41,7 +41,7 @@ var tl: tls;
 var ident: tls_identity;
 var chain_der: [59049]tryte;
 var head: [6561]char;
-var client: [27]char;
+var client: [46]char;                  // the peer, as text (an IPv6 address at most)
 
 // What a request asked, and what the answer was (for the log).
 var method: [27]char;
@@ -599,14 +599,13 @@ fn main(argc: int, argv: **char) -> int {
         fputs(STDERR_FILENO, ": not a directory\n");
         return 1;
     }
-    var l: int = socket(AF_INET, SOCK_STREAM, 0);
-    if (l < 0) { perror2("httpd", "socket"); return 1; }
-    var one: int = 1;
-    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
-    var a: sockaddr_in;
-    sockaddr_set(&a, INADDR_ANY, port);
-    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("httpd", "bind"); return 1; }
-    if (listen(l, 9) < 0) { perror2("httpd", "listen"); return 1; }
+    // IPv4 and IPv6 (docs/IPV6.md §6)
+    var fams: [2]int;
+    fams[0] = AF_INET;
+    fams[1] = AF_INET6;
+    var ls: [2]int;
+    var nl: int = listen_on(&fams[0], 2, port, &ls[0]);
+    if (nl < 0) { perror2("httpd", "bind"); return 1; }
     var num: [15]char;
     fputs(STDERR_FILENO, secure ? "httpd: serving HTTPS from " : "httpd: serving ");
     fputs(STDERR_FILENO, root);
@@ -614,9 +613,9 @@ fn main(argc: int, argv: **char) -> int {
     fputs(STDERR_FILENO, itoa(port, &num[0]));
     fputs(STDERR_FILENO, "\n");
     loop {
-        var from: sockaddr_in;
-        var flen: int = sizeof(sockaddr_in);
-        var s: int = accept(l, &from, &flen);
+        var from: sockaddr_in6;
+        var flen: int = 0;
+        var s: int = accept_any(&ls[0], nl, &from, &flen);
         if (s < 0) {
             if (errno == EINTR) { continue; }
             perror2("httpd", "accept");
@@ -624,10 +623,10 @@ fn main(argc: int, argv: **char) -> int {
         }
         var st: int = 0;
         while (waitpid(-1, &st, WNOHANG) > 0) {}
-        strncpy(&client[0], inet_ntoa(from.sin_addr), 26);
-        client[26] = 0;
+        strncpy(&client[0], sa_ntoa(&from), 45);
+        client[45] = 0;
         if (once) {
-            close(l);
+            close_all(&ls[0], nl);
             sock = s;
             serve_conn();
             shutdown(s, SHUT_RDWR);
@@ -636,7 +635,7 @@ fn main(argc: int, argv: **char) -> int {
         }
         var pid: int = fork();
         if (pid == 0) {
-            close(l);
+            close_all(&ls[0], nl);
             sock = s;
             serve_conn();
             shutdown(s, SHUT_RDWR);

@@ -36,7 +36,9 @@ const PROC_NET_TLINK: int = 15;
 const PROC_NET_IF_INET6: int = 16;
 const PROC_NET_NEIGH6: int = 17;
 const PROC_NET_STAT6: int = 18;
-const PROC_NET_LAST: int = 18;
+const PROC_NET_TCP6: int = 19;
+const PROC_NET_UDP6: int = 20;
+const PROC_NET_LAST: int = 20;
 const PROC_KINDS: int = 27;
 const ESRCH_: int = 3;
 
@@ -101,6 +103,8 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "if_inet6")) { return iget(FS_PROC, m, PROC_NET_IF_INET6); }
         if (proc_name_eq(s, len, "neigh6")) { return iget(FS_PROC, m, PROC_NET_NEIGH6); }
         if (proc_name_eq(s, len, "stat6")) { return iget(FS_PROC, m, PROC_NET_STAT6); }
+        if (proc_name_eq(s, len, "tcp6")) { return iget(FS_PROC, m, PROC_NET_TCP6); }
+        if (proc_name_eq(s, len, "udp6")) { return iget(FS_PROC, m, PROC_NET_UDP6); }
         return -ENOENT_;
     }
     if (proc_name_eq(s, len, "net")) { return iget(FS_PROC, m, PROC_NET); }
@@ -136,6 +140,8 @@ fn proc_name_of(i: int, buf: *char) -> int {
         case PROC_NET_IF_INET6: copy_str(buf, "if_inet6", 9);
         case PROC_NET_NEIGH6: copy_str(buf, "neigh6", 7);
         case PROC_NET_STAT6: copy_str(buf, "stat6", 6);
+        case PROC_NET_TCP6: copy_str(buf, "tcp6", 5);
+        case PROC_NET_UDP6: copy_str(buf, "udp6", 5);
         case PROC_PID: itoa(proc_pid(i), buf);
         default: copy_str(buf, "proc", 5);
     }
@@ -150,7 +156,7 @@ fn proc_readdir(dir: int, pos: int, name: *char, info: *int) -> int {
     if (pos == 1) { copy_str(name, "..", 3); info[0] = PROC_ROOT; info[1] = DT_DIR; return 2; }
     if (k == PROC_NET) {
         // in name order
-        if (pos - 2 >= 9) { return 0; }
+        if (pos - 2 >= 11) { return 0; }
         info[0] = proc_net_kinds[pos - 2];
         inodes_name_of_kind(info[0], name);
         return pos + 1;
@@ -402,6 +408,7 @@ fn proc_net(k: int) {
         return;
     }
     if (k == PROC_NET_IF_INET6 || k == PROC_NET_NEIGH6 || k == PROC_NET_STAT6) { proc_net6(k); return; }
+    if (k == PROC_NET_TCP6 || k == PROC_NET_UDP6) { proc_sock6(k); return; }
     if (k == PROC_NET_STAT) {
         var n: int = 0;
         while (n < NSTATS) {
@@ -454,8 +461,8 @@ fn proc_read(i: int, pos: int, buf: *tryte, n: int) -> int {
     return n;
 }
 
-var proc_net_kinds: [9]int = { PROC_NET_ARP, PROC_NET_DEV, PROC_NET_IF_INET6, PROC_NET_NEIGH6, PROC_NET_STAT,
-                               PROC_NET_STAT6, PROC_NET_TCP, PROC_NET_TLINK, PROC_NET_UDP };
+var proc_net_kinds: [11]int = { PROC_NET_ARP, PROC_NET_DEV, PROC_NET_IF_INET6, PROC_NET_NEIGH6, PROC_NET_STAT,
+                                PROC_NET_STAT6, PROC_NET_TCP, PROC_NET_TCP6, PROC_NET_TLINK, PROC_NET_UDP, PROC_NET_UDP6 };
 
 // The name of a /proc/net file kind.
 fn inodes_name_of_kind(k: int, name: *char) {
@@ -467,7 +474,9 @@ fn inodes_name_of_kind(k: int, name: *char) {
         case PROC_NET_STAT: copy_str(name, "stat", 5);
         case PROC_NET_STAT6: copy_str(name, "stat6", 6);
         case PROC_NET_TCP: copy_str(name, "tcp", 4);
+        case PROC_NET_TCP6: copy_str(name, "tcp6", 5);
         case PROC_NET_TLINK: copy_str(name, "tlink", 6);
+        case PROC_NET_UDP6: copy_str(name, "udp6", 5);
         default: copy_str(name, "udp", 4);
     }
 }
@@ -556,4 +565,49 @@ fn proc_net6(k: int) {
     ps("mtu ");
     pi(link_mtu6);
     pc('\n');
+}
+
+// /proc/net/tcp6 and udp6: as tcp and udp, with 32 hex digits of address
+// in Linux's order (four 32-bit words, each little-endian, as tcp's is).
+fn pa6linux(a: *tryte) {
+    var w: int = 0;
+    while (w < 4) {
+        var j: int = 3;
+        while (j >= 0) { phex(a[4 * w + j], 2); j -= 1; }
+        w += 1;
+    }
+}
+
+fn proc_sock6(k: int) {
+    ps("  sl  local_address                         remote_address                        st tx_queue rx_queue uid\n");
+    var want: int = k == PROC_NET_TCP6 ? SOCK_STREAM : SOCK_DGRAM;
+    var sl: int = 0;
+    var s: int = 0;
+    while (s < NSOCKS) {
+        var q: *Socket = &socks[s];
+        if (q.used && q.type == want && q.family == AF_INET6) {
+            pcol(2);
+            if (sl < 10) { pc(' '); }
+            pi(sl);
+            ps(": ");
+            pa6linux(a6(q.laddr));
+            pc(':');
+            phex(q.lport, 4);
+            pc(' ');
+            pa6linux(a6(q.raddr));
+            pc(':');
+            phex(q.rport, 4);
+            pc(' ');
+            phex(k == PROC_NET_TCP6 ? q.state : (q.raddr != 0 ? TCP_ESTABLISHED : TCP_CLOSE), 2);
+            pc(' ');
+            phex(k == PROC_NET_TCP6 ? q.tx_count : 0, 8);
+            pc(':');
+            phex(q.rx_count, 8);
+            pc(' ');
+            pi(q.uid);
+            pc('\n');
+            sl += 1;
+        }
+        s += 1;
+    }
 }

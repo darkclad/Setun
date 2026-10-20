@@ -64,7 +64,7 @@ const KEY_PATH: *char = "/etc/ssh/ssh_host_ed25519_key";
 var ssh_server: int;                      // 1 in sshd, 0 in the client
 var ssh_prog: *char = "ssh";             // the client's name in messages
 var sock: int;
-var peer: [16]char;
+var peer: [46]char;                    // an IPv6 address at most
 
 // ---- transport: buffers and keys ----------------------------------------------------------
 

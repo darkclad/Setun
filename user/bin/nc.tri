@@ -1,4 +1,4 @@
-// nc [-l] [-u] [-b] [-z] [-v] [-p PORT] [-w SECONDS] [HOST] PORT: netcat.
+// nc [-l] [-u] [-b] [-z] [-v] [-4|-6|-t] [-p PORT] [-w SECONDS] [HOST] PORT: netcat.
 //
 //   nc HOST PORT        connect, then copy stdin to the socket and the socket to stdout
 //   nc -l [-p] PORT     listen for one connection (or, with -u, one sender) and do the same
@@ -8,6 +8,8 @@
 //   -z                  only see whether HOST PORT accepts a connection
 //   -v                  say what happens on stderr
 //   -w SECONDS          give up connecting after this long
+//   -4, -6, -t          IPv4 (the default for -l), IPv6, or TNET; an address
+//                       literal for HOST decides by itself
 //
 // When stdin ends, a TCP connection is half-closed (shutdown SHUT_WR) and
 // nc keeps printing until the other side closes too.
@@ -111,7 +113,7 @@ fn pump(s: int) -> int {
 }
 
 fn usage() -> int {
-    fputs(STDERR_FILENO, "usage: nc [-lubtzv] [-p port] [-w secs] [host] port\n");
+    fputs(STDERR_FILENO, "usage: nc [-lubtzv46] [-p port] [-w secs] [host] port\n");
     return 2;
 }
 
@@ -128,11 +130,14 @@ fn main(argc: int, argv: **char) -> int {
     var port: int = -1;
     var wait_s: int = 0;
     var family: int = AF_INET;
-    var c: int = getopt(argc, argv, "lubtzvp:w:");
+    var addr6: [16]int;
+    var c: int = getopt(argc, argv, "lubtzv46p:w:");
     while (c != -1) {
         switch (c) {
             case 'l': listen_mode = 1;
             case 't': family = AF_TNP;
+            case '4': family = AF_INET;
+            case '6': family = AF_INET6;
             case 'u': udp = 1;
             case 'b': binary = 1;
             case 'z': scan = 1;
@@ -141,12 +146,13 @@ fn main(argc: int, argv: **char) -> int {
             case 'w': { wait_s = atoi(optarg); if (wait_s <= 0) { return usage(); } }
             default: return usage();
         }
-        c = getopt(argc, argv, "lubtzvp:w:");
+        c = getopt(argc, argv, "lubtzv46p:w:");
     }
     var rest: int = argc - optind;
     var dst: int = 0;
     if (!listen_mode && rest == 2) {
-        family = resolve_any(argv[optind], &dst);
+        if (inet_pton6(argv[optind], &addr6[0])) { family = AF_INET6; }
+        else { family = resolve_any(argv[optind], &dst); }
         if (family == 0) {
             fputs(STDERR_FILENO, "nc: ");
             fputs(STDERR_FILENO, argv[optind]);
@@ -157,47 +163,48 @@ fn main(argc: int, argv: **char) -> int {
     if (family == AF_TNP) { binary = 1; native = 1; }   // TNET carries trytes: text goes as it is
     var s: int = socket(family, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (s < 0) { return fail("socket"); }
-    var a: sockaddr_in;
+    var a: sockaddr_in6;
+    var alen: int = sa_len(family);
     if (listen_mode) {
         if (rest == 1 && port < 0) { port = parse_port(argv[optind]); }
         else if (rest != 0) { return usage(); }
         if (port < 0) { return usage(); }
         var one: int = 1;
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, 3);
-        sockaddr_set_family(&a, family, INADDR_ANY, port);
-        if (bind(s, &a, sizeof(sockaddr_in)) < 0) { return fail("bind"); }
+        sa_set(&a, family, INADDR_ANY, null, port);
+        if (bind(s, &a as *sockaddr_in, alen) < 0) { return fail("bind"); }
         if (udp) {
             // the first datagram's sender becomes the peer
             var n: int = 0;
-            var from: sockaddr_in;
-            var flen: int = sizeof(sockaddr_in);
-            n = recvfrom(s, &wire[0], 2187, MSG_PEEK, &from, &flen);
+            var from: sockaddr_in6;
+            var flen: int = sizeof(sockaddr_in6);
+            n = recvfrom(s, &wire[0], 2187, MSG_PEEK, &from as *sockaddr_in, &flen);
             if (n < 0) { return fail("recvfrom"); }
-            if (connect(s, &from, sizeof(sockaddr_in)) < 0) { return fail("connect"); }
-            say("nc: datagram from ", inet_ntoa(from.sin_addr), "\n");
+            if (connect(s, &from as *sockaddr_in, flen) < 0) { return fail("connect"); }
+            say("nc: datagram from ", sa_ntoa(&from), "\n");
             return pump(s);
         }
         if (listen(s, 1) < 0) { return fail("listen"); }
         say("nc: listening on port ", argv[argc - 1], "\n");
-        var from: sockaddr_in;
-        var flen: int = sizeof(sockaddr_in);
-        var conn: int = accept(s, &from, &flen);
+        var from: sockaddr_in6;
+        var flen: int = sizeof(sockaddr_in6);
+        var conn: int = accept(s, &from as *sockaddr_in, &flen);
         if (conn < 0) { return fail("accept"); }
         close(s);
-        say("nc: connection from ", addr_ntoa(from.sin_family, from.sin_addr), "\n");
+        say("nc: connection from ", sa_ntoa(&from), "\n");
         return pump(conn);
     }
     if (rest != 2) { return usage(); }
     var dport: int = parse_port(argv[optind + 1]);
     if (dport < 0) { return usage(); }
     if (port >= 0) {
-        sockaddr_set_family(&a, family, INADDR_ANY, port);
-        if (bind(s, &a, sizeof(sockaddr_in)) < 0) { return fail("bind"); }
+        sa_set(&a, family, INADDR_ANY, null, port);
+        if (bind(s, &a as *sockaddr_in, alen) < 0) { return fail("bind"); }
     }
-    sockaddr_set_family(&a, family, dst, dport);
+    sa_set(&a, family, dst, &addr6[0], dport);
     if (wait_s > 0 && !udp) {
         fcntl(s, 4, O_NONBLOCK);                         // F_SETFL
-        if (connect(s, &a, sizeof(sockaddr_in)) < 0 && errno != EINPROGRESS) { return fail("connect"); }
+        if (connect(s, &a as *sockaddr_in, alen) < 0 && errno != EINPROGRESS) { return fail("connect"); }
         var p: pollfd;
         p.fd = s;
         p.events = POLLOUT;
@@ -210,7 +217,7 @@ fn main(argc: int, argv: **char) -> int {
         getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen);
         if (err != 0) { errno = err; return fail("connect"); }
         fcntl(s, 4, 0);
-    } else if (connect(s, &a, sizeof(sockaddr_in)) < 0) {
+    } else if (connect(s, &a as *sockaddr_in, alen) < 0) {
         return fail("connect");
     }
     if (scan || verbose) {

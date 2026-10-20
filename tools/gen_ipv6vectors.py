@@ -262,6 +262,72 @@ def main():
     m = icmp(P_GL, S_GL, bytes([134, 0, 0, 0, 64, 0, 7, 8]) + bytes(8))
     ex('ra-from-global-ignored', to_station(P_GL, S_GL, 58, m, hop=255), [])
 
+    # ---- UDP and TCP to closed ports (V2; the station listens on 22, 23 and 80) ----------
+    def l4sum(src, dst, nh, seg):
+        return csum(src + dst + len(seg).to_bytes(4, 'big') + bytes([0, 0, 0, nh]) + seg)
+
+    def udp(src, dst, sport, dport, data, fix=True, ulen=None):
+        u = bytearray(sport.to_bytes(2, 'big') + dport.to_bytes(2, 'big') + (8 + len(data) if ulen is None else ulen).to_bytes(2, 'big') + b'\0\0' + data)
+        if fix:                                   # over the UDP length's octets (RFC 768)
+            n = int.from_bytes(u[4:6], 'big')
+            c = l4sum(src, dst, 17, bytes(u[:n]))
+            u[6:8] = (c or 0xffff).to_bytes(2, 'big')
+        return bytes(u)
+
+    def unreachable(packet, code):
+        src, dst = packet[8:24], packet[24:40]
+        me = dst
+        msg = bytes([1, code, 0, 0, 0, 0, 0, 0]) + packet[:1280 - 48]
+        return from_station(me, src, 58, icmp(me, src, msg))
+
+    def tcp(src, dst, sport, dport, seq, ack, flags, data=b'', wnd=1000, doff=5, fix=True):
+        t = bytearray(sport.to_bytes(2, 'big') + dport.to_bytes(2, 'big') + seq.to_bytes(4, 'big') + ack.to_bytes(4, 'big')
+                      + bytes([doff << 4, flags]) + wnd.to_bytes(2, 'big') + b'\0\0\0\0' + data)
+        if fix:
+            t[16:18] = l4sum(src, dst, 6, bytes(t)).to_bytes(2, 'big')
+        return bytes(t)
+
+    pkt = ip6(P_GL, S_GL, 17, udp(P_GL, S_GL, 4000, 9, b'anyone?'))
+    ex('udp-closed-port', eth(S_MAC, P_MAC, pkt), [unreachable(pkt, 4)])
+    # a payload whose true checksum is 0 (its last word evens the sum): sent
+    # as 0xFFFF it is good; with 0 in the field it would also add up, so
+    # only the rule that 0 means "none", forbidden over IPv6, refuses it
+    base = udp(P_GL, S_GL, 4000, 9, b'zero?!\0\0', fix=False)
+    adj = l4sum(P_GL, S_GL, 17, base)
+    zero = bytearray(base); zero[14:16] = adj.to_bytes(2, 'big')
+    assert l4sum(P_GL, S_GL, 17, bytes(zero)) in (0, 0xffff)
+    pkt = ip6(P_GL, S_GL, 17, bytes(zero))
+    ex('udp-zero-checksum', eth(S_MAC, P_MAC, pkt), [])
+    ffff = bytearray(zero); ffff[6:8] = b'\xff\xff'
+    pkt = ip6(P_GL, S_GL, 17, bytes(ffff))
+    ex('udp-checksum-ffff', eth(S_MAC, P_MAC, pkt), [unreachable(pkt, 4)])
+    pkt = ip6(P_GL, S_GL, 17, udp(P_GL, S_GL, 4000, 9, b'anyone?', fix=False))
+    ex('udp-zero-checksum-wrong-anyway', eth(S_MAC, P_MAC, pkt), [])
+    bad = bytearray(udp(P_GL, S_GL, 4000, 9, b'anyone?')); bad[8] ^= 1
+    ex('udp-bad-checksum', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 17, bytes(bad))), [])
+    pkt = ip6(P_GL, S_GL, 17, udp(P_GL, S_GL, 4000, 9, b'anyone?', ulen=16))
+    ex('udp-length-past-payload', eth(S_MAC, P_MAC, pkt), [])
+    pkt = ip6(P_GL, S_GL, 17, udp(P_GL, S_GL, 4000, 9, b'anyone?', ulen=12) + b'pad')
+    ex('udp-closed-port-shorter-length', eth(S_MAC, P_MAC, pkt), [unreachable(pkt, 4)])
+    pkt = ip6(P_GL, ALLNODES, 17, udp(P_GL, ALLNODES, 4000, 9, b'anyone?'))
+    ex('udp-closed-port-multicast', eth(mcast_mac(ALLNODES), P_MAC, pkt), [])
+    ex('udp-short-header', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 17, b'\x0f\xa0\x00\x09\x00')), [])
+
+    def rst(seq, ack, flags):
+        t = tcp(S_GL, P_GL, 7777, 5555, seq, ack, flags, wnd=0)
+        return from_station(S_GL, P_GL, 6, t)
+
+    ex('tcp-syn-closed-port', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 1000, 0, 0x02))), [rst(0, 1001, 0x14)])
+    ex('tcp-syn-closed-port-wraps', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 0xffffffff, 0, 0x02))), [rst(0, 0, 0x14)])
+    ex('tcp-ack-closed-port', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 50, 5000, 0x10))), [rst(5000, 0, 0x04)])
+    ex('tcp-fin-data-closed-port', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 50, 0, 0x01, b'hi'))), [rst(0, 53, 0x14)])
+    ex('tcp-rst-closed-port', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 50, 0, 0x04))), [])
+    bad = bytearray(tcp(P_GL, S_GL, 5555, 7777, 1000, 0, 0x02)); bad[4] ^= 1
+    ex('tcp-bad-checksum', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, bytes(bad))), [])
+    ex('tcp-to-multicast', eth(mcast_mac(ALLNODES), P_MAC, ip6(P_GL, ALLNODES, 6, tcp(P_GL, ALLNODES, 5555, 7777, 1000, 0, 0x02))), [])
+    ex('tcp-offset-too-small', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 1000, 0, 0x02, doff=4))), [])
+    ex('tcp-short-header', eth(S_MAC, P_MAC, ip6(P_GL, S_GL, 6, tcp(P_GL, S_GL, 5555, 7777, 1000, 0, 0x02)[:19])), [])
+
     sys.stdout.reconfigure(encoding='utf-8', newline='\n')
     print('# Setun-11̅ IPv6 conformance vectors (docs/IPV6.md §7), made by')
     print('# tools/gen_ipv6vectors.py from an independent model of the specification.')

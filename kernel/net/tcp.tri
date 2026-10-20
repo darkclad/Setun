@@ -1,7 +1,7 @@
 // TCP (RFC 9293), with retransmission timing from RFC 6298. The same state
-// machine serves TNET's TSP (tsp.tri): tcp_segment() takes a segment of
-// either family, and the family decides the header, the sequence
-// arithmetic and the way out.
+// machine serves IPv6 (docs/IPV6.md §4) and TNET's TSP (tsp.tri):
+// tcp_segment() takes a segment of any family, and the family decides the
+// header, the sequence arithmetic and the way out.
 //
 // Kept simple where the virtual link allows it, and said so:
 //   - segments are accepted in order only; anything ahead of rcv_nxt is
@@ -37,6 +37,7 @@ const TH_ACK: int = 16;
 
 const TCP_HLEN: int = 20;
 const TCP_MSS: int = 1460;
+const TCP6_MSS: int = 1440;               // 1500 - 40 - 20
 const RTO_MIN: int = 20;                  // ticks: 200 ms
 const RTO_MAX: int = 6000;                // 60 s
 const SYN_RETRIES: int = 5;
@@ -72,7 +73,8 @@ fn tcp_rcv_wnd(s: int) -> int {
 fn tcp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
     if (socks[s].family == AF_TNP) { tsp_send_seg(s, seq, flags, off, n); return; }
     var k: *Socket = &socks[s];
-    var t: *tryte = &txbuf[L4_OFF];
+    var v6: int = k.family == AF_INET6;
+    var t: *tryte = &txbuf[v6 ? L6_OFF : L4_OFF];
     var hl: int = is_tcp_flag(flags, TH_SYN) ? 24 : TCP_HLEN;
     put16(t, 0, k.lport);
     put16(t, 2, k.rport);
@@ -87,12 +89,17 @@ fn tcp_send_seg(s: int, seq: int, flags: int, off: int, n: int) {
     if (hl == 24) {
         t[20] = 2;                            // MSS
         t[21] = 4;
-        put16(t, 22, TCP_MSS);
+        put16(t, 22, v6 ? TCP6_MSS : TCP_MSS);
     }
     if (n > 0) { ring_read(k.txf, k.tx_head, off, t + hl, n); }
     var src: int = k.laddr;
-    put16(t, 16, csum_fold(csum_add(csum_pseudo(src, k.raddr, IPPROTO_TCP, hl + n), t, 0, hl + n)));
     if (is_tcp_flag(flags, TH_ACK)) { k.adv_edge = ssa(s, k.rcv_nxt, wnd); }
+    if (v6) {
+        put16(t, 16, csum6(a6(src), a6(k.raddr), NH_TCP, t, hl + n));
+        ip6_send(NH_TCP, src, k.raddr, hl + n, 64);
+        return;
+    }
+    put16(t, 16, csum_fold(csum_add(csum_pseudo(src, k.raddr, IPPROTO_TCP, hl + n), t, 0, hl + n)));
     ip_send(IPPROTO_TCP, src, k.raddr, hl + n);
 }
 
@@ -153,7 +160,8 @@ fn tcp_output(s: int) {
 fn tcp_reset_to(fam: int, src: int, dst: int, sport: int, dport: int, seq: int, ack: int, flags: int, seg_len: int) {
     if (is_tcp_flag(flags, TH_RST)) { return; }
     if (fam == AF_TNP) { tsp_reset_to(src, sport, dport, seq, ack, flags, seg_len); return; }
-    var t: *tryte = &txbuf[L4_OFF];
+    var v6: int = fam == AF_INET6;
+    var t: *tryte = &txbuf[v6 ? L6_OFF : L4_OFF];
     put16(t, 0, dport);
     put16(t, 2, sport);
     if (is_tcp_flag(flags, TH_ACK)) {
@@ -169,8 +177,13 @@ fn tcp_reset_to(fam: int, src: int, dst: int, sport: int, dport: int, seq: int, 
     put16(t, 14, 0);
     put16(t, 16, 0);
     put16(t, 18, 0);
-    put16(t, 16, csum_fold(csum_add(csum_pseudo(dst, src, IPPROTO_TCP, TCP_HLEN), t, 0, TCP_HLEN)));
     net_count(NS_TCP_RST_OUT);
+    if (v6) {
+        put16(t, 16, csum6(a6(dst), a6(src), NH_TCP, t, TCP_HLEN));
+        ip6_send(NH_TCP, dst, src, TCP_HLEN, 64);
+        return;
+    }
+    put16(t, 16, csum_fold(csum_add(csum_pseudo(dst, src, IPPROTO_TCP, TCP_HLEN), t, 0, TCP_HLEN)));
     ip_send(IPPROTO_TCP, dst, src, TCP_HLEN);
 }
 
@@ -221,6 +234,12 @@ fn tcp_connect(s: int, dst: int, port: int) -> int {
     if (k.family == AF_TNP) {
         if (!tl_up) { return -ENETUNREACH; }
         k.laddr = tl_addr;
+    } else if (k.family == AF_INET6) {
+        if (k.laddr == 0) {
+            var a: int = ip6_source_for(dst);
+            if (a == 0) { return -ENETUNREACH; }
+            k.laddr = a;
+        }
     } else if (k.laddr == 0) {
         if (!is_local_addr(dst)) {
             if (!netifs[NETIF_ETH].up || netifs[NETIF_ETH].addr == 0) { return -ENETUNREACH; }
@@ -389,7 +408,24 @@ fn tcp_input(p: *tryte, hl: int, total: int, src: int, dst: int) {
     tcp_segment(AF_INET, src, dst, sport, dport, seq, ack, flags, wnd, th + doff, dlen, tcp_parse_mss(th, doff));
 }
 
-// A segment of either family, its header already read: the state machine
+// A TCP segment over IPv6 (docs/IPV6.md §4): to a unicast address only.
+fn tcp6_input(p: *tryte, off: int, total: int, sh: int, dh: int) {
+    c6(S6_TCP_IN);
+    var th: *tryte = p + off;
+    var n: int = total - off;
+    if (n < TCP_HLEN) { c6(S6_TCP_ERR); return; }
+    var doff: int = th[12] / 16 * 4;
+    if (doff < TCP_HLEN || doff > n) { c6(S6_TCP_ERR); return; }
+    if (csum6(p + 8, p + 24, NH_TCP, th, n) != 0) { c6(S6_TCP_ERR); return; }
+    if (in6_is_mcast(p + 24) || sh == 0) { return; }
+    var flags: int = th[13];
+    if (is_tcp_flag(flags, TH_ACK)) { nd_confirm(sh); }        // the neighbour got what we sent
+    var mss: int = tcp_parse_mss(th, doff);
+    if (mss > TCP6_MSS) { mss = TCP6_MSS; }
+    tcp_segment(AF_INET6, sh, dh, get16(th, 0), get16(th, 2), get32(th, 4), get32(th, 8), flags, get16(th, 14), th + doff, n - doff, mss);
+}
+
+// A segment of any family, its header already read: the state machine
 // (RFC 9293). data: the dlen payload trytes; mss: the peer's (from a SYN).
 fn tcp_segment(fam: int, src: int, dst: int, sport: int, dport: int, seq: int, ack: int, flags: int, wnd: int, data: *tryte, dlen: int, mss: int) {
     var seg_len: int = dlen + (is_tcp_flag(flags, TH_SYN) ? 1 : 0) + (is_tcp_flag(flags, TH_FIN) ? 1 : 0);

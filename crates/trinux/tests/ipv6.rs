@@ -196,7 +196,7 @@ fn the_exchange_vectors() {
         }
         n += 1;
     }
-    assert!(n >= 60, "{n} vectors");
+    assert!(n >= 76, "{n} vectors");
     has(&s.cmd("cat /proc/net/stat6"), &["ip6_frag_dropped 1\n"]);
 }
 
@@ -221,6 +221,17 @@ fn duplicate_addresses_are_never_used() {
     s.net.inject(&mut s.m, &icmp6_frame(S_MAC, P_MAC, a6("fd00::77"), tent, 64, &e));
     s.idle(1_000_000);
     assert!(v6_frames(s.net.captured()).is_empty(), "no echo reply, no solicitation");
+    // nor UDP: no port unreachable from an address that is not ours yet
+    let mut u = vec![0x0f, 0xa0, 0, 9, 0, 12, 0, 0, b'u', b'd', b'p', b'?'];
+    let sum = setun_net::ip6::checksum(&[&a6("fd00::77").octets(), &tent.octets(), &[0, 0, 0, 12, 0, 0, 0, 17], &u]);
+    u[6..8].copy_from_slice(&sum.to_be_bytes());
+    let mut f = vec![0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 2, 0, 0, 0, 0, 0x77, 0x86, 0xdd, 0x60, 0, 0, 0, 0, 12, 17, 64];
+    f.extend_from_slice(&a6("fd00::77").octets());
+    f.extend_from_slice(&tent.octets());
+    f.extend_from_slice(&u);
+    s.net.inject(&mut s.m, &f);
+    s.idle(1_000_000);
+    assert!(v6_frames(s.net.captured()).is_empty(), "no port unreachable");
     assert!(s.cmd("cat /proc/net/if_inet6").contains("fd01000000000000505400fffe123456 02 40 00 40     eth0\n"), "tentative");
     s.net.inject(&mut s.m, &na(P_MAC, tent, a6("ff02::1"), tent, 0x20, P_MAC));
     s.idle(20_000_000);
@@ -341,4 +352,115 @@ fn icmp6_errors_are_rate_limited() {
     s.net.inject(&mut s.m, &bad);
     s.idle(200_000);
     assert_eq!(v6_frames(s.net.captured()).into_iter().filter(|f| f[54] == 4).count(), 1, "refilled");
+}
+
+/// V2's gate (docs/IPV6.md §8): TCP and UDP over IPv6 both ways, telnetd
+/// on IPv6, and netstat and ifconfig showing it.
+#[test]
+fn tcp_and_udp_over_ipv6() {
+    let mut s = boot6();
+    // a server in Trinux, the gateway's smoltcp as the client
+    s.cmd("echo 'back over IPv6' > /tmp/reply; nc -6 -l 2323 < /tmp/reply > /tmp/got &");
+    s.idle(10_000_000);
+    let c = s.net.connect6(2323);
+    s.run_until("established", 200_000_000, |s| s.net.state(c) == setun_net::State::Established);
+    let o = s.cmd("netstat -a");
+    has(&o, &["tcp6       0      0 fd00::5054:ff:fe12:3456:2323 fd00::2:49152           FIN_WAIT2\n", "tcp6       0      0 :::23                   :::*                    LISTEN\n"]);
+    // Linux's order: each 32-bit word little-endian
+    has(&s.cmd("cat /proc/net/tcp6"), &["000000FD00000000FF005450563412FE:0913 000000FD000000000000000002000000:"]);
+    s.net.send(c, "тернарный over IPv6\n".as_bytes());
+    s.run_until("the reply and the guest's FIN", 200_000_000, |s| s.net.guest_closed(c));
+    assert_eq!(String::from_utf8(s.net.recv(c)).unwrap(), "back over IPv6\n");
+    s.net.close(c);
+    has(&s.cmd("wait; cat /tmp/got"), &["тернарный over IPv6\n"]);
+    // TCP's acknowledgements confirmed the neighbour (no DELAY, no probes)
+    has(&s.cmd("cat /proc/net/neigh6"), &["fd00::2                                  52:55:0a:00:02:02 REACHABLE"]);
+    // bulk from the gateway: its segments keep to the MSS of 1440 Trinux announced
+    s.cmd("nc -6 -l 2324 > /tmp/bulk &");
+    s.idle(10_000_000);
+    let c = s.net.connect6(2324);
+    s.run_until("established", 200_000_000, |s| s.net.state(c) == setun_net::State::Established);
+    let block: Vec<u8> = (0..12000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let mut sent = 0;
+    s.run_until("12000 octets sent", 2_000_000_000, |s| {
+        if sent < block.len() {
+            sent += s.net.send(c, &block[sent..]);
+        }
+        sent == block.len() && s.net.unacked(c) == 0
+    });
+    s.net.close(c);
+    has(&s.cmd("wait; wc -c /tmp/bulk"), &["12000 /tmp/bulk"]);
+    // a client in Trinux, a listener on the gateway
+    let l = s.net.listen(8080);
+    s.type_line("seq 1 2000 | nc fd00::2 8080; echo nc status $?");
+    let mut conn = None;
+    s.run_until("a connection", 300_000_000, |s| {
+        conn = conn.or_else(|| s.net.accept(l));
+        conn.is_some()
+    });
+    let c = conn.unwrap();
+    s.run_until("all of seq and the FIN", 2_000_000_000, |s| s.net.guest_closed(c));
+    let want: String = (1..=2000).map(|i| format!("{i}\n")).collect();
+    assert!(String::from_utf8(s.net.recv(c)).unwrap() == want, "the data differ");
+    s.net.send(c, b"thanks\n");
+    s.net.close(c);
+    s.wait_prompt(300_000_000);
+    has(&s.out, &["thanks\nnc status 0\n"]);
+    // telnetd answers on IPv6
+    let t = s.net.connect6(23);
+    s.run_until("a login prompt", 300_000_000, |s| String::from_utf8_lossy(s.net.peek(t)).contains("login: "));
+    s.net.abort(t);
+    s.idle(10_000_000);
+    has(&s.log("telnetd"), &["telnetd: connection from fd00::2\n"]);
+    // datagrams both ways
+    let u = s.net.udp_bind(7);
+    s.cmd("echo 'datagram6' | nc -u fd00::2 7");
+    let (from, _, data) = s.net.udp_recv_from(u).expect("a datagram");
+    assert_eq!(from, std::net::IpAddr::V6(s_gl()));
+    assert_eq!(data, b"datagram6\n");
+    s.send("nc -6 -u -l 5000 > /tmp/u &\n");
+    s.wait_prompt(100_000_000);
+    s.idle(5_000_000);
+    let g = s.net.udp_bind(40000);
+    s.net.udp_send6(g, 5000, b"hello over IPv6\n");
+    s.idle(10_000_000);
+    has(&s.cmd("cat /tmp/u; kill %1"), &["hello over IPv6\n"]);
+    // nobody on the port: ICMPv6 port unreachable, counted
+    s.net.udp_send6(g, 5999, b"anyone?");
+    s.idle(5_000_000);
+    has(&s.cmd("cat /proc/net/stat6"), &["udp6_errors 1\n"]);
+    // ifconfig shows both addresses, as net-tools does
+    has(
+        &s.cmd("ifconfig eth0"),
+        &["        inet6 fe80::5054:ff:fe12:3456  prefixlen 64  scopeid 0x20<link>\n        inet6 fd00::5054:ff:fe12:3456  prefixlen 64  scopeid 0x0<global>\n        ether 52:54:00:12:34:56\n"],
+    );
+}
+
+/// A SYN-ACK over IPv6 announces an MSS of 1440 (1500 - 40 - 20), not
+/// IPv4's 1460: seen on the wire, since smoltcp keeps to its own anyway.
+#[test]
+fn tcp6_announces_mss_1440() {
+    let mut s = boot6();
+    s.net.set_capture(true);
+    let p = a6("fd00::77");
+    s.net.inject(&mut s.m, &ns_from_peer(p, s_gl()));
+    s.idle(10_000_000);
+    s.net.captured();
+    // a SYN to telnetd from the peer, with an MSS option of its own
+    let mut t = vec![0x13, 0x88, 0, 23, 0, 0, 0x03, 0xe8, 0, 0, 0, 0, 0x60, 0x02, 0x10, 0x00, 0, 0, 0, 0, 2, 4, 0x05, 0xb4];
+    let mut pseudo = p.octets().to_vec();
+    pseudo.extend_from_slice(&s_gl().octets());
+    pseudo.extend_from_slice(&[0, 0, 0, 24, 0, 0, 0, 6]);
+    let c = setun_net::ip6::checksum(&[&pseudo, &t]);
+    t[16..18].copy_from_slice(&c.to_be_bytes());
+    let mut f = vec![0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 2, 0, 0, 0, 0, 0x77, 0x86, 0xdd, 0x60, 0, 0, 0, 0, 24, 6, 64];
+    f.extend_from_slice(&p.octets());
+    f.extend_from_slice(&s_gl().octets());
+    f.extend_from_slice(&t);
+    s.net.inject(&mut s.m, &f);
+    s.idle(2_000_000);
+    let got = v6_frames(s.net.captured());
+    let synack = got.iter().find(|f| f[20] == 6 && f[54 + 13] == 0x12).expect("a SYN-ACK");
+    assert_eq!(synack[54 + 12] >> 4, 6, "a header of 24 octets");
+    assert_eq!(&synack[74..78], &[2, 4, 0x05, 0xa0], "MSS 1440");
 }

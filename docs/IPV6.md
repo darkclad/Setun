@@ -1,6 +1,6 @@
 # IPv6
 
-**Status (2026-10-14): V1 built: Trinux autoconfigures from the gateway's Router Advertisements, defends and checks its addresses, resolves neighbours, and `ping6` works; the exchange vectors pass (§7). V2 next.** Trinux speaks IPv6 beside IPv4 on the same `TNIC` card ([`NETWORK.md`](NETWORK.md)): a host stack in Trine with Neighbor Discovery, stateless address autoconfiguration, ICMPv6, UDP and TCP, and `AF_INET6` sockets. `setun-net` grows the other side: a router that advertises a prefix, a NAT to the host's IPv6 sockets, and DNS answers with AAAA records. Gate: **the host's OpenSSH logs in to Trinux over IPv6, and Trinux's `wget` and `ssh` reach the host over IPv6.**
+**Status (2026-10-14): V1 and V2 built. Trinux autoconfigures from the gateway's Router Advertisements, defends and checks its addresses, resolves neighbours, answers `ping6`, and carries TCP and UDP over IPv6; `nc`, `telnetd`, `httpd` and `sshd` speak it, and `ifconfig` and `netstat` show it. The exchange vectors pass (§7). V3, the gateway's NAT and AAAA, next.** Trinux speaks IPv6 beside IPv4 on the same `TNIC` card ([`NETWORK.md`](NETWORK.md)): a host stack in Trine with Neighbor Discovery, stateless address autoconfiguration, ICMPv6, UDP and TCP, and `AF_INET6` sockets. `setun-net` grows the other side: a router that advertises a prefix, a NAT to the host's IPv6 sockets, and DNS answers with AAAA records. Gate: **the host's OpenSSH logs in to Trinux over IPv6, and Trinux's `wget` and `ssh` reach the host over IPv6.**
 
 | Layer | What | Section | Milestone |
 |---|---|---|---|
@@ -109,14 +109,17 @@ MLD reports are not sent: the virtual link has no switch that snoops them, and t
 | 3 … 18 | `sin6_addr`: 16 octets |
 | 19 | `sin6_scope_id`: 0, or 2 (`eth0`) for a link-local address |
 
-- SOCK_STREAM (TCP), SOCK_DGRAM (UDP) and SOCK_RAW with `IPPROTO_ICMPV6` (58, root only). Raw sockets came with V1; the others answer `EPROTONOSUPPORT` until V2.
+- SOCK_STREAM (TCP), SOCK_DGRAM (UDP) and SOCK_RAW with `IPPROTO_ICMPV6` (58, root only). TCP is the same state machine as IPv4's (NETWORK.md §3): only the header, the checksum's pseudo-header, the MSS and the way out differ.
+- The two families have their own ports: `[::]:22` and `0.0.0.0:22` bind side by side.
+- An `AF_INET6` address given to an `AF_INET` socket is refused with `EAFNOSUPPORT` before its length is looked at, as Linux does.
+- A TCP segment that acknowledges confirms its sender as a reachable neighbour (RFC 4861 §7.3.1), so a busy connection never waits in DELAY or sends probes.
 - A raw ICMPv6 socket works as in Linux: the kernel computes the checksum of what is sent, and a receive returns the ICMPv6 message without its IPv6 header.
 - **IPv6 sockets are IPv6-only**, as if `IPV6_V6ONLY` were always set (OpenBSD's choice): no IPv4-mapped addresses. A server that wants both families opens two sockets. `setsockopt(IPV6_V6ONLY, 1)` succeeds; setting 0 fails with `ENOPROTOOPT`.
 - A link-local address needs a scope: `connect`, `bind` and `sendto` with an `fe80::` address and scope 0 fail with `EINVAL`.
 - TCP's MSS is 1440 (1500 − 40 − 20), announced as such.
 - UDP checksums are mandatory: a zero checksum is dropped, and one that computes to 0 is sent as 0xFFFF.
 - `getsockname`, `getpeername`, `accept` and `recvfrom` write a `sockaddr_in6` and say its length, 60 trytes.
-- `/proc/net/tcp6`, `/proc/net/udp6` and `/proc/net/if_inet6` follow Linux's columns, in hex.
+- `/proc/net/tcp6`, `/proc/net/udp6` and `/proc/net/if_inet6` follow Linux's columns, in hex. The addresses in `tcp6` and `udp6` are in Linux's order, four 32-bit words each written little-endian, as `tcp`'s IPv4 addresses already are.
 
 ## 5. The host side (`setun-net`)
 
@@ -136,11 +139,12 @@ MLD reports are not sent: the virtual link has no switch that snoops them, and t
 - tlibc: `inet_pton`/`inet_ntop` for both families, `struct sockaddr_in6`, `getaddrinfo`-style `resolve_any` returning AAAA as well.
 - **`ping6 [-c count] [-s size] [-W timeout] host`**, a raw ICMPv6 socket, set-user-ID root like `ping`, printed as iputils prints it. It shows no `ttl=`: a raw socket does not see the hop limit without `IPV6_RECVHOPLIMIT`. A link-local address is on eth0.
 - **`ip6vec`** checks `inet_pton6` and `inet_ntop6` against the vectors' text lines (§7).
-- **`nc -6`/`-4`**. Without either, an address literal decides; a name tries AAAA first, then A (RFC 6724's default preference, since the prefix is unique-local and the NAT carries both).
+- **`nc -6`/`-4`**. Without either, an address literal decides; `nc -l` listens on IPv4 unless given `-6`. A name tries AAAA first, then A (RFC 6724's default preference, since the prefix is unique-local and the NAT carries both), from V4.
+- tlibc's `listen_on` and `accept_any` give a server a listening socket per family and accept from whichever is ready; `sa_set`, `sa_len` and `sa_ntoa` handle a `struct sockaddr_in6`, which is big enough for every family.
 - **`wget`, `ssh`, `scp`, `sftp`, `host`** take IPv6 literals in brackets where a port can follow. `host` prints AAAA records.
-- **`telnetd`, `sshd` and `httpd` listen on both families.**
+- **`telnetd`, `sshd` and `httpd` listen on both families** (and `sshd` on TNET too), and log IPv6 peers in RFC 5952 text.
 - `/proc/net/if_inet6` has Linux's columns (in lowercase hex, as Linux writes them); `/proc/net/neigh6` lists the neighbour cache with its states and the default router; `/proc/net/stat6` has the counters, the RDNSS address and the link MTU.
-- `ifconfig` shows `inet6` lines with scope and state. `netstat` shows `tcp6` and `udp6` (V2).
+- `ifconfig` shows `inet6` lines between `inet` and `ether`, in net-tools' form (`inet6 fe80::5054:ff:fe12:3456  prefixlen 64  scopeid 0x20<link>`), with `tentative`, `deprecated` or `dadfailed` after an address that is not usable. `netstat` shows `tcp6` and `udp6` lines, the addresses as `fd00::2:22`.
 
 ## 7. Conformance
 
@@ -157,6 +161,6 @@ The gateway's smoltcp drops a packet that needs a neighbour it has not resolved,
 | | Contents | Gate |
 |---|---|---|
 | V1 ✅ | §1–§3 in the kernel; raw ICMPv6 sockets, `ping6`, `ip6vec`; `inject`/`capture` and RAs in `setun-net`; `/proc/net/{if_inet6,neigh6,stat6}`; the vectors | Trinux autoconfigures `fd00::5054:ff:fe12:3456` and pings `fd00::2` |
-| V2 | §4: UDP and TCP over IPv6; `nc -6`; `ifconfig` and `netstat` for IPv6; telnetd and httpd on both families | a test connection over IPv6 reaches `telnetd`; UDP both ways |
+| V2 ✅ | §4: UDP and TCP over IPv6; `nc -6`; `ifconfig` and `netstat` for IPv6; telnetd, httpd and sshd on both families; `Network::connect6`, `udp_send6` | a test connection over IPv6 reaches `telnetd`; UDP both ways |
 | V3 | §5: NAT, AAAA, `--net6` | `wget http://[fd00::2]:port/` from a host server on `::1`; the host's OpenSSH logs in over `--net6` |
 | V4 | §6: names, brackets, `ssh`/`scp`/`sftp`/`host`, `netstat` | `ssh` from Trinux to the host's sshd on `::1` by name |

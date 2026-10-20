@@ -543,13 +543,13 @@ quits.
 
 | Command | Synopsis | Description |
 |---|---|---|
-| `ifconfig` | `ifconfig [iface [addr] [netmask m] [gw g] [up\|down]]` | `/sbin`; show the interfaces, or set one (root) |
+| `ifconfig` | `ifconfig [iface [addr] [netmask m] [gw g] [up\|down]]` | `/sbin`; show the interfaces (IPv6 addresses from `/proc/net/if_inet6` too), or set one (root) |
 | `ping` | `ping [-c count] [-s size] [-W timeout] host` | set-user-ID root (raw ICMP), drops root once its socket is open; `size` at most 1472 |
 | `ping6` | `ping6 [-c count] [-s size] [-W timeout] host` | ICMPv6 echo (IPV6.md §6): `host` an IPv6 address (a link-local one is on eth0); set-user-ID root like `ping`; `size` at most 1452; no `ttl=` |
 | `ip6vec` | `ip6vec [file]` | checks `inet_pton6`/`inet_ntop6` against `/usr/share/ipv6vectors.txt` (IPV6.md §7) |
 | `tping` | `tping [-c count] [-s size] [-W timeout] host` | TCMP echo over TNET (TNET.md §3.1): data of `size` trytes over the whole tryte range (default 27, at most 2166), each checked on return; set-user-ID root like `ping` |
-| `nc` | `nc [-lubtzv] [-p port] [-w secs] [host] port` | connect, or `-l` listen for one connection; `-u` UDP; `-t` listen on TNET (a host with a TNET address connects over it); over TNET any tryte goes as it is, text included; `-b` octets as they are (otherwise text goes out as UTF-8 and UTF-8 comes in as characters); `-z` only test the port; `-v` verbose; `-w` connect timeout |
-| `netstat` | `netstat [-tualn]` | sockets from `/proc/net/tcp` and `/proc/net/udp`; `-a` all, `-l` listening only; addresses are always numeric |
+| `nc` | `nc [-lubtzv46] [-p port] [-w secs] [host] port` | connect, or `-l` listen for one connection; `-u` UDP; `-t` listen on TNET (a host with a TNET address connects over it); `-6` listen on IPv6 (an IPv6 address literal connects over it), `-4` IPv4, the default; over TNET any tryte goes as it is, text included; `-b` octets as they are (otherwise text goes out as UTF-8 and UTF-8 comes in as characters); `-z` only test the port; `-v` verbose; `-w` connect timeout |
+| `netstat` | `netstat [-tualn]` | sockets from `/proc/net/tcp`, `udp`, `tcp6` and `udp6`; `-a` all, `-l` listening only; addresses are always numeric |
 | `host` | `host [-s server] name` | DNS A records only (`/etc/hosts` is not read). Status 0 found, 1 not, 2 usage |
 | `wget` | `wget [-q] [-b] [-S] [-O file] [--max-redirect=n] [--no-check-certificate] [--ca-certificate=file] URL` | HTTP/1.1 and HTTPS (TLS 1.3); follows up to 20 redirects; chunked bodies; `-O -` writes to standard output; `-b` keeps octets; `-S` prints headers. Exit status as GNU wget: 4 network or TLS trouble, 5 certificate not verified, 7 malformed answer, 8 error answer or too many redirects |
 | `ssh` | `ssh [-p port] [-l user] [-i key] [-o KexAlgorithms=list] [-t \| -T] [user@]host [command ...]` | SSH client, over IPv4 or TNET; `~.` at the start of a line disconnects; `-o KexAlgorithms` picks the key exchanges to offer (default: the two post-quantum hybrids, then curve25519); exit status is the remote one, or 255 |

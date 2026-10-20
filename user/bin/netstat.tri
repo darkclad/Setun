@@ -1,5 +1,5 @@
-// netstat [-t] [-u] [-a] [-l]: the sockets, from /proc/net/tcp and
-// /proc/net/udp. Without -a only connections are shown, with -l only
+// netstat [-t] [-u] [-a] [-l]: the sockets, from /proc/net/tcp, udp,
+// tcp6 and udp6. Without -a only connections are shown, with -l only
 // listening sockets; addresses are always numeric.
 
 import "../lib/tlibc.tri";
@@ -40,6 +40,29 @@ fn put_addr(s: *char, width: int) {
     while (len < width) { puts(" "); len += 1; }
 }
 
+// 32 hex digits (Linux's order: four little-endian words) and a port into
+// "fd00::2:22", padded.
+fn put_addr6(s: *char, width: int) {
+    var a: [16]int;
+    var w: int = 0;
+    while (w < 4) {
+        var j: int = 0;
+        while (j < 4) { a[4 * w + 3 - j] = hexval(s + 8 * w + 2 * j, 2); j += 1; }
+        w += 1;
+    }
+    var port: int = hexval(s + 33, 4);
+    var out: [56]char;
+    strcpy(&out[0], inet_ntop6(&a[0]));
+    var n: int = strlen(&out[0]);
+    out[n] = ':';
+    n += 1;
+    if (port == 0) { out[n] = '*'; n += 1; out[n] = 0; }
+    else { itoa(port, &out[n]); }
+    puts(&out[0]);
+    var len: int = strlen(&out[0]);
+    while (len < width) { puts(" "); len += 1; }
+}
+
 fn state_name(st: int) -> *char {
     switch (st) {
         case 1: return "ESTABLISHED";
@@ -65,7 +88,7 @@ fn pad_int(v: int, width: int) {
     puts(s);
 }
 
-fn show(path: *char, proto: *char, tcp: int) {
+fn show(path: *char, proto: *char, tcp: int, v6: int) {
     var fd: int = open(path, O_RDONLY, 0);
     if (fd < 0) { perror2("netstat", path); return; }
     var n: int = read(fd, &buf[0], 6560);
@@ -82,19 +105,28 @@ fn show(path: *char, proto: *char, tcp: int) {
         var k: int = line;
         while (buf[k] != ':') { k += 1; }
         k += 2;
+        // with IPv6, each address is 32 digits instead of 8
+        var aw: int = v6 ? 38 : 14;
         var local: *char = &buf[k];
-        var remote: *char = &buf[k + 14];
-        var st: int = hexval(&buf[k + 28], 2);
-        var txq: int = hexval(&buf[k + 31], 8);
-        var rxq: int = hexval(&buf[k + 40], 8);
+        var remote: *char = &buf[k + aw];
+        var st: int = hexval(&buf[k + 2 * aw], 2);
+        var txq: int = hexval(&buf[k + 2 * aw + 3], 8);
+        var rxq: int = hexval(&buf[k + 2 * aw + 12], 8);
         var is_listen: int = tcp ? st == 10 : st == 7;
         if (all || (listening && is_listen) || (!listening && !is_listen)) {
             puts(proto);
-            pad_int(rxq, 9);
+            pad_int(rxq, 8);
             pad_int(txq, 7);
             puts(" ");
-            put_addr(local, 24);
-            put_addr(remote, 24);
+            if (v6) {
+                put_addr6(local, 23);           // and a space, even after a long address
+                puts(" ");
+                put_addr6(remote, 23);
+                puts(" ");
+            } else {
+                put_addr(local, 24);
+                put_addr(remote, 24);
+            }
             if (tcp) { puts(state_name(st)); }
             puts("\n");
         }
@@ -124,7 +156,7 @@ fn main(argc: int, argv: **char) -> int {
     puts(all ? "Active Internet connections (servers and established)\n"
              : listening ? "Active Internet connections (only servers)\n" : "Active Internet connections (w/o servers)\n");
     puts("Proto Recv-Q Send-Q Local Address           Foreign Address         State\n");
-    if (t) { show("/proc/net/tcp", "tcp", 1); }
-    if (u) { show("/proc/net/udp", "udp", 0); }
+    if (t) { show("/proc/net/tcp", "tcp ", 1, 0); show("/proc/net/tcp6", "tcp6", 1, 1); }
+    if (u) { show("/proc/net/udp", "udp ", 0, 0); show("/proc/net/udp6", "udp6", 0, 1); }
     return 0;
 }

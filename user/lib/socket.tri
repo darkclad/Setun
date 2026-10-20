@@ -743,3 +743,76 @@ fn text_to_utf8(in: *char, n: int, out: *tryte) -> int {
     }
     return m;
 }
+
+// ---- any family: struct sockaddr_in6 is big enough for all ----------------------------------
+
+fn sa_len(family: int) -> int { return family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in); }
+
+// family's address: addr (IPv4, TNET) or the 16 octets at addr6 (IPv6).
+fn sa_set(a: *sockaddr_in6, family: int, addr: int, addr6: *int, port: int) {
+    if (family == AF_INET6) {
+        var zero: [16]int;
+        var k: int = 0;
+        while (k < 16) { zero[k] = 0; k += 1; }
+        sockaddr6_set(a, addr6 == null ? &zero[0] : addr6, port);
+        return;
+    }
+    sockaddr_set_family(a as *sockaddr_in, family, addr, port);
+}
+
+// The address in text, in a static buffer.
+fn sa_ntoa(a: *sockaddr_in6) -> *char {
+    if (a.sin6_family == AF_INET6) { return inet_ntop6(&a.sin6_addr[0]); }
+    var b: *sockaddr_in = a as *sockaddr_in;
+    return addr_ntoa(b.sin_family, b.sin_addr);
+}
+
+// A listening TCP socket on port for each family in fams that can have
+// one (the first must: its failure is reported as -1 with errno); their
+// descriptors go into fds. The count.
+fn listen_on(fams: *int, nf: int, port: int, fds: *int) -> int {
+    var n: int = 0;
+    var i: int = 0;
+    while (i < nf) {
+        var l: int = socket(fams[i], SOCK_STREAM, 0);
+        if (l >= 0) {
+            var one: int = 1;
+            setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
+            var a: sockaddr_in6;
+            sa_set(&a, fams[i], 0, null, port);
+            if (bind(l, &a as *sockaddr_in, sa_len(fams[i])) < 0 || listen(l, 9) < 0) {
+                var e: int = errno;
+                close(l);
+                l = -1;
+                errno = e;
+            }
+        }
+        if (l < 0 && i == 0) { return -1; }
+        if (l >= 0) { fds[n] = l; n += 1; }
+        i += 1;
+    }
+    return n;
+}
+
+// Accept a connection on whichever of the n listening sockets has one
+// (at most 3); the peer's address goes to *from. -1 with errno.
+fn accept_any(fds: *int, n: int, from: *sockaddr_in6, flen: *int) -> int {
+    var which: int = fds[0];
+    if (n > 1) {
+        var ps: [3]pollfd;
+        var i: int = 0;
+        while (i < n) { ps[i].fd = fds[i]; ps[i].events = POLLIN; ps[i].revents = 0; i += 1; }
+        if (poll(&ps[0], n, -1) < 0) { return -1; }
+        i = 0;
+        while (i < n && ps[i].revents == 0) { i += 1; }
+        if (i == n) { errno = EINTR; return -1; }
+        which = fds[i];
+    }
+    *flen = sizeof(sockaddr_in6);
+    return accept(which, from as *sockaddr_in, flen);
+}
+
+fn close_all(fds: *int, n: int) {
+    var i: int = 0;
+    while (i < n) { close(fds[i]); i += 1; }
+}

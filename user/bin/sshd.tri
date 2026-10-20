@@ -724,43 +724,22 @@ fn main(argc: int, argv: **char) -> int {
     ssh_server = 1;
     crypt_init();
     if (host_key() < 0) { return 1; }
-    var l: int = socket(AF_INET, SOCK_STREAM, 0);
-    if (l < 0) { perror2("sshd", "socket"); return 1; }
-    var one: int = 1;
-    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, 3);
-    var a: sockaddr_in;
-    sockaddr_set(&a, INADDR_ANY, port);
-    if (bind(l, &a, sizeof(sockaddr_in)) < 0) { perror2("sshd", "bind"); return 1; }
-    if (listen(l, 9) < 0) { perror2("sshd", "listen"); return 1; }
-    // and on TNET, when the port fits in a tryte (docs/TNET.md §5)
-    var lt: int = port <= 9841 ? socket(AF_TNP, SOCK_STREAM, 0) : -1;
-    if (lt >= 0) {
-        setsockopt(lt, SOL_SOCKET, SO_REUSEADDR, &one, 3);
-        sockaddr_set_family(&a, AF_TNP, 0, port);
-        if (bind(lt, &a, sizeof(sockaddr_in)) < 0 || listen(lt, 9) < 0) { close(lt); lt = -1; }
-    }
+    // IPv4, IPv6 (docs/IPV6.md §6), and TNET when the port fits in a tryte (docs/TNET.md §5)
+    var fams: [3]int;
+    fams[0] = AF_INET;
+    fams[1] = AF_INET6;
+    fams[2] = AF_TNP;
+    var ls: [3]int;
+    var nl: int = listen_on(&fams[0], port <= 9841 ? 3 : 2, port, &ls[0]);
+    if (nl < 0) { perror2("sshd", "bind"); return 1; }
     fputs(STDERR_FILENO, "sshd: listening on port ");
     var tmp: [15]char;
     fputs(STDERR_FILENO, itoa(port, &tmp[0]));
     fputs(STDERR_FILENO, "\n");
     loop {
-        var from: sockaddr_in;
-        var flen: int = sizeof(sockaddr_in);
-        var which: int = l;
-        if (lt >= 0) {
-            var ps: [2]pollfd;
-            ps[0].fd = l;
-            ps[0].events = POLLIN;
-            ps[1].fd = lt;
-            ps[1].events = POLLIN;
-            if (poll(&ps[0], 2, -1) < 0) {
-                if (errno == EINTR) { continue; }
-                perror2("sshd", "poll");
-                return 1;
-            }
-            if (ps[0].revents == 0) { which = lt; }
-        }
-        var s: int = accept(which, &from, &flen);
+        var from: sockaddr_in6;
+        var flen: int = 0;
+        var s: int = accept_any(&ls[0], nl, &from, &flen);
         if (s < 0) {
             if (errno == EINTR) { continue; }
             perror2("sshd", "accept");
@@ -768,10 +747,9 @@ fn main(argc: int, argv: **char) -> int {
         }
         var st: int = 0;
         while (waitpid(-1, &st, WNOHANG) > 0) {}
-        strcpy(&peer[0], addr_ntoa(from.sin_family, from.sin_addr));
+        strcpy(&peer[0], sa_ntoa(&from));
         if (once) {
-            close(l);
-            if (lt >= 0) { close(lt); }
+            close_all(&ls[0], nl);
             sock = s;
             log2("connection from ", &peer[0]);
             serve();
@@ -779,8 +757,7 @@ fn main(argc: int, argv: **char) -> int {
         }
         var pid: int = fork();
         if (pid == 0) {
-            close(l);
-            if (lt >= 0) { close(lt); }
+            close_all(&ls[0], nl);
             sock = s;
             log2("connection from ", &peer[0]);
             serve();
