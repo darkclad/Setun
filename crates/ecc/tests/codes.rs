@@ -57,7 +57,7 @@ fn sec_columns() {
     all.sort();
     all.dedup();
     assert_eq!(all.len(), 31);
-    assert!(all.iter().all(|&v| v >= 1 && v <= 40));
+    assert!(all.iter().all(|&v| (1..=40).contains(&v)));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Setun-26 browser front end: plain `extern "C"` WebAssembly exports, driven
+//! Setun-11̅ browser front end: plain `extern "C"` WebAssembly exports, driven
 //! by `web/index.html` (no wasm-bindgen needed).
 //!
 //! The page calls `setun_boot`, then once per animation frame: input calls,

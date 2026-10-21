@@ -477,9 +477,25 @@ fn poke_outside_map_panics() {
 }
 
 #[test]
-#[should_panic(expected = "ROM image too large")]
+#[should_panic(expected = "more than the ROM's")]
 fn oversized_rom_panics() {
     Machine::new(1, 0).load_rom(&vec![0; 3 * PAGE as usize + 1]);
+}
+
+/// An image from outside (`setun --rom`): refused whole, with the reason.
+#[test]
+fn bad_rom_images_are_refused() {
+    let mut m = Machine::new(1, 0);
+    let e = m.try_load_rom(&vec![0; 3 * PAGE as usize + 1]).unwrap_err();
+    assert!(e.contains("more than the ROM's"), "{e}");
+    let mut img = vec![5i16; 10];
+    img[7] = 9842;
+    let e = m.try_load_rom(&img).unwrap_err();
+    assert_eq!(e, "tryte 7 is 9842, outside -9841..9841");
+    let base = setun_core::memory::frame_start(setun_core::memory::ROM_FIRST_FRAME);
+    assert_eq!(m.mem.read_tryte(base).unwrap().value(), 0, "nothing was loaded");
+    assert!(m.try_load_rom(&[9841, -9841, 0]).is_ok());
+    assert_eq!(m.mem.read_tryte(base).unwrap().value(), 9841);
 }
 
 // ---- devices ---------------------------------------------------------------

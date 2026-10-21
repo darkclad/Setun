@@ -97,13 +97,7 @@ fn an_interactive_ssh_session() {
 /// it, and scp with the address itself in brackets.
 #[test]
 fn ssh_and_scp_by_name_over_ipv6() {
-    let mut s = Session::boot();
-    let mut tries = 0;
-    while !s.out.contains("eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n") {
-        tries += 1;
-        assert!(tries < 100, "no global address");
-        s.idle(10_000_000);
-    }
+    let mut s = Session::boot6();
     s.net.dns_name6("trinux6.test", setun_net::GUEST6);
     let o = with_password(&mut s, "ssh -i /nokey root@trinux6.test 'netstat -t | grep ESTAB'; echo status $?", "root");
     has(&o, &["root@trinux6.test's password: ", "status 0\n"]);

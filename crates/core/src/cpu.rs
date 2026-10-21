@@ -1,4 +1,4 @@
-//! Setun-26 CPU: registers, decode/execute, traps and the MMU.
+//! Setun-11̅ CPU: registers, decode/execute, traps and the MMU.
 
 use crate::io::Io;
 use crate::isa::{alu, cond, cr, falu, fcvt, fld, fsr, io as port, mem, memr, mode, op, sys, valu, vector, vmem, vmov};
@@ -20,7 +20,7 @@ mod jit;
 pub const RESET_PC: i64 = -59_049;
 
 /// `CPUID` value: ISA version (v0.7) in the low trits, and trit 1 (+1):
-/// the FPU is present (always +1 on Setun-26).
+/// the FPU is present (always +1 on Setun-11̅).
 pub const CPUID_VERSION: i64 = 7;
 pub const CPUID: i64 = CPUID_VERSION + 2_541_865_828_329; // + 3^26
 
@@ -65,6 +65,10 @@ pub enum Step {
     /// A fault while delivering a double fault: the machine was reset.
     TripleFault,
 }
+
+/// A region being compiled: (request, its blocks and their offsets from
+/// the root, code slot, root's word index, arena generation).
+type JitPending = (u64, Vec<(u32, i64)>, usize, usize, u64);
 
 pub struct Cpu {
     regs: [Word; 27],
@@ -144,9 +148,8 @@ pub struct Cpu {
     jit_threshold: u32,
     /// Regions being compiled: request id → (root block, slot, word, arena
     /// generation), to check the block is still current when code arrives.
-    /// Regions being compiled: (request, its blocks and their offsets
-    /// from the root, code slot, root's word index, arena generation).
-    jit_pending: Vec<(u64, Vec<(u32, i64)>, usize, usize, u64)>,
+    /// Regions being compiled.
+    jit_pending: Vec<JitPending>,
     jit_next: u64,
     /// A fault raised inside compiled code, for the block engine to deliver.
     jit_fault: Option<Fault>,

@@ -1,4 +1,4 @@
-//! Setun-26 assembly language.
+//! Setun-11̅ assembly language.
 //!
 //! ```text
 //! ; comment                        NAME = expr   /   .equ NAME, expr

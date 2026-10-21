@@ -1,4 +1,4 @@
-//! Setun-26 assembler and disassembler.
+//! Setun-11̅ assembler and disassembler.
 //!
 //! ```text
 //! setun-asm build IN.s [-o OUT.t1b2] [--rom] [--listing]

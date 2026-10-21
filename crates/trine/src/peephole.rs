@@ -396,10 +396,9 @@ fn redundant(lines: &[String], live: &[u32]) -> Option<usize> {
                 }
             }
             None => {
-                match info(&i).map(|inf| inf.ctl) {
-                    // a conditional branch: its fall-through keeps the values
-                    Some(Ctl::Branch(_)) => continue,
-                    _ => {}
+                // a conditional branch: its fall-through keeps the values
+                if let Some(Ctl::Branch(_)) = info(&i).map(|inf| inf.ctl) {
+                    continue;
                 }
                 match op {
                     // stores move memory on; registers stay

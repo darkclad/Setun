@@ -1169,7 +1169,6 @@ dependencies = [
  "backtrace",
  "setun-asm",
  "setun-core",
- "ternary",
  "trine",
  "trinux",
 ]

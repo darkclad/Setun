@@ -5,111 +5,25 @@
 
 mod common;
 use common::*;
-use std::io::{ErrorKind, Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 
-/// A host-side server on [::1]: it reads a request up to `end`, answers
-/// `reply(request)` and closes. `EchoServer::new()` answers a line with
-/// "the host got: LINE".
-struct EchoServer {
-    listener: TcpListener,
-    open: Vec<(TcpStream, Vec<u8>)>,
-    requests: Vec<String>,
-    end: &'static [u8],
-    reply: fn(&str) -> Vec<u8>,
-}
-
-impl EchoServer {
-    fn new() -> EchoServer {
-        Self::speaking(b"\n", |req| format!("the host got: {req}").into_bytes())
-    }
-
-    fn speaking(end: &'static [u8], reply: fn(&str) -> Vec<u8>) -> EchoServer {
-        let listener = TcpListener::bind("[::1]:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        EchoServer { listener, open: Vec::new(), requests: Vec::new(), end, reply }
-    }
-
-    fn port(&self) -> u16 {
-        self.listener.local_addr().unwrap().port()
-    }
-
-    fn poll(&mut self) {
-        while let Ok((c, _)) = self.listener.accept() {
-            c.set_nonblocking(true).unwrap();
-            self.open.push((c, Vec::new()));
-        }
-        let mut k = 0;
-        while k < self.open.len() {
-            let (c, buf) = &mut self.open[k];
-            let mut b = [0u8; 4096];
-            let done = match c.read(&mut b) {
-                Ok(0) => true,
-                Ok(n) => {
-                    buf.extend_from_slice(&b[..n]);
-                    buf.windows(self.end.len()).any(|w| w == self.end)
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => false,
-                Err(_) => true,
-            };
-            if done {
-                let req = String::from_utf8_lossy(buf).into_owned();
-                c.set_nonblocking(false).unwrap();
-                let _ = c.write_all(&(self.reply)(&req));
-                let _ = c.shutdown(std::net::Shutdown::Both);
-                self.requests.push(req);
-                self.open.remove(k);
-            } else {
-                k += 1;
-            }
-        }
-    }
-}
-
-/// Type a command and wait for its prompt, running `serve` meanwhile.
-fn cmd_polling(s: &mut Session, line: &str, mut serve: impl FnMut()) -> String {
-    let start = s.out.len();
-    s.send(&format!("{line}\n"));
-    let mut n = 0u64;
-    loop {
-        serve();
-        let o = &s.out[start..];
-        if o.len() > line.len() + 1 && o.ends_with("$ ") {
-            break;
-        }
-        assert!(n < 2_000_000_000, "timed out on {line:?}:\n{}", s.out);
-        s.step();
-        n += SLICE;
-    }
-    let text = s.out[start..].to_string();
-    s.mark = s.out.len();
-    let body = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
-    body.strip_suffix("$ ").unwrap_or(&body).to_string()
-}
-
-/// Booted, with the global IPv6 address configured.
-fn boot6() -> Session {
-    let mut s = Session::boot();
-    let mut tries = 0;
-    while !s.out.contains("eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n") {
-        tries += 1;
-        assert!(tries < 100, "no global address:\n{}", s.out);
-        s.idle(10_000_000);
-    }
-    s
+/// A line server on [::1]: it answers a line with "the host got: LINE".
+fn echo6() -> HostServer {
+    HostServer::new("[::1]:0", b"\n", |req| format!("the host got: {req}").into_bytes())
 }
 
 #[test]
 fn trinux_connects_out_over_ipv6() {
-    let mut s = boot6();
-    let mut srv = EchoServer::new();
+    let mut s = Session::boot6();
+    let mut srv = echo6();
     let p = srv.port();
     // fd00::2 stands for the host's ::1
-    let o = cmd_polling(&mut s, &format!("echo hi over IPv6 | nc fd00::2 {p}; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("echo hi over IPv6 | nc fd00::2 {p}; echo status $?"), || srv.poll());
     has(&o, &["the host got: hi over IPv6\nstatus 0"]);
     // an outside address that stands for the host, as a real server would
     s.net.alias6("2001:db8::7".parse().unwrap(), "::1".parse().unwrap());
-    let o = cmd_polling(&mut s, &format!("echo outside | nc -v 2001:db8::7 {p}"), || srv.poll());
+    let o = s.cmd_with(&format!("echo outside | nc -v 2001:db8::7 {p}"), || srv.poll());
     has(&o, &[&format!("Connection to 2001:db8::7 port {p} [tcp] succeeded!"), "the host got: outside\n"]);
     assert_eq!(srv.requests, vec!["hi over IPv6\n", "outside\n"]);
     assert!(s.net.outbound_flows() <= 2);
@@ -124,14 +38,14 @@ fn trinux_connects_out_over_ipv6() {
     assert_eq!(s.net.outbound_flows(), before, "nothing went to the host");
     // with the NAT off, the gateway refuses at once
     s.net.set_outbound(false);
-    let o = cmd_polling(&mut s, &format!("nc fd00::2 {p}; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("nc fd00::2 {p}; echo status $?"), || srv.poll());
     has(&o, &["nc: connect: Connection refused\nstatus 1"]);
     assert_eq!(srv.requests.len(), 2, "nothing more reached the host");
 }
 
 #[test]
 fn udp_out_over_ipv6() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     let echo = UdpSocket::bind("[::1]:0").unwrap();
     echo.set_nonblocking(true).unwrap();
     let p = echo.local_addr().unwrap().port();
@@ -145,10 +59,10 @@ fn udp_out_over_ipv6() {
             froms.push(from);
         }
     };
-    let o = cmd_polling(&mut s, &format!("echo 'datagram over IPv6' | nc -u fd00::2 {p}"), &mut serve);
+    let o = s.cmd_with(&format!("echo 'datagram over IPv6' | nc -u fd00::2 {p}"), &mut serve);
     has(&o, &["echo: datagram over IPv6\n"]);
     s.net.alias6("2001:db8::9".parse().unwrap(), "::1".parse().unwrap());
-    let o = cmd_polling(&mut s, &format!("echo 'Сетунь' | nc -u 2001:db8::9 {p}"), &mut serve);
+    let o = s.cmd_with(&format!("echo 'Сетунь' | nc -u 2001:db8::9 {p}"), &mut serve);
     has(&o, &["echo: Сетунь\n"]);
     assert!(froms.iter().all(|f| f.is_ipv6()), "{froms:?}");
     assert!(s.net.stats.udp_out >= 2 && s.net.stats.udp_in >= 2);
@@ -159,7 +73,7 @@ fn udp_out_over_ipv6() {
 /// on ::1 or 127.0.0.1, the guest side always IPv6.
 #[test]
 fn a_port_forward_over_ipv6() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     for host in ["[::1]:0", "127.0.0.1:0"] {
         let a = s.net.forward6(host.parse().unwrap(), 23).unwrap();
         let mut c = TcpStream::connect(a).unwrap();
@@ -189,7 +103,7 @@ fn a_port_forward_over_ipv6() {
 /// names in nc and ping6, and /etc/hosts' ::1.
 #[test]
 fn names_of_either_family() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.dns_name6("six.test", "2001:db8::7".parse().unwrap());
     s.net.dns_name("both.test", [203, 0, 113, 7]);
     s.net.dns_name6("both.test", "2001:db8::8".parse().unwrap());
@@ -211,9 +125,9 @@ fn names_of_either_family() {
     has(&o, &["Host nosuch.invalid not found: 3(NXDOMAIN)\nstatus 1"]);
     // a name with only an AAAA record reaches the host through the NAT
     s.net.alias6("2001:db8::7".parse().unwrap(), "::1".parse().unwrap());
-    let mut srv = EchoServer::new();
+    let mut srv = echo6();
     let p = srv.port();
-    let o = cmd_polling(&mut s, &format!("echo by name | nc six.test {p}; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("echo by name | nc six.test {p}; echo status $?"), || srv.poll());
     has(&o, &["the host got: by name\nstatus 0"]);
     // -4 refuses a name that has IPv6 only; -6 refuses one with IPv4 only
     let o = s.cmd(&format!("nc -4 six.test {p}; echo status $?"));
@@ -256,20 +170,20 @@ fn http(req: &str) -> Vec<u8> {
 /// name that has IPv6 only.
 #[test]
 fn wget_over_ipv6() {
-    let mut s = boot6();
-    let mut srv = EchoServer::speaking(b"\r\n\r\n", http);
+    let mut s = Session::boot6();
+    let mut srv = HostServer::new("[::1]:0", b"\r\n\r\n", http);
     let p = srv.port();
-    let o = cmd_polling(&mut s, &format!("wget -O - http://[fd00::2]:{p}/hello.txt; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("wget -O - http://[fd00::2]:{p}/hello.txt; echo status $?"), || srv.poll());
     has(&o, &["Connecting to fd00::2 (fd00::2)... connected.", "200 OK\nпривет по IPv6\n", "status 0"]);
     assert!(srv.requests[0].contains(&format!("\r\nHost: [fd00::2]:{p}\r\n")), "{}", srv.requests[0]);
     // a redirect to a path keeps the brackets
-    let o = cmd_polling(&mut s, &format!("wget -q -O - http://[fd00::2]:{p}/moved; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("wget -q -O - http://[fd00::2]:{p}/moved; echo status $?"), || srv.poll());
     has(&o, &["привет по IPv6\nstatus 0"]);
     assert!(srv.requests[2].starts_with("GET /hello.txt ") && srv.requests[2].contains(&format!("Host: [fd00::2]:{p}\r\n")), "{}", srv.requests[2]);
     // by name
     s.net.dns_name6("web6.test", "2001:db8::80".parse().unwrap());
     s.net.alias6("2001:db8::80".parse().unwrap(), "::1".parse().unwrap());
-    let o = cmd_polling(&mut s, &format!("wget -q -O - http://web6.test:{p}/hello.txt; echo status $?"), || srv.poll());
+    let o = s.cmd_with(&format!("wget -q -O - http://web6.test:{p}/hello.txt; echo status $?"), || srv.poll());
     has(&o, &["привет по IPv6\nstatus 0"]);
     assert!(srv.requests[3].contains(&format!("Host: web6.test:{p}\r\n")));
     // malformed brackets
@@ -284,7 +198,7 @@ fn wget_over_ipv6() {
 /// take a bracketed address as one).
 #[test]
 fn literals_are_not_names() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     let o = s.cmd("host '[fd00::2]'; host 'a:b'; host 'web/x'; echo status $?");
     has(&o, &["host: '[fd00::2]' is not a legal name\n", "host: 'a:b' is not a legal name\n", "host: 'web/x' is not a legal name\n"]);
     let o = s.cmd("nc '[fd00::2]' 22; echo status $?");

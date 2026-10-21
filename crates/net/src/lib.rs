@@ -1,4 +1,4 @@
-//! `setun-net`: a user-mode network behind the Setun-26 network card
+//! `setun-net`: a user-mode network behind the Setun-11̅ network card
 //! (docs/NETWORK.md §2), in the manner of QEMU's "slirp".
 //!
 //! The network is the guest's gateway at 10.0.2.2 on 10.0.2.0/24, built on
@@ -291,11 +291,6 @@ impl Network {
         self.nat.names.entry(name.to_ascii_lowercase()).or_default().push(IpAddr::V6(addr));
     }
 
-    /// How long a host connection may take before the guest is refused.
-    pub fn set_connect_timeout(&mut self, d: std::time::Duration) {
-        self.nat.connect_timeout = d;
-    }
-
     /// Connections made through the NAT so far.
     pub fn outbound_flows(&self) -> usize {
         self.nat.flows.len()
@@ -320,10 +315,6 @@ impl Network {
     /// Edit frames in flight (see [`tcp_payload`] and [`fix_checksums`]).
     pub fn set_mangle(&mut self, f: impl FnMut(Dir, &mut Vec<u8>) + Send + 'static) {
         self.mangle = Some(Box::new(f));
-    }
-
-    pub fn clear_mangle(&mut self) {
-        self.mangle = None;
     }
 
     /// Exchange frames with the card and move data on every connection.
@@ -384,12 +375,6 @@ impl Network {
             self.stats.frames_to_guest += 1;
             m.dev.net_receive(&f);
         }
-    }
-
-    /// How long (µs of emulated time) until smoltcp has a timer to run, if
-    /// it has one: a front end may sleep that long when the guest is idle.
-    pub fn poll_delay_us(&mut self, m: &Machine) -> Option<i64> {
-        self.iface.poll_delay(now(m), &self.sockets).map(|d| d.total_micros() as i64)
     }
 
     fn ephemeral_port(&mut self) -> u16 {
@@ -725,6 +710,30 @@ impl Network {
 }
 
 /// Where the TCP payload of an Ethernet/IPv4/TCP frame lies, if it is one.
+/// The Internet checksum (RFC 1071) of the parts, as if they were one run
+/// of octets: the ones'-complement sum of its 16-bit words, folded and
+/// complemented. An odd-length part's last octet pairs with the next part's
+/// first; the run as a whole is padded with a zero.
+pub fn checksum(parts: &[&[u8]]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut high: Option<u8> = None;
+    for p in parts {
+        for &b in p.iter() {
+            match high.take() {
+                Some(h) => sum += u32::from(h) << 8 | u32::from(b),
+                None => high = Some(b),
+            }
+        }
+    }
+    if let Some(h) = high {
+        sum += u32::from(h) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 pub fn tcp_payload(f: &[u8]) -> Option<std::ops::Range<usize>> {
     if f.len() < 54 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 6 {
         return None;
@@ -745,7 +754,7 @@ pub fn fix_checksums(f: &mut [u8]) {
         let len = u16::from_be_bytes([f[18], f[19]]) as usize;
         f[70] = 0;
         f[71] = 0;
-        let c = ip6::checksum(&[&f[22..54], &(len as u32).to_be_bytes(), &[0, 0, 0, 6], &f[54..54 + len]]);
+        let c = checksum(&[&f[22..54], &(len as u32).to_be_bytes(), &[0, 0, 0, 6], &f[54..54 + len]]);
         f[70..72].copy_from_slice(&c.to_be_bytes());
         return;
     }
@@ -755,20 +764,8 @@ pub fn fix_checksums(f: &mut [u8]) {
     let len = total - ihl;
     f[t + 16] = 0;
     f[t + 17] = 0;
-    let mut sum: u32 = 0;
-    for c in f[26..34].chunks(2) {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
-    }
-    sum += 6 + len as u32;
-    for c in f[t..t + len].chunks(2) {
-        sum += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let c = !(sum as u16);
-    f[t + 16] = (c >> 8) as u8;
-    f[t + 17] = c as u8;
+    let c = checksum(&[&f[26..34], &[0, 6], &(len as u16).to_be_bytes(), &f[t..t + len]]);
+    f[t + 16..t + 18].copy_from_slice(&c.to_be_bytes());
 }
 
 // ---- the NAT and DNS (nat.rs) ---------------------------------------------------------------

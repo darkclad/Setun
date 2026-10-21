@@ -30,7 +30,7 @@ pub fn run(path: &Path) {
         total += 1;
     }
     let mut v: Vec<_> = hits.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     println!("{} steps, {total} samples", steps);
     for (n, c) in v.iter().take(20) {
         println!("{:>6.2}%  {n}", 100.0 * *c as f64 / total as f64);
@@ -122,7 +122,7 @@ pub fn trinux(script: &str) {
     }
     let show = |h: std::collections::HashMap<String, u64>, n: usize| {
         let mut v: Vec<_> = h.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (k, c) in v.iter().take(n) {
             println!("{:>6.2}%  {k}", 100.0 * *c as f64 / total as f64);
         }

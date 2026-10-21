@@ -40,7 +40,7 @@ pub fn trits_of(mut v: i64, n: usize) -> Vec<Trit> {
     let mut t = vec![0; n];
     for x in t.iter_mut() {
         let r = v.rem_euclid(3);
-        let d = if r == 2 { -1 } else { r as i64 };
+        let d = if r == 2 { -1 } else { r };
         *x = d as Trit;
         v = (v - d) / 3;
     }

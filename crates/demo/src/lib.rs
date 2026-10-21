@@ -1,4 +1,4 @@
-//! Demo ROM for the Setun-26 front ends, written in assembly (`demo.s`).
+//! Demo ROM for the Setun-11̅ front ends, written in assembly (`demo.s`).
 //!
 //! Boots from the reset vector (paging off, ring +1) and shows:
 //! * a text-mode screen with machine facts, the 27 text colours, the RAM size

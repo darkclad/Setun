@@ -1,6 +1,10 @@
 //! Trinux K6: the tfs root on disk, the buffer cache, mounts, /proc and ps.
 //! Files must survive a reboot; damaged disks must give errors, not crashes.
 
+mod common;
+#[allow(unused_imports)]
+use common::{has as assert_has};
+
 use std::path::PathBuf;
 use trinux::tfs::{self, Tfs};
 use trinux::{Root, TFS_START};
@@ -68,11 +72,6 @@ fn damaged_disk(f: impl FnOnce(&mut Tfs)) -> Vec<i16> {
     disk
 }
 
-fn assert_has(out: &str, wants: &[&str]) {
-    for w in wants {
-        assert!(out.contains(w), "missing {w:?} in:\n{out}");
-    }
-}
 
 fn assert_clean(disk: &[i16]) {
     let fs = trinux::tfs_of(disk).unwrap();

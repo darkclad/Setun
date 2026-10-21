@@ -110,14 +110,7 @@ fn ip_frame(proto: u8, payload: &[u8], tweak: impl FnOnce(&mut Vec<u8>)) -> Vec<
 }
 
 fn checksum(data: &[u8]) -> u16 {
-    let mut s: u32 = 0;
-    for c in data.chunks(2) {
-        s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
-    }
-    while s > 0xffff {
-        s = (s & 0xffff) + (s >> 16);
-    }
-    !(s as u16)
+    setun_net::checksum(&[data])
 }
 
 fn icmp_echo(seq: u8) -> Vec<u8> {
@@ -411,7 +404,7 @@ impl Telnet {
         };
         self.text.push_str(std::str::from_utf8(&keep[..cut]).unwrap());
         let mut rest = keep[cut..].to_vec();
-        rest.extend(self.raw.drain(..));
+        rest.append(&mut self.raw);
         self.raw = rest;
     }
 

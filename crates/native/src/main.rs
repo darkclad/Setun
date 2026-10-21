@@ -1,4 +1,4 @@
-//! Setun-26 native front end.
+//! The Setun-11̅ native front end, binary `setun`.
 //!
 //! A window showing the display (text or graphics mode), keyboard and mouse
 //! input, and the serial console on stdin/stdout. Without `--rom` it boots
@@ -7,11 +7,7 @@
 //! (for ssh); without `--disk` it boots a Trinux disk built from the source
 //! tree.
 //!
-//! ```text
-//! setun [--rom FILE.t1b2] [--disk FILE.t1b2] [--ram FRAMES] [--mips N]
-//!       [--scale N] [--headless INSTRUCTIONS] [--keys TEXT] [--screenshot FILE.png]
-//! setun --console [--disk FILE.t1b2] [--ram FRAMES]
-//! ```
+//! `setun --help` prints the options (`usage()` below).
 
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
 use setun_core::devices::FileDisk;
@@ -65,11 +61,10 @@ impl Links {
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale N]\n\
-         \x20            [--headless INSTRUCTIONS] [--keys TEXT] [--screenshot FILE.png]\n\
-         \x20      setun --console [--disk FILE.t1b2] [--ram FRAMES]\n\
+const USAGE: &str = "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale 1|2|4]\n\
+         \x20            [--headless INSTRUCTIONS] [--keys TEXT] [--press A,B,..] [--screenshot FILE.png]\n\
+         \x20            [--net SPEC]... [--net6 SPEC]... [--tlink SPEC] [--tlink-addr A.B.C]\n\
+         \x20      setun --console [--disk FILE.t1b2] [--ram FRAMES] [--net SPEC]... [--net6 SPEC]... [--tlink SPEC]\n\
          \n\
          --ram FRAMES     RAM in 3^9-tryte pages (default 19683 = 3^18 trytes)\n\
          --mips N         emulated speed in millions of instructions per second (default 10)\n\
@@ -82,8 +77,18 @@ fn usage() -> ! {
          --net [ADDR:]HOST:GUEST  attach the user-mode network, forwarding a host port (repeatable; 'on': none)\n\
          --net6 [ADDR:]HOST:GUEST the same, reaching the guest over IPv6 (ADDR defaults to [::1])\n\
          --tlink listen:PORT | connect:HOST:PORT  a ternary link to another setun over UDP\n\
-         --tlink-addr A.B.C   this station's TNET address, three trytes (default 0.0.1)"
-    );
+         --tlink-addr A.B.C   this station's TNET address, three trytes (default 0.0.1)\n\
+         --help           this text";
+
+/// A bad command line: the usage on stderr, status 2.
+fn usage() -> ! {
+    eprintln!("{USAGE}");
+    std::process::exit(2)
+}
+
+/// A value for `flag` that does not make sense.
+fn bad(flag: &str, why: &str) -> ! {
+    eprintln!("setun: {flag}: {why}");
     std::process::exit(2)
 }
 
@@ -111,9 +116,28 @@ fn parse_args() -> Args {
             "--rom" => a.rom = Some(val().into()),
             "--demo" => a.demo = true,
             "--disk" => a.disk = Some(val().into()),
-            "--ram" => a.ram_frames = val().parse().unwrap_or_else(|_| usage()),
-            "--mips" => a.mips = val().parse().unwrap_or_else(|_| usage()),
-            "--scale" => a.scale = val().parse().unwrap_or_else(|_| usage()),
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                std::process::exit(0)
+            }
+            "--ram" => {
+                a.ram_frames = val().parse().unwrap_or_else(|_| usage());
+                if a.ram_frames < 1 {
+                    bad("--ram", "at least 1 page");
+                }
+            }
+            "--mips" => {
+                a.mips = val().parse().unwrap_or_else(|_| usage());
+                if !(a.mips > 0.0 && a.mips.is_finite()) {
+                    bad("--mips", "a speed above 0");
+                }
+            }
+            "--scale" => {
+                a.scale = val().parse().unwrap_or_else(|_| usage());
+                if ![1, 2, 4].contains(&a.scale) {
+                    bad("--scale", "1, 2 or 4");
+                }
+            }
             "--headless" => a.headless = Some(val().parse().unwrap_or_else(|_| usage())),
             "--keys" => a.keys = val(),
             "--press" => {
@@ -192,6 +216,9 @@ fn unix_now() -> i64 {
 /// Read a T1B2 file: one tryte per little-endian i16.
 fn read_t1b2(path: &PathBuf) -> std::io::Result<Vec<i16>> {
     let bytes = std::fs::read(path)?;
+    if bytes.len() % 2 != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "an odd number of bytes: not a .t1b2 image"));
+    }
     Ok(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
 }
 
@@ -203,7 +230,10 @@ fn build_machine(args: &Args) -> Machine {
                 std::process::exit(1)
             });
             let mut m = Machine::new(args.ram_frames, unix_now());
-            m.load_rom(&rom);
+            if let Err(e) = m.try_load_rom(&rom) {
+                eprintln!("setun: ROM {}: {e}", path.display());
+                std::process::exit(1)
+            }
             m
         }
         None if args.demo => setun_demo::machine(args.ram_frames, unix_now()),
@@ -234,11 +264,16 @@ fn save_png(m: &Machine, path: &PathBuf) {
     let mut px = Vec::new();
     let (w, h) = m.dev.display.render(&m.mem, &mut px);
     let rgb: Vec<u8> = px.iter().flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8]).collect();
-    let file = std::fs::File::create(path).expect("create screenshot");
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header().and_then(|mut wr| wr.write_image_data(&rgb)).expect("write screenshot");
+    let written = std::fs::File::create(path).map_err(|e| e.to_string()).and_then(|file| {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().and_then(|mut wr| wr.write_image_data(&rgb)).map_err(|e| e.to_string())
+    });
+    if let Err(e) = written {
+        eprintln!("setun: cannot write screenshot {}: {e}", path.display());
+        std::process::exit(1)
+    }
 }
 
 fn headless(mut m: Machine, n: u64, args: &Args) {
@@ -346,7 +381,7 @@ fn main() {
     let scale = match args.scale {
         1 => Scale::X1,
         4 => Scale::X4,
-        _ => Scale::X2,
+        _ => Scale::X2, // parse_args lets only 1, 2 and 4 through
     };
     let mut window = Window::new(
         "Setun-11̅",

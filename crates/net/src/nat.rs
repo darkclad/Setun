@@ -37,6 +37,10 @@ pub(crate) enum FlowState {
     Open,
 }
 
+/// A DNS query waiting for the resolver: who asked, whether on the IPv6
+/// server, the query, and where the addresses will come.
+pub(crate) type PendingDns = (smoltcp::wire::IpEndpoint, bool, Vec<u8>, Receiver<Vec<IpAddr>>);
+
 pub(crate) struct Flow {
     pub gport: u16,
     pub dst: IpAddr,
@@ -55,8 +59,8 @@ pub(crate) struct Nat {
     pub aliases: HashMap<IpAddr, IpAddr>,
     /// Names DNS answers itself (tests), before asking the host.
     pub names: HashMap<String, Vec<IpAddr>>,
-    /// Queries waiting for the resolver: who asked (and on which server), the query.
-    pub pending_dns: Vec<(smoltcp::wire::IpEndpoint, bool, Vec<u8>, Receiver<Vec<IpAddr>>)>,
+    /// Queries waiting for the resolver.
+    pub pending_dns: Vec<PendingDns>,
     pub connect_timeout: Duration,
 }
 
@@ -148,16 +152,8 @@ pub(crate) fn fix_ip_checksum(f: &mut [u8]) {
     let ihl = (f[14] & 15) as usize * 4;
     f[24] = 0;
     f[25] = 0;
-    let mut sum: u32 = 0;
-    for c in f[14..14 + ihl].chunks(2) {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let c = !(sum as u16);
-    f[24] = (c >> 8) as u8;
-    f[25] = c as u8;
+    let c = crate::checksum(&[&f[14..14 + ihl]]);
+    f[24..26].copy_from_slice(&c.to_be_bytes());
 }
 
 impl Nat {
@@ -355,24 +351,9 @@ pub(crate) fn udp_frame(to_mac: [u8; 6], src: IpAddr, sport: u16, dst: IpAddr, d
     f.extend_from_slice(&[0, 0]);
     f.extend_from_slice(data);
     fix_ip_checksum(&mut f);
-    // the UDP checksum over the pseudo-header
-    let mut sum: u32 = 0;
-    for c in f[26..34].chunks(2) {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
-    }
-    sum += 17 + ulen as u32;
-    for c in f[34..].chunks(2) {
-        sum += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let c = match !(sum as u16) {
-        0 => 0xffff,
-        x => x,
-    };
-    f[40] = (c >> 8) as u8;
-    f[41] = c as u8;
+    // the UDP checksum over the pseudo-header; 0 goes as 0xFFFF
+    let c = crate::checksum(&[&f[26..34], &[0, 17], &(ulen as u16).to_be_bytes(), &f[34..]]);
+    f[40..42].copy_from_slice(&(if c == 0 { 0xffff } else { c }).to_be_bytes());
     f
 }
 
@@ -385,7 +366,7 @@ fn udp6_frame(to_mac: [u8; 6], src: IpAddr, sport: u16, dst: IpAddr, dport: u16,
     u.extend_from_slice(&(ulen as u16).to_be_bytes());
     u.extend_from_slice(&[0, 0]);
     u.extend_from_slice(data);
-    let c = crate::ip6::checksum(&[&src.octets(), &dst.octets(), &(ulen as u32).to_be_bytes(), &[0, 0, 0, 17], &u]);
+    let c = crate::checksum(&[&src.octets(), &dst.octets(), &(ulen as u32).to_be_bytes(), &[0, 0, 0, 17], &u]);
     u[6..8].copy_from_slice(&(if c == 0 { 0xffff } else { c }).to_be_bytes());
     let mut f = Vec::with_capacity(54 + ulen);
     f.extend_from_slice(&to_mac);
@@ -470,7 +451,17 @@ mod tests {
         let f = udp6_frame([2; 6], "2001:db8::1".parse().unwrap(), 53, "fd00::5".parse().unwrap(), 4000, b"reply");
         assert_eq!(f.len(), 54 + 8 + 5);
         assert_eq!(&f[12..14], &[0x86, 0xdd]);
-        let c = crate::ip6::checksum(&[&f[22..54], &13u32.to_be_bytes(), &[0, 0, 0, 17], &f[54..]]);
+        let c = crate::checksum(&[&f[22..54], &13u32.to_be_bytes(), &[0, 0, 0, 17], &f[54..]]);
         assert_eq!(c, 0, "the checksum adds up");
+    }
+
+    #[test]
+    fn odd_parts_carry_their_last_octet() {
+        // RFC 1071's example, split at odd places: the same sum as in one piece
+        let data = [0x00u8, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        let whole = crate::checksum(&[&data]);
+        assert_eq!(whole, !0xddf2u16);
+        assert_eq!(crate::checksum(&[&data[..3], &data[3..5], &data[5..]]), whole);
+        assert_eq!(crate::checksum(&[&data[..7]]), crate::checksum(&[&data[..7], &[0]]), "a lone last octet is padded");
     }
 }

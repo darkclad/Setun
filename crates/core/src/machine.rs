@@ -1,4 +1,4 @@
-//! A complete Setun-26: CPU + memory + devices + emulated time.
+//! A complete Setun-11̅: CPU + memory + devices + emulated time.
 
 use crate::cpu::{Cpu, Step};
 use crate::devices::{Devices, Power};
@@ -31,13 +31,28 @@ impl Machine {
     }
 
     /// Load the BIOS image (up to 3^10 trytes) into ROM frames −3..−1,
-    /// starting at the lowest ROM address.
+    /// starting at the lowest ROM address. Panics on an image that
+    /// [`Machine::try_load_rom`] refuses.
     pub fn load_rom(&mut self, trytes: &[i16]) {
-        assert!(trytes.len() as i64 <= ROM_FRAMES * PAGE, "ROM image too large");
-        let base = frame_start(ROM_FIRST_FRAME);
-        for (i, &t) in trytes.iter().enumerate() {
-            self.mem.poke(base + i as i64, Tryte::new(t as i64).expect("tryte out of range"));
+        self.try_load_rom(trytes).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// The same, for an image from outside: too large, or a value that is
+    /// not a tryte, is an error and nothing is loaded.
+    pub fn try_load_rom(&mut self, trytes: &[i16]) -> Result<(), String> {
+        let max = ROM_FRAMES * PAGE;
+        if trytes.len() as i64 > max {
+            return Err(format!("the image has {} trytes, more than the ROM's {max}", trytes.len()));
         }
+        let mut words = Vec::with_capacity(trytes.len());
+        for (i, &t) in trytes.iter().enumerate() {
+            words.push(Tryte::new(t as i64).ok_or_else(|| format!("tryte {i} is {t}, outside -9841..9841"))?);
+        }
+        let base = frame_start(ROM_FIRST_FRAME);
+        for (i, t) in words.into_iter().enumerate() {
+            self.mem.poke(base + i as i64, t);
+        }
+        Ok(())
     }
 
     /// Execute one instruction and let emulated time and devices move on.

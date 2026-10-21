@@ -1,6 +1,10 @@
 //! Users and groups: login, su, passwd, useradd/userdel, id, chown, and the
 //! kernel's permission checks, each with the ways it must refuse.
 
+mod common;
+#[allow(unused_imports)]
+use common::{has as assert_has, lacks as assert_lacks};
+
 /// Boot the default disk, log in as root at the first prompt, and type each
 /// line at a "$ " prompt. A line starting with `~` is sent as it is at the
 /// next prompt ending in ": " (login, password), once the output has been quiet
@@ -53,17 +57,7 @@ fn session(lines: &[&str], max_steps: u64) -> String {
     out
 }
 
-fn assert_has(out: &str, wants: &[&str]) {
-    for w in wants {
-        assert!(out.contains(w), "missing {w:?} in:\n{out}");
-    }
-}
 
-fn assert_lacks(out: &str, nots: &[&str]) {
-    for w in nots {
-        assert!(!out.contains(w), "unexpected {w:?} in:\n{out}");
-    }
-}
 
 #[test]
 fn accounts_and_identities() {

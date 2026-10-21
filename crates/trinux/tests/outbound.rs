@@ -4,90 +4,19 @@
 
 mod common;
 use common::*;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 
-/// A tiny host-side server, polled between slices of emulation: it reads
-/// a request up to `end`, then answers with `reply(request)` and closes.
-struct HostServer {
-    listener: TcpListener,
-    open: Vec<(TcpStream, Vec<u8>)>,
-    pub requests: Vec<String>,
-    end: &'static [u8],
-    reply: fn(&str) -> Vec<u8>,
-}
-
-impl HostServer {
-    fn new(end: &'static [u8], reply: fn(&str) -> Vec<u8>) -> HostServer {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        HostServer { listener, open: Vec::new(), requests: Vec::new(), end, reply }
-    }
-
-    fn port(&self) -> u16 {
-        self.listener.local_addr().unwrap().port()
-    }
-
-    fn poll(&mut self) {
-        while let Ok((c, _)) = self.listener.accept() {
-            c.set_nonblocking(true).unwrap();
-            self.open.push((c, Vec::new()));
-        }
-        let mut k = 0;
-        while k < self.open.len() {
-            let (c, buf) = &mut self.open[k];
-            let mut b = [0u8; 4096];
-            let done = match c.read(&mut b) {
-                Ok(0) => true,
-                Ok(n) => {
-                    buf.extend_from_slice(&b[..n]);
-                    buf.windows(self.end.len()).any(|w| w == self.end)
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => false,
-                Err(_) => true,
-            };
-            if done {
-                let req = String::from_utf8_lossy(buf).into_owned();
-                let answer = (self.reply)(&req);
-                c.set_nonblocking(false).unwrap();
-                let _ = c.write_all(&answer);
-                let _ = c.shutdown(std::net::Shutdown::Both);
-                self.requests.push(req);
-                self.open.remove(k);
-            } else {
-                k += 1;
-            }
-        }
-    }
-}
-
-/// Type a command and wait for its prompt, serving the host side meanwhile.
-fn cmd_serving(s: &mut Session, srv: &mut HostServer, line: &str) -> String {
-    let start = s.out.len();
-    s.send(&format!("{line}\n"));
-    let mut n = 0u64;
-    loop {
-        srv.poll();
-        let o = &s.out[start..];
-        if o.len() > line.len() + 1 && o.ends_with("$ ") {
-            break;
-        }
-        assert!(n < 2_000_000_000, "timed out on {line:?}:\n{}", s.out);
-        s.step();
-        n += SLICE;
-    }
-    let text = s.out[start..].to_string();
-    s.mark = s.out.len();
-    let body = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
-    body.strip_suffix("$ ").unwrap_or(&body).to_string()
+/// A command with the host server polled meanwhile.
+fn cmd_srv(s: &mut Session, srv: &mut HostServer, line: &str) -> String {
+    s.cmd_with(line, || srv.poll())
 }
 
 fn echo_server() -> HostServer {
-    HostServer::new(b"\n", |req| format!("the host got: {req}").into_bytes())
+    HostServer::new("127.0.0.1:0", b"\n", |req| format!("the host got: {req}").into_bytes())
 }
 
 fn http_server() -> HostServer {
-    HostServer::new(b"\r\n\r\n", |req| {
+    HostServer::new("127.0.0.1:0", b"\r\n\r\n", |req| {
         let path = req.split(' ').nth(1).unwrap_or("/");
         match path {
             "/hello.txt" => "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nпривет из хоста\n".as_bytes().to_vec(),
@@ -124,11 +53,11 @@ fn trinux_connects_out_to_the_host() {
     let mut s = Session::boot();
     let mut srv = echo_server();
     let p = srv.port();
-    let o = cmd_serving(&mut s, &mut srv, &format!("echo hi from trinux | nc 10.0.2.2 {p}; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("echo hi from trinux | nc 10.0.2.2 {p}; echo status $?"));
     has(&o, &["the host got: hi from trinux\nstatus 0"]);
     // an address that stands for the host, as an outside server would
     s.net.alias([203, 0, 113, 7], "127.0.0.1".parse().unwrap());
-    let o = cmd_serving(&mut s, &mut srv, &format!("echo outside | nc -v 203.0.113.7 {p}"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("echo outside | nc -v 203.0.113.7 {p}"));
     has(&o, &[&format!("Connection to 203.0.113.7 port {p} [tcp] succeeded!"), "the host got: outside\n"]);
     assert_eq!(srv.requests, vec!["hi from trinux\n", "outside\n"]);
     // a port nobody listens on
@@ -140,7 +69,7 @@ fn trinux_connects_out_to_the_host() {
     has(&o, &["nc: connect: Connection refused\nstatus 1"]);
     // with the NAT turned off, the gateway refuses at once
     s.net.set_outbound(false);
-    let o = cmd_serving(&mut s, &mut srv, &format!("nc 10.0.2.2 {p}; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("nc 10.0.2.2 {p}; echo status $?"));
     has(&o, &["nc: connect: Connection refused\nstatus 1"]);
     assert_eq!(srv.requests.len(), 2, "nothing reached the host");
 }
@@ -174,12 +103,12 @@ fn wget_over_http() {
     let p = srv.port();
     s.net.alias([203, 0, 113, 8], "127.0.0.1".parse().unwrap());
     s.net.dns_name("web.test", [203, 0, 113, 8]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/hello.txt"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/hello.txt"));
     assert_eq!(o, "привет из хоста\n");
     assert!(srv.requests[0].starts_with(&format!("GET /hello.txt HTTP/1.1\r\nHost: web.test:{p}\r\n")), "{:?}", srv.requests);
-    let o = cmd_serving(&mut s, &mut srv, &format!("cd /tmp; wget http://10.0.2.2:{p}/big; tail -n 1 big; wc -l big"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("cd /tmp; wget http://10.0.2.2:{p}/big; tail -n 1 big; wc -l big"));
     has(&o, &["Saved 23893 octets to 'big'", "\n5000\n", "5000 big"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget http://web.test:{p}/missing; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget http://web.test:{p}/missing; echo status $?"));
     has(&o, &["wget: HTTP/1.0 404 Not Found\nstatus 8"]);
     let o = s.cmd("wget ftp://web.test/; echo status $?; wget --bogus http://web.test/; echo status $?; wget http://nosuch.invalid/; echo status $?");
     has(&o, &["wget: only http:// and https:// URLs\nstatus 1\nusage: wget", "status 1\n", "wget: unable to resolve host address 'nosuch.invalid'\nstatus 4"]);
@@ -192,7 +121,7 @@ fn wget_follows_redirects_and_reads_chunks() {
     let p = srv.port();
     s.net.alias([203, 0, 113, 8], "127.0.0.1".parse().unwrap());
     s.net.dns_name("web.test", [203, 0, 113, 8]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -O - http://web.test:{p}/abs; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -O - http://web.test:{p}/abs; echo status $?"));
     has(&o, &[
         &format!("Location: http://web.test:{p}/moved [following]\n"),
         "Location: /hello.txt [following]\n",
@@ -200,59 +129,39 @@ fn wget_follows_redirects_and_reads_chunks() {
         "status 0",
     ]);
     // a relative target, with a query; saved under the final name
-    let o = cmd_serving(&mut s, &mut srv, &format!("cd /tmp; wget http://web.test:{p}/rel/a; echo status $?; cat b"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("cd /tmp; wget http://web.test:{p}/rel/a; echo status $?; cat b"));
     has(&o, &["Location: b?x=1 [following]", "Saved 6 octets to 'b'\nstatus 0\nrel b\n"]);
     assert!(srv.requests.iter().any(|r| r.starts_with("GET /rel/b?x=1 HTTP/1.1\r\n")), "{:?}", srv.requests);
     // a loop gives up after 20, or as many as asked; none at all with 0
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/loop; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/loop; echo status $?"));
     has(&o, &["wget: 20 redirections exceeded.\nstatus 8"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q --max-redirect=2 http://web.test:{p}/loop; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q --max-redirect=2 http://web.test:{p}/loop; echo status $?"));
     has(&o, &["wget: 2 redirections exceeded.\nstatus 8"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q --max-redirect=0 http://web.test:{p}/moved; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q --max-redirect=0 http://web.test:{p}/moved; echo status $?"));
     has(&o, &["wget: 0 redirections exceeded.\nstatus 8"]);
     // a 3xx without a Location is an answer like any other
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/304; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q http://web.test:{p}/304; echo status $?"));
     has(&o, &["wget: HTTP/1.1 304 Not Modified\nstatus 8"]);
     // chunked: extensions and trailers handled, nothing after the last chunk
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/chunked; echo; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/chunked; echo; echo status $?"));
     has(&o, &["Wikipedia in\r\n\r\nchunks.\nstatus 0"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/badchunk; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/badchunk; echo status $?"));
     has(&o, &["wget: a malformed chunk\nstatus 7"]);
     // a body cut short; an answer that is not HTTP; a 5 KB header
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/short; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/short; echo status $?"));
     has(&o, &["wget: the connection closed before the end of the body\nstatus 4"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/garbage; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O /tmp/x http://web.test:{p}/garbage; echo status $?"));
     has(&o, &["wget: not an HTTP answer\nstatus 7"]);
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/longhead; echo status $?"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -q -O - http://web.test:{p}/longhead; echo status $?"));
     has(&o, &["ok\nstatus 0"]);
     // -S: the headers as they came
-    let o = cmd_serving(&mut s, &mut srv, &format!("wget -S -O /tmp/x http://web.test:{p}/moved"));
+    let o = cmd_srv(&mut s, &mut srv, &format!("wget -S -O /tmp/x http://web.test:{p}/moved"));
     has(&o, &["  HTTP/1.1 301 Moved Permanently\n  Location: /hello.txt\n  Content-Length: 0\n", "  HTTP/1.0 200 OK\n  Content-Type: text/plain\n"]);
 }
 
 // ---- UDP through the NAT, and NTP -----------------------------------------------------------
 
 /// Type a command and wait for its prompt, calling `serve` between slices.
-fn cmd_polling(s: &mut Session, line: &str, mut serve: impl FnMut()) -> String {
-    let start = s.out.len();
-    s.send(&format!("{line}\n"));
-    let mut n = 0u64;
-    loop {
-        serve();
-        let o = &s.out[start..];
-        if o.len() > line.len() + 1 && o.ends_with("$ ") {
-            break;
-        }
-        assert!(n < 2_000_000_000, "timed out on {line:?}:\n{}", s.out);
-        s.step();
-        n += SLICE;
-    }
-    let text = s.out[start..].to_string();
-    s.mark = s.out.len();
-    let body = text.splitn(2, '\n').nth(1).unwrap_or("").to_string();
-    body.strip_suffix("$ ").unwrap_or(&body).to_string()
-}
-
 fn udp_socket() -> std::net::UdpSocket {
     let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     u.set_nonblocking(true).unwrap();
@@ -295,10 +204,10 @@ fn udp_out_through_the_nat() {
             let _ = echo.send_to(&r, from);
         }
     };
-    let o = cmd_polling(&mut s, &format!("echo 'hi over udp' | nc -u 10.0.2.2 {p}"), &mut serve);
+    let o = s.cmd_with(&format!("echo 'hi over udp' | nc -u 10.0.2.2 {p}"), &mut serve);
     has(&o, &["echo: hi over udp\n"]);
     s.net.alias([203, 0, 113, 9], "127.0.0.1".parse().unwrap());
-    let o = cmd_polling(&mut s, &format!("echo 'Сетунь' | nc -u 203.0.113.9 {p}"), &mut serve);
+    let o = s.cmd_with(&format!("echo 'Сетунь' | nc -u 203.0.113.9 {p}"), &mut serve);
     has(&o, &["echo: Сетунь\n"]);
     assert!(s.net.stats.udp_out >= 2 && s.net.stats.udp_in >= 2);
     // the DNS server and test ports stay where they were
@@ -307,7 +216,7 @@ fn udp_out_through_the_nat() {
     // with the NAT off, nothing goes out
     s.net.set_outbound(false);
     let before = s.net.stats.udp_out;
-    let o = cmd_polling(&mut s, &format!("echo lost | nc -u 10.0.2.2 {p}; echo done"), &mut serve);
+    let o = s.cmd_with(&format!("echo lost | nc -u 10.0.2.2 {p}; echo done"), &mut serve);
     has(&o, &["done\n"]);
     assert!(!o.contains("echo: lost"));
     assert_eq!(s.net.stats.udp_out, before);
@@ -327,16 +236,16 @@ fn ntpdate_sets_the_clock() {
         ntp_answer(&broken, true, false);
         ntp_answer(&kiss, false, true);
     };
-    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pg} 10.0.2.2; echo status $?; date"), &mut serve);
+    let o = s.cmd_with(&format!("ntpdate -q -p {pg} 10.0.2.2; echo status $?; date"), &mut serve);
     has(&o, &["server 10.0.2.2, stratum 2, offset ", " s: 2030-01-01 00:00:00 UTC\nstatus 0\n"]);
     assert!(!o.contains("2030\n") && !o.contains("Jan  1"), "-q leaves the clock alone: {o}");
-    let o = cmd_polling(&mut s, &format!("su user -c 'ntpdate -p {pg} 10.0.2.2'; echo status $?"), &mut serve);
+    let o = s.cmd_with(&format!("su user -c 'ntpdate -p {pg} 10.0.2.2'; echo status $?"), &mut serve);
     has(&o, &["ntpdate: cannot set the clock: Operation not permitted\nstatus 2"]);
-    let o = cmd_polling(&mut s, &format!("ntpdate -p {pg} 10.0.2.2; echo status $?; date +%Y"), &mut serve);
+    let o = s.cmd_with(&format!("ntpdate -p {pg} 10.0.2.2; echo status $?; date +%Y"), &mut serve);
     has(&o, &["ntpdate: the clock is set\nstatus 0\n2030\n"]);
-    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pb} 10.0.2.2; echo status $?"), &mut serve);
+    let o = s.cmd_with(&format!("ntpdate -q -p {pb} 10.0.2.2; echo status $?"), &mut serve);
     has(&o, &["ntpdate: no server suitable for synchronization found\nstatus 1"]);
-    let o = cmd_polling(&mut s, &format!("ntpdate -q -p {pk} 10.0.2.2; echo status $?"), &mut serve);
+    let o = s.cmd_with(&format!("ntpdate -q -p {pk} 10.0.2.2; echo status $?"), &mut serve);
     has(&o, &["ntpdate: the server is not synchronised (kiss-o'-death)\nstatus 1"]);
     let o = s.cmd("ntpdate -q nosuch.invalid; echo status $?; ntpdate; echo status $?");
     has(&o, &["ntpdate: nosuch.invalid: Name or service not known\nstatus 1", "usage: ntpdate [-q] [-p port] server\nstatus 2"]);

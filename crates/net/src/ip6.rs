@@ -17,19 +17,7 @@ pub const GUEST6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0x5054, 0x00ff
 /// Seconds between unsolicited advertisements.
 pub const RA_INTERVAL_S: i64 = 200;
 
-/// The ones'-complement sum of 16-bit words, folded and complemented.
-pub fn checksum(parts: &[&[u8]]) -> u16 {
-    let mut sum: u32 = 0;
-    for p in parts {
-        for c in p.chunks(2) {
-            sum += u32::from(c[0]) << 8 | u32::from(*c.get(1).unwrap_or(&0));
-        }
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
+pub use crate::checksum;
 
 /// An Ethernet frame carrying an ICMPv6 message from `src` to `dst` (hop
 /// limit `hop`), with its checksum filled in.

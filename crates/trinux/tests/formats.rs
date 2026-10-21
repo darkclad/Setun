@@ -3,6 +3,10 @@
 //! (WAV, PPM, PGM made here), with their round trips, the picture on the
 //! framebuffer, and their errors.
 
+mod common;
+#[allow(unused_imports)]
+use common::{has as assert_has};
+
 use std::path::PathBuf;
 
 /// Boot `disk`, log in as root and type each line at the prompt.
@@ -41,11 +45,6 @@ fn session(disk: &[i16], lines: &[&str], max_steps: u64) -> (String, setun_core:
     (out, m)
 }
 
-fn assert_has(out: &str, wants: &[&str]) {
-    for w in wants {
-        assert!(out.contains(w), "missing {w:?} in:\n{out}");
-    }
-}
 
 /// A PCM WAV with the 44-byte header tau2wav writes.
 fn wav(channels: u16, rate: u32, bits: u16, samples: &[i32]) -> Vec<u8> {

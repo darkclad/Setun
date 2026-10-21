@@ -113,7 +113,7 @@ fn certificate_files_that_are_broken() {
         has(&x509(&mut s, &format!("/tmp/tls/{file}.pem")), &[&format!("x509: /tmp/tls/{file}.pem: {why}\nstatus 2")]);
     }
     // a broken file of roots: the good ones still count
-    s.cmd(&format!("cat /tmp/tls/junk.pem /tmp/tls/roots.pem /tmp/tls/cut.pem > /tmp/tls/mixed.pem"));
+    s.cmd("cat /tmp/tls/junk.pem /tmp/tls/roots.pem /tmp/tls/cut.pem > /tmp/tls/mixed.pem");
     has(&s.cmd("x509 -l -C /tmp/tls/mixed.pem"), &["Setun Test Root RSA\nSetun Test Root EC\n"]);
     has(&s.cmd("x509 -C /tmp/nosuch -l; echo status $?"), &["x509: cannot read /tmp/nosuch\nstatus 2"]);
     has(&s.cmd("x509; echo status $?; x509 -l /tmp/tls/web.pem; echo status $?"), &["usage: x509", "status 2\nusage: x509", "status 2"]);
@@ -154,14 +154,6 @@ impl Drop for TlsServer {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-fn have_openssl() -> bool {
-    let ok = Command::new("openssl").arg("version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
-    if !ok {
-        eprintln!("no openssl on this host: skipped");
-    }
-    ok
 }
 
 /// Serve with chain `name` (the leaf, the rest sent along); `opts` replace

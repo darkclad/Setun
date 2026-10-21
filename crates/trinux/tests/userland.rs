@@ -1,6 +1,10 @@
 //! Trinux K7: the shell language, the core utilities and tlibc, each with
 //! its error cases.
 
+mod common;
+#[allow(unused_imports)]
+use common::{has as assert_has, lacks as assert_lacks};
+
 /// Boot the default disk and type each line at a prompt ("$ " or the
 /// continuation prompt "> "). A line starting with `~` is sent as it is
 /// (no newline added) once the machine has had 3 M steps since the last
@@ -55,17 +59,7 @@ fn session(lines: &[&str], max_steps: u64) -> String {
     session_m(lines, max_steps).0
 }
 
-fn assert_has(out: &str, wants: &[&str]) {
-    for w in wants {
-        assert!(out.contains(w), "missing {w:?} in:\n{out}");
-    }
-}
 
-fn assert_lacks(out: &str, nots: &[&str]) {
-    for w in nots {
-        assert!(!out.contains(w), "unexpected {w:?} in:\n{out}");
-    }
-}
 
 #[test]
 fn k7_shell_language() {

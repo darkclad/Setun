@@ -1,4 +1,4 @@
-//! Setun-26 disassembler.
+//! Setun-11̅ disassembler.
 //!
 //! Output uses the assembly syntax of [`crate::text`], and every line is
 //! checked by reassembling it: if the text would not produce the identical

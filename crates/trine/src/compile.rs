@@ -1,4 +1,4 @@
-//! Type checking and code generation: Trine AST → Setun-26 assembly text.
+//! Type checking and code generation: Trine AST → Setun-11̅ assembly text.
 //!
 //! Code generation is deliberately simple (v1): every expression leaves its
 //! value in `r1` (a `real` in `f1`); intermediate values live on the stack
@@ -3491,8 +3491,8 @@ impl Compiler {
             return Ok(*ret);
         }
         let has_long = params.iter().any(|p| p.is_long());
-        if self.o(3) && direct.is_some() && args.len() <= 6 && !has_long {
-            return self.call_in_registers(&direct.as_ref().unwrap().0, args, &params, *ret);
+        if let Some(d) = direct.as_ref().filter(|_| self.o(3) && args.len() <= 6 && !has_long) {
+            return self.call_in_registers(&d.0, args, &params, *ret);
         }
         for (a, p) in args.iter().zip(&params) {
             if p.is_long() {

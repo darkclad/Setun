@@ -1,4 +1,4 @@
-//! Trine: the systems language of Setun-26 (`docs/LANGUAGE.md`).
+//! Trine: the systems language of Setun-11̅ (`docs/LANGUAGE.md`).
 //!
 //! Pipeline: [`lexer`] → [`parser`] → [`compile`] (type checking + code
 //! generation to assembly text) → `setun-asm` → a T1B2 image. The driver adds

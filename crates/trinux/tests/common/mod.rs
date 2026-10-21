@@ -125,7 +125,7 @@ impl Session {
         let text = self.out[start..].to_string();
         self.mark = self.out.len();
         // drop the echoed command line and the prompt
-        let body = text.splitn(2, '\n').nth(1).unwrap_or("");
+        let body = text.split_once('\n').map(|x| x.1).unwrap_or("");
         body.strip_suffix("$ ").unwrap_or(body).to_string()
     }
 
@@ -142,8 +142,7 @@ impl Session {
             line = next.to_string();
         }
         self.mark = self.out.len();
-        self.send("EOF
-");
+        self.send("EOF\n");
         self.until("EOF", 200_000_000, |o| o.ends_with("$ "));
         let o = self.out[start..].to_string();
         self.mark = self.out.len();
@@ -157,8 +156,115 @@ pub fn has(out: &str, wants: &[&str]) {
     }
 }
 
+pub fn lacks(out: &str, nots: &[&str]) {
+    for w in nots {
+        assert!(!out.contains(w), "unexpected {w:?} in:\n{out}");
+    }
+}
+
+/// Is there an openssl on this host? (Tests that need one skip without.)
+pub fn have_openssl() -> bool {
+    use std::process::{Command, Stdio};
+    let ok = Command::new("openssl").arg("version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+    if !ok {
+        eprintln!("no openssl on this host: skipped");
+    }
+    ok
+}
+
+/// A tiny host-side server, polled between slices of emulation: it reads a
+/// request up to `end`, then answers with `reply(request)` and closes. The
+/// requests are kept.
+pub struct HostServer {
+    listener: std::net::TcpListener,
+    open: Vec<(std::net::TcpStream, Vec<u8>)>,
+    pub requests: Vec<String>,
+    end: &'static [u8],
+    reply: fn(&str) -> Vec<u8>,
+}
+
+impl HostServer {
+    /// Listening on `bind` ("127.0.0.1:0", "[::1]:0").
+    pub fn new(bind: &str, end: &'static [u8], reply: fn(&str) -> Vec<u8>) -> HostServer {
+        let listener = std::net::TcpListener::bind(bind).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        HostServer { listener, open: Vec::new(), requests: Vec::new(), end, reply }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.listener.local_addr().unwrap().port()
+    }
+
+    pub fn poll(&mut self) {
+        use std::io::{ErrorKind, Read, Write};
+        while let Ok((c, _)) = self.listener.accept() {
+            c.set_nonblocking(true).unwrap();
+            self.open.push((c, Vec::new()));
+        }
+        let mut k = 0;
+        while k < self.open.len() {
+            let (c, buf) = &mut self.open[k];
+            let mut b = [0u8; 4096];
+            let done = match c.read(&mut b) {
+                Ok(0) => true,
+                Ok(n) => {
+                    buf.extend_from_slice(&b[..n]);
+                    buf.windows(self.end.len()).any(|w| w == self.end)
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => false,
+                Err(_) => true,
+            };
+            if done {
+                let req = String::from_utf8_lossy(buf).into_owned();
+                let answer = (self.reply)(&req);
+                c.set_nonblocking(false).unwrap();
+                let _ = c.write_all(&answer);
+                let _ = c.shutdown(std::net::Shutdown::Both);
+                self.requests.push(req);
+                self.open.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+    }
+}
+
 
 impl Session {
+    /// Booted, with eth0's global IPv6 address configured (docs/IPV6.md).
+    pub fn boot6() -> Session {
+        let mut s = Session::boot();
+        let mut tries = 0;
+        while !s.out.contains("eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n") {
+            tries += 1;
+            assert!(tries < 100, "no global address:\n{}", s.out);
+            s.idle(10_000_000);
+        }
+        s
+    }
+
+    /// Type a command and wait for its prompt, running `serve` (a host-side
+    /// server) between slices; what the command printed.
+    pub fn cmd_with(&mut self, line: &str, mut serve: impl FnMut()) -> String {
+        let start = self.out.len();
+        self.send(&format!("{line}\n"));
+        let mut n = 0u64;
+        loop {
+            serve();
+            let o = &self.out[start..];
+            if o.len() > line.len() + 1 && o.ends_with("$ ") {
+                break;
+            }
+            assert!(n < 2_000_000_000, "timed out on {line:?}:\n{}", self.out);
+            self.step();
+            n += SLICE;
+        }
+        let text = self.out[start..].to_string();
+        self.mark = self.out.len();
+        let body = text.split_once('\n').map(|x| x.1).unwrap_or("");
+        body.strip_suffix("$ ").unwrap_or(body).to_string()
+    }
+
     /// Type a line without waiting for a prompt.
     pub fn type_line(&mut self, line: &str) {
         self.send(&format!("{line}\n"));

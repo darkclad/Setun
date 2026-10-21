@@ -1,4 +1,4 @@
-//! Setun-26 floating point (ISA §14): real27 and real81.
+//! Setun-11̅ floating point (ISA §14): real27 and real81.
 //!
 //! A value is `m · 3^E` with a balanced fraction `m = M · 3^−n`: the
 //! significand M carries the sign, so there is no sign trit and no −0. Both
@@ -792,7 +792,7 @@ fn split27(v: i128) -> (i128, i64) {
     (q, lo)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn bal_split(v: i128, m: i128) -> (i128, i128) {
     let h = (m - 1) / 2;
     let lo = (v + h).rem_euclid(m) - h;

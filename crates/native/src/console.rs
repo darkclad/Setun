@@ -242,7 +242,7 @@ mod tests {
         assert!(out.contains("done\r\n"), "{out}");
         assert!(!out.contains("hi there\n") || out.contains("hi there\r\n"));
         // quit came at 12 s: the clocks agree to within a slice or two
-        assert!(real >= 12_000_000 && real < 12_100_000, "real {real}");
+        assert!((12_000_000..12_100_000).contains(&real), "real {real}");
         assert!((emulated - real).abs() < 50_000, "emulated {emulated} vs real {real}");
     }
 

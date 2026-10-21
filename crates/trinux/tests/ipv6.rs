@@ -75,18 +75,6 @@ fn s_gl() -> Ipv6Address {
     setun_net::GUEST6
 }
 
-/// Booted, with both addresses of eth0 configured.
-fn boot6() -> Session {
-    let mut s = Session::boot();
-    let mut tries = 0;
-    while !s.out.contains("eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n") {
-        tries += 1;
-        assert!(tries < 100, "no global address:\n{}", s.out);
-        s.idle(10_000_000);
-    }
-    s
-}
-
 fn v6_frames(fs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     fs.into_iter().filter(|f| f.len() >= 14 && f[12] == 0x86 && f[13] == 0xdd).collect()
 }
@@ -101,7 +89,7 @@ fn hexs(b: &[u8]) -> String {
 
 #[test]
 fn autoconfigures_and_pings() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     has(&s.out, &["eth0: inet6 fe80::5054:ff:fe12:3456 scope link\n", "eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n"]);
     let o = s.cmd("cat /proc/net/if_inet6");
     assert_eq!(
@@ -132,7 +120,7 @@ fn autoconfigures_and_pings() {
 
 #[test]
 fn ping6_failures() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     let o = s.cmd("ping6 nonsense; echo rc=$?");
     has(&o, &["ping6: nonsense: Name or service not known\n", "rc=2"]);
     let o = s.cmd("ping6 -c 0 ::1; echo rc=$?");
@@ -166,7 +154,7 @@ fn text_vectors() {
 #[test]
 fn the_exchange_vectors() {
     let text = std::fs::read_to_string(trinux::user_dir().join("share/ipv6vectors.txt")).unwrap();
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.set_capture(true);
     let (p_gl, p_ll) = (a6("fd00::77"), a6("fe80::77"));
     // the peer becomes a neighbour (each solicitation is answered)
@@ -204,7 +192,7 @@ fn the_exchange_vectors() {
 /// answers for the tentative address, or solicits it at the same time.
 #[test]
 fn duplicate_addresses_are_never_used() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.set_capture(true);
     // a new prefix: its address is tentative while DAD runs, and a defender answers
     s.net.inject(&mut s.m, &ra(1800, a6("fd01::"), 0xc0, 86400, 14400));
@@ -265,7 +253,7 @@ fn duplicate_addresses_are_never_used() {
 /// address; and the slots run out after three.
 #[test]
 fn prefix_lifetimes_and_refusals() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.inject(&mut s.m, &ra(1800, a6("fd04::"), 0xc0, 40, 20));
     s.idle(15_000_000);
     has(&s.cmd("cat /proc/net/if_inet6"), &["fd04000000000000505400fffe123456 02 40 00 00     eth0\n"]);
@@ -299,7 +287,7 @@ fn prefix_lifetimes_and_refusals() {
 /// then away.
 #[test]
 fn unreachable_neighbours_are_probed_then_dropped() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.set_capture(true);
     let p = a6("fd00::77");
     s.net.inject(&mut s.m, &ns_from_peer(p, s_gl()));
@@ -329,7 +317,7 @@ fn unreachable_neighbours_are_probed_then_dropped() {
 /// ICMPv6 errors (§2): a burst of 9, then one per 100 ms.
 #[test]
 fn icmp6_errors_are_rate_limited() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.set_capture(true);
     let p = a6("fd00::77");
     s.net.inject(&mut s.m, &ns_from_peer(p, s_gl()));
@@ -358,7 +346,7 @@ fn icmp6_errors_are_rate_limited() {
 /// on IPv6, and netstat and ifconfig showing it.
 #[test]
 fn tcp_and_udp_over_ipv6() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     // a server in Trinux, the gateway's smoltcp as the client
     s.cmd("echo 'back over IPv6' > /tmp/reply; nc -6 -l 2323 < /tmp/reply > /tmp/got &");
     s.idle(10_000_000);
@@ -440,7 +428,7 @@ fn tcp_and_udp_over_ipv6() {
 /// IPv4's 1460: seen on the wire, since smoltcp keeps to its own anyway.
 #[test]
 fn tcp6_announces_mss_1440() {
-    let mut s = boot6();
+    let mut s = Session::boot6();
     s.net.set_capture(true);
     let p = a6("fd00::77");
     s.net.inject(&mut s.m, &ns_from_peer(p, s_gl()));

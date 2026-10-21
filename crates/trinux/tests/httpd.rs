@@ -149,11 +149,7 @@ fn httpd_refuses_what_it_should() {
 
 // ---- HTTPS: httpd -s against OpenSSL's s_client, and against our own wget ------------------
 
-use std::process::{Command, Stdio};
-
-fn have_openssl() -> bool {
-    Command::new("openssl").arg("version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
-}
+use std::process::Command;
 
 /// Start `httpd -s` (making its key and certificate the first time), forward
 /// a host port to 443, and fetch the certificate to a host file. No request

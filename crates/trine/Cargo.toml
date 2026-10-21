@@ -1,6 +1,6 @@
 [package]
 name = "trine"
-description = "Compiler for Trine, the C-like systems language of Setun-26"
+description = "Compiler for Trine, the C-like systems language of Setun-11̅"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

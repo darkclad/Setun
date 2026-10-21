@@ -106,18 +106,7 @@ pub fn unifont_file() -> Result<Vec<i16>, String> {
 /// U+0400..U+045F as glyphs 256..351, then № as glyph 352.
 pub const FONT_GLYPHS: usize = 353;
 
-/// The font file's glyph for a code point, if it has one.
-pub fn font_index(cp: u32) -> Option<usize> {
-    use setun_core::devices::{CYRILLIC_FIRST, CYRILLIC_LAST};
-    match cp {
-        0..=255 => Some(cp as usize),
-        CYRILLIC_FIRST..=CYRILLIC_LAST => Some(256 + (cp - CYRILLIC_FIRST) as usize),
-        setun_core::devices::NUMERO => Some(352),
-        _ => None,
-    }
-}
-
-/// The code point of font file glyph `i` (the inverse of `font_index`).
+/// The code point of font file glyph `i`.
 pub fn font_char(i: usize) -> char {
     let cp = match i {
         0..=255 => i as u32,

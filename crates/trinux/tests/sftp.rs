@@ -102,9 +102,7 @@ fn scp_both_ways_and_refusals() {
     let (code, _, err) = scp(&mut s, &["root@127.0.0.1:/nope", "x"]);
     assert_ne!(code, 0);
     assert!(err.contains("No such file"), "{err}");
-    s.cmd(&format!(
-        "mkdir -p /home/user/.ssh 2>/dev/null; mkdir /home/user/.ssh; cp /root/.ssh/authorized_keys /home/user/.ssh/; chown user /home/user/.ssh /home/user/.ssh/authorized_keys"
-    ));
+    s.cmd("mkdir -p /home/user/.ssh 2>/dev/null; mkdir /home/user/.ssh; cp /root/.ssh/authorized_keys /home/user/.ssh/; chown user /home/user/.ssh /home/user/.ssh/authorized_keys");
     let (code, _, err) = scp(&mut s, &["numbers", "user@127.0.0.1:/root/numbers"]);
     assert_ne!(code, 0);
     assert!(err.contains("ermission denied"), "{err}");
