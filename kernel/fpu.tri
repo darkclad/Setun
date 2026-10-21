@@ -19,7 +19,6 @@ const FSR_RESET: int = 19683 * 121;   // flags clear, masks IV DZ OF UF IX on
 const MODE_FE_TRIT: int = 24;
 
 var fpu_owner: int;                   // the task whose registers are live; 0 = nobody
-var fpu_switches: int;                // -12 traps that loaded a task's state (procfs)
 
 extern fn fpu_save(area: *int);
 extern fn fpu_load(area: *int);
@@ -133,7 +132,6 @@ fn fpu_unavailable() {
     fpu_kernel_enable();
     fpu_load(fpu_area(t));
     fpu_owner = current;
-    fpu_switches += 1;
 }
 
 // Called by trap_return with the frame about to be restored.

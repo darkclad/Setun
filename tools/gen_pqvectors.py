@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Vectors for /bin/pqtest: SHA-3 and SHAKE (from Python's hashlib) and
+"""Vectors for /bin/pqtest: SHA-3 and SHAKE (from Python's hashlib),
 ML-KEM-768 (from tools/mlkem.py, itself checked against OpenSSL by
-tools/check_mlkem.py). Prints Trine source to paste into user/bin/pqtest.tri
-between the "vectors" markers.
+tools/check_mlkem.py) and sntrup761 (from tools/sntrup761.py). Prints Trine
+source to paste into user/bin/pqtest.tri between the "vectors" markers.
 
     python tools/gen_pqvectors.py
 """
 import hashlib
+import os
 import sys
-sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mlkem import keygen, encaps, decaps
 import sntrup761 as sn
 import random
@@ -120,4 +121,5 @@ for c in sncases:
         out.append(f'    "{v}",')
 out.append('};')
 out.append('// ---- end of vectors ----')
+sys.stdout.reconfigure(newline='\n')   # LF, also on Windows
 print('\n'.join(out))

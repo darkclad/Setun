@@ -19,7 +19,6 @@ const VEC_WORDS: int = 78;
 const MODE_VE_TRIT: int = 19;
 
 var vec_owner: int;                   // the task whose registers are live; 0 = nobody
-var vec_switches: int;                // -13 traps that loaded a task's state
 
 extern fn vec_save(area: *int);
 extern fn vec_load(area: *int);
@@ -130,7 +129,6 @@ fn vec_unavailable() {
     vec_kernel_enable();
     vec_load(a);
     vec_owner = current;
-    vec_switches += 1;
 }
 
 // Called by trap_return with the frame about to be restored.

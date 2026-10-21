@@ -48,13 +48,8 @@ const SA_RESTART: int = 268435456;
 // Interrupted system calls return these (never seen by user code): the
 // call is restarted if no handler runs (and, for ERESTARTSYS, if the
 // handler has SA_RESTART); otherwise it fails with EINTR.
-const ERESTARTSYS: int = 512;
-const ERESTARTNOHAND: int = 514;
-const ERESTART_RESTARTBLOCK: int = 516;
 const SYS_INSN_TRYTES: int = 3;
 
-const EINTR: int = 4;
-const ESRCH: int = 3;
 
 const SIGFRAME_WORDS: int = 192;      // trap frame (28), old mask, magic, FPU flag + state (82), vector flag + state (78)
 const SF_FPU: int = 30;               // 1 if the FPU state follows

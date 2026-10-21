@@ -1,11 +1,13 @@
-// /bin/pqtest: SHA-3, SHAKE and ML-KEM-768 against vectors from Python's
-// hashlib and tools/mlkem.py (itself checked against OpenSSL by
-// tools/check_mlkem.py), one line per check, with the time each took.
+// /bin/pqtest: SHA-3, SHAKE, ML-KEM-768 and sntrup761 against vectors from
+// Python's hashlib, tools/mlkem.py (itself checked against OpenSSL by
+// tools/check_mlkem.py) and tools/sntrup761.py, one line per check, with
+// the time each took.
 
 import "../lib/tlibc.tri";
 import "../lib/sha3.tri";
 import "../lib/mlkem.tri";
 import "../lib/sntrup.tri";
+import "../lib/ctype.tri";
 
 var failures: int;
 var t0: int;
@@ -175,12 +177,10 @@ fn guard_ok(p: *tryte, n: int) -> int {
     return 1;
 }
 
-fn hexval(ch: int) -> int { return ch <= '9' ? ch - '0' : ch - 'a' + 10; }
-
 fn unhex(s: *char, p: *tryte) -> int {
     var n: int = 0;
     while (s[2 * n] != 0) {
-        p[n] = (hexval(s[2 * n]) * 16 + hexval(s[2 * n + 1])) as tryte;
+        p[n] = (xdigit_val(s[2 * n]) * 16 + xdigit_val(s[2 * n + 1])) as tryte;
         n += 1;
     }
     return n;

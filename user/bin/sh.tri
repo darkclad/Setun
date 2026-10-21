@@ -3098,9 +3098,8 @@ fn eval_text(s: *char, n: int) -> int {
 var inbuf: [2187]char;
 var in_len: int;
 var in_pos: int;
-var got_sigint: int;
 
-fn on_sigint(sig: int) { got_sigint = 1; }
+fn on_sigint(sig: int) {}                       // caught, so the shell itself lives on
 
 // Append the next line from fd to src (with its newline): 1 = a line,
 // 0 = end of file, -1 = interrupted.

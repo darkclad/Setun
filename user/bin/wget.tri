@@ -22,6 +22,7 @@ import "../lib/getopt.tri";
 import "../lib/socket.tri";
 import "../lib/time.tri";
 import "../lib/tls.tri";
+import "../lib/ctype.tri";
 
 var quiet: int;
 var binary: int;
@@ -226,13 +227,6 @@ fn put_body(p: *tryte, m: int) {
     }
 }
 
-fn hexdigit(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
 // Feed received octets through the chunked decoder.
 fn chunk_data(p: *tryte, m: int) {
     var k: int = 0;
@@ -261,8 +255,8 @@ fn chunk_data(p: *tryte, m: int) {
             // a size in hex, perhaps ";extensions"
             var size: int = 0;
             var j: int = 0;
-            while (j < cn && hexdigit(cline[j]) >= 0) {
-                size = size * 16 + hexdigit(cline[j]);
+            while (j < cn && xdigit_val(cline[j]) >= 0) {
+                size = size * 16 + xdigit_val(cline[j]);
                 j += 1;
                 if (size > 1594323) { bad_chunk = 1; }
             }

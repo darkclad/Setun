@@ -3,7 +3,7 @@
 // User space is the negative half (L1 indices -9841..-1). Regions:
 //   text   read-only + execute, loaded by execve
 //   heap   from the bss start to brk, demand-zero
-//   stack  27 pages below USER_LIMIT, demand-zero
+//   stack  USER_STACK_PAGES pages below USER_STACK, demand-zero
 // After fork, writable pages are shared read-only with the SW trit set
 // (copy on write); frame_ref counts the sharers. Pages with the SW trit at
 // -1 are shared as they are, never copied: the mapped framebuffer (negative
@@ -19,7 +19,7 @@ const USER_BASE: int = -847288609443;         // -3^25
 const USER_LIMIT: int = -193710245;           // the highest user address
 const USER_STACK: int = -387420492;           // initial stack top (-3^18 - 3)
 const USER_STACK_PAGES: int = 27;
-const USER_STACK_LOW: int = -387420492 - 27 * 19683;
+const USER_STACK_LOW: int = USER_STACK - USER_STACK_PAGES * 19683;
 
 fn user_pte(frame: int, writable: int, exec: int) -> int {
     var v: int = writable ? PTE_V : -PTE_V;

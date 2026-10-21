@@ -459,7 +459,7 @@ fn _modL(r: *tryte, x: *int) {
 }
 
 // r (64 octets) = r mod L, in r[0..31].
-fn _reduce(r: *tryte) {
+fn _gf_reduce(r: *tryte) {
     var x: [64]int;
     var i: int = 0;
     while (i < 64) { x[i] = r[i]; r[i] = 0; i += 1; }
@@ -497,7 +497,7 @@ fn ed25519_sign(sig: *tryte, m: *tryte, n: int, sk: *tryte) {
     sha512_update(&c, &d[32], 32);
     sha512_update(&c, m, n);
     sha512_final(&c, &r[0]);
-    _reduce(&r[0]);
+    _gf_reduce(&r[0]);
     var p: ge;
     ge_scalarbase(&p, &r[0]);
     ge_pack(sig, &p);
@@ -507,7 +507,7 @@ fn ed25519_sign(sig: *tryte, m: *tryte, n: int, sk: *tryte) {
     sha512_update(&c, sk + 32, 32);
     sha512_update(&c, m, n);
     sha512_final(&c, &h[0]);
-    _reduce(&h[0]);
+    _gf_reduce(&h[0]);
     var x: [64]int;
     var i: int = 0;
     while (i < 64) { x[i] = 0; i += 1; }
@@ -609,7 +609,7 @@ fn ed25519_verify(sig: *tryte, m: *tryte, n: int, pk: *tryte) -> int {
     sha512_update(&c, pk, 32);
     sha512_update(&c, m, n);
     sha512_final(&c, &h[0]);
-    _reduce(&h[0]);
+    _gf_reduce(&h[0]);
     var p: ge;
     ge_scalarmult(&p, &q, &h[0]);              // -k·A
     var b: ge;

@@ -6,6 +6,7 @@ import "../lib/tlibc.tri";
 import "../lib/c25519.tri";
 import "../lib/chacha.tri";
 import "../lib/base64.tri";
+import "../lib/ctype.tri";
 
 var failures: int;
 var a: [256]tryte;
@@ -31,13 +32,11 @@ fn ok(what: *char, cond: int) {
     t0 = ms();
 }
 
-fn hexval(c: int) -> int { return c <= '9' ? c - '0' : c - 'a' + 10; }
-
 // Parse hex into p; the number of octets.
 fn unhex(s: *char, p: *tryte) -> int {
     var n: int = 0;
     while (s[2 * n] != 0) {
-        p[n] = (hexval(s[2 * n]) * 16 + hexval(s[2 * n + 1])) as tryte;
+        p[n] = (xdigit_val(s[2 * n]) * 16 + xdigit_val(s[2 * n + 1])) as tryte;
         n += 1;
     }
     return n;

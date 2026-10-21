@@ -239,12 +239,6 @@ fn kw_code(id: int) -> int {
     return 0;
 }
 
-fn pu_code(s: *char) -> int {
-    var k: int = 1;
-    while (k <= PU_COUNT) { if (streq(pu_text[k], s)) { return k; } k += 1; }
-    return 0;
-}
-
 // tokens of the file being parsed
 var tk_kind: ivec;
 var tk_val: ivec;                        // the value, name, string id or code
@@ -266,7 +260,6 @@ var lx_n: int;
 var lx_i: int;
 var lx_line: int;
 var lx_col: int;
-var lx_file: int;
 
 fn bump() {
     if (lx_s[lx_i] == '\n') { lx_line += 1; lx_col = 1; } else { lx_col += 1; }
@@ -351,7 +344,6 @@ fn lex(src: *char, n: int, file: int) {
     lx_i = 0;
     lx_line = 1;
     lx_col = 1;
-    lx_file = file;
     tk_kind.n = 0;
     tk_val.n = 0;
     tk_pos.n = 0;

@@ -27,10 +27,6 @@ const SEEK_SET: int = 0;
 const SEEK_CUR: int = 1;
 const SEEK_END: int = 2;
 
-const EACCES: int = 13;
-const EMFILE: int = 24;
-const ESPIPE: int = 29;
-const ERANGE: int = 34;
 
 // struct stat: one word per field (see tlibc).
 struct Stat {
@@ -187,7 +183,7 @@ fn get_path_into(p: int, dst: *char) -> int {
     if (p == 0) { return -EFAULT; }
     var n: int = copy_user_string(p, dst, 243);
     if (n < 0) { return is_user_address(p) ? -ENAMETOOLONG : -EFAULT; }
-    if (n == 0) { return -ENOENT_; }
+    if (n == 0) { return -ENOENT; }
     return 0;
 }
 
@@ -227,7 +223,7 @@ fn sys_openat(dirfd: int, path: int, flags: int, mode: int) -> int {
     var i: int = path_lookup(&kpath[0], base);
     if (i >= 0 && has(flags, O_CREAT) && has(flags, O_EXCL)) { return -EEXIST; }
     var created: int = 0;
-    if (i == -ENOENT_ && has(flags, O_CREAT)) {
+    if (i == -ENOENT && has(flags, O_CREAT)) {
         i = vfs_create(&kpath[0], base, I_REG, apply_umask(mode % 512));
         created = 1;                                  // a new file opens whatever its mode
     }
@@ -510,7 +506,7 @@ fn sys_sync() -> int {
 fn sys_fsync(fd: int) -> int {
     var f: int = fd_file(fd);
     if (f < 0) { return f; }
-    if (inodes[files[f].ino].fs == FS_TFS && tfs_sync() < 0) { return -EIO_; }
+    if (inodes[files[f].ino].fs == FS_TFS && tfs_sync() < 0) { return -EIO; }
     return 0;
 }
 
@@ -550,7 +546,7 @@ fn sys_statfs(path: int, buf: int) -> int {
 
 // mount(source, target, type, flags, data): ramfs/tmpfs and proc.
 fn sys_mount(source: int, target: int, type: int, flags: int, data: int) -> int {
-    if (!capable()) { return -EPERM_C; }
+    if (!capable()) { return -EPERM; }
     var tname: [27]char;
     var src: [27]char;
     if (copy_user_string(type, &tname[0], 27) < 0) { return -EFAULT; }
@@ -572,7 +568,7 @@ fn sys_mount(source: int, target: int, type: int, flags: int, data: int) -> int 
 }
 
 fn sys_umount2(target: int, flags: int) -> int {
-    if (!capable()) { return -EPERM_C; }
+    if (!capable()) { return -EPERM; }
     var r: int = get_path(target);
     if (r < 0) { return r; }
     var i: int = path_lookup(&kpath[0], current_task().cwd);
@@ -589,7 +585,7 @@ const REBOOT_CMD_HALT: int = 3454992675;
 
 fn sys_reboot(magic1: int, magic2: int, cmd: int) -> int {
     if (magic1 != REBOOT_MAGIC1 || magic2 != REBOOT_MAGIC2) { return -EINVAL; }
-    if (!capable()) { return -EPERM_C; }
+    if (!capable()) { return -EPERM; }
     if (cmd != REBOOT_CMD_RESTART && cmd != REBOOT_CMD_POWER_OFF && cmd != REBOOT_CMD_HALT) { return -EINVAL; }
     if (tfs_shutdown() < 0) { printk("reboot: some buffers could not be written\n"); }
     if (cmd == REBOOT_CMD_RESTART) {

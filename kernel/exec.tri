@@ -17,11 +17,6 @@ const TEF_MAGIC: int = 0zB007AB15;
 const MAX_ARGS: int = 81;             // argv and envp strings together
 const ARG_BYTES: int = 2187;
 
-const E2BIG: int = 7;
-const ENOENT: int = 2;
-const ENOEXEC: int = 8;
-const ENOMEM: int = 12;
-const ELOOP: int = 40;
 const SCRIPT_DEPTH: int = 4;          // a script's interpreter may be a script, 4 deep
 
 // Arguments, copied into the kernel before the old address space goes.

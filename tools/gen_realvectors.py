@@ -4,7 +4,7 @@ An independent reference: every operation is computed here in exact
 rational arithmetic (Python's Fraction and big integers) from the rules of
 docs/REAL.md, sharing no code with crates/real. The vectors go to
 crates/real/tests/vectors.txt, which crates/real/tests/conformance.rs
-(the library) and crates/core/tests/fpu_conformance.rs (the FPU's
+(the library) and crates/trine/tests/fpu_conformance.rs (the FPU's
 instructions) check.
 
     python tools/gen_realvectors.py > crates/real/tests/vectors.txt

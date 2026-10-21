@@ -205,3 +205,35 @@ fn group_name(gid: int) -> *char {
     if (g != null) { strncpy(&id_name_buf[0], g.gr_name, 26); id_name_buf[26] = 0; return &id_name_buf[0]; }
     return itoa(gid, &id_name_buf[0]);
 }
+
+// Print prompt on out, then read a line from the terminal: echo off unless
+// echo is set (passwords), ended by a newline or a carriage return. Its
+// length, or -1 at the end of the input.
+fn pw_ask(out: int, prompt: *char, buf: *char, max: int, echo: int) -> int {
+    fputs(out, prompt);
+    var saved: termios;
+    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (tty && !echo) {
+        var quiet: termios;
+        tcgetattr(STDIN_FILENO, &quiet);
+        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    var n: int = 0;
+    var got: int = 0;
+    loop {
+        var c: [1]char;
+        var r: int = read(STDIN_FILENO, &c[0], 1);
+        if (r < 0 && errno == EINTR) { continue; }
+        if (r <= 0) { break; }
+        got = 1;
+        if (c[0] == '\n' || c[0] == '\r') { break; }
+        if (n < max - 1) { buf[n] = c[0]; n += 1; }
+    }
+    buf[n] = 0;
+    if (tty && !echo) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+        fputs(out, "\n");
+    }
+    return got ? n : -1;
+}

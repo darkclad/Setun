@@ -1,5 +1,7 @@
 // Trinux: physical memory layout and boot constants (docs/KERNEL.md §2-3).
 
+import "errno.tri";
+
 import "ports.tri";
 
 const TRINUX_VERSION: *char = "0.1";

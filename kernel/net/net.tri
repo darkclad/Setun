@@ -33,10 +33,6 @@ const INADDR_BROADCAST: int = 4294967295; // 255.255.255.255
 const TWO32: int = 4294967296;
 
 // errno values the network uses (Linux)
-const ENETUNREACH: int = 101;
-const EHOSTUNREACH: int = 113;
-const EMSGSIZE: int = 90;
-const ENOBUFS: int = 105;
 
 // ---- octets ----------------------------------------------------------------------------------
 

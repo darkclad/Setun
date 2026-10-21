@@ -1,5 +1,5 @@
 // octets.tri: Trinux files (trytes) as octets for the network, the rules
-// sftp-server, scp and sftp share (docs/NETWORK.md §11):
+// sftp-server, scp, sftp and httpd share (docs/NETWORK.md §11):
 //   - a file whose trytes are all 0..255 travels octet for octet;
 //   - a file with any other tryte (a character beyond 255, an overlined
 //     one) travels as UTF-8 text;

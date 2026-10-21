@@ -493,7 +493,6 @@ var vn_keys: cvec;                       // key texts, NUL-terminated
 var vn_tab: *int;                        // hash -> key offset + 1
 var vn_num: *int;                        // and its value number
 var vn_size: int;
-var vn_used: int;
 
 fn vn_fresh() -> int { vn_next += 1; return vn_next; }
 
@@ -513,7 +512,6 @@ fn vn_lookup(k: *char) -> int {
     cv_str(&vn_keys, k);
     cv_push(&vn_keys, 0);
     vn_num[h] = vn_fresh();
-    vn_used += 1;
     return vn_num[h];
 }
 

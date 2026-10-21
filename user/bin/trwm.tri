@@ -68,7 +68,7 @@ const TITLE_ON: int = -10 * 729 - 6 * 27 + 8;
 const TITLE_OFF: int = -4 * 729 - 4 * 27 - 3;
 const FRAME: int = -11 * 729 - 11 * 27 - 11;
 
-fn log2(a: *char, b: *char) {
+fn wm_log(a: *char, b: *char) {
     fputs(STDERR_FILENO, "trwm: ");
     fputs(STDERR_FILENO, a);
     if (b != null) { fputs(STDERR_FILENO, b); }
@@ -258,12 +258,12 @@ fn close_window(i: int, why: *char) {
 fn spawn(path: *char) -> int {
     var i: int = 0;
     while (i < MAXWIN && wins[i].used) { i += 1; }
-    if (i == MAXWIN) { log2("too many windows; not starting ", path); return -1; }
+    if (i == MAXWIN) { wm_log("too many windows; not starting ", path); return -1; }
     var req: [2]int;
     var ev: [2]int;
-    if (pipe(&req[0]) < 0 || pipe(&ev[0]) < 0) { log2("pipe failed for ", path); return -1; }
+    if (pipe(&req[0]) < 0 || pipe(&ev[0]) < 0) { wm_log("pipe failed for ", path); return -1; }
     var pid: int = fork();
-    if (pid < 0) { log2("fork failed for ", path); return -1; }
+    if (pid < 0) { wm_log("fork failed for ", path); return -1; }
     if (pid == 0) {
         dup2(req[1], TRW_REQ_FD);
         dup2(ev[0], TRW_EV_FD);
@@ -465,7 +465,7 @@ fn hit_window(x: int, y: int) -> int {
 }
 
 fn quit_session() {
-    log2("exit", null);
+    wm_log("exit", null);
     running = 0;
 }
 
@@ -559,7 +559,7 @@ fn key_event(ev: int) {
     var layout: int = km_layout;
     var c: int = keymap_event(ev);
     if (km_layout != layout) {
-        log2("layout ", keymap_layout_name());
+        wm_log("layout ", keymap_layout_name());
         damage(0, 0, screen.w, PANEL_H);
     }
     var t: int = top_window();

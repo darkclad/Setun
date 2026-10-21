@@ -6,6 +6,7 @@
 import "../lib/tlibc.tri";
 import "../lib/stdlib.tri";
 import "../lib/socket.tri";
+import "../lib/ctype.tri";
 
 var sock: int;
 var devbuf: [2187]char;
@@ -71,8 +72,6 @@ fn counters(name: *char, c: *int) {
 
 var if6buf: [2187]char;
 
-fn hexdig(c: int) -> int { return c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10; }
-
 // "        inet6 fe80::5054:ff:fe12:3456  prefixlen 64  scopeid 0x20<link>"
 // for each of the interface's lines in /proc/net/if_inet6 (docs/IPV6.md
 // §6), with its state when it is not usable.
@@ -96,10 +95,10 @@ fn inet6_lines(name: *char) {
         if (strcmp(&if6buf[nm], name) != 0) { continue; }
         var a: [16]int;
         var k: int = 0;
-        while (k < 16) { a[k] = hexdig(if6buf[line + 2 * k]) * 16 + hexdig(if6buf[line + 2 * k + 1]); k += 1; }
-        var plen: int = hexdig(if6buf[line + 36]) * 16 + hexdig(if6buf[line + 37]);
-        var scope: int = hexdig(if6buf[line + 39]) * 16 + hexdig(if6buf[line + 40]);
-        var fl: int = hexdig(if6buf[line + 42]) * 16 + hexdig(if6buf[line + 43]);
+        while (k < 16) { a[k] = xdigit_val(if6buf[line + 2 * k]) * 16 + xdigit_val(if6buf[line + 2 * k + 1]); k += 1; }
+        var plen: int = xdigit_val(if6buf[line + 36]) * 16 + xdigit_val(if6buf[line + 37]);
+        var scope: int = xdigit_val(if6buf[line + 39]) * 16 + xdigit_val(if6buf[line + 40]);
+        var fl: int = xdigit_val(if6buf[line + 42]) * 16 + xdigit_val(if6buf[line + 43]);
         puts("        inet6 ");
         puts(inet_ntop6(&a[0]));
         puts("  prefixlen ");

@@ -15,9 +15,6 @@ const INPUT_CHAN: int = 20200;        // readers of either device
 const KQ: int = 81;
 const MQ: int = 81;
 const MOUSE_EVENT_WORDS: int = 6;
-const EBUSY_IN: int = 16;
-const EAGAIN_IN: int = 11;
-const EINVAL_IN: int = 22;
 
 var kbd_open: int;
 var kq: [81]int;
@@ -83,7 +80,7 @@ fn mouse_poll_one() {
 }
 
 fn kbd_dev_open() -> int {
-    if (kbd_open) { return -EBUSY_IN; }
+    if (kbd_open) { return -EBUSY; }
     kbd_open = 1;
     kq_count = 0;
     return 0;
@@ -92,7 +89,7 @@ fn kbd_dev_open() -> int {
 fn kbd_dev_close() { kbd_open = 0; }
 
 fn mouse_dev_open() -> int {
-    if (mouse_open) { return -EBUSY_IN; }
+    if (mouse_open) { return -EBUSY; }
     mouse_open = 1;
     mq_count = 0;
     return 0;
@@ -102,10 +99,10 @@ fn mouse_dev_close() { mouse_open = 0; }
 
 // Whole events only: n must hold at least one.
 fn kbd_dev_read(buf: *tryte, n: int, nonblock: int) -> int {
-    if (n < 3) { return -EINVAL_IN; }
-    if ((buf as int + 1) % 3 != 0) { return -EINVAL_IN; }
+    if (n < 3) { return -EINVAL; }
+    if ((buf as int + 1) % 3 != 0) { return -EINVAL; }
     while (kq_count == 0) {
-        if (nonblock) { return -EAGAIN_IN; }
+        if (nonblock) { return -EAGAIN; }
         if (sleep_on(INPUT_CHAN)) { return -ERESTARTSYS; }
     }
     var w: *int = (buf as int + 1) as *int;
@@ -120,10 +117,10 @@ fn kbd_dev_read(buf: *tryte, n: int, nonblock: int) -> int {
 }
 
 fn mouse_dev_read(buf: *tryte, n: int, nonblock: int) -> int {
-    if (n < 3 * MOUSE_EVENT_WORDS) { return -EINVAL_IN; }
-    if ((buf as int + 1) % 3 != 0) { return -EINVAL_IN; }
+    if (n < 3 * MOUSE_EVENT_WORDS) { return -EINVAL; }
+    if ((buf as int + 1) % 3 != 0) { return -EINVAL; }
     while (mq_count == 0) {
-        if (nonblock) { return -EAGAIN_IN; }
+        if (nonblock) { return -EAGAIN; }
         if (sleep_on(INPUT_CHAN)) { return -ERESTARTSYS; }
     }
     var w: *int = (buf as int + 1) as *int;

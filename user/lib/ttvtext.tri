@@ -13,6 +13,7 @@ import "string.tri";
 import "ttv.tri";
 import "long.tri";
 import "real.tri";
+import "ctype.tri";
 
 var tt_buf: [6561]char;               // one text or octet string
 
@@ -135,13 +136,6 @@ fn tt_starts(s: *char) -> int {
     return 1;
 }
 
-fn tt_hexval(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
 fn tt_parse(b: *TtvBuf) -> int {
     tt_skip_ws();
     if (tt_starts("null")) { ttv_parse_at += 4; ttv_null(b); return 0; }
@@ -173,8 +167,8 @@ fn tt_parse(b: *TtvBuf) -> int {
         ttv_parse_at += 2;
         var m: int = 0;
         while (tt_src[ttv_parse_at] != '"') {
-            var hi: int = tt_hexval(tt_src[ttv_parse_at]);
-            var lo: int = tt_hexval(tt_src[ttv_parse_at + 1]);
+            var hi: int = xdigit_val(tt_src[ttv_parse_at]);
+            var lo: int = xdigit_val(tt_src[ttv_parse_at + 1]);
             if (hi < 0 || lo < 0 || m >= 6560) { return -1; }
             tt_buf[m] = (hi * 16 + lo) as char;
             m += 1;

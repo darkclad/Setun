@@ -8,6 +8,7 @@
 // UTF-8, converted with utf8_encode/utf8_decode.
 
 import "tlibc.tri";
+import "ctype.tri";
 
 const AF_UNSPEC: int = 0;
 const AF_INET: int = 2;
@@ -163,13 +164,6 @@ fn inet_ntoa(a: int) -> *char {
     return &_ntoa_buf[0];
 }
 
-fn _hex6val(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
 // IPv6 text (RFC 4291 §2.2: groups of 1..4 hex digits, one "::", an IPv4
 // tail) into 16 octets at out; 1 if valid, as inet_pton(AF_INET6).
 fn inet_pton6(s: *char, out: *int) -> int {
@@ -202,8 +196,8 @@ fn inet_pton6(s: *char, out: *int) -> int {
         }
         var v: int = 0;
         var d: int = 0;
-        while (_hex6val(s[k]) >= 0) {
-            v = v * 16 + _hex6val(s[k]);
+        while (xdigit_val(s[k]) >= 0) {
+            v = v * 16 + xdigit_val(s[k]);
             k += 1;
             d += 1;
             if (d > 4) { return 0; }
@@ -292,38 +286,56 @@ var _hosts_buf: [2187]char;
 
 // The address for `name`: a dotted quad, "localhost", or a line of
 // /etc/hosts. 1 if found.
-fn resolve_host(name: *char, out: *int) -> int {
-    if (inet_aton(name, out)) { return 1; }
+// The address /etc/hosts gives name in family want (AF_INET, AF_INET6 or
+// AF_TNP): into *out, or the 16 octets at out for IPv6. 1 if found.
+fn _hosts_find(name: *char, want: int, out: *int) -> int {
     var fd: int = open("/etc/hosts", O_RDONLY, 0);
-    if (fd >= 0) {
-        var n: int = read(fd, &_hosts_buf[0], 2186);
-        close(fd);
-        if (n < 0) { n = 0; }
-        _hosts_buf[n] = 0;
-        var k: int = 0;
-        while (k < n) {
-            // one line: address, then names
-            var line: int = k;
-            while (k < n && _hosts_buf[k] != '\n') { k += 1; }
-            var end: int = k;
-            k += 1;
-            if (_hosts_buf[line] == '#') { continue; }
-            var j: int = line;
+    if (fd < 0) { return 0; }
+    var n: int = read(fd, &_hosts_buf[0], 2186);
+    close(fd);
+    if (n < 0) { n = 0; }
+    _hosts_buf[n] = 0;
+    var k: int = 0;
+    while (k < n) {
+        // one line: address, then names
+        var line: int = k;
+        while (k < n && _hosts_buf[k] != '\n') { k += 1; }
+        var end: int = k;
+        k += 1;
+        if (_hosts_buf[line] == '#') { continue; }
+        var j: int = line;
+        while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
+        var saved: char = _hosts_buf[j];
+        _hosts_buf[j] = 0;
+        var o: [16]int;
+        var addr: int = 0;
+        var ok: int = 0;
+        if (want == AF_INET6) { ok = inet_pton6(&_hosts_buf[line], &o[0]); }
+        else if (want == AF_TNP) { ok = tn_aton(&_hosts_buf[line], &addr); }
+        else { ok = inet_aton(&_hosts_buf[line], &addr); }
+        _hosts_buf[j] = saved;
+        if (!ok) { continue; }
+        while (j < end) {
+            while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
+            var w: int = j;
             while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-            var saved: char = _hosts_buf[j];
-            _hosts_buf[j] = 0;
-            var addr: int = 0;
-            var ok: int = inet_aton(&_hosts_buf[line], &addr);
-            _hosts_buf[j] = saved;
-            if (!ok) { continue; }
-            while (j < end) {
-                while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
-                var w: int = j;
-                while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-                if (j > w && _name_is(&_hosts_buf[w], j - w, name)) { *out = addr; return 1; }
+            if (j > w && _name_is(&_hosts_buf[w], j - w, name)) {
+                if (want == AF_INET6) {
+                    var c: int = 0;
+                    while (c < 16) { out[c] = o[c]; c += 1; }
+                } else {
+                    *out = addr;
+                }
+                return 1;
             }
         }
     }
+    return 0;
+}
+
+fn resolve_host(name: *char, out: *int) -> int {
+    if (inet_aton(name, out)) { return 1; }
+    if (_hosts_find(name, AF_INET, out)) { return 1; }
     if (_name_is("localhost", 9, name)) { *out = INADDR_LOOPBACK; return 1; }
     var addrs: [1]int;
     if (dns_lookup(name, dns_server(), &addrs[0], 1) > 0) { *out = addrs[0]; return 1; }
@@ -394,41 +406,9 @@ fn tn_ntoa(a: int) -> *char {
 fn resolve_any(name: *char, out: *int) -> int {
     if (tn_aton(name, out)) { return AF_TNP; }
     if (inet_aton(name, out)) { return AF_INET; }
-    var fd: int = open("/etc/hosts", O_RDONLY, 0);
-    if (fd >= 0) {
-        var n: int = read(fd, &_hosts_buf[0], 2186);
-        close(fd);
-        if (n < 0) { n = 0; }
-        _hosts_buf[n] = 0;
-        var found_inet: int = 0;
-        var inet_addr_found: int = 0;
-        var k: int = 0;
-        while (k < n) {
-            var line: int = k;
-            while (k < n && _hosts_buf[k] != '\n') { k += 1; }
-            var end: int = k;
-            k += 1;
-            if (_hosts_buf[line] == '#') { continue; }
-            var j: int = line;
-            while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-            var saved: char = _hosts_buf[j];
-            _hosts_buf[j] = 0;
-            var addr: int = 0;
-            var fam: int = tn_aton(&_hosts_buf[line], &addr) ? AF_TNP : (inet_aton(&_hosts_buf[line], &addr) ? AF_INET : 0);
-            _hosts_buf[j] = saved;
-            if (fam == 0) { continue; }
-            while (j < end) {
-                while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
-                var w: int = j;
-                while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-                if (j > w && _name_is(&_hosts_buf[w], j - w, name)) {
-                    if (fam == AF_TNP) { *out = addr; return AF_TNP; }
-                    if (!found_inet) { found_inet = 1; inet_addr_found = addr; }
-                }
-            }
-        }
-        if (found_inet) { *out = inet_addr_found; return AF_INET; }
-    }
+    // a TNET line wins over an IPv4 one, wherever it is
+    if (_hosts_find(name, AF_TNP, out)) { return AF_TNP; }
+    if (_hosts_find(name, AF_INET, out)) { return AF_INET; }
     if (_name_is("localhost", 9, name)) { *out = INADDR_LOOPBACK; return AF_INET; }
     var addrs: [1]int;
     if (dns_lookup(name, dns_server(), &addrs[0], 1) > 0) { *out = addrs[0]; return AF_INET; }
@@ -450,12 +430,13 @@ fn addr_ntoa(family: int, a: int) -> *char { return family == AF_TNP ? tn_ntoa(a
 const DNS_TIMEOUT: int = -2;          // dns_lookup: no answer from the server
 const DNS_BAD_NAME: int = -3;         //             not a name DNS can carry
 
-// The first nameserver in /etc/resolv.conf, or 10.0.2.3.
-fn dns_server() -> int {
+// The first nameserver of /etc/resolv.conf in family want (AF_INET, or 0
+// for either), port 53, into *srv; 10.0.2.3 if there is none.
+fn _resolv_server(srv: *sockaddr_in6, want: int) {
     var buf: [729]char;
+    sa_set(srv, AF_INET, 167772675, null, 53);   // 10.0.2.3
     var fd: int = open("/etc/resolv.conf", O_RDONLY, 0);
-    var a: int = 167772675;                       // 10.0.2.3
-    if (fd < 0) { return a; }
+    if (fd < 0) { return; }
     var n: int = read(fd, &buf[0], 728);
     close(fd);
     if (n < 0) { n = 0; }
@@ -470,14 +451,23 @@ fn dns_server() -> int {
             var saved: char = buf[e];
             buf[e] = 0;
             var v: int = 0;
-            var ok: int = inet_aton(&buf[j], &v);
+            var o: [16]int;
+            var got: int = 0;
+            if (inet_aton(&buf[j], &v)) { sa_set(srv, AF_INET, v, null, 53); got = 1; }
+            else if (want == 0 && inet_pton6(&buf[j], &o[0])) { sockaddr6_set(srv, &o[0], 53); got = 1; }
             buf[e] = saved;
-            if (ok) { return v; }
+            if (got) { return; }
         }
         while (k < n && buf[k] != '\n') { k += 1; }
         k += 1;
     }
-    return a;
+}
+
+// The first IPv4 nameserver in /etc/resolv.conf, or 10.0.2.3.
+fn dns_server() -> int {
+    var srv: sockaddr_in6;
+    _resolv_server(&srv, AF_INET);
+    return (&srv as *sockaddr_in).sin_addr;
 }
 
 fn _prefix(s: *char, p: *char) -> int {
@@ -528,32 +518,7 @@ fn dns_lookup6(name: *char, srv: *sockaddr_in6, out: *int, max: int) -> int {
 // The DNS server of /etc/resolv.conf's first usable nameserver line, IPv4
 // or IPv6 (10.0.2.3 if there is none), port 53.
 fn dns_server_sa(srv: *sockaddr_in6) {
-    var buf: [729]char;
-    sa_set(srv, AF_INET, 167772675, null, 53);   // 10.0.2.3
-    var fd: int = open("/etc/resolv.conf", O_RDONLY, 0);
-    if (fd < 0) { return; }
-    var n: int = read(fd, &buf[0], 728);
-    close(fd);
-    if (n < 0) { n = 0; }
-    buf[n] = 0;
-    var k: int = 0;
-    while (k < n) {
-        if (_prefix(&buf[k], "nameserver")) {
-            var j: int = k + 10;
-            while (buf[j] == ' ' || buf[j] == '\t') { j += 1; }
-            var e: int = j;
-            while (buf[e] != 0 && buf[e] != '\n' && buf[e] != ' ') { e += 1; }
-            var saved: char = buf[e];
-            buf[e] = 0;
-            var v: int = 0;
-            var o: [16]int;
-            if (inet_aton(&buf[j], &v)) { buf[e] = saved; sa_set(srv, AF_INET, v, null, 53); return; }
-            if (inet_pton6(&buf[j], &o[0])) { buf[e] = saved; sockaddr6_set(srv, &o[0], 53); return; }
-            buf[e] = saved;
-        }
-        while (k < n && buf[k] != '\n') { k += 1; }
-        k += 1;
-    }
+    _resolv_server(srv, 0);
 }
 
 // Is a the address of the server at srv (its family, address and port 53)?
@@ -886,43 +851,6 @@ fn close_all(fds: *int, n: int) {
 
 // ---- names of any family (docs/IPV6.md §6) ------------------------------------------------
 
-// An IPv6 address for name in /etc/hosts: its 16 octets into out; 1 if found.
-fn _hosts6(name: *char, out: *int) -> int {
-    var fd: int = open("/etc/hosts", O_RDONLY, 0);
-    if (fd < 0) { return 0; }
-    var n: int = read(fd, &_hosts_buf[0], 2186);
-    close(fd);
-    if (n < 0) { n = 0; }
-    _hosts_buf[n] = 0;
-    var k: int = 0;
-    while (k < n) {
-        var line: int = k;
-        while (k < n && _hosts_buf[k] != '\n') { k += 1; }
-        var end: int = k;
-        k += 1;
-        if (_hosts_buf[line] == '#') { continue; }
-        var j: int = line;
-        while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-        var saved: char = _hosts_buf[j];
-        _hosts_buf[j] = 0;
-        var o: [16]int;
-        var ok: int = inet_pton6(&_hosts_buf[line], &o[0]);
-        _hosts_buf[j] = saved;
-        if (!ok) { continue; }
-        while (j < end) {
-            while (j < end && (_hosts_buf[j] == ' ' || _hosts_buf[j] == '\t')) { j += 1; }
-            var w: int = j;
-            while (j < end && _hosts_buf[j] != ' ' && _hosts_buf[j] != '\t') { j += 1; }
-            if (j > w && _name_is(&_hosts_buf[w], j - w, name)) {
-                var c: int = 0;
-                while (c < 16) { out[c] = o[c]; c += 1; }
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
 // name as a socket address with port, in *sa: an IPv6 or IPv4 literal, a
 // TNET address, /etc/hosts, then DNS. want is AF_INET, AF_INET6 or AF_TNP
 // to take only that family, 0 for any: IPv4 is tried before IPv6 (RFC 6724
@@ -943,7 +871,7 @@ fn resolve_name(name: *char, want: int, sa: *sockaddr_in6, port: int) -> int {
         }
         if (want != 0) { return 0; }
     }
-    if (_hosts6(name, &o[0]) || (_name_is("localhost", 9, name) && inet_pton6("::1", &o[0]))) {
+    if (_hosts_find(name, AF_INET6, &o[0]) || (_name_is("localhost", 9, name) && inet_pton6("::1", &o[0]))) {
         sockaddr6_set(sa, &o[0], port);
         return AF_INET6;
     }

@@ -24,7 +24,6 @@ var rmax: int;
 var lwin: int;
 var server_ch: int;
 var exit_code: int = 255;
-var got_status: int;
 var raw_tty: int;
 var saved_tty: termios;
 var dec: utf8_state;
@@ -131,10 +130,8 @@ fn session_message(t: int) {
             var want: int = get_bool();
             if (streq(&type[0], "exit-status")) {
                 exit_code = get_u32();
-                got_status = 1;
             } else if (streq(&type[0], "exit-signal")) {
                 exit_code = 255;
-                got_status = 1;
             }
             if (want) {
                 out_start(SSH_MSG_CHANNEL_FAILURE);

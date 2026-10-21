@@ -11,6 +11,7 @@ import "../lib/chacha.tri";
 import "../lib/aes.tri";
 import "pkvectors.inc.tri";
 import "aesvectors.inc.tri";
+import "../lib/ctype.tri";
 
 var failures: int;
 var t0: int;
@@ -32,12 +33,10 @@ fn ok(what: *char, cond: int) {
     t0 = ms();
 }
 
-fn hv(c: int) -> int { return c <= '9' ? c - '0' : c - 'a' + 10; }
-
 fn unhex(s: *char, p: *tryte) -> int {
     var n: int = 0;
     while (s[2 * n] != 0) {
-        p[n] = (hv(s[2 * n]) * 16 + hv(s[2 * n + 1])) as tryte;
+        p[n] = (xdigit_val(s[2 * n]) * 16 + xdigit_val(s[2 * n + 1])) as tryte;
         n += 1;
     }
     return n;
@@ -250,6 +249,7 @@ fn main(argc: int, argv: **char) -> int {
     ok("ECDSA P-256 sign, \"test\"", sign_case(CURVE_P256, HASH_SHA256, SP256_D, SP256_PUB, SP256_M1, SP256_R1, SP256_S1));
     ok("ECDSA P-256 sign, 300 octets", sign_case(CURVE_P256, HASH_SHA256, SP256_D, SP256_PUB, SP256_M2, SP256_R2, SP256_S2));
     ok("ECDSA P-384 sign, RFC 6979 \"sample\"", sign_case(CURVE_P384, HASH_SHA384, SP384_D, SP384_PUB, SP384_M0, SP384_R0, SP384_S0));
+    ok("ECDSA P-384 sign, \"test\"", sign_case(CURVE_P384, HASH_SHA384, SP384_D, SP384_PUB, SP384_M1, SP384_R1, SP384_S1));
     ok("ECDSA P-384 sign, 300 octets", sign_case(CURVE_P384, HASH_SHA384, SP384_D, SP384_PUB, SP384_M2, SP384_R2, SP384_S2));
     ok("ECDSA sign refuses a key of 0 or n", sign_refusals());
 

@@ -105,8 +105,6 @@ fn tn_raw_deliver(src: int, p: *tryte, n: int) {
 const TDP_HLEN: int = 2;
 const TDP_MAXDATA: int = 2167;            // TNP_MAXDATA - TDP_HLEN
 
-var tdp_no_port: int;
-var tdp_rcvbuf: int;
 
 fn tdp_sendmsg(s: int, p: *tryte, n: int, dst: int, port: int) -> int {
     if (n > TDP_MAXDATA) { return -EMSGSIZE; }
@@ -138,9 +136,8 @@ fn tdp_input(src: int, p: *tryte, n: int, pkt: *tryte, total: int) {
         s += 1;
     }
     if (best < 0) {
-        tdp_no_port += 1;
         tcmp_unreachable(src, TCMP_NO_PORT, pkt, total);
         return;
     }
-    if (!dgram_queue(best, src, sport, p + TDP_HLEN, n - TDP_HLEN)) { tdp_rcvbuf += 1; }
+    dgram_queue(best, src, sport, p + TDP_HLEN, n - TDP_HLEN);            // dropped if the ring is full
 }

@@ -7,6 +7,13 @@ fn isalpha(c: int) -> int { return isupper(c) || islower(c); }
 fn isalnum(c: int) -> int { return isalpha(c) || isdigit(c); }
 fn isspace(c: int) -> int { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12; }
 fn isxdigit(c: int) -> int { return isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+// A hex digit's value (either case), or -1 for anything else.
+fn xdigit_val(c: int) -> int {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return -1;
+}
 // An overlined character (code point -33..-126, the negated character) is
 // printable; it is a letter or digit when the character is.
 fn isprint(c: int) -> int { return (c >= 32 && c < 127) || (c <= -33 && c >= -126); }

@@ -42,22 +42,6 @@ const S_IFREG: int = 32768;
 const S_IFSOCK: int = 49152;
 
 // errno (Linux)
-const EPERM: int = 1;
-const ENOENT_: int = 2;
-const EIO_: int = 5;
-const EBUSY: int = 16;
-const EEXIST: int = 17;
-const EXDEV: int = 18;
-const ENODEV: int = 19;
-const ENOTDIR: int = 20;
-const EISDIR: int = 21;
-const EINVAL_: int = 22;
-const ENFILE: int = 23;
-const ENOSPC: int = 28;
-const EROFS: int = 30;
-const ENAMETOOLONG: int = 36;
-const ENOTEMPTY: int = 39;
-const EACCES_: int = 13;
 
 struct Inode {
     type: int;
@@ -328,7 +312,7 @@ fn ram_lookup(dir: int, s: *char, len: int) -> int {
         if (k == len && inodes[c].name[len] == 0) { return c; }
         c = inodes[c].sibling;
     }
-    return -ENOENT_;
+    return -ENOENT;
 }
 
 fn ram_create(dir: int, s: *char, len: int, type: int, mode: int) -> int {
@@ -431,7 +415,7 @@ fn walk(path: *char, cwd: int, want_parent: int) -> int {
     loop {
         while (path[i] == '/') { i += 1; }
         if (path[i] == 0) {
-            if (want_parent) { return -ENOENT_; }        // no last component ("/")
+            if (want_parent) { return -ENOENT; }        // no last component ("/")
             return cur;
         }
         var start: int = i;
@@ -473,9 +457,9 @@ fn vfs_create(path: *char, cwd: int, type: int, mode: int) -> int {
     if (leaf_is_dot()) { return -EEXIST; }
     var found: int = fs_lookup(dir, &leaf[0], leaf_len);
     if (found >= 0) { return -EEXIST; }
-    if (found != -ENOENT_) { return found; }
+    if (found != -ENOENT) { return found; }
     var fs: int = inodes[dir].fs;
-    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_PROC) { return -EACCES; }
     var w: int = inode_permission(dir, MAY_WRITE + MAY_EXEC);
     if (w < 0) { return w; }
     var r: int = fs == FS_TFS ? tfs_create(dir, &leaf[0], leaf_len, type, mode) : ram_create(dir, &leaf[0], leaf_len, type, mode);
@@ -507,12 +491,12 @@ fn is_mount_root(i: int) -> int { return i == root_ino || inodes[i].covered >= 0
 fn vfs_unlink(path: *char, cwd: int, want_dir: int) -> int {
     var dir: int = walk(path, cwd, 1);
     if (dir < 0) { return dir; }
-    if (leaf_is_dot()) { return want_dir ? -EINVAL_ : -EISDIR; }
+    if (leaf_is_dot()) { return want_dir ? -EINVAL : -EISDIR; }
     var i: int = fs_lookup(dir, &leaf[0], leaf_len);
     if (i < 0) { return i; }
     var w: int = inode_permission(dir, MAY_WRITE + MAY_EXEC);
     if (w < 0) { return w; }
-    if (!sticky_ok(dir, i)) { return -EPERM_C; }
+    if (!sticky_ok(dir, i)) { return -EPERM; }
     if (is_mount_root(i)) { return -EBUSY; }
     var n: *Inode = &inodes[i];
     if (n.type == I_DIR && is_some_cwd(i)) { return -EBUSY; }      // Linux allows it; we keep cwd alive
@@ -520,7 +504,7 @@ fn vfs_unlink(path: *char, cwd: int, want_dir: int) -> int {
         if (n.type != I_DIR) { return -ENOTDIR; }
     } else if (n.type == I_DIR) { return -EISDIR; }
     var fs: int = inodes[dir].fs;
-    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_PROC) { return -EACCES; }
     if (fs == FS_TFS) {
         var r: int = tfs_unlink(dir, &leaf[0], leaf_len, i);
         if (r < 0) { return r; }
@@ -571,21 +555,21 @@ fn vfs_rename(oldpath: *char, newpath: *char, cwd: int) -> int {
     var w: int = inode_permission(od, MAY_WRITE + MAY_EXEC);
     if (w >= 0) { w = inode_permission(nd, MAY_WRITE + MAY_EXEC); }
     if (w < 0) { return w; }
-    if (!sticky_ok(od, src)) { return -EPERM_C; }
+    if (!sticky_ok(od, src)) { return -EPERM; }
     if (inodes[src].mounted >= 0) { return -EBUSY; }
-    if (inodes[src].type == I_DIR && is_inside(nd, src)) { return -EINVAL_; }
+    if (inodes[src].type == I_DIR && is_inside(nd, src)) { return -EINVAL; }
     var dst: int = fs_lookup(nd, &leaf[0], leaf_len);
     if (dst == src) { return 0; }
     if (dst >= 0) {
         if (inodes[dst].mounted >= 0) { return -EBUSY; }
         if (inodes[src].type == I_DIR && inodes[dst].type != I_DIR) { return -ENOTDIR; }
         if (inodes[src].type != I_DIR && inodes[dst].type == I_DIR) { return -EISDIR; }
-        if (!sticky_ok(nd, dst)) { return -EPERM_C; }
-    } else if (dst != -ENOENT_) {
+        if (!sticky_ok(nd, dst)) { return -EPERM; }
+    } else if (dst != -ENOENT) {
         return dst;
     }
     var fs: int = inodes[od].fs;
-    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_PROC) { return -EACCES; }
     if (fs == FS_TFS) {
         var tr: int = tfs_rename(od, &leaf2[0], olen, src, nd, &leaf[0], leaf_len, dst);
         if (tr < 0) { return tr; }
@@ -685,7 +669,7 @@ fn vfs_write(i: int, pos: int, buf: *tryte, n: int) -> int {
     var fs: int = inodes[i].fs;
     inode_gen += 1;
     inodes[i].gen = inode_gen;
-    if (fs == FS_PROC) { return -EACCES_; }
+    if (fs == FS_PROC) { return -EACCES; }
     var r: int = fs == FS_TFS ? tfs_write(i, pos, buf, n) : ram_write(i, pos, buf, n);
     if (r > 0) { inode_modified(i); }
     return r;
@@ -813,7 +797,7 @@ fn do_mount(fs: int, point: int, source: *char, target: *char) -> int {
 
 fn do_umount(root: int) -> int {
     var m: int = inodes[root].mnt;
-    if (inodes[root].covered < 0 || m < 0 || !mounts[m].used || mounts[m].root != root) { return -EINVAL_; }
+    if (inodes[root].covered < 0 || m < 0 || !mounts[m].used || mounts[m].root != root) { return -EINVAL; }
     var i: int = 1;
     while (i < NINODES) {                        // busy: open files, working directories, mounts inside
         if (inodes[i].type != I_FREE && inodes[i].mnt == m) {

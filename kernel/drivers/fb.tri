@@ -19,9 +19,6 @@ const FBIOPUT_VSCREENINFO: int = 17921;
 const FBIO_CURSOR: int = 17928;
 const FB_FIRST_FRAME: int = -81;      // FB_BASE is the first tryte of frame -81
 const FB_MAX_FRAMES: int = 25;        // 800 x 600 trytes fit in 25 frames
-const EBUSY_FB: int = 16;
-const EINVAL_FB: int = 22;
-const ENOTTY_FB: int = 25;
 
 struct FbInfo {
     xres: int;
@@ -60,7 +57,7 @@ fn fb_set_mode(m: int) {
 }
 
 fn fb_dev_open() -> int {
-    if (fb_open) { return -EBUSY_FB; }
+    if (fb_open) { return -EBUSY; }
     fb_open = 1;
     return 0;
 }
@@ -83,7 +80,7 @@ fn fb_dev_ioctl(cmd: int, arg: int) -> int {
         }
         case FBIOPUT_VSCREENINFO: {
             var j: *FbInfo = arg as *FbInfo;
-            if (j.mode < -1 || j.mode > 1) { return -EINVAL_FB; }
+            if (j.mode < -1 || j.mode > 1) { return -EINVAL; }
             if (j.mode != fb_mode()) { fb_set_mode(j.mode); }
             return 0;
         }
@@ -95,7 +92,7 @@ fn fb_dev_ioctl(cmd: int, arg: int) -> int {
             return 0;
         }
     }
-    return -ENOTTY_FB;
+    return -ENOTTY;
 }
 
 fn fb_dev_read(pos: int, buf: *tryte, n: int) -> int {

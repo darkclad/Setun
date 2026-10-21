@@ -151,32 +151,7 @@ fn ask_password(buf: *char, max: int) -> int {
     strcat(&prompt[0], "@");
     strcat(&prompt[0], &host[0]);
     strcat(&prompt[0], "'s password: ");
-    fputs(STDERR_FILENO, &prompt[0]);
-    var saved: termios;
-    var tty: int = tcgetattr(STDIN_FILENO, &saved) == 0;
-    if (tty) {
-        var quiet: termios;
-        tcgetattr(STDIN_FILENO, &quiet);
-        if (quiet.c_lflag / ECHO % 2 != 0) { quiet.c_lflag -= ECHO; }
-        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
-    }
-    var n: int = 0;
-    var got: int = 0;
-    loop {
-        var c: [1]char;
-        var r: int = read(STDIN_FILENO, &c[0], 1);
-        if (r < 0 && errno == EINTR) { continue; }
-        if (r <= 0) { break; }
-        got = 1;
-        if (c[0] == '\n' || c[0] == '\r') { break; }
-        if (n < max - 1) { buf[n] = c[0]; n += 1; }
-    }
-    buf[n] = 0;
-    if (tty) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
-        fputs(STDERR_FILENO, "\n");
-    }
-    return got ? n : -1;
+    return pw_ask(STDERR_FILENO, &prompt[0], buf, max, 0);
 }
 
 fn login(identity: *char) {

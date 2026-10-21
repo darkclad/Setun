@@ -21,7 +21,6 @@ const F_DUPFD_CLOEXEC: int = 1030;
 const FD_CLOEXEC: int = 1;
 const O_CLOEXEC: int = 524288;
 const O_NONBLOCK: int = 2048;
-const EMLINK: int = 31;
 
 // struct utsname: six fields of 65 characters (Linux's sizes).
 struct Utsname {
@@ -53,7 +52,7 @@ fn sys_clock_settime(clk: int, ts: int) -> int {
     if (!user_range_ok(ts - 1, 6)) { return -EFAULT; }
     var t: *int = ts as *int;
     if (t[0] < 0 || t[1] < 0 || t[1] > 999999999) { return -EINVAL; }
-    if (current_task().euid != 0) { return -EPERM_; }
+    if (current_task().euid != 0) { return -EPERM; }
     out(RTC_SECONDS, t[0]);
     return 0;
 }
@@ -169,7 +168,7 @@ fn sys_linkat(olddirfd: int, oldpath: int, newdirfd: int, newpath: int) -> int {
     if (leaf_is_dot()) { return -EEXIST; }
     var exists: int = fs_lookup(dir, &leaf[0], leaf_len);
     if (exists >= 0) { return -EEXIST; }
-    if (exists != -ENOENT_) { return exists; }
+    if (exists != -ENOENT) { return exists; }
     var w: int = inode_permission(dir, MAY_WRITE + MAY_EXEC);
     if (w < 0) { return w; }
     if (inodes[dir].mnt != inodes[src].mnt) { return -EXDEV; }
@@ -231,7 +230,6 @@ fn close_on_exec(t: *Task) {
 
 const MAP_SHARED: int = 1;
 const FB_VA_PAGE: int = -14348907;               // -3^15: the page index of the mapping
-const ENODEV_M: int = 19;
 
 fn fb_va() -> int { return FB_VA_PAGE * 19683 - 9841; }   // its first tryte
 
@@ -280,7 +278,7 @@ fn sys_mmap(addr: int, len: int, prot: int, flags: int, fd: int, off: int) -> in
     if (f < 0) { return f; }
     if (len <= 0 || off != 0 || flags % 2 != MAP_SHARED) { return -EINVAL; }
     var i: int = files[f].ino;
-    if (inodes[i].type != I_CHR || inodes[i].rdev != DEV_FB0) { return -ENODEV_M; }
+    if (inodes[i].type != I_CHR || inodes[i].rdev != DEV_FB0) { return -ENODEV; }
     if (len > fb_size()) { return -EINVAL; }
     var frames: int = (len + 19682) / 19683;
     var t: *Task = current_task();

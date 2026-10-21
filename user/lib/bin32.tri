@@ -6,13 +6,13 @@
 
 import "tlibc.tri";
 import "stdlib.tri";
-import "u32.tri";                     // TWO32
+import "u32.tri";
 
 const MASK32: int = 4294967295;
 
 var _pow2: [33]int;
 
-// Kept for the callers: the powers of two (no tables are needed any more).
+// The powers of two, which rotr32 divides by (BROT needs a constant amount).
 fn bin32_init() {
     if (_pow2[0] != 0) { return; }
     var k: int = 0;

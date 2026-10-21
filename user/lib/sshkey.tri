@@ -8,12 +8,7 @@ import "tlibc.tri";
 import "string.tri";
 import "c25519.tri";
 import "base64.tri";
-
-fn _hexval(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    return -1;
-}
+import "ctype.tri";
 
 // The public-key blob: string "ssh-ed25519", string key (51 octets).
 fn key_blob(pk: *tryte, blob: *tryte) {
@@ -46,8 +41,8 @@ fn key_load(path: *char, sk: *tryte, pk: *tryte) -> int {
     var seed: [32]tryte;
     var k: int = 0;
     while (k < 32) {
-        var hi: int = _hexval(text[2 * k]);
-        var lo: int = _hexval(text[2 * k + 1]);
+        var hi: int = xdigit_val(text[2 * k]);
+        var lo: int = xdigit_val(text[2 * k + 1]);
         if (hi < 0 || lo < 0) { return -2; }
         seed[k] = (hi * 16 + lo) as tryte;
         k += 1;

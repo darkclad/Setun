@@ -615,7 +615,7 @@ fn icmp6_to_tcp(q: *tryte, n: int, type: int) {
     if (n < 8 + IP6_HLEN + 4 || q[8 + 6] != NH_TCP) { return; }
     var code: int = q[1];
     var err: int = 0;
-    if (type == ICMP6_PARAM) { err = EPROTO_; }
+    if (type == ICMP6_PARAM) { err = EPROTO; }
     else if (code == 1) { err = EACCES; }
     else if (code == 3) { err = EHOSTUNREACH; }
     else if (code == 4) { err = ECONNREFUSED; }
@@ -626,7 +626,6 @@ fn icmp6_to_tcp(q: *tryte, n: int, type: int) {
     tcp6_icmp_abort(dh, get16(t, 0), get16(t, 2), err);
 }
 
-const EPROTO_: int = 71;
 
 // Report a problem with the received packet p (total octets) to its
 // sender (§2), unless the rules forbid it.

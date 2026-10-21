@@ -40,15 +40,12 @@ const PROC_NET_TCP6: int = 19;
 const PROC_NET_UDP6: int = 20;
 const PROC_NET_LAST: int = 20;
 const PROC_KINDS: int = 27;
-const ESRCH_: int = 3;
 
-var proc_mnt: int = -1;
 
 fn proc_kind(i: int) -> int { return inodes[i].ino_no % PROC_KINDS; }
 fn proc_pid(i: int) -> int { return inodes[i].ino_no / PROC_KINDS; }
 
 fn proc_root(mnt: int) -> int {
-    proc_mnt = mnt;
     return iget(FS_PROC, mnt, PROC_ROOT);
 }
 
@@ -68,7 +65,7 @@ fn proc_iload(i: int) -> int {
         inodes[i].type = I_REG;
         inodes[i].mode = k == PROC_CMDLINE || k == PROC_STAT || k == PROC_STATUS ? 292 : 292;   // 0444
     }
-    if (k >= PROC_PID && k <= PROC_CMDLINE && live_task(proc_pid(i)) < 0) { return -ENOENT_; }
+    if (k >= PROC_PID && k <= PROC_CMDLINE && live_task(proc_pid(i)) < 0) { return -ENOENT; }
     return 0;
 }
 
@@ -90,7 +87,7 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "stat")) { return iget(FS_PROC, m, base + PROC_STAT); }
         if (proc_name_eq(s, len, "status")) { return iget(FS_PROC, m, base + PROC_STATUS); }
         if (proc_name_eq(s, len, "cmdline")) { return iget(FS_PROC, m, base + PROC_CMDLINE); }
-        return -ENOENT_;
+        return -ENOENT;
     }
     if (k == PROC_NET) {
         if (len == 2 && s[0] == '.' && s[1] == '.') { return iget(FS_PROC, m, PROC_ROOT); }
@@ -105,7 +102,7 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
         if (proc_name_eq(s, len, "stat6")) { return iget(FS_PROC, m, PROC_NET_STAT6); }
         if (proc_name_eq(s, len, "tcp6")) { return iget(FS_PROC, m, PROC_NET_TCP6); }
         if (proc_name_eq(s, len, "udp6")) { return iget(FS_PROC, m, PROC_NET_UDP6); }
-        return -ENOENT_;
+        return -ENOENT;
     }
     if (proc_name_eq(s, len, "net")) { return iget(FS_PROC, m, PROC_NET); }
     if (proc_name_eq(s, len, "meminfo")) { return iget(FS_PROC, m, PROC_MEMINFO); }
@@ -114,11 +111,11 @@ fn proc_lookup(dir: int, s: *char, len: int) -> int {
     var pid: int = 0;
     var j: int = 0;
     while (j < len) {
-        if (s[j] < '0' || s[j] > '9' || j > 9) { return -ENOENT_; }
+        if (s[j] < '0' || s[j] > '9' || j > 9) { return -ENOENT; }
         pid = pid * 10 + s[j] - '0';
         j += 1;
     }
-    if (len == 0 || live_task(pid) < 0) { return -ENOENT_; }
+    if (len == 0 || live_task(pid) < 0) { return -ENOENT; }
     return iget(FS_PROC, m, PROC_KINDS * pid + PROC_PID);
 }
 
@@ -270,7 +267,7 @@ fn proc_generate(i: int) -> int {
     }
     if (k >= PROC_NET_DEV && k <= PROC_NET_LAST) { proc_net(k); return 0; }
     var ti: int = live_task(proc_pid(i));
-    if (ti < 0) { return -ESRCH_; }
+    if (ti < 0) { return -ESRCH; }
     var t: *Task = &tasks[ti];
     if (k == PROC_STAT) {
         pi(t.pid); ps(" ("); ps(&t.comm[0]); ps(") "); pc(state_char(t)); pc(' ');

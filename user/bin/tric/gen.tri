@@ -966,8 +966,8 @@ fn vc_st(s: int) -> int {
     return 0;
 }
 
-// The direct calls in function item it's body: callees[from..callees.n),
-// to be cut back with calls_done(from).
+// The direct calls in function item its body: callees[from..callees.n),
+// which the caller cuts back to from when it is done with them.
 fn calls_of(it: int) -> int {
     var from: int = callees.n;
     var tn: int = taken.n;

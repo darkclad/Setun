@@ -22,6 +22,7 @@ import "x509.tri";
 import "hmac.tri";
 import "chacha.tri";
 import "aes.tri";
+import "ctype.tri";
 
 const TLS_CHACHA20_POLY1305_SHA256: int = 4867;     // 0x1303
 const TLS_AES_128_GCM_SHA256: int = 4865;           // 0x1301
@@ -1114,7 +1115,7 @@ fn _server_hello_out(t: *tls, buf: *tryte, hrr: int, group: int, share: *tryte, 
 
 fn unhex_into(h: *char, out: *tryte) {
     var k: int = 0;
-    while (h[2 * k] != 0) { out[k] = (_hx(h[2 * k]) * 16 + _hx(h[2 * k + 1])) as tryte; k += 1; }
+    while (h[2 * k] != 0) { out[k] = (xdigit_val(h[2 * k]) * 16 + xdigit_val(h[2 * k + 1])) as tryte; k += 1; }
 }
 
 // The server's handshake over the accepted socket fd, as id: 0, or

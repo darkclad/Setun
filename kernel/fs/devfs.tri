@@ -39,8 +39,6 @@ fn dev_tty(rdev: int, f: int) -> int {
     return -1;
 }
 
-fn dev_is_tty(rdev: int) -> int { return dev_tty(rdev, -1) >= 0; }
-
 // open(2) on a device node: may refuse, may set up per-file state.
 fn dev_open(rdev: int, f: int) -> int {
     if (rdev == DEV_FB0) { return fb_dev_open(); }

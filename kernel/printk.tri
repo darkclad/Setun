@@ -27,11 +27,6 @@ fn pr(s: *char) { print(s); }
 fn pr_int(v: int) { print_int(v); }
 fn pr_nl() { print("\n"); }
 
-fn pr_b27(v: int) {
-    var buf: [10]char;
-    print(itoa27(v, &buf[0]));
-}
-
 // Stop the machine with a message. Never returns.
 fn panic(s: *char) {
     screen_attr = 0t1111TT000;          // white on red

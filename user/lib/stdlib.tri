@@ -13,7 +13,6 @@ import "ctype.tri";
 // first payload word, so it works as a word or struct pointer as well as
 // a tryte buffer (which then starts at that address).
 
-const HEAP_MAGIC: int = 6561;
 const LONG_MAX: int = 3812798742493;       // (3^27 - 1) / 2
 const LONG_MIN: int = -3812798742493;
 

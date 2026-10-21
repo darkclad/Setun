@@ -476,7 +476,6 @@ fn sftp_list(path: *char, each: fn(*char)) -> int {
 
 // ---- whole files ---------------------------------------------------------------------------
 
-var _xfer: [16384]tryte;
 
 // Copy a local file to the remote path. 0, or -status / -1000-errno.
 fn sftp_put(local: *char, remote: *char) -> int {

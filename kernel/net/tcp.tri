@@ -114,12 +114,6 @@ fn tcp_arm_rtx(s: int) {
     if (socks[s].rtx_at == 0) { socks[s].rtx_at = jiffies + socks[s].rto; }
 }
 
-// Has the FIN gone out (snd_nxt is past the data)?
-fn tcp_fin_sent(s: int) -> int {
-    var k: *Socket = &socks[s];
-    return k.fin_out && ssd(s, k.snd_nxt, k.snd_una) > k.tx_count;
-}
-
 // Send what the window allows, then the FIN if one is due.
 fn tcp_output(s: int) {
     var k: *Socket = &socks[s];

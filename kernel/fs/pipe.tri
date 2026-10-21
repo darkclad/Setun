@@ -11,7 +11,6 @@ import "../sched.tri";
 
 const NPIPES: int = 27;
 const PIPE_SIZE: int = 19683;
-const EPIPE: int = 32;
 
 struct Pipe {
     used: int;

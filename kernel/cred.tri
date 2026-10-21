@@ -17,13 +17,8 @@ const NGROUPS_MAX: int = 9;
 const S_ISUID: int = 2048;
 const S_ISGID: int = 1024;
 const S_ISVTX: int = 512;
-const EPERM_C: int = 1;
-const EACCES_C: int = 13;
-const EINVAL_C: int = 22;
-const EFAULT_C: int = 14;
 
 fn cur_euid() -> int { return current_task().euid; }
-fn cur_egid() -> int { return current_task().egid; }
 fn capable() -> int { return current_task().euid == 0; }
 
 fn in_group_p(g: int) -> int {
@@ -40,16 +35,16 @@ fn inode_permission(i: int, mask: int) -> int {
     var t: *Task = current_task();
     var m: int = inodes[i].mode;
     if (t.euid == 0) {
-        if (mask % 2 != 0 && inodes[i].type != I_DIR && m / 64 % 2 == 0 && m / 8 % 2 == 0 && m % 2 == 0) { return -EACCES_C; }
+        if (mask % 2 != 0 && inodes[i].type != I_DIR && m / 64 % 2 == 0 && m / 8 % 2 == 0 && m % 2 == 0) { return -EACCES; }
         return 0;
     }
     var bits: int;
     if (inodes[i].uid == t.euid) { bits = m / 64 % 8; }
     else if (in_group_p(inodes[i].gid)) { bits = m / 8 % 8; }
     else { bits = m % 8; }
-    if (mask / 4 % 2 != 0 && bits / 4 % 2 == 0) { return -EACCES_C; }
-    if (mask / 2 % 2 != 0 && bits / 2 % 2 == 0) { return -EACCES_C; }
-    if (mask % 2 != 0 && bits % 2 == 0) { return -EACCES_C; }
+    if (mask / 4 % 2 != 0 && bits / 4 % 2 == 0) { return -EACCES; }
+    if (mask / 2 % 2 != 0 && bits / 2 % 2 == 0) { return -EACCES; }
+    if (mask % 2 != 0 && bits % 2 == 0) { return -EACCES; }
     return 0;
 }
 
@@ -96,18 +91,18 @@ fn sys_getegid() -> int { return current_task().egid; }
 // their real or saved one.
 fn sys_setuid(u: int) -> int {
     var t: *Task = current_task();
-    if (u < 0) { return -EINVAL_C; }
+    if (u < 0) { return -EINVAL; }
     if (t.euid == 0) { t.uid = u; t.euid = u; t.suid = u; return 0; }
     if (u == t.uid || u == t.suid) { t.euid = u; return 0; }
-    return -EPERM_C;
+    return -EPERM;
 }
 
 fn sys_setgid(g: int) -> int {
     var t: *Task = current_task();
-    if (g < 0) { return -EINVAL_C; }
+    if (g < 0) { return -EINVAL; }
     if (t.euid == 0) { t.gid = g; t.egid = g; t.sgid = g; return 0; }
     if (g == t.gid || g == t.sgid) { t.egid = g; return 0; }
-    return -EPERM_C;
+    return -EPERM;
 }
 
 // One of the three IDs may become v (-1 leaves it) if root, or if v is
@@ -119,7 +114,7 @@ fn id_allowed(v: int, a: int, b: int, c: int) -> int {
 fn sys_setresuid(r: int, e: int, s: int) -> int {
     var t: *Task = current_task();
     if (!id_allowed(r, t.uid, t.euid, t.suid) || !id_allowed(e, t.uid, t.euid, t.suid) || !id_allowed(s, t.uid, t.euid, t.suid)) {
-        return -EPERM_C;
+        return -EPERM;
     }
     if (r != -1) { t.uid = r; }
     if (e != -1) { t.euid = e; }
@@ -130,7 +125,7 @@ fn sys_setresuid(r: int, e: int, s: int) -> int {
 fn sys_setresgid(r: int, e: int, s: int) -> int {
     var t: *Task = current_task();
     if (!id_allowed(r, t.gid, t.egid, t.sgid) || !id_allowed(e, t.gid, t.egid, t.sgid) || !id_allowed(s, t.gid, t.egid, t.sgid)) {
-        return -EPERM_C;
+        return -EPERM;
     }
     if (r != -1) { t.gid = r; }
     if (e != -1) { t.egid = e; }
@@ -143,8 +138,8 @@ fn sys_setresgid(r: int, e: int, s: int) -> int {
 fn sys_setreuid(r: int, e: int) -> int {
     var t: *Task = current_task();
     var old: int = t.uid;
-    if (r != -1 && !capable() && r != t.uid && r != t.euid) { return -EPERM_C; }
-    if (!id_allowed(e, t.uid, t.euid, t.suid)) { return -EPERM_C; }
+    if (r != -1 && !capable() && r != t.uid && r != t.euid) { return -EPERM; }
+    if (!id_allowed(e, t.uid, t.euid, t.suid)) { return -EPERM; }
     if (r != -1) { t.uid = r; }
     if (e != -1) { t.euid = e; }
     if (r != -1 || (e != -1 && e != old)) { t.suid = t.euid; }
@@ -154,8 +149,8 @@ fn sys_setreuid(r: int, e: int) -> int {
 fn sys_setregid(r: int, e: int) -> int {
     var t: *Task = current_task();
     var old: int = t.gid;
-    if (r != -1 && !capable() && r != t.gid && r != t.egid) { return -EPERM_C; }
-    if (!id_allowed(e, t.gid, t.egid, t.sgid)) { return -EPERM_C; }
+    if (r != -1 && !capable() && r != t.gid && r != t.egid) { return -EPERM; }
+    if (!id_allowed(e, t.gid, t.egid, t.sgid)) { return -EPERM; }
     if (r != -1) { t.gid = r; }
     if (e != -1) { t.egid = e; }
     if (r != -1 || (e != -1 && e != old)) { t.sgid = t.egid; }
@@ -163,20 +158,20 @@ fn sys_setregid(r: int, e: int) -> int {
 }
 
 fn put_user_int(p: int, v: int) -> int {
-    if (!user_range_ok(p - 1, 3)) { return -EFAULT_C; }
+    if (!user_range_ok(p - 1, 3)) { return -EFAULT; }
     *(p as *int) = v;
     return 0;
 }
 
 fn sys_getresuid(r: int, e: int, s: int) -> int {
     var t: *Task = current_task();
-    if (put_user_int(r, t.uid) < 0 || put_user_int(e, t.euid) < 0 || put_user_int(s, t.suid) < 0) { return -EFAULT_C; }
+    if (put_user_int(r, t.uid) < 0 || put_user_int(e, t.euid) < 0 || put_user_int(s, t.suid) < 0) { return -EFAULT; }
     return 0;
 }
 
 fn sys_getresgid(r: int, e: int, s: int) -> int {
     var t: *Task = current_task();
-    if (put_user_int(r, t.gid) < 0 || put_user_int(e, t.egid) < 0 || put_user_int(s, t.sgid) < 0) { return -EFAULT_C; }
+    if (put_user_int(r, t.gid) < 0 || put_user_int(e, t.egid) < 0 || put_user_int(s, t.sgid) < 0) { return -EFAULT; }
     return 0;
 }
 
@@ -184,8 +179,8 @@ fn sys_getresgid(r: int, e: int, s: int) -> int {
 fn sys_getgroups(size: int, list: int) -> int {
     var t: *Task = current_task();
     if (size == 0) { return t.ngroups; }
-    if (size < t.ngroups) { return -EINVAL_C; }
-    if (!user_range_ok(list - 1, 3 * t.ngroups)) { return -EFAULT_C; }
+    if (size < t.ngroups) { return -EINVAL; }
+    if (!user_range_ok(list - 1, 3 * t.ngroups)) { return -EFAULT; }
     var p: *int = list as *int;
     var k: int = 0;
     while (k < t.ngroups) { p[k] = t.groups[k]; k += 1; }
@@ -193,9 +188,9 @@ fn sys_getgroups(size: int, list: int) -> int {
 }
 
 fn sys_setgroups(n: int, list: int) -> int {
-    if (!capable()) { return -EPERM_C; }
-    if (n < 0 || n > NGROUPS_MAX) { return -EINVAL_C; }
-    if (n > 0 && !user_range_ok(list - 1, 3 * n)) { return -EFAULT_C; }
+    if (!capable()) { return -EPERM; }
+    if (n < 0 || n > NGROUPS_MAX) { return -EINVAL; }
+    if (n > 0 && !user_range_ok(list - 1, 3 * n)) { return -EFAULT; }
     var t: *Task = current_task();
     var p: *int = list as *int;
     var k: int = 0;
@@ -208,11 +203,11 @@ fn sys_setgroups(n: int, list: int) -> int {
 // group, to one of its own. A change by anyone else but root clears the
 // set-ID bits.
 fn do_chown(i: int, u: int, g: int) -> int {
-    if (inodes[i].fs == FS_PROC) { return -EPERM_C; }
+    if (inodes[i].fs == FS_PROC) { return -EPERM; }
     if (!capable()) {
-        if (inodes[i].uid != cur_euid()) { return -EPERM_C; }
-        if (u != -1 && u != inodes[i].uid) { return -EPERM_C; }
-        if (g != -1 && g != inodes[i].gid && !in_group_p(g)) { return -EPERM_C; }
+        if (inodes[i].uid != cur_euid()) { return -EPERM; }
+        if (u != -1 && u != inodes[i].uid) { return -EPERM; }
+        if (g != -1 && g != inodes[i].gid && !in_group_p(g)) { return -EPERM; }
     }
     if (u != -1) { inodes[i].uid = u; }
     if (g != -1) { inodes[i].gid = g; }

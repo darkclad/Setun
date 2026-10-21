@@ -328,8 +328,8 @@ fn uf_fetch(cp: int, rows: *int) -> int {
         while (c < px) {
             if (left == 0) { v = data[t] + 8192; t += 1; left = 14; }
             left -= 1;
-            var bit: int = v / pow2(left) % 2;
-            if (bit) { row += pow2(c); }
+            var bit: int = v / bsh(1, left) % 2;
+            if (bit) { row += bsh(1, c); }
             c += 1;
         }
         rows[r] = row;
@@ -338,8 +338,6 @@ fn uf_fetch(cp: int, rows: *int) -> int {
     return px;
 }
 
-var pow2_t: [17]int = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
-fn pow2(k: int) -> int { return pow2_t[k]; }
 
 // Unifont's glyph for cp shrunk to 8x8 (each output pixel: any of its 2x2,
 // or 1x2 for an 8-pixel glyph); 0 if there is none.
@@ -355,9 +353,9 @@ fn uf_small(cp: int, out: *int) -> int {
         var c: int = 0;
         while (c < 8) {
             var on: int;
-            if (w == 16) { on = (a / pow2(2 * c) % 4) != 0 || (b / pow2(2 * c) % 4) != 0; }
-            else { on = (a / pow2(c) % 2) != 0 || (b / pow2(c) % 2) != 0; }
-            if (on) { m += pow2(c); }
+            if (w == 16) { on = (a / bsh(1, 2 * c) % 4) != 0 || (b / bsh(1, 2 * c) % 4) != 0; }
+            else { on = (a / bsh(1, c) % 2) != 0 || (b / bsh(1, c) % 2) != 0; }
+            if (on) { m += bsh(1, c); }
             c += 1;
         }
         out[r] = m;
@@ -391,12 +389,12 @@ fn draw_char16(s: *Surface, x: int, y: int, c: int, fg: int, bg: int) -> int {
         if (w == 16 && cells == 1) {
             var m: int = 0;
             var k: int = 0;
-            while (k < 8) { if (bits / pow2(2 * k) % 4 != 0) { m += pow2(k); } k += 1; }
+            while (k < 8) { if (bits / bsh(1, 2 * k) % 4 != 0) { m += bsh(1, k); } k += 1; }
             bits = m;
         } else if (w == 8 && cells == 2) {
             bits = bits * 16;                          // centred: 4 pixels in
         }
-        if (over && r == 0) { bits = pow2(cw - 1) - 1; }
+        if (over && r == 0) { bits = bsh(1, cw - 1) - 1; }
         var yy: int = y + r;
         if (yy >= 0 && yy < s.h) {
             var col: int = 0;

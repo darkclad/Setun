@@ -101,7 +101,7 @@ var session_id: [64]tryte;               // H of the first exchange
 var session_id_len: int;
 
 // The program's messages: "sshd[pid]: ..." in the server, "ssh: ..." in the client.
-fn log2(a: *char, b: *char) {
+fn ssh_log(a: *char, b: *char) {
     if (ssh_server) {
         fputs(STDERR_FILENO, "sshd[");
         var tmp: [15]char;
@@ -246,20 +246,6 @@ fn list_has(at: int, n: int, name: *char) -> int {
     return 0;
 }
 
-// The index of name in the name-list, or -1.
-fn list_pos(at: int, n: int, name: *char) -> int {
-    var k: int = 0;
-    var i: int = 0;
-    while (k <= n) {
-        var e: int = k;
-        while (e < n && pkt[at + e] != ',') { e += 1; }
-        if (is_text(at + k, e - k, name)) { return i; }
-        k = e + 1;
-        i += 1;
-    }
-    return -1;
-}
-
 // Is name the first entry of the name-list?
 fn list_first_is(at: int, n: int, name: *char) -> int {
     var e: int = 0;
@@ -292,14 +278,14 @@ fn send_packet() {
     }
     seq_out = (seq_out + 1) % TWO32;
     if (write_all(sock, &wire[0], total) < 0) {
-        log2("write to the client failed: ", strerror(errno));
+        ssh_log("write to the client failed: ", strerror(errno));
         _exit(1);
     }
 }
 
 // Tell the client why, and end the connection.
 fn disconnect(reason: int, why: *char) {
-    log2("disconnecting: ", why);
+    ssh_log("disconnecting: ", why);
     out_start(SSH_MSG_DISCONNECT);
     put_u32(reason);
     put_text(why);
@@ -316,11 +302,11 @@ fn net_read(block: int) -> int {
     var n: int = recv(sock, &inb[in_len], 72000 - in_len, block ? 0 : MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EINTR) { return 0; }
-        log2("read from the client: ", strerror(errno));
+        ssh_log("read from the client: ", strerror(errno));
         _exit(1);
     }
     if (n == 0) {
-        log2("connection closed by ", &peer[0]);
+        ssh_log("connection closed by ", &peer[0]);
         _exit(0);
     }
     in_len += n;
@@ -378,7 +364,7 @@ fn read_packet() -> int {
         var t: int = get_byte();
         if ((t == SSH_MSG_IGNORE || t == SSH_MSG_DEBUG || t == SSH_MSG_UNIMPLEMENTED) && !(strict && kexes == 0)) { continue; }
         if (t == SSH_MSG_DISCONNECT) {
-            log2("the client disconnected: ", &peer[0]);
+            ssh_log("the client disconnected: ", &peer[0]);
             _exit(0);
         }
         return t;
@@ -578,7 +564,7 @@ var hyb_dk: [2400]tryte;                  // the client's KEM secret key (ML-KEM
 
 // The rest of a key exchange after both KEXINITs, as the server.
 fn kex_server(drop_guess: int) {
-    log2("key exchange ", kex_name(kex_alg));
+    ssh_log("key exchange ", kex_name(kex_alg));
     var t: int = read_packet();
     if (drop_guess) { t = read_packet(); }
     if (t != SSH_MSG_KEX_ECDH_INIT) { disconnect(DISCONNECT_PROTOCOL_ERROR, "expected KEX_ECDH_INIT"); }
@@ -697,20 +683,20 @@ fn version_exchange() {
             k += 1;
         }
         if (nl < 0) {
-            if (in_len > 255) { log2("no version line from ", &peer[0]); _exit(1); }
+            if (in_len > 255) { ssh_log("no version line from ", &peer[0]); _exit(1); }
             net_read(1);
             continue;
         }
         var end: int = nl;
         if (end > 0 && inb[end - 1] == 13) { end -= 1; }
-        if (end > 253) { log2("an overlong line before the version from ", &peer[0]); _exit(1); }   // RFC 4253: 255 with CR LF
+        if (end > 253) { ssh_log("an overlong line before the version from ", &peer[0]); _exit(1); }   // RFC 4253: 255 with CR LF
         var is_ssh: int = end >= 4 && inb[0] == 'S' && inb[1] == 'S' && inb[2] == 'H' && inb[3] == '-';
         if (is_ssh) {
             var v2: int = end >= 8 && inb[4] == '2' && inb[5] == '.' && inb[6] == '0' && inb[7] == '-';
             var v199: int = end >= 9 && inb[4] == '1' && inb[5] == '.' && inb[6] == '9' && inb[7] == '9' && inb[8] == '-';
             if (!v2 && !v199) {
                 write_all(sock, "Protocol mismatch.\r\n" as *tryte, 20);
-                log2("not SSH 2 from ", &peer[0]);
+                ssh_log("not SSH 2 from ", &peer[0]);
                 _exit(1);
             }
             var theirs: *tryte = ssh_server ? &v_c[0] : &v_s[0];
@@ -722,7 +708,7 @@ fn version_exchange() {
         }
         consume(nl + 1);
         lines += 1;
-        if (lines > 20) { log2("no version line from ", &peer[0]); _exit(1); }
+        if (lines > 20) { ssh_log("no version line from ", &peer[0]); _exit(1); }
     }
 }
 

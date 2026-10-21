@@ -1,6 +1,7 @@
-"""AES-GCM and ECDH test vectors for user/bin/pktest.tri, from Python's cryptography
+"""AES-GCM, ECDH and ECDSA signing test vectors for user/bin/pktest.tri, from Python's cryptography
 (an implementation independent of user/lib/aes.tri).
 Usage: python tools/aesvectors.py > user/bin/aesvectors.inc.tri"""
+import sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 def h(b):
@@ -46,4 +47,5 @@ for tag, curve, nb, hsh in [("P256", ec.SECP256R1(), 32, hashes.SHA256()), ("P38
         out.append(f'const S{tag}_M{i}: *char = "{h(msg)}";')
         out.append(f'const S{tag}_R{i}: *char = "{r.to_bytes(nb, "big").hex()}";')
         out.append(f'const S{tag}_S{i}: *char = "{s.to_bytes(nb, "big").hex()}";')
+sys.stdout.reconfigure(newline='\n')   # LF, also on Windows
 print("\n".join(out))

@@ -62,23 +62,6 @@ const EPHEMERAL_LOW: int = 32768;
 const EPHEMERAL_HIGH: int = 60999;
 
 // errno (Linux)
-const ENOTSOCK: int = 88;
-const EDESTADDRREQ: int = 89;
-const ENOPROTOOPT: int = 92;
-const EPROTONOSUPPORT: int = 93;
-const ESOCKTNOSUPPORT: int = 94;
-const EOPNOTSUPP: int = 95;
-const EAFNOSUPPORT: int = 97;
-const EADDRINUSE: int = 98;
-const EADDRNOTAVAIL: int = 99;
-const ECONNABORTED: int = 103;
-const ECONNRESET: int = 104;
-const EISCONN: int = 106;
-const ENOTCONN: int = 107;
-const ETIMEDOUT: int = 110;
-const ECONNREFUSED: int = 111;
-const EALREADY: int = 114;
-const EINPROGRESS: int = 115;
 
 struct SockaddrIn {
     family: int;
@@ -870,7 +853,6 @@ const IFF_UP: int = 1;
 const IFF_BROADCAST: int = 2;
 const IFF_LOOPBACK: int = 8;
 const IFF_RUNNING: int = 64;
-const ENODEV_NET: int = 19;
 
 struct Ifreq {
     name: [27]char;
@@ -879,13 +861,13 @@ struct Ifreq {
 }
 
 fn sock_ioctl(cmd: int, arg: int) -> int {
-    if (cmd < SIOCGIFFLAGS || cmd > SIOCSIFGW) { return -ENOTTY_NET; }
+    if (cmd < SIOCGIFFLAGS || cmd > SIOCSIFGW) { return -ENOTTY; }
     if (!user_range_ok(arg - 1, sizeof(Ifreq))) { return -EFAULT; }
     var r: *Ifreq = arg as *Ifreq;
     var ifx: int = -1;
     if (names_equal(&r.name[0], "lo")) { ifx = NETIF_LO; }
     if (names_equal(&r.name[0], "eth0") && eth_present) { ifx = NETIF_ETH; }
-    if (ifx < 0) { return -ENODEV_NET; }
+    if (ifx < 0) { return -ENODEV; }
     var e: *Netif = &netifs[ifx];
     var setting: int = cmd == SIOCSIFFLAGS || cmd == SIOCSIFADDR || cmd == SIOCSIFNETMASK || cmd == SIOCSIFGW;
     if (setting && current_task().euid != 0) { return -EPERM; }
@@ -920,12 +902,11 @@ fn sock_ioctl(cmd: int, arg: int) -> int {
             if (v != 0 && !same_subnet(v, e.addr, e.mask)) { return -ENETUNREACH; }
             e.gw = v;
         }
-        default: return -ENOTTY_NET;
+        default: return -ENOTTY;
     }
     return 0;
 }
 
-const ENOTTY_NET: int = 25;
 
 // ---- raw ICMP ------------------------------------------------------------------------------------------
 

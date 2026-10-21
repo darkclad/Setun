@@ -53,4 +53,5 @@ for name, hx in out:
     lines.append(f'const V_{name.upper()}: *char = "{hx}";')
 import sys
 open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+sys.stdout.reconfigure(newline='\n')   # LF, also on Windows
 print(len(out))

@@ -26,12 +26,6 @@ const TASK_STOPPED: int = 4;
 const USER_MODE: int = -1 + MODE_IE + MODE_PG;
 
 // Linux errno values
-const EBADF: int = 9;
-const ECHILD: int = 10;
-const EAGAIN: int = 11;
-const EFAULT: int = 14;
-const EINVAL: int = 22;
-const ENOSYS: int = 38;
 
 // Linux signal numbers for CPU faults (the rest are in signal.tri)
 const SIGILL: int = 4;
@@ -135,7 +129,6 @@ const SYS_GETRANDOM: int = 278;
 
 const WNOHANG: int = 1;
 const WUNTRACED: int = 2;
-const EPERM_: int = 1;
 const TIMER_CHAN: int = 40000;        // woken on every tick
 const POLL_CHAN: int = 40001;         // tasks in poll(): woken by any wake_up
 const HEAP_MAX: int = 729 * 19683;    // brk may grow 729 pages past the bss
@@ -582,8 +575,8 @@ fn sys_setpgid(pid: int, pgid: int) -> int {
     if (i < 0) { return -ESRCH; }
     var t: *Task = &tasks[i];
     if (t.pid != me.pid && t.ppid != me.pid) { return -ESRCH; }
-    if (t.sid != me.sid || t.sid == t.pid) { return -EPERM_; }      // other session, or a session leader
-    if (pgid != pid && !group_exists(pgid, me.sid)) { return -EPERM_; }
+    if (t.sid != me.sid || t.sid == t.pid) { return -EPERM; }      // other session, or a session leader
+    if (pgid != pid && !group_exists(pgid, me.sid)) { return -EPERM; }
     t.pgid = pgid;
     return 0;
 }
@@ -602,7 +595,7 @@ fn sys_getsid(pid: int) -> int {
 
 fn sys_setsid() -> int {
     var t: *Task = current_task();
-    if (t.pgid == t.pid) { return -EPERM_; }                      // already a group leader
+    if (t.pgid == t.pid) { return -EPERM; }                      // already a group leader
     t.sid = t.pid;
     t.pgid = t.pid;
     return t.sid;

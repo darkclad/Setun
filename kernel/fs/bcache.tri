@@ -17,9 +17,6 @@ var buf_sector: [27]int;              // the sector held, or -1
 var buf_dirty: [27]int;
 var buf_stamp: [27]int;               // for LRU
 var buf_clock: int;
-var buf_hits: int;
-var buf_misses: int;
-var buf_errors: int;
 
 fn bcache_init() {
     var c: int = alloc_pages(3);
@@ -38,7 +35,6 @@ fn buf_word(b: int, j: int) -> *int { return (frame_start(buf_first + b) + 1 + 3
 fn bwrite_out(b: int) -> int {
     if (!buf_dirty[b]) { return 0; }
     if (disk_write(buf_sector[b], 1, buf_first + b) != 0) {
-        buf_errors += 1;
         printk("bcache: write error, sector ");
         pr_int(buf_sector[b]);
         pr_nl();
@@ -57,7 +53,6 @@ fn bget(sector: int, read: int) -> int {
     while (b < NBUF) {
         if (buf_sector[b] == sector) {
             buf_stamp[b] = buf_clock;
-            buf_hits += 1;
             if (!read) {
                 zero_words(buf_word(b, 0), 6561);
                 buf_dirty[b] = 1;
@@ -67,12 +62,10 @@ fn bget(sector: int, read: int) -> int {
         if (buf_stamp[b] < buf_stamp[victim]) { victim = b; }
         b += 1;
     }
-    buf_misses += 1;
     if (bwrite_out(victim) < 0) { return -1; }
     buf_sector[victim] = -1;
     if (read) {
         if (disk_read(sector, 1, buf_first + victim) != 0) {
-            buf_errors += 1;
             printk("bcache: read error, sector ");
             pr_int(sector);
             pr_nl();

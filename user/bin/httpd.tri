@@ -30,6 +30,7 @@ import "../lib/socket.tri";
 import "../lib/time.tri";
 import "../lib/octets.tri";
 import "../lib/tls.tri";
+import "../lib/ctype.tri";
 
 const MAX_HEAD: int = 6561;             // the request line and headers
 var request_seconds: int;                // to send them (and shake hands), or 408 and goodbye; 0: forever
@@ -158,13 +159,6 @@ fn content_type(path: *char, text: int) -> *char {
     return "application/octet-stream";
 }
 
-fn hexval(c: int) -> int {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-    return -1;
-}
-
 // Percent-decode the path of target (up to ? or #) into out as characters
 // (the octets are UTF-8). 0, or -1 if it is malformed or holds a NUL.
 fn decode_path(t: *char, out: *char, max: int) -> int {
@@ -174,8 +168,8 @@ fn decode_path(t: *char, out: *char, max: int) -> int {
     while (t[k] != 0 && t[k] != '?' && t[k] != '#') {
         var c: int = t[k];
         if (c == '%') {
-            var h: int = hexval(t[k + 1]);
-            var l: int = h < 0 ? -1 : hexval(t[k + 2]);
+            var h: int = xdigit_val(t[k + 1]);
+            var l: int = h < 0 ? -1 : xdigit_val(t[k + 2]);
             if (l < 0) { return -1; }
             c = h * 16 + l;
             k += 3;
