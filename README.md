@@ -3,8 +3,8 @@
 Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 "Setun-26" is the same name in ASCII, for file names (`docs/SETUN26_ISA.md`)
 and places where the overline, a combining character, would be lost. The
-repository is called Setun70 after the machine that started it; the design
-was once called Setun-386.
+project began as an emulator of the Setun-70, the machine that inspired it,
+and the design was once called Setun-386.
 
 A balanced-ternary computer sized like an Intel 386, with an emulator, BIOS,
 compiler, kernel and window system. It is a new CPU designed from scratch and
