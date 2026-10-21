@@ -76,7 +76,9 @@ The emulator stays deterministic: the card only exchanges frames with queues, an
 - Time is the emulator's clock, so a test run is reproducible.
 - Outbound connections (a NAT to host sockets) and DNS at `10.0.2.3` (§9).
 
-The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`; `--net6` reaches the guest over IPv6, [`IPV6.md`](IPV6.md) §5). Then `telnet localhost 2323` reaches Trinux's `telnetd`. The web build has no network yet: `LINK` reads 0.
+The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`; `--net6` reaches the guest over IPv6, [`IPV6.md`](IPV6.md) §5). Then `telnet localhost 2323` reaches Trinux's `telnetd`.
+
+The web build: the card's frames go to `setun-relay` over a WebSocket, one Ethernet frame per binary message (`web/emu.html`, the exports `setun_net_*` in `crates/web`). The relay runs a gateway per connection through `Network::new` and `Network::exchange`, the same gateway without a machine, in **public-only** mode (`set_public_only`): `10.0.2.2` no longer stands for the host, and TCP to a private, loopback, link-local, shared or unique-local address gets a reset while UDP to one is dropped, so a visitor's machine reaches the internet and not the server's network. Trinux looks at `LINK` when it boots, so the page reaches the relay first and boots with the link up. Without a relay `LINK` reads 0.
 
 ## 3. The kernel stack (`kernel/net/`)
 

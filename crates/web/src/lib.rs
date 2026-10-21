@@ -39,6 +39,14 @@ thread_local! {
     static JIT_OUT: RefCell<(u64, Vec<u8>)> = const { RefCell::new((0, Vec::new())) };
     /// Entropy for the next machine's TRNG, from the page's crypto.getRandomValues.
     static SEED: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
+    /// The network card has a link (the page has a relay): Trinux looks at
+    /// boot, so this applies to the next boot or power-cycle.
+    static NET_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Frames the card sent, waiting for the page; the one handed out last.
+    static NET_TX: RefCell<std::collections::VecDeque<Vec<u8>>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    static NET_OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Where the page writes a frame for the card.
+    static NET_IN: RefCell<Vec<u8>> = RefCell::new(vec![0; 1514]);
 }
 
 /// Set word `i` (0..8) of the seed for the next boot or power-cycle. The
@@ -103,6 +111,8 @@ fn new_machine_unseeded(kind: u32, ram: i64, unix: i64, disk: Option<Box<dyn set
     }
     let mut m = Machine::new(ram, unix);
     m.cpu.set_jit_enabled(JIT_ON.with(|j| j.get()));
+    m.dev.nic.link = NET_LINK.with(|l| l.get());
+    NET_TX.with(|q| q.borrow_mut().clear());
     m.load_rom(&trytes_le(BIOS));
     let store = disk.unwrap_or_else(|| Box::new(MemDisk::from_trytes(&trinux_disk())));
     m.dev.disks[0].attach(store);
@@ -157,6 +167,56 @@ pub extern "C" fn setun_disk_sectors() -> u32 {
 }
 
 const _: () = assert!(PAGE == 19_683);
+
+// ---- the network card ------------------------------------------------------------------
+//
+// The page carries the card's Ethernet frames to a relay (setun-relay) over
+// a WebSocket: `setun_net_take` + `setun_net_ptr` for each frame the card
+// sent, `setun_net_buf` + `setun_net_receive` for each frame that came back.
+
+/// Give the card a link (1) or not (0) from the next boot or power-cycle.
+#[no_mangle]
+pub extern "C" fn setun_net_link(on: u32) {
+    NET_LINK.with(|l| l.set(on != 0));
+}
+
+/// The next frame the card sent: its length (0: none).
+#[no_mangle]
+pub extern "C" fn setun_net_take() -> u32 {
+    NET_TX.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            q.extend(with(|e| e.m.dev.net_take_tx()));
+        }
+        match q.pop_front() {
+            Some(f) => NET_OUT.with(|o| {
+                *o.borrow_mut() = f;
+                o.borrow().len() as u32
+            }),
+            None => 0,
+        }
+    })
+}
+
+/// The octets of the frame `setun_net_take` handed out.
+#[no_mangle]
+pub extern "C" fn setun_net_ptr() -> *const u8 {
+    NET_OUT.with(|o| o.borrow().as_ptr())
+}
+
+/// Where to write a frame for the card (1514 octets).
+#[no_mangle]
+pub extern "C" fn setun_net_buf() -> *mut u8 {
+    NET_IN.with(|b| b.borrow_mut().as_mut_ptr())
+}
+
+/// The first `len` octets at `setun_net_buf` are a frame for the card.
+#[no_mangle]
+pub extern "C" fn setun_net_receive(len: u32) {
+    let len = (len as usize).min(1514);
+    let f = NET_IN.with(|b| b.borrow()[..len].to_vec());
+    with(|e| e.m.dev.net_receive(&f));
+}
 
 // ---- the JIT ---------------------------------------------------------------------------
 //
@@ -424,6 +484,58 @@ mod tests {
         login();
         type_line("cat /home/w\n");
         run_until("No such file or directory", 40);
+    }
+
+    /// The page's part, played by the test: frames between the exports and
+    /// a gateway (the relay's), until `want` appears on the console.
+    fn run_with_gateway(net: &mut setun_net::Network, want: &str, max_millions: u32) -> String {
+        let mut all = String::new();
+        for _ in 0..max_millions * 10 {
+            setun_run(100_000);
+            let mut out = Vec::new();
+            loop {
+                let n = setun_net_take() as usize;
+                if n == 0 {
+                    break;
+                }
+                out.push(unsafe { std::slice::from_raw_parts(setun_net_ptr(), n) }.to_vec());
+            }
+            let now = with(|e| e.m.dev.now_us());
+            for f in net.exchange(now, out) {
+                unsafe { std::ptr::copy_nonoverlapping(f.as_ptr(), setun_net_buf(), f.len()) };
+                setun_net_receive(f.len() as u32);
+            }
+            all += &output();
+            if all.contains(want) {
+                return all;
+            }
+        }
+        panic!("no {want:?} in:\n{all}");
+    }
+
+    #[test]
+    fn the_card_reaches_a_gateway_through_the_exports() {
+        // no link: Trinux sees none
+        setun_net_link(0);
+        setun_boot(KIND_TRINUX, 729, 1_790_000_000.0);
+        let out = run_until("login: ", 80);
+        assert!(out.contains("no link"), "{out}");
+        // a link from the next boot: it comes up, and pings reach the gateway and back
+        setun_net_link(1);
+        setun_power_cycle(1_790_000_100.0);
+        let mut net = setun_net::Network::new(0);
+        net.set_public_only(true);
+        let out = run_with_gateway(&mut net, "login: ", 80);
+        assert!(out.contains("link up"), "{out}");
+        type_line("root\n");
+        run_with_gateway(&mut net, "Password: ", 20);
+        type_line("root\n");
+        run_with_gateway(&mut net, "$ ", 40);
+        type_line("ping -c 2 10.0.2.2\n");
+        let out = run_with_gateway(&mut net, "2 received", 80);
+        assert!(out.contains("2 packets transmitted"), "{out}");
+        assert!(net.stats.frames_from_guest > 0 && net.stats.frames_to_guest > 0);
+        setun_net_link(0);
     }
 
     #[test]

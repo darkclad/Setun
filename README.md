@@ -65,6 +65,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
 | `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio, `--net`, `--net6` |
 | `crates/net` | `setun-net`: the network behind the card, a user-mode gateway (10.0.2.2) on smoltcp with port forwards |
+| `crates/relay` | `setun-relay`: that gateway behind a WebSocket, for the browser build's card, public addresses only |
 | `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in); the pages: `index.html` (choose), `emu.html` (the front panel), `term.html` (a terminal to a server's Trinux) |
 | `deploy/` | a container running Trinux for SSH logins and a browser terminal (`deploy/vm`), and the web server's configuration (`deploy/web`) |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
@@ -116,6 +117,11 @@ as `user` (password `user`) or `root` (password `root`), then type at the
 prompt, or press **Window system** for `trwm term clock colors paint`.
 Power-cycle keeps the disk, so files written in the browser survive a reboot;
 **Fresh disk** restores it. The old demo ROM is still under **Boot**.
+**Network** → Internet reboots with the card linked to `setun-relay` behind
+`net/` on the page's server: the same gateway as `setun --net`, one per
+visitor, that reaches public addresses only (not the server or its LAN).
+`cargo run --release -p setun-relay` runs one on 127.0.0.1:8027;
+`node tools/wnet.mjs` checks it.
 
 Speed: the browser build compiles hot code to WebAssembly as it runs (a JIT,
 like the native one), and runs Trinux at a few hundred MIPS with the clock

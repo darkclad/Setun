@@ -51,3 +51,4 @@ python tools/gen_isavectors.py > crates/core/tests/isa_vectors.txt
 |---|---|
 | `wtest.mjs` | runs `crates/core/tests/fast_path.rs` compiled to WebAssembly (`crates/wtest`), the JIT's modules compiled as they are queued. Build first: `cargo build --release -p setun-wtest --target wasm32-unknown-unknown`, then `node tools/wtest.mjs [name filter]` |
 | `wjit.mjs` | boots Trinux in `web/setun.wasm`, logs in and runs commands with the JIT off and on; the transcripts must match, and the times show the JIT's gain: `node tools/wjit.mjs [web/setun.wasm]` |
+| `wnet.mjs` | boots Trinux in `web/setun.wasm` with its card carried to `setun-relay` over a WebSocket, as the page does; checks DNS and HTTP through it, and that a private address and the relay's host are refused: `node tools/wnet.mjs [web/setun.wasm] [ws://127.0.0.1:8027/]` |

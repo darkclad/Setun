@@ -224,6 +224,50 @@ pub(crate) struct Query {
 }
 
 /// Parse a query with one question. None if it is malformed.
+/// A connection attempt that has already failed: refused by policy.
+pub(crate) fn refused() -> Receiver<std::io::Result<TcpStream>> {
+    let (tx, rx) = channel();
+    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a public address")));
+    rx
+}
+
+/// An address on the public internet: not private, loopback, link-local,
+/// shared (100.64/10), unspecified, multicast, broadcast, reserved or for
+/// documentation; for IPv6 also not unique-local (fc00::/7), and an
+/// IPv4-mapped address is judged by its IPv4 address.
+pub fn is_public(a: IpAddr) -> bool {
+    match a {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || v.is_broadcast()
+                || v.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || o[0] >= 240
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18))
+        }
+        IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let s = v.segments();
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || v.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                || (s[0] == 0x64 && s[1] == 0xff9b))
+        }
+    }
+}
+
 pub(crate) fn parse_query(q: &[u8]) -> Option<Query> {
     if q.len() < 12 || q[2] & 0x80 != 0 || u16::from_be_bytes([q[4], q[5]]) != 1 {
         return None;

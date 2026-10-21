@@ -128,6 +128,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
         <dt>Ring</dt><dd id="st-ring">–</dd>
         <dt>CPU</dt><dd id="st-cpu">–</dd>
         <dt>Display</dt><dd id="st-mode">–</dd>
+        <dt>Network</dt><dd id="st-net">off</dd>
       </dl>
 
       <div class="controls">
@@ -162,7 +163,14 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           <option value="0" selected>Max</option>
         </select>
       </div>
-      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page; <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. In the browser the network card has no link, so <kbd>ssh</kbd>, <kbd>wget</kbd> and <kbd>sshd</kbd> need the native build (<kbd>setun --net</kbd>).</p>
+      <div class="controls" data-trinux>
+        <label class="label" for="net" style="align-self:center">Network</label>
+        <select id="net">
+          <option value="off" selected>Off</option>
+          <option value="relay">Internet</option>
+        </select>
+      </div>
+      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page; <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. <b>Network</b> → Internet power-cycles the machine with its network card linked, through the server, to the internet (not to the server's own network): then try <kbd>host example.com</kbd>, <kbd>wget -O - https://example.com</kbd> or <kbd>ssh</kbd> to a machine you have an account on.</p>
       <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
     </aside>
   </div>
@@ -279,6 +287,58 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           .catch(() => wasm.setun_jit_done(id, 0));
       }
     }
+    // ---- the network: Ethernet frames to the relay (setun-relay) over a WebSocket ----
+    // Trinux looks at the card's link when it boots, so the relay is reached
+    // first and the machine booted (or power-cycled) with the link up.
+    let ws = null, wsWanted = false, retry = null;
+    const netIn = [];
+    function netStatus(s) { $("st-net").textContent = s; }
+    function relayUrl() { const u = new URL("net/", location.href); u.protocol = u.protocol === "https:" ? "wss:" : "ws:"; return u.href; }
+    function connectRelay(timeoutMs) {
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+        let sock;
+        try { sock = new WebSocket(relayUrl()); } catch (e) { finish(false); return; }
+        sock.binaryType = "arraybuffer";
+        netStatus("connecting");
+        sock.onopen = () => { ws = sock; netStatus("internet"); finish(true); };
+        sock.onmessage = (e) => { if (e.data instanceof ArrayBuffer && netIn.length < 2187) netIn.push(new Uint8Array(e.data)); };
+        sock.onclose = () => {
+          if (ws === sock) ws = null;
+          finish(false);
+          if (!wsWanted) { netStatus("off"); return; }
+          netStatus("lost; retrying");
+          clearTimeout(retry);
+          retry = setTimeout(() => { if (wsWanted && !ws) connectRelay(5000); }, 5000);
+        };
+        setTimeout(() => { if (!done) { try { sock.close(); } catch (e) {} finish(false); } }, timeoutMs);
+      });
+    }
+    async function setNetwork(on) {
+      wsWanted = on;
+      clearTimeout(retry);
+      if (!on) { if (ws) ws.close(); ws = null; netIn.length = 0; netStatus("off"); wasm.setun_net_link(0); return; }
+      const ok = ws ? true : await connectRelay(4000);
+      if (!ok) netStatus("no relay; retrying");
+      wasm.setun_net_link(1);            // linked even while the relay is away: it comes back
+    }
+    function netService() {
+      for (;;) {
+        const n = wasm.setun_net_take();
+        if (!n) break;
+        if (ws && ws.readyState === 1) ws.send(new Uint8Array(wasm.memory.buffer, wasm.setun_net_ptr(), n).slice());
+      }
+      while (netIn.length) {
+        const f = netIn.shift();
+        if (f.length > 1514) continue;
+        new Uint8Array(wasm.memory.buffer, wasm.setun_net_buf(), f.length).set(f);
+        wasm.setun_net_receive(f.length);
+      }
+    }
+    try { const saved = localStorage.getItem("setun-net"); if (saved === "relay") $("net").value = "relay"; } catch (e) {}
+    if (typeof wasm.setun_net_link === "function" && $("net").value === "relay") await setNetwork(true);
+
     seed();
     wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
     showKind();
@@ -398,6 +458,13 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     $("btn-text").addEventListener("click", () => press(41));
     $("btn-reset").addEventListener("click", () => { seed(); wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
     $("btn-fresh").addEventListener("click", () => { seed(); wasm.setun_fresh_disk(Date.now() / 1000); serialEl.textContent = ""; });
+    $("net").addEventListener("change", async () => {
+      const on = $("net").value === "relay";
+      try { localStorage.setItem("setun-net", $("net").value); } catch (e) {}
+      await setNetwork(on);
+      seed(); wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = "";
+      canvas.focus();
+    });
     $("machine").addEventListener("change", () => {
       seed();
       wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
@@ -426,6 +493,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       }
       executed += n;
       jitService();
+      netService();
 
       const ptr = wasm.setun_render(performance.now());
       const w = wasm.setun_width(), h = wasm.setun_height();

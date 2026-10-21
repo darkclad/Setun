@@ -1,0 +1,15 @@
+[package]
+name = "setun-relay"
+description = "A WebSocket relay that gives a Setun-11̅ network card in a browser a gateway to the internet"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "setun-relay"
+path = "src/main.rs"
+
+[dependencies]
+setun-net = { path = "../net" }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

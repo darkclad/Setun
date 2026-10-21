@@ -21,7 +21,7 @@
 pub mod ip6;
 mod nat;
 pub use ip6::{DNS6, GATEWAY6, GATEWAY6_LL, GUEST6};
-pub use nat::DNS;
+pub use nat::{is_public, DNS};
 pub mod tnet;
 
 use setun_core::Machine;
@@ -101,6 +101,9 @@ pub struct Stats {
     /// Datagrams the guest sent out through the NAT, and replies brought back.
     pub udp_out: u64,
     pub udp_in: u64,
+    /// Datagrams dropped because their destination is not public
+    /// ([`Network::set_public_only`]).
+    pub udp_refused: u64,
 }
 
 /// The frame queues smoltcp sees as its network device.
@@ -176,6 +179,9 @@ pub struct Network {
     dns: SocketHandle,
     dns6: SocketHandle,
     outbound: bool,
+    /// Only public addresses for outbound traffic (a relay for strangers'
+    /// machines): no host alias, nothing private, loopback or link-local.
+    public_only: bool,
     /// Frames from the guest kept for a test instead of reaching the gateway.
     capture: Option<Vec<Vec<u8>>>,
     /// A Router Solicitation came in: advertise at once.
@@ -186,18 +192,21 @@ pub struct Network {
     pub stats: Stats,
 }
 
-fn now(m: &Machine) -> Instant {
-    Instant::from_micros(m.dev.now_us())
-}
-
 impl Network {
     /// A network attached to `m`'s card (its `LINK` reads +1 from now on).
     pub fn attach(m: &mut Machine) -> Self {
         m.dev.nic.link = true;
+        Self::new(m.dev.now_us())
+    }
+
+    /// The gateway alone, for a card that is somewhere else (a relay):
+    /// frames go in and out through [`Network::exchange`]. `now_us` is the
+    /// clock its timers run on from here.
+    pub fn new(now_us: i64) -> Self {
         let mut wire = Wire::default();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));
         config.random_seed = 0x5e7u64; // reproducible initial sequence numbers
-        let mut iface = Interface::new(config, &mut wire, now(m));
+        let mut iface = Interface::new(config, &mut wire, Instant::from_micros(now_us));
         iface.update_ip_addrs(|a| {
             a.push(IpCidr::new(IpAddress::Ipv4(GATEWAY), 24)).unwrap();
             a.push(IpCidr::new(IpAddress::Ipv4(DNS), 24)).unwrap();
@@ -241,6 +250,7 @@ impl Network {
             dns,
             dns6,
             outbound: true,
+            public_only: false,
             capture: None,
             ra_due: false,
             last_ra_us: None,
@@ -268,6 +278,15 @@ impl Network {
     /// Let the guest connect out through host sockets (on by default).
     pub fn set_outbound(&mut self, on: bool) {
         self.outbound = on;
+    }
+
+    /// Let outbound connections and datagrams reach only public addresses:
+    /// 10.0.2.2 stops standing for the host, and private, loopback,
+    /// link-local, shared (100.64/10) and unique-local destinations are
+    /// refused (TCP gets a reset, UDP is dropped). For a gateway that serves
+    /// machines whose users should not reach the host's own network.
+    pub fn set_public_only(&mut self, on: bool) {
+        self.public_only = on;
     }
 
     /// Make guest address `seen` stand for host address `host` (10.0.2.2
@@ -320,7 +339,17 @@ impl Network {
     /// Exchange frames with the card and move data on every connection.
     /// Call it often: after each slice of emulation.
     pub fn poll(&mut self, m: &mut Machine) {
-        for mut f in m.dev.net_take_tx() {
+        let now_us = m.dev.now_us();
+        for f in self.exchange(now_us, m.dev.net_take_tx()) {
+            m.dev.net_receive(&f);
+        }
+    }
+
+    /// One round of the gateway: the frames the card sent, in; the frames
+    /// for the card, out. `now_us` is the gateway's clock.
+    pub fn exchange(&mut self, now_us: i64, from_guest: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut to_guest = Vec::new();
+        for mut f in from_guest {
             if let Some(g) = self.mangle.as_mut() {
                 g(Dir::FromGuest, &mut f);
             }
@@ -342,8 +371,8 @@ impl Network {
         }
         self.nat_connects();
         self.accept_forwards();
-        let t = now(m);
-        let us = m.dev.now_us();
+        let t = Instant::from_micros(now_us);
+        let us = now_us;
         if self.capture.is_none() && (self.ra_due || self.last_ra_us.is_some_and(|l| us - l >= ip6::RA_INTERVAL_S * 1_000_000)) {
             self.ra_due = false;
             self.last_ra_us = Some(us);
@@ -363,7 +392,7 @@ impl Network {
                 continue;
             }
             self.stats.frames_to_guest += 1;
-            m.dev.net_receive(&f);
+            to_guest.push(f);
         }
         self.nat_prune(); // after the frames that still needed the flows (a refusal's RST)
         self.udp_poll();
@@ -373,8 +402,9 @@ impl Network {
                 continue;
             }
             self.stats.frames_to_guest += 1;
-            m.dev.net_receive(&f);
+            to_guest.push(f);
         }
+        to_guest
     }
 
     fn ephemeral_port(&mut self) -> u16 {
@@ -811,7 +841,11 @@ impl Network {
             return Some(f);
         }
         let standin = self.nat.standin();
-        let rx = self.nat.start_connect(SocketAddr::new(self.nat.host_for(dst), dport));
+        let rx = if self.public_only && (to_host || !nat::is_public(dst)) {
+            nat::refused()
+        } else {
+            self.nat.start_connect(SocketAddr::new(self.nat.host_for(dst), dport))
+        };
         self.nat.flows.push(nat::Flow { gport: sport, dst, dport, standin, state: nat::FlowState::Connecting(rx, f), conn: None });
         None
     }
@@ -947,6 +981,10 @@ impl Network {
         let to_host = dst == nat::gateway_for(v6) && !self.udp_ports.contains(&dport);
         if !self.outbound || !(outside || to_host) {
             return Some(f);
+        }
+        if self.public_only && (to_host || !nat::is_public(dst)) {
+            self.stats.udp_refused += 1;
+            return None;
         }
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&f[6..12]);

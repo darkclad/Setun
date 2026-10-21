@@ -2,6 +2,8 @@
 #   port 2227   Trinux's sshd (a real ssh client: ssh -p 2227 user@HOST)
 #   port 7681   ttyd: a terminal in the browser that logs in over that ssh
 #               (served under /term/, for web/term.html)
+#   port 8027   setun-relay: the internet for the browser emulator's network
+#               card, public addresses only (served under /net/, for web/emu.html)
 # The disk is /data/trinux.disk, made on first start; keep /data on a volume.
 #
 #   docker build -f deploy/vm/Dockerfile -t setun-vm .
@@ -10,7 +12,7 @@
 FROM rust:1-trixie AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p setun-native -p trinux --bin setun --bin mkdisk
+RUN cargo build --release -p setun-native -p trinux -p setun-relay --bin setun --bin mkdisk --bin setun-relay
 
 FROM debian:trixie-slim
 RUN apt-get update \
@@ -27,9 +29,9 @@ COPY --from=build /src/fonts /src/fonts
 COPY --from=build /src/crates/trine/lib /src/crates/trine/lib
 # the paths are crates/trinux/../../kernel and so on: the directory must exist
 RUN mkdir -p /src/crates/trinux
-COPY --from=build /src/target/release/setun /src/target/release/mkdisk /usr/local/bin/
+COPY --from=build /src/target/release/setun /src/target/release/mkdisk /src/target/release/setun-relay /usr/local/bin/
 COPY deploy/vm/start.sh deploy/vm/login.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/login.sh
 VOLUME /data
-EXPOSE 2227 7681
+EXPOSE 2227 7681 8027
 ENTRYPOINT ["tini", "--", "start.sh"]

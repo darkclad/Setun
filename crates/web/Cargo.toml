@@ -13,6 +13,9 @@ crate-type = ["cdylib", "rlib"]
 setun-core = { path = "../core" }
 setun-demo = { path = "../demo" }
 
+[dev-dependencies]
+setun-net = { path = "../net" }
+
 [build-dependencies]
 trine = { path = "../trine" }
 trinux = { path = "../trinux" }
