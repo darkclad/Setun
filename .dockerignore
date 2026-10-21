@@ -1,0 +1,5 @@
+target
+.git
+web/setun.wasm
+web/deploy.env
+*.disk

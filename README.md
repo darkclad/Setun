@@ -65,7 +65,8 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
 | `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio, `--net`, `--net6` |
 | `crates/net` | `setun-net`: the network behind the card, a user-mode gateway (10.0.2.2) on smoltcp with port forwards |
-| `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in) and the front-panel page |
+| `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in); the pages: `index.html` (choose), `emu.html` (the front panel), `term.html` (a terminal to a server's Trinux) |
+| `deploy/` | a container running Trinux for SSH logins and a browser terminal (`deploy/vm`), and the web server's configuration (`deploy/web`) |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
 | `examples/` | Trine programs, e.g. `mandel.tri` |
 | `bios/` | the BIOS (`bios.tri`, built into `setun`) and a sample boot sector |
@@ -107,10 +108,10 @@ cargo run --release -p setun-native -- --console --net 2222:22 # then `ssh -p 22
 cargo run --release -p setun-native -- --console --net 8080:80 # then http://localhost:8080/ is Trinux's httpd
 cargo run --release -p setun-native -- --console --net6 2222:22 # the same ssh, reaching Trinux over IPv6
 sh web/build.sh                                # build web/setun.wasm (BIOS + Trinux disk inside; needs the wasm32-unknown-unknown target)
-python -m http.server 8026 --directory web     # then open http://localhost:8026
+python -m http.server 8026 --directory web     # then open http://localhost:8026/emu.html
 ```
 
-The browser page boots Trinux from the built-in disk (3^7 pages of RAM). Log in
+The emulator page (`emu.html`) boots Trinux from the built-in disk (3^7 pages of RAM). Log in
 as `user` (password `user`) or `root` (password `root`), then type at the
 prompt, or press **Window system** for `trwm term clock colors paint`.
 Power-cycle keeps the disk, so files written in the browser survive a reboot;
@@ -130,6 +131,25 @@ cargo run --release -p setun-native -- --console --tlink connect:127.0.0.1:7000 
 ```
 
 then, logged in on the second, `ssh root@0.0.1` reaches the first over TNET.
+
+### A shared machine on a server
+
+`deploy/vm` is a container that keeps one Trinux running on a disk in a
+volume, with its `sshd` on port 2227 and [ttyd](https://github.com/tsl0922/ttyd)
+on 7681, a terminal in the browser that asks for an account and logs in over
+that ssh:
+
+```
+docker build -f deploy/vm/Dockerfile -t setun-vm .
+docker run -d --name setun-vm -p 2227:2227 -v setun-data:/data setun-vm
+ssh -p 2227 user@localhost
+docker exec -it setun-vm tmux attach -t vm      # the machine's serial console (Ctrl-b d leaves)
+```
+
+`deploy/web/default.conf` serves `web/` with nginx and passes `/term/` to
+the container's ttyd, for `term.html`. The disk starts with the accounts
+`root` and `user` and their default passwords: change both (`passwd`) before
+anyone else can reach the port.
 
 ## Tests
 

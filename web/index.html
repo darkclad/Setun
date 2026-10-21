@@ -71,7 +71,7 @@ code { font: 13px var(--font-display); color: var(--ink); background: var(--pane
       <p>One Setun-11̅ runs on the server all the time, with a disk that keeps what you leave on it. This opens a terminal to it over SSH.</p>
       <ul>
         <li>accounts and files persist; others may be logged in too</li>
-        <li>or from your own terminal: <code id="ssh-cmd">ssh -p 2222 user@this-host</code></li>
+        <li>or from your own terminal: <code id="ssh-cmd">ssh -p 2227 user@this-host</code></li>
       </ul>
       <span class="go">Open the terminal →</span>
     </a>
@@ -79,5 +79,5 @@ code { font: 13px var(--font-display); color: var(--ink); background: var(--pane
   <p class="note">The source, the instruction set and the manuals: <a href="https://github.com/darkclad/Setun" style="color:var(--ink)">github.com/darkclad/Setun</a>.</p>
 </div>
 <script>
-document.getElementById("ssh-cmd").textContent = "ssh -p 2222 user@" + location.hostname;
+document.getElementById("ssh-cmd").textContent = "ssh -p 2227 user@" + location.hostname;
 </script>
