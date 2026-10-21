@@ -44,7 +44,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/TNET.md`](docs/TNET.md): the native ternary network between Setun machines: the `TLINK` card, TL frames with a TCRC-18 check over GF(3), TNP addresses, TSP streams
 - [`docs/NETWORK.md`](docs/NETWORK.md): networking: the `TNIC` card, the host-side network, Trinux's TCP/IP stack and sockets, telnet and SSH logins, TLS for `wget`, a web server
 - [`docs/ROADMAP.md`](docs/ROADMAP.md): build order and milestones
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/): the historical Setun-70 (heritage and background only)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/reference/`](docs/reference/README.md): the historical Setun-70 and its sources (heritage and background only)
 
 ## Layout
 
@@ -99,11 +99,17 @@ like the native one), and runs Trinux at a few hundred MIPS at Max (about
 
 ## Credits
 
-The Setun-70 reference material in `docs/reference/` was collected by Stanislav
-Maslovski ([smaslovski/Setun70](https://github.com/smaslovski/Setun70), GPL-3).
-It is included for study only.
+The historical Setun-70 sources are collected, with the 1970 report's ALGOL
+text transcribed, in Stanislav Maslovski's Setun-70 emulator,
+[smaslovski/Setun70](https://github.com/smaslovski/Setun70); they are listed in
+[`docs/reference/`](docs/reference/README.md), not copied here.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). This covers everything in the repository except
-`docs/reference/`, which keeps its original license (GPL-3, see Credits).
+MIT, see [LICENSE](LICENSE), except `fonts/unifont/`: GNU Unifont 18.0.01,
+© Roman Czyborra, Paul Hardy and contributors, used under the SIL Open Font
+License 1.1 ([`fonts/unifont/OFL-1.1.txt`](fonts/unifont/OFL-1.1.txt)). The
+glyphs are packed into the Trinux disk image, and so into the web build, which
+must carry that notice. Other third-party material (the root certificates,
+Unicode data, the Rust crates the binaries link) is listed in
+[NOTICE](NOTICE).

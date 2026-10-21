@@ -2,10 +2,10 @@
 
 Primary source: Brusentsov & Zhogolev, *Algorithmic description of the structure
 and instruction set of the Setun-70 computer*, MSU Computing Center report
-No. 27-VT (417), 1970. The ALGOL text (OCR'd by S. Maslovski) is in
-[`reference/Setun70.alg`](reference/Setun70.alg). The overview paper by
-Brusentsov, Zhogolev and Maslov (1971) is in `reference/` (Russian). This file
-summarizes both. **Where this digest and the ALGOL disagree, the ALGOL wins.**
+No. 27-VT (417), 1970. The ALGOL text (OCR'd by S. Maslovski) is
+[`Setun70.alg`](https://github.com/smaslovski/Setun70/blob/master/Setun70.alg) in his Setun-70 emulator. The
+overview paper by Brusentsov, Zhogolev and Maslov (1971) is in Russian; both
+are listed in [`reference/`](reference/README.md). This file summarizes them. **Where this digest and the ALGOL disagree, the ALGOL wins.**
 
 ## Data
 
@@ -102,7 +102,7 @@ The stack word at index `pa` occupies trytes `3·pa−1 .. 3·pa+1` of page `ph`
 Special operations S1..S27 cover I/O channel read/write/control (`CG*`, `LG*`,
 `LU*`), second-level page seek and copy (`LQ*`, `CF*`, `LF*`), stack pointer
 access (`CP`, `EXP`, `LP`), the `c` stack (`CMC`, `RMC`, `LMC`) and page registers
-(`LH*`). See `reference/Описание_наборa_инструкций_Сетунь_70.pdf` and the ALGOL.
+(`LH*`). See the instruction set description listed in [`reference/`](reference/README.md), and the ALGOL.
 
 ## I/O
 

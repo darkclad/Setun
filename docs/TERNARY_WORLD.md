@@ -1,6 +1,6 @@
 # Ternary World Roadmap
 
-As of 2026-10-06, with the decisions of that day. Copied from the shared doc. The milestone plan for Setun-11̅ itself is in [`ROADMAP.md`](ROADMAP.md).
+Written 2026-10-06, with the decisions of that day; later entries are dated. The milestone plan for Setun-11̅ itself is in [`ROADMAP.md`](ROADMAP.md).
 
 ## Purpose and scope
 
@@ -165,7 +165,7 @@ Today every Setun-11̅ network packet is binary: `TNIC` carries one octet per tr
 Decided 2026-10-06:
 
 - The native stack keeps BSD sockets, with a new ternary address family, so `ssh`, `wget` and `httpd` run over both stacks.
-- Native networking comes before IPv6. IPv6 is added only if the binary side needs it. (2026-10-14: TNET is done and the user asked for IPv6; it is under way in [`IPV6.md`](IPV6.md).)
+- Native networking comes before IPv6. IPv6 is added only if the binary side needs it. (2026-10-14: TNET was done, and IPv6 followed: [`IPV6.md`](IPV6.md).)
 
 ## 7. Security and cryptography
 

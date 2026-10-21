@@ -2,3 +2,7 @@
 **/*.rs.bk
 /pkg
 /trinux.disk
+/web/deploy.env
+.claude/
+.idea/
+.vscode/

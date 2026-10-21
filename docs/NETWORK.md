@@ -389,7 +389,7 @@ $ ssh user@somehost 'uname -a'                # or: ssh -p 2222 -i key -t host
   - a changed host key refused;
   - a refused port and an unknown name;
   - an interactive pty session left with `exit`, and one left with `~.`.
-- **Interop**: Trinux's client was also tried against a real OpenSSH server, on another machine, reached through the NAT. Key exchange, the Ed25519 host key's signature, NEWKEYS and the encrypted login exchange all worked, up to the password prompt. This was a one-off check: nothing was changed on that server, and it is not part of the automated tests.
+- **Interop**: Trinux's client was also tried against a real OpenSSH server on another machine, reached through the NAT. Key exchange, the Ed25519 host key's signature, NEWKEYS and the encrypted login exchange all worked, up to the password prompt. This was a one-off check: nothing was changed on that server, and it is not part of the automated tests.
 
 ## 11. Copying files: `sftp` and `scp` (N9)
 
