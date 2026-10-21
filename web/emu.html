@@ -1,0 +1,458 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setun-11̅ Emulator</title>
+<style>
+/* Layout: an instrument front panel. Screen in a bezel on the left; lamp
+   rows, status and controls in a side column; serial console below.
+   Deliberately single-theme (a dark console), set explicitly. */
+:root {
+  --panel: #151916;      /* graphite, slight green bias */
+  --bezel: #1f2520;
+  --line: #333c35;
+  --ink: #dadfcd;
+  --dim: #8c9483;
+  --plus: #f2a73b;       /* lamp lit +1 (amber) */
+  --minus: #58c3d0;      /* lamp lit −1 (cyan) */
+  --off: #2b322c;        /* lamp at 0 */
+  --screen: #000;
+  --font-display: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  --font-body: system-ui, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+html, body { background: var(--panel); color: var(--ink); }
+body { font: 15px/1.5 var(--font-body); padding-inline: 16px; padding-block: 20px 32px; }
+.wrap { max-width: 1640px; margin-inline: auto; display: grid; gap: 18px; }
+a.back { color: var(--dim); text-decoration: none; font: 13px var(--font-display); align-self: center; }
+a.back:hover { color: var(--ink); }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.mark { font: 800 clamp(26px, 4vw, 38px)/1 var(--font-display); letter-spacing: 0.02em; margin: 0; }
+.mark span { color: var(--plus); }
+/* An overlined digit; the display font has no usable U+0305, so the bar is drawn here. */
+.mark .ov { text-decoration: overline; text-decoration-thickness: 0.09em; }
+.tag { color: var(--dim); margin: 0; }
+.facts { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px/1.4 var(--font-display); color: var(--dim); }
+.facts b { color: var(--ink); font-weight: 600; }
+
+/* The screen and the side column side by side while both fit, else stacked.
+   "Fit" fills the space left of the column; a fixed size keeps its pixels
+   (shrinking only when the window is narrower). */
+.deck { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+.bezel { background: var(--bezel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; position: relative; flex: 1 1 560px; min-width: 0; box-sizing: border-box; }
+.deck.fixed .bezel { flex: 0 1 auto; }
+/* The machine's picture keeps its proportions inside the box (letterboxed
+   when the box is another shape, as 1200×800 is to a 4:3 mode). */
+canvas#screen { display: block; width: 100%; aspect-ratio: 4 / 3; max-width: 100%; background: var(--screen); image-rendering: pixelated; object-fit: contain; border-radius: 3px; outline: none; cursor: crosshair; }
+.deck.fixed canvas#screen { width: var(--w); aspect-ratio: var(--ar); height: auto; }
+/* Full screen, or where the browser refuses that, the whole window. */
+.bezel:fullscreen, .bezel.filled { display: flex; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 0; background: #000; }
+.bezel.filled { position: fixed; inset: 0; z-index: 10; }
+.bezel:fullscreen canvas#screen, .bezel.filled canvas#screen { width: 100%; height: 100%; max-width: none; aspect-ratio: auto; border-radius: 0; }
+.bezel:fullscreen .hint, .bezel.filled .hint { bottom: 16px; }
+#btn-leave { position: absolute; top: 10px; right: 10px; opacity: 0.55; }
+#btn-leave:hover, #btn-leave:focus-visible { opacity: 1; }
+.bezel:not(:fullscreen):not(.filled) #btn-leave { display: none; }
+canvas#screen:focus-visible { box-shadow: 0 0 0 2px var(--plus); }
+.hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); background: rgba(21,25,22,.88); border: 1px solid var(--line); color: var(--ink); font: 12px var(--font-display); padding: 6px 10px; border-radius: 6px; pointer-events: none; white-space: nowrap; }
+.hint[hidden] { display: none; }
+
+.side { display: grid; gap: 14px; min-width: 0; }
+.deck .side { flex: 1 1 280px; max-width: 420px; }
+.group { display: grid; gap: 8px; }
+.label { font: 600 11px/1 var(--font-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+.lamps { display: grid; grid-template-columns: repeat(27, 1fr); gap: 2px; }
+.lamp { aspect-ratio: 1; border-radius: 50%; background: var(--off); }
+.lamp.p { background: var(--plus); box-shadow: 0 0 5px var(--plus); }
+.lamp.m { background: var(--minus); box-shadow: 0 0 5px var(--minus); }
+.lamps .lamp:nth-child(9n) { margin-right: 3px; }
+.readout { display: flex; justify-content: space-between; font: 13px var(--font-display); font-variant-numeric: tabular-nums; }
+.readout .b27 { color: var(--ink); letter-spacing: 0.08em; }
+.readout .b27 .neg { text-decoration: overline; text-decoration-thickness: 1.5px; }
+.readout .dec { color: var(--dim); }
+
+.status { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font: 13px var(--font-display); font-variant-numeric: tabular-nums; margin: 0; }
+.status dt { color: var(--dim); }
+.status dd { margin: 0; text-align: right; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px; }
+button, select { font: 600 12px var(--font-display); color: var(--ink); background: var(--bezel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--dim); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--plus); outline-offset: 1px; }
+.legend { color: var(--dim); font-size: 13px; margin: 0; }
+.legend kbd { font: 11px var(--font-display); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; color: var(--ink); }
+.legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: 0; margin-right: 4px; }
+
+.console { display: grid; gap: 8px; }
+pre#serial { margin: 0; min-height: 7.5em; max-height: 14em; overflow: auto; background: var(--bezel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: 13px/1.45 var(--font-display); white-space: pre-wrap; overflow-wrap: anywhere; }
+form#send { display: flex; gap: 8px; }
+input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(--ink); background: var(--bezel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+.error { color: #ff8a7a; font: 13px var(--font-display); }
+@media (prefers-reduced-motion: reduce) { .lamp.p, .lamp.m { box-shadow: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <a class="back" href="./">← Setun-11̅</a>
+    <h1 class="mark" aria-label="Setun-11̅">SETUN<span aria-hidden="true">-1<span class="ov">1</span></span></h1>
+    <p class="tag">A balanced-ternary computer booting Trinux, its POSIX-style OS, in your browser.</p>
+    <div class="facts" aria-label="Machine facts">
+      <span>tryte <b>3² trits</b></span>
+      <span>word <b>3³ trits</b></span>
+      <span>address space <b>3^27</b></span>
+      <span>colours <b>3^9</b></span>
+    </div>
+  </header>
+
+  <div class="deck" id="deck">
+    <div class="bezel" id="bezel">
+      <canvas id="screen" width="640" height="480" tabindex="0" aria-label="Setun-11̅ display. Click to type."></canvas>
+      <div class="hint" id="hint">Click the screen to type</div>
+      <button type="button" id="btn-leave">Leave full screen</button>
+    </div>
+
+    <aside class="side">
+      <div class="group">
+        <div class="label">Program counter</div>
+        <div class="lamps" id="lamps-pc" aria-hidden="true"></div>
+        <div class="readout"><span class="b27" id="pc-b27">000000000</span><span class="dec" id="pc-dec">0</span></div>
+      </div>
+      <div class="group">
+        <div class="label">Register r1</div>
+        <div class="lamps" id="lamps-r1" aria-hidden="true"></div>
+        <div class="readout"><span class="b27" id="r1-b27">000000000</span><span class="dec" id="r1-dec">0</span></div>
+      </div>
+      <p class="legend"><span class="sw" style="background:var(--plus)"></span>+1 &nbsp; <span class="sw" style="background:var(--off)"></span>0 &nbsp; <span class="sw" style="background:var(--minus)"></span>−1 &nbsp;· base 27: 0–9 A–D = 0…13, overlined = negative (<span style="text-decoration:overline">5</span> = −5)</p>
+
+      <dl class="status">
+        <dt>Speed</dt><dd id="st-mips">–</dd>
+        <dt>Ring</dt><dd id="st-ring">–</dd>
+        <dt>CPU</dt><dd id="st-cpu">–</dd>
+        <dt>Display</dt><dd id="st-mode">–</dd>
+      </dl>
+
+      <div class="controls">
+        <button type="button" id="btn-wm" data-trinux>Window system</button>
+        <button type="button" id="btn-reset">Power-cycle</button>
+        <button type="button" id="btn-fresh" data-trinux>Fresh disk</button>
+        <button type="button" id="btn-gfx" data-demo hidden>Graphics (Tab)</button>
+        <button type="button" id="btn-text" data-demo hidden>Text (Esc)</button>
+      </div>
+      <div class="controls">
+        <label class="label" for="size" style="align-self:center">Screen</label>
+        <select id="size">
+          <option value="fit" selected>Fit</option>
+          <option value="640x480">640×480</option>
+          <option value="800x600">800×600</option>
+          <option value="1024x768">1024×768</option>
+          <option value="1200x800">1200×800</option>
+        </select>
+        <button type="button" id="btn-full">Full screen</button>
+      </div>
+      <div class="controls">
+        <label class="label" for="machine" style="align-self:center">Boot</label>
+        <select id="machine">
+          <option value="0" selected>Trinux</option>
+          <option value="1">Demo ROM</option>
+        </select>
+        <label class="label" for="speed" style="align-self:center">Clock</label>
+        <select id="speed">
+          <option value="1">1 MIPS</option>
+          <option value="10">10 MIPS</option>
+          <option value="20">20 MIPS</option>
+          <option value="0" selected>Max</option>
+        </select>
+      </div>
+      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page; <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. In the browser the network card has no link, so <kbd>ssh</kbd>, <kbd>wget</kbd> and <kbd>sshd</kbd> need the native build (<kbd>setun --net</kbd>).</p>
+      <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
+    </aside>
+  </div>
+
+  <section class="console" aria-label="Serial console">
+    <div class="label">Serial console</div>
+    <pre id="serial" aria-live="polite"></pre>
+    <form id="send">
+      <input id="line" autocomplete="off" placeholder="A command for the Trinux shell, e.g. echo Привет, Setun!" aria-label="Text to send over serial">
+      <button type="submit">Send</button>
+    </form>
+    <div class="error" id="error" hidden></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const HID = { Enter: 40, Escape: 41, Backspace: 42, Tab: 43, Space: 44, Minus: 45, Equal: 46,
+    BracketLeft: 47, BracketRight: 48, Backslash: 49, Semicolon: 51, Quote: 52, Backquote: 53,
+    Comma: 54, Period: 55, Slash: 56, CapsLock: 57, Insert: 73, Home: 74, PageUp: 75, Delete: 76,
+    End: 77, PageDown: 78, ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
+    ControlLeft: 224, ShiftLeft: 225, AltLeft: 226, MetaLeft: 227, ControlRight: 228,
+    ShiftRight: 229, AltRight: 230, MetaRight: 231 };
+  for (let i = 0; i < 26; i++) HID["Key" + String.fromCharCode(65 + i)] = 4 + i;
+  for (let i = 1; i <= 9; i++) HID["Digit" + i] = 29 + i;
+  HID.Digit0 = 39;
+  for (let i = 1; i <= 12; i++) HID["F" + i] = 57 + i;
+
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("screen"), ctx = canvas.getContext("2d"), serialEl = $("serial");
+  const B27 = "0123456789ABCD";
+
+  // Balanced-ternary trits (MSB first) of an integer that fits a double exactly.
+  function trits(v, n) {
+    const t = new Array(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+      let r = ((v % 3) + 3) % 3;
+      if (r === 2) r = -1;
+      t[i] = r;
+      v = (v - r) / 3;
+    }
+    return t;
+  }
+  // Base-27 digits into el: 0-9 A-D, a negative digit overlined.
+  function showB27(el, t) {
+    el.textContent = "";
+    for (let i = 0; i < t.length; i += 3) {
+      const d = t[i] * 9 + t[i + 1] * 3 + t[i + 2];
+      const span = document.createElement("span");
+      span.textContent = B27[Math.abs(d)];
+      if (d < 0) span.className = "neg";
+      el.appendChild(span);
+    }
+  }
+  function makeLamps(el) {
+    const out = [];
+    for (let i = 0; i < 27; i++) { const d = document.createElement("div"); d.className = "lamp"; el.appendChild(d); out.push(d); }
+    return out;
+  }
+  const lamps = { pc: makeLamps($("lamps-pc")), r1: makeLamps($("lamps-r1")) };
+  function showWord(name, v) {
+    const t = trits(v, 27);
+    lamps[name].forEach((d, i) => { d.className = t[i] > 0 ? "lamp p" : t[i] < 0 ? "lamp m" : "lamp"; });
+    showB27($(name + "-b27"), t);
+    $(name + "-dec").textContent = v.toLocaleString("en-US").replace(/,/g, " ");
+  }
+  // Full screen for el: true once it is; false if the browser refuses, or
+// does not answer within a second (some embedded browsers never do).
+  function goFull(el) {
+    return Promise.race([
+      el.requestFullscreen().then(() => true, () => false),
+      new Promise((r) => setTimeout(() => r(!!document.fullscreenElement), 1000)),
+    ]);
+  }
+  function showError(msg) { const e = $("error"); e.textContent = msg; e.hidden = false; }
+
+  async function start() {
+    let wasm;
+    try {
+      const res = await fetch("setun.wasm");
+      if (!res.ok) throw new Error("setun.wasm: HTTP " + res.status);
+      const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+      wasm = instance.exports;
+    } catch (err) {
+      showError("The emulator could not start: " + err.message + ". This browser may block WebAssembly here.");
+      return;
+    }
+    function showKind() {
+      const trinux = wasm.setun_kind() === 0;
+      document.querySelectorAll("[data-trinux]").forEach((el) => { el.hidden = !trinux; });
+      document.querySelectorAll("[data-demo]").forEach((el) => { el.hidden = trinux; });
+    }
+    // fresh browser entropy for the machine's random-number device, before every boot
+    function seed() {
+      const w = new Uint32Array(8);
+      crypto.getRandomValues(w);
+      w.forEach((v, i) => wasm.setun_seed_word(i, v));
+    }
+    // The JIT: hot code comes out as small WebAssembly modules, which import
+    // the emulator's memory and function table; they are compiled in the
+    // background and linked into the table, and the emulator is told where.
+    const table = wasm.__indirect_function_table;
+    const jitOn = table instanceof WebAssembly.Table && typeof wasm.setun_jit_enable === "function";
+    if (jitOn) wasm.setun_jit_enable(1);
+    function jitService() {
+      if (!jitOn) return;
+      for (;;) {
+        const n = wasm.setun_jit_take();
+        if (!n) return;
+        const code = new Uint8Array(wasm.memory.buffer, wasm.setun_jit_ptr(), n).slice();
+        const id = wasm.setun_jit_id();
+        WebAssembly.instantiate(code, { env: { memory: wasm.memory, table } })
+          .then(({ instance }) => { const idx = table.grow(1); table.set(idx, instance.exports.run); wasm.setun_jit_done(id, idx); })
+          .catch(() => wasm.setun_jit_done(id, 0));
+      }
+    }
+    seed();
+    wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
+    showKind();
+    const decoder = new TextDecoder();
+
+    function press(code) { wasm.setun_key(code, 1); wasm.setun_key(code, 0); }
+    // Characters to (HID code, shift) on a US layout, for key events that
+    // carry no physical key code (some input methods, automation).
+    const CHAR = {};
+    const rows = [["1234567890", "!@#$%^&*()", 30], ["-=[]\\", "_+{}|", 45], [";'`,./", ":\"~<>?", 51]];
+    for (const [plain, shifted, first] of rows) {
+      for (let i = 0; i < plain.length; i++) {
+        CHAR[plain[i]] = [first + i, 0];
+        CHAR[shifted[i]] = [first + i, 1];
+      }
+    }
+    for (let i = 0; i < 26; i++) {
+      CHAR[String.fromCharCode(97 + i)] = [4 + i, 0];
+      CHAR[String.fromCharCode(65 + i)] = [4 + i, 1];
+    }
+    CHAR[" "] = [44, 0];
+    const typed = new Set();
+    canvas.addEventListener("keydown", (e) => {
+      const c = HID[e.code];
+      if (c !== undefined) { wasm.setun_key(c, 1); e.preventDefault(); return; }
+      const k = CHAR[e.key] || (e.key === "Enter" ? [40, 0] : e.key === "Backspace" ? [42, 0] : null);
+      if (!k) return;
+      if (k[1]) wasm.setun_key(225, 1);
+      wasm.setun_key(k[0], 1);
+      wasm.setun_key(k[0], 0);
+      if (k[1]) wasm.setun_key(225, 0);
+      typed.add(e.key);
+      e.preventDefault();
+    });
+    canvas.addEventListener("keyup", (e) => {
+      const c = HID[e.code];
+      if (c !== undefined) { wasm.setun_key(c, 0); e.preventDefault(); return; }
+      if (typed.delete(e.key)) e.preventDefault();         // already pressed and released
+    });
+    canvas.addEventListener("focus", () => { $("hint").hidden = true; });
+    canvas.addEventListener("blur", () => { $("hint").hidden = false; });
+    let buttons = 0;
+    // Mouse states queue up and reach the machine one by one, each followed
+    // by a short slice of emulation, so a quick press-move-release between
+    // two frames is still seen in order (the device holds only one state).
+    const mouseQueue = [];
+    function mouse(e, isButton) {
+      const r = canvas.getBoundingClientRect();
+      // object-fit: contain centres the picture at one scale; outside it, clamp to the edge
+      const k = Math.min(r.width / canvas.width, r.height / canvas.height);
+      const ox = r.left + (r.width - canvas.width * k) / 2, oy = r.top + (r.height - canvas.height * k) / 2;
+      const x = Math.max(0, Math.min(canvas.width - 1, Math.floor((e.clientX - ox) / k)));
+      const y = Math.max(0, Math.min(canvas.height - 1, Math.floor((e.clientY - oy) / k)));
+      const last = mouseQueue[mouseQueue.length - 1];
+      if (!isButton && last && last.motion) { last.x = x; last.y = y; }   // consecutive motion: keep the latest
+      else mouseQueue.push({ x, y, buttons, motion: !isButton });
+    }
+    function feedMouse() {
+      while (mouseQueue.length) {
+        const m = mouseQueue.shift();
+        wasm.setun_mouse(m.x, m.y, m.buttons);
+        if (mouseQueue.length) wasm.setun_run(30000);
+      }
+    }
+    canvas.addEventListener("mousemove", (e) => mouse(e, false));
+    canvas.addEventListener("mousedown", (e) => { buttons |= [1, 2, 4][e.button] || 0; mouse(e, true); canvas.focus(); });
+    canvas.addEventListener("mouseup", (e) => { buttons &= ~([1, 2, 4][e.button] || 0); mouse(e, true); });
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    canvas.addEventListener("wheel", (e) => { wasm.setun_wheel(Math.sign(e.deltaY)); e.preventDefault(); }, { passive: false });
+
+    $("send").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = $("line").value + "\n";
+      for (const ch of text) wasm.setun_serial_char(ch.codePointAt(0));
+      $("line").value = "";
+    });
+    function sendLine(text) { for (const ch of text + "\n") wasm.setun_serial_char(ch.codePointAt(0)); }
+    $("btn-wm").addEventListener("click", () => { sendLine("trwm term clock colors paint &"); canvas.focus(); });
+
+    // The screen's size on the page (remembered in this browser), and full screen.
+    function applySize() {
+      const v = $("size").value, deck = $("deck");
+      if (v === "fit") { deck.classList.remove("fixed"); return; }
+      const [w, h] = v.split("x").map(Number);
+      deck.classList.add("fixed");
+      deck.style.setProperty("--w", w + "px");
+      deck.style.setProperty("--ar", w + " / " + h);
+    }
+    try { const saved = localStorage.getItem("setun-size"); if (saved && [...$("size").options].some((o) => o.value === saved)) $("size").value = saved; } catch (e) {}
+    applySize();
+    $("size").addEventListener("change", () => {
+      applySize();
+      try { localStorage.setItem("setun-size", $("size").value); } catch (e) {}
+      canvas.focus();
+    });
+    $("btn-full").addEventListener("click", async () => {
+      if (!(await goFull($("bezel")))) $("bezel").classList.add("filled");   // refused: fill the window
+      canvas.focus();
+    });
+    $("btn-leave").addEventListener("click", async () => {
+      $("bezel").classList.remove("filled");
+      if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} }
+      canvas.focus();
+    });
+    document.addEventListener("fullscreenchange", async () => {
+      // In full screen, Esc goes to the machine where the browser allows it
+      // (holding Esc leaves); elsewhere Esc leaves full screen at once.
+      if (document.fullscreenElement) {
+        $("bezel").classList.remove("filled");     // a late answer: real full screen after all
+        try { await navigator.keyboard.lock(["Escape"]); } catch (e) {}
+        canvas.focus();
+      } else {
+        try { navigator.keyboard.unlock(); } catch (e) {}
+      }
+    });
+    $("btn-gfx").addEventListener("click", () => press(43));
+    $("btn-text").addEventListener("click", () => press(41));
+    $("btn-reset").addEventListener("click", () => { seed(); wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = ""; });
+    $("btn-fresh").addEventListener("click", () => { seed(); wasm.setun_fresh_disk(Date.now() / 1000); serialEl.textContent = ""; });
+    $("machine").addEventListener("change", () => {
+      seed();
+      wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
+      serialEl.textContent = "";
+      showKind();
+    });
+
+    let img = null, last = performance.now(), executed = 0, statT = last, off = false;
+    const modes = { "-1": "text 80×30", "0": "640×480", "1": "800×600" };
+    const ringNames = { "-1": "−1 user", "0": "0 drivers", "1": "+1 kernel" };
+
+    function frame(now) {
+      // Catch up after throttled frames, but never more than half a second.
+      const dt = Math.min(now - last, 500); last = now;
+      feedMouse();
+      const target = Number($("speed").value);
+      // Max: emulate for three quarters of the time between frames (8-40 ms),
+      // so slow or throttled frame rates still get most of the CPU.
+      let n = target > 0 ? Math.round(target * 1e6 * dt / 1000) : 0;
+      if (target === 0) {
+        const budget = Math.min(Math.max(dt * 0.75, 8), 40);
+        const t0 = performance.now(); n = 0;
+        while (performance.now() - t0 < budget) { off = wasm.setun_run(50000) === 1; n += 50000; if (off) break; }
+      } else if (n > 0) {
+        off = wasm.setun_run(n) === 1;
+      }
+      executed += n;
+      jitService();
+
+      const ptr = wasm.setun_render(performance.now());
+      const w = wasm.setun_width(), h = wasm.setun_height();
+      if (canvas.width !== w || canvas.height !== h || !img) { canvas.width = w; canvas.height = h; img = ctx.createImageData(w, h); }
+      img.data.set(new Uint8Array(wasm.memory.buffer, ptr, w * h * 4));
+      ctx.putImageData(img, 0, 0);
+
+      const len = wasm.setun_serial_take();
+      if (len > 0) {
+        serialEl.textContent += decoder.decode(new Uint8Array(wasm.memory.buffer, wasm.setun_serial_ptr(), len));
+        if (serialEl.textContent.length > 20000) serialEl.textContent = serialEl.textContent.slice(-15000);
+        serialEl.scrollTop = serialEl.scrollHeight;
+      }
+
+      showWord("pc", wasm.setun_pc());
+      showWord("r1", wasm.setun_reg(1));
+      if (now - statT > 500) {
+        $("st-mips").textContent = (executed / (now - statT) / 1000).toFixed(1) + " MIPS";
+        executed = 0; statT = now;
+        $("st-ring").textContent = ringNames[wasm.setun_ring()];
+        $("st-cpu").textContent = off ? "powered off" : wasm.setun_halted() ? "halted (HLT)" : "running";
+        $("st-mode").textContent = modes[wasm.setun_display_mode()];
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+  start();
+})();
+</script>

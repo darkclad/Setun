@@ -1,0 +1,87 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setun-11̅ Terminal</title>
+<style>
+/* A terminal to the server's Trinux: ttyd (served at term/) in a frame, with
+   a bar for going back and for full screen. */
+:root {
+  --panel: #151916;
+  --bezel: #1f2520;
+  --line: #333c35;
+  --ink: #dadfcd;
+  --dim: #8c9483;
+  --plus: #f2a73b;
+  --minus: #58c3d0;
+  --font-display: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  --font-body: system-ui, "Segoe UI", sans-serif;
+  color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; background: var(--panel); color: var(--ink); }
+body { display: grid; grid-template-rows: auto minmax(0, 1fr); font: 15px/1.5 var(--font-body); }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.bar a.back { color: var(--dim); text-decoration: none; font: 13px var(--font-display); }
+.bar a.back:hover { color: var(--ink); }
+.mark { font: 800 20px/1 var(--font-display); margin: 0; }
+.mark span { color: var(--plus); }
+.mark .ov { text-decoration: overline; text-decoration-thickness: 0.09em; }
+.where { color: var(--dim); font: 13px var(--font-display); }
+.where b { color: var(--minus); font-weight: 600; }
+.bar .end { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.legend { color: var(--dim); font-size: 13px; }
+.legend kbd { font: 11px var(--font-display); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; color: var(--ink); }
+button { font: 600 12px var(--font-display); color: var(--ink); background: var(--bezel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+button:hover { border-color: var(--dim); }
+button:focus-visible { outline: 2px solid var(--plus); outline-offset: 1px; }
+.screen { padding: 12px 16px 16px; min-height: 0; display: grid; }
+.frame { background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-height: 0; display: grid; }
+.frame:fullscreen { border: 0; border-radius: 0; }
+/* where the browser refuses full screen: the whole window, with a way out */
+.frame.filled { position: fixed; inset: 0; z-index: 10; border: 0; border-radius: 0; }
+#leave { position: fixed; top: 8px; right: 12px; z-index: 11; opacity: 0.6; }
+#leave:hover, #leave:focus-visible { opacity: 1; }
+iframe { width: 100%; height: 100%; border: 0; display: block; background: #000; }
+</style>
+
+<div class="bar">
+  <a class="back" href="./">← Setun-11̅</a>
+  <h1 class="mark" aria-label="Setun-11̅ terminal">SETUN<span aria-hidden="true">-1<span class="ov">1</span></span></h1>
+  <span class="where">the <b>server's</b> Trinux, over SSH</span>
+  <div class="end">
+    <span class="legend">Log in as <kbd>user</kbd> or an account you made there.</span>
+    <button type="button" id="full">Full screen</button>
+  </div>
+</div>
+<div class="screen">
+  <div class="frame" id="frame">
+    <iframe id="term" src="term/" title="Terminal to the server's Trinux"></iframe>
+  </div>
+  <button type="button" id="leave" hidden>Leave full screen</button>
+</div>
+<script>
+(() => {
+  const frame = document.getElementById("frame"), term = document.getElementById("term");
+  const full = document.getElementById("full");
+  const leave = document.getElementById("leave");
+  function fill(on) { frame.classList.toggle("filled", on); leave.hidden = !on; }
+  // Full screen for el: true once it is; false if the browser refuses, or
+// does not answer within a second (some embedded browsers never do).
+  function goFull(el) {
+    return Promise.race([
+      el.requestFullscreen().then(() => true, () => false),
+      new Promise((r) => setTimeout(() => r(!!document.fullscreenElement), 1000)),
+    ]);
+  }
+  full.addEventListener("click", async () => {
+    if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch (e) {} }
+    else if (!(await goFull(frame))) fill(true);   // refused: fill the window
+    term.focus();
+  });
+  leave.addEventListener("click", () => { fill(false); term.focus(); });
+  document.addEventListener("fullscreenchange", () => {
+    if (document.fullscreenElement) fill(false);   // a late answer: real full screen after all
+    full.textContent = document.fullscreenElement ? "Leave full screen" : "Full screen";
+    term.focus();
+  });
+  term.addEventListener("load", () => term.focus());
+})();
+</script>

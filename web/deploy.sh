@@ -1,5 +1,5 @@
 #!/bin/sh
-# Copy the browser front end (web/index.html and web/setun.wasm) to a static
+# Copy the browser front end (the pages in web/ and web/setun.wasm) to a static
 # web server over ssh. Where to: DEPLOY_HOST (an ssh destination) and
 # DEPLOY_DIR (the directory the server serves), from the environment or from
 # web/deploy.env (not tracked; two lines of KEY=value).
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 : "${DEPLOY_DIR:?set DEPLOY_DIR (or write web/deploy.env)}"
 [ "$1" = "--no-build" ] || sh web/build.sh
 # copy under temporary names, then rename, so a reload never sees half a file
-scp -q web/index.html "$DEPLOY_HOST:$DEPLOY_DIR/index.html.new"
-scp -q web/setun.wasm "$DEPLOY_HOST:$DEPLOY_DIR/setun.wasm.new"
-ssh "$DEPLOY_HOST" "cd '$DEPLOY_DIR' && mv setun.wasm.new setun.wasm && mv index.html.new index.html && ls -l"
+PAGES="index.html emu.html term.html"
+for f in $PAGES setun.wasm; do scp -q "web/$f" "$DEPLOY_HOST:$DEPLOY_DIR/$f.new"; done
+ssh "$DEPLOY_HOST" "cd '$DEPLOY_DIR' && mv setun.wasm.new setun.wasm && for f in $PAGES; do mv \$f.new \$f; done && ls -l"
 echo "deployed: $(git rev-parse --short HEAD)$(git diff --quiet -- crates kernel user web || echo ' (with uncommitted changes)')"

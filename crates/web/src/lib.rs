@@ -1,5 +1,5 @@
 //! Setun-11̅ browser front end: plain `extern "C"` WebAssembly exports, driven
-//! by `web/index.html` (no wasm-bindgen needed).
+//! by `web/emu.html` (no wasm-bindgen needed).
 //!
 //! The page calls `setun_boot`, then once per animation frame: input calls,
 //! `setun_run`, `setun_render` (RGBA pixels in WASM memory) and
@@ -179,6 +179,9 @@ pub extern "C" fn setun_jit_enable(on: u32) {
 }
 
 /// The next module to compile: its length in bytes (0: none waiting).
+/// (The module queue exists only in the WebAssembly build; the host build
+/// of this crate is for its tests.)
+#[cfg(target_arch = "wasm32")]
 #[no_mangle]
 pub extern "C" fn setun_jit_take() -> u32 {
     match setun_core::cpu::Cpu::jit_take() {
@@ -203,6 +206,7 @@ pub extern "C" fn setun_jit_id() -> f64 {
 }
 
 /// Request `id` compiled: its `run` is at `index` in the table (0: failed).
+#[cfg(target_arch = "wasm32")]
 #[no_mangle]
 pub extern "C" fn setun_jit_done(id: f64, index: u32) {
     setun_core::cpu::Cpu::jit_finished(id as u64, index);
@@ -323,13 +327,17 @@ mod tests {
     #[test]
     fn web_page_and_module_carry_the_new_name() {
         let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
-        let page = std::fs::read_to_string(web.join("index.html")).unwrap();
-        assert!(page.contains("<title>Setun-11\u{305}</title>"), "page title");
-        // the heading draws the bar with CSS over the second 1, and names the machine for screen readers
-        assert!(page.contains(r#"aria-label="Setun-11̅">SETUN<span aria-hidden="true">-1<span class="ov">1</span>"#), "heading");
         let wasm = std::fs::read(web.join("setun.wasm")).unwrap();
+        for (file, title) in [("index.html", "Setun-11\u{305}"), ("emu.html", "Setun-11\u{305} Emulator"), ("term.html", "Setun-11\u{305} Terminal")] {
+            let page = std::fs::read_to_string(web.join(file)).unwrap();
+            assert!(page.contains(&format!("<title>{title}</title>")), "{file}: title");
+            // the heading draws the bar with CSS over the second 1, and names the machine for screen readers
+            assert!(page.contains(r#"SETUN<span aria-hidden="true">-1<span class="ov">1</span>"#), "{file}: heading");
+            for old in ["Setun-386", "SETUN-386", "Setun-387", "SETUN-387", "setun386"] {
+                assert!(!page.contains(old), "{old} in {file}");
+            }
+        }
         for old in ["Setun-386", "SETUN-386", "Setun-387", "SETUN-387", "setun386"] {
-            assert!(!page.contains(old), "{old} in index.html");
             assert!(!wasm.windows(old.len()).any(|w| w == old.as_bytes()), "{old} in setun.wasm");
         }
     }
