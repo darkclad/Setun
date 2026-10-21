@@ -83,7 +83,7 @@ cargo run --release -p setun-native -- --console              # no window: this 
 cargo run --release -p setun-native -- --console --net 2323:23 # with a network; then `telnet localhost 2323` logs in
 cargo run --release -p setun-native -- --console --net 2222:22 # then `ssh -p 2222 root@localhost` (password root)
 cargo run --release -p setun-native -- --console --net 8080:80 # then http://localhost:8080/ is Trinux's httpd
-sh web/build.sh                                # rebuild web/setun.wasm (BIOS + Trinux disk inside)
+sh web/build.sh                                # build web/setun.wasm (BIOS + Trinux disk inside; needs the wasm32-unknown-unknown target)
 python -m http.server 8026 --directory web     # then open http://localhost:8026
 ```
 
