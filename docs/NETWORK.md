@@ -356,7 +356,7 @@ Not covered:
 ### In Trinux
 
 - `/etc/resolv.conf` names 10.0.2.3.
-- `resolve_host()` in `socket.tri` tries, in order: a dotted quad, `/etc/hosts`, `localhost`, then DNS (`dns_lookup`: one A question, 3 tries of 2 s, compressed names, answers checked against the query's id and the server). `nc`, `ping` and `wget` all go through it.
+- `resolve_host()` in `socket.tri` tries, in order: a dotted quad, `/etc/hosts`, `localhost`, then DNS (`dns_lookup`: one A question, 3 tries of 2 s, compressed names, answers checked against the query's id and the server). `ping` and `ntpdate` go through it; `nc`, `wget`, `ssh` and the rest go through `resolve_name`, which adds IPv6 ([`IPV6.md`](IPV6.md) §6).
 - `host [-s server] name` asks DNS only, the way bind's `host` does.
 - `wget [-q] [-b] [-S] [-O file] [--max-redirect=n] URL`: HTTP/1.1 GET over `http://` (and `https://`, §14). It follows redirects (301, 302, 303, 307, 308; 20 at most, relative targets too, across http and https), reads chunked bodies, honours Content-Length, and reads headers a line at a time, so long ones cost nothing. `-S` prints the answer's headers. Text arrives as UTF-8 and is stored as characters (`-b` keeps the octets). The exit codes follow GNU wget: 4 for network trouble, 7 for a malformed answer, 8 for an error answer or too many redirects.
 - Tests: `crates/trinux/tests/outbound.rs` runs real servers on the host inside the test (an echo server and a small HTTP server).

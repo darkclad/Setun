@@ -8,19 +8,26 @@ use common::*;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 
-/// A host-side line server on [::1]: it reads a line, answers "the host
-/// got: LINE" and closes.
+/// A host-side server on [::1]: it reads a request up to `end`, answers
+/// `reply(request)` and closes. `EchoServer::new()` answers a line with
+/// "the host got: LINE".
 struct EchoServer {
     listener: TcpListener,
     open: Vec<(TcpStream, Vec<u8>)>,
     requests: Vec<String>,
+    end: &'static [u8],
+    reply: fn(&str) -> Vec<u8>,
 }
 
 impl EchoServer {
     fn new() -> EchoServer {
+        Self::speaking(b"\n", |req| format!("the host got: {req}").into_bytes())
+    }
+
+    fn speaking(end: &'static [u8], reply: fn(&str) -> Vec<u8>) -> EchoServer {
         let listener = TcpListener::bind("[::1]:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        EchoServer { listener, open: Vec::new(), requests: Vec::new() }
+        EchoServer { listener, open: Vec::new(), requests: Vec::new(), end, reply }
     }
 
     fn port(&self) -> u16 {
@@ -40,7 +47,7 @@ impl EchoServer {
                 Ok(0) => true,
                 Ok(n) => {
                     buf.extend_from_slice(&b[..n]);
-                    buf.contains(&b'\n')
+                    buf.windows(self.end.len()).any(|w| w == self.end)
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => false,
                 Err(_) => true,
@@ -48,7 +55,7 @@ impl EchoServer {
             if done {
                 let req = String::from_utf8_lossy(buf).into_owned();
                 c.set_nonblocking(false).unwrap();
-                let _ = c.write_all(format!("the host got: {req}").as_bytes());
+                let _ = c.write_all(&(self.reply)(&req));
                 let _ = c.shutdown(std::net::Shutdown::Both);
                 self.requests.push(req);
                 self.open.remove(k);
@@ -174,4 +181,112 @@ fn a_port_forward_over_ipv6() {
     let log = s.log("telnetd");
     assert_eq!(log.matches("telnetd: connection from fd00::2\n").count(), 2, "{log}");
     assert_eq!(s.net.open_forwards(), 0);
+}
+
+// ---- V4: names and brackets (docs/IPV6.md §6) -------------------------------------------
+
+/// DNS's AAAA answers through `host` (over an IPv4 and an IPv6 server),
+/// names in nc and ping6, and /etc/hosts' ::1.
+#[test]
+fn names_of_either_family() {
+    let mut s = boot6();
+    s.net.dns_name6("six.test", "2001:db8::7".parse().unwrap());
+    s.net.dns_name("both.test", [203, 0, 113, 7]);
+    s.net.dns_name6("both.test", "2001:db8::8".parse().unwrap());
+    s.net.dns_name("four.test", [203, 0, 113, 9]);
+    let o = s.cmd("host six.test; echo status $?");
+    has(&o, &["six.test has IPv6 address 2001:db8::7\nstatus 0"]);
+    let o = s.cmd("host both.test");
+    has(&o, &["both.test has address 203.0.113.7\nboth.test has IPv6 address 2001:db8::8\n"]);
+    let o = s.cmd("host four.test");
+    assert_eq!(o, "four.test has address 203.0.113.9\n");
+    // the same server over IPv6
+    let o = s.cmd("host -s fd00::3 six.test; echo status $?");
+    has(&o, &["six.test has IPv6 address 2001:db8::7\nstatus 0"]);
+    let o = s.cmd("host -s fd00::99 six.test; echo status $?");
+    has(&o, &[";; connection timed out; no servers could be reached\nstatus 1"]);
+    let o = s.cmd("host -s nonsense six.test; echo status $?");
+    has(&o, &["usage: host", "status 2"]);
+    let o = s.cmd("host nosuch.invalid; echo status $?");
+    has(&o, &["Host nosuch.invalid not found: 3(NXDOMAIN)\nstatus 1"]);
+    // a name with only an AAAA record reaches the host through the NAT
+    s.net.alias6("2001:db8::7".parse().unwrap(), "::1".parse().unwrap());
+    let mut srv = EchoServer::new();
+    let p = srv.port();
+    let o = cmd_polling(&mut s, &format!("echo by name | nc six.test {p}; echo status $?"), || srv.poll());
+    has(&o, &["the host got: by name\nstatus 0"]);
+    // -4 refuses a name that has IPv6 only; -6 refuses one with IPv4 only
+    let o = s.cmd(&format!("nc -4 six.test {p}; echo status $?"));
+    has(&o, &["nc: six.test: Name or service not known\nstatus 1"]);
+    let o = s.cmd(&format!("nc -6 four.test {p}; echo status $?"));
+    has(&o, &["nc: four.test: Name or service not known\nstatus 1"]);
+    // localhost: IPv4 first, ::1 with -6 (/etc/hosts)
+    s.cmd("nc -6 -l 2400 > /tmp/six &");
+    s.idle(10_000_000);
+    s.cmd("echo over ::1 | nc -6 localhost 2400; wait");
+    has(&s.cmd("cat /tmp/six"), &["over ::1\n"]);
+    // without -6, localhost is IPv4: only an IPv4 listener hears it
+    s.cmd("nc -l 2401 > /tmp/four &");
+    s.idle(10_000_000);
+    s.cmd("echo over 127.0.0.1 | nc localhost 2401; wait");
+    has(&s.cmd("cat /tmp/four"), &["over 127.0.0.1\n"]);
+    // a nameserver given as an IPv6 address in /etc/resolv.conf
+    s.cmd("cp /etc/resolv.conf /tmp/resolv; echo 'nameserver fd00::3' > /etc/resolv.conf");
+    let o = s.cmd("host six.test; ping6 -c 1 six.test | head -n 1");
+    has(&o, &["six.test has IPv6 address 2001:db8::7\n", "PING six.test(2001:db8::7) 56 data bytes\n"]);
+    s.cmd("echo 'nameserver fd00::99' > /etc/resolv.conf");
+    has(&s.cmd("host six.test; echo status $?"), &[";; connection timed out; no servers could be reached\nstatus 1"]);
+    s.cmd("cp /tmp/resolv /etc/resolv.conf");
+    let o = s.cmd("ping6 -c 1 ip6-localhost");
+    has(&o, &["PING ip6-localhost(::1) 56 data bytes", "64 bytes from ::1: icmp_seq=1"]);
+    let o = s.cmd("ping6 -c 1 four.test; echo status $?");
+    has(&o, &["ping6: four.test: Name or service not known\nstatus 2"]);
+}
+
+fn http(req: &str) -> Vec<u8> {
+    let path = req.split(' ').nth(1).unwrap_or("/");
+    match path {
+        "/hello.txt" => "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nпривет по IPv6\n".as_bytes().to_vec(),
+        "/moved" => b"HTTP/1.1 301 Moved Permanently\r\nLocation: /hello.txt\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        _ => b"HTTP/1.0 404 Not Found\r\n\r\nnope\n".to_vec(),
+    }
+}
+
+/// wget with an IPv6 address in brackets (RFC 3986 §3.2.2), and with a
+/// name that has IPv6 only.
+#[test]
+fn wget_over_ipv6() {
+    let mut s = boot6();
+    let mut srv = EchoServer::speaking(b"\r\n\r\n", http);
+    let p = srv.port();
+    let o = cmd_polling(&mut s, &format!("wget -O - http://[fd00::2]:{p}/hello.txt; echo status $?"), || srv.poll());
+    has(&o, &["Connecting to fd00::2 (fd00::2)... connected.", "200 OK\nпривет по IPv6\n", "status 0"]);
+    assert!(srv.requests[0].contains(&format!("\r\nHost: [fd00::2]:{p}\r\n")), "{}", srv.requests[0]);
+    // a redirect to a path keeps the brackets
+    let o = cmd_polling(&mut s, &format!("wget -q -O - http://[fd00::2]:{p}/moved; echo status $?"), || srv.poll());
+    has(&o, &["привет по IPv6\nstatus 0"]);
+    assert!(srv.requests[2].starts_with("GET /hello.txt ") && srv.requests[2].contains(&format!("Host: [fd00::2]:{p}\r\n")), "{}", srv.requests[2]);
+    // by name
+    s.net.dns_name6("web6.test", "2001:db8::80".parse().unwrap());
+    s.net.alias6("2001:db8::80".parse().unwrap(), "::1".parse().unwrap());
+    let o = cmd_polling(&mut s, &format!("wget -q -O - http://web6.test:{p}/hello.txt; echo status $?"), || srv.poll());
+    has(&o, &["привет по IPv6\nstatus 0"]);
+    assert!(srv.requests[3].contains(&format!("Host: web6.test:{p}\r\n")));
+    // malformed brackets
+    let o = s.cmd("wget http://[fd00::2/x; echo status $?");
+    has(&o, &["wget: no ']' after an IPv6 address\n"]);
+    let o = s.cmd("wget http://[not-an-address]/; echo status $?");
+    has(&o, &["wget: bad IPv6 address in the URL\n"]);
+    assert_eq!(srv.requests.len(), 4);
+}
+
+/// What is not a host name never reaches DNS (the host's resolver might
+/// take a bracketed address as one).
+#[test]
+fn literals_are_not_names() {
+    let mut s = boot6();
+    let o = s.cmd("host '[fd00::2]'; host 'a:b'; host 'web/x'; echo status $?");
+    has(&o, &["host: '[fd00::2]' is not a legal name\n", "host: 'a:b' is not a legal name\n", "host: 'web/x' is not a legal name\n"]);
+    let o = s.cmd("nc '[fd00::2]' 22; echo status $?");
+    has(&o, &["nc: [fd00::2]: Name or service not known\nstatus 1"]);
 }

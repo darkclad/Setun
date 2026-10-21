@@ -223,6 +223,12 @@ fn client_target(spec: *char) {
     }
     strncpy(&host[0], spec, 242);
     host[242] = 0;
+    // an IPv6 address may come in brackets ([fd00::2], as in scp's targets)
+    if (host[0] == '[') {
+        var e: int = 1;
+        while (host[e] != 0 && host[e] != ']') { host[e - 1] = host[e]; e += 1; }
+        host[e - 1] = 0;
+    }
     if (user[0] == 0) {
         var pw: *passwd = getpwuid(getuid());
         strcpy(&user[0], pw == null ? "root" : pw.pw_name);
@@ -244,8 +250,8 @@ fn client_connect(identity: *char) {
         strcat(&identity[0], "/id_ed25519");
     }
     strcat(&known_path[0], "/known_hosts");
-    var addr: int = 0;
-    var family: int = resolve_any(&host[0], &addr);
+    var a: sockaddr_in6;
+    var family: int = resolve_name(&host[0], 0, &a, port);
     if (family == 0) {
         fputs(STDERR_FILENO, ssh_prog);
         fputs(STDERR_FILENO, ": Could not resolve hostname ");
@@ -254,9 +260,7 @@ fn client_connect(identity: *char) {
         _exit(255);
     }
     sock = socket(family, SOCK_STREAM, 0);
-    var a: sockaddr_in;
-    sockaddr_set_family(&a, family, addr, port);
-    if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
+    if (sock < 0 || connect(sock, &a as *sockaddr_in, sa_len(family)) < 0) {
         var num: [15]char;
         fputs(STDERR_FILENO, ssh_prog);
         fputs(STDERR_FILENO, ": connect to host ");
@@ -268,7 +272,7 @@ fn client_connect(identity: *char) {
         fputs(STDERR_FILENO, "\n");
         _exit(255);
     }
-    strcpy(&peer[0], addr_ntoa(family, addr));
+    strcpy(&peer[0], sa_ntoa(&a));
     ssh_server = 0;
     ssh_host_key_ok = &check_host_key;
     version_exchange();

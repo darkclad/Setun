@@ -16,14 +16,11 @@ import "../lib/sftpclient.tri";
 var quiet: int;
 var recursive: int;
 
-// Is s "host:path" (a colon before any slash)? Its path part, or null.
+// Is s "host:path" (a colon before any slash; an IPv6 host in brackets)?
+// Its path part, or null.
 fn remote_part(s: *char) -> *char {
-    var k: int = 0;
-    while (s[k] != 0 && s[k] != '/') {
-        if (s[k] == ':') { return &s[k + 1]; }
-        k += 1;
-    }
-    return null;
+    var k: int = remote_colon(s);
+    return k < 0 ? null : &s[k + 1];
 }
 
 fn base_name(p: *char) -> *char {
@@ -81,16 +78,14 @@ fn main(argc: int, argv: **char) -> int {
             return 1;
         }
         if (!upload && spec[0] == 0) {
-            var n: int = 0;
-            while (argv[i][n] != ':') { n += 1; }
+            var n: int = remote_colon(argv[i]);
             strncpy(&spec[0], argv[i], n < 290 ? n : 290);
             spec[n < 290 ? n : 290] = 0;
         }
         i += 1;
     }
     if (upload) {
-        var n: int = 0;
-        while (target[n] != ':') { n += 1; }
+        var n: int = remote_colon(target);
         strncpy(&spec[0], target, n < 290 ? n : 290);
         spec[n < 290 ? n : 290] = 0;
     }

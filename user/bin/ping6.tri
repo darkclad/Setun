@@ -1,7 +1,7 @@
 // ping6 [-c COUNT] [-s SIZE] [-W SECONDS] HOST: ICMPv6 echo requests
 // (docs/IPV6.md §6), printed as iputils prints them, without the hop limit
-// (a raw ICMPv6 socket does not see it). HOST is an IPv6 address; a
-// link-local one is on eth0. Raw sockets need root, so ping6 is
+// (a raw ICMPv6 socket does not see it). HOST is an IPv6 address (a
+// link-local one is on eth0) or a name with one. Raw sockets need root, so ping6 is
 // set-user-ID root and gives that up once its socket is open.
 
 import "../lib/tlibc.tri";
@@ -46,8 +46,8 @@ fn main(argc: int, argv: **char) -> int {
     }
     if (optind != argc - 1) { return usage(); }
     var host: *char = argv[optind];
-    var dst: [16]int;
-    if (!inet_pton6(host, &dst[0])) {
+    var to: sockaddr_in6;
+    if (resolve_name(host, AF_INET6, &to, 0) == 0) {
         fputs(STDERR_FILENO, "ping6: ");
         fputs(STDERR_FILENO, host);
         fputs(STDERR_FILENO, ": Name or service not known\n");
@@ -57,10 +57,8 @@ fn main(argc: int, argv: **char) -> int {
     var e: int = errno;
     setuid(getuid());                          // done with root
     if (fd < 0) { errno = e; perror2("ping6", "socket"); return 2; }
-    var to: sockaddr_in6;
-    sockaddr6_set(&to, &dst[0], 0);
     var shown: [46]char;
-    strcpy(&shown[0], inet_ntop6(&dst[0]));
+    strcpy(&shown[0], inet_ntop6(&to.sin6_addr[0]));
     var ident: int = getpid() % 65536;
     puts("PING ");
     puts(host);

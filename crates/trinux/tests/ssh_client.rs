@@ -91,3 +91,29 @@ fn an_interactive_ssh_session() {
     let o = s.cmd("echo still $USER");
     has(&o, &["still root\n"]);
 }
+
+/// IPv6 by name (docs/IPV6.md, V4's gate): a name with only an AAAA record,
+/// from the gateway's DNS, for Trinux's own global address; ssh and scp to
+/// it, and scp with the address itself in brackets.
+#[test]
+fn ssh_and_scp_by_name_over_ipv6() {
+    let mut s = Session::boot();
+    let mut tries = 0;
+    while !s.out.contains("eth0: inet6 fd00::5054:ff:fe12:3456 scope global\n") {
+        tries += 1;
+        assert!(tries < 100, "no global address");
+        s.idle(10_000_000);
+    }
+    s.net.dns_name6("trinux6.test", setun_net::GUEST6);
+    let o = with_password(&mut s, "ssh -i /nokey root@trinux6.test 'netstat -t | grep ESTAB'; echo status $?", "root");
+    has(&o, &["root@trinux6.test's password: ", "status 0\n"]);
+    assert!(o.contains("tcp6") && o.contains("fd00::5054:ff:fe12:3456:22"), "{o}");
+    has(&s.log("sshd"), &["connection from fd00::5054:ff:fe12:3456\n"]);
+    s.cmd("echo copied over IPv6 > /tmp/src");
+    let o = with_password(&mut s, "scp -i /nokey /tmp/src 'root@[fd00::5054:ff:fe12:3456]:/tmp/dst'; echo status $?", "root");
+    has(&o, &["status 0\n"]);
+    has(&s.cmd("cat /tmp/dst"), &["copied over IPv6\n"]);
+    let o = with_password(&mut s, "scp -i /nokey root@trinux6.test:/tmp/dst /tmp/back; echo status $?", "root");
+    has(&o, &["status 0\n"]);
+    has(&s.cmd("cat /tmp/back"), &["copied over IPv6\n"]);
+}

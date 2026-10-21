@@ -1,5 +1,6 @@
-// host [-s SERVER] NAME: look a name up in DNS (A records), the way
-// bind's host(1) reports it. /etc/hosts is not consulted.
+// host [-s SERVER] NAME: look a name up in DNS (A and AAAA records), the
+// way bind's host(1) reports it. SERVER is an IPv4 or IPv6 address
+// (docs/IPV6.md §6). /etc/hosts is not consulted.
 // Exit status: 0 found, 1 not found or no answer, 2 usage.
 
 import "../lib/tlibc.tri";
@@ -7,24 +8,27 @@ import "../lib/string.tri";
 import "../lib/getopt.tri";
 import "../lib/socket.tri";
 
+fn usage() -> int {
+    fputs(STDERR_FILENO, "usage: host [-s server] name\n");
+    return 2;
+}
+
 fn main(argc: int, argv: **char) -> int {
-    var server: int = dns_server();
+    var srv: sockaddr_in6;
+    dns_server_sa(&srv);
     var c: int = getopt(argc, argv, "s:");
     while (c != -1) {
-        if (c == 's' && inet_aton(optarg, &server)) {
-        } else {
-            fputs(STDERR_FILENO, "usage: host [-s server] name\n");
-            return 2;
-        }
+        var v4: int = 0;
+        var v6: [16]int;
+        if (c == 's' && inet_aton(optarg, &v4)) { sa_set(&srv, AF_INET, v4, null, 53); }
+        else if (c == 's' && inet_pton6(optarg, &v6[0])) { sockaddr6_set(&srv, &v6[0], 53); }
+        else { return usage(); }
         c = getopt(argc, argv, "s:");
     }
-    if (optind != argc - 1) {
-        fputs(STDERR_FILENO, "usage: host [-s server] name\n");
-        return 2;
-    }
+    if (optind != argc - 1) { return usage(); }
     var name: *char = argv[optind];
     var addrs: [9]int;
-    var n: int = dns_lookup(name, server, &addrs[0], 9);
+    var n: int = _dns_ask(name, &srv, 1, &addrs[0], 9);
     if (n == DNS_TIMEOUT) {
         puts(";; connection timed out; no servers could be reached\n");
         return 1;
@@ -35,10 +39,10 @@ fn main(argc: int, argv: **char) -> int {
         fputs(STDERR_FILENO, "' is not a legal name\n");
         return 1;
     }
-    if (n <= 0) {
+    if (n == DNS_NXDOMAIN || n < 0) {
         puts("Host ");
         puts(name);
-        puts(n == 0 ? " not found: 3(NXDOMAIN)\n" : " not found: 2(SERVFAIL)\n");
+        puts(n == DNS_NXDOMAIN ? " not found: 3(NXDOMAIN)\n" : " not found: 2(SERVFAIL)\n");
         return 1;
     }
     var k: int = 0;
@@ -48,6 +52,21 @@ fn main(argc: int, argv: **char) -> int {
         puts(inet_ntoa(addrs[k]));
         puts("\n");
         k += 1;
+    }
+    var six: [144]int;
+    var m: int = _dns_ask(name, &srv, 28, &six[0], 9);
+    k = 0;
+    while (k < m) {
+        puts(name);
+        puts(" has IPv6 address ");
+        puts(inet_ntop6(&six[16 * k]));
+        puts("\n");
+        k += 1;
+    }
+    if (n == 0 && m <= 0) {
+        puts(name);
+        puts(" has no address records\n");
+        return 1;
     }
     return 0;
 }

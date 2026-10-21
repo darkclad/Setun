@@ -80,6 +80,14 @@ fn tls_trouble() -> int {
     return 4;
 }
 
+// The host as a URL or Host header has it: an IPv6 address in brackets.
+fn put_host(dst: *char) {
+    var v6: int = strchr(&host[0], ':') != null;
+    if (v6) { strcat(dst, "["); }
+    strncat(dst, &host[0], 242);
+    if (v6) { strcat(dst, "]"); }
+}
+
 // Split url_buf into secure, host, port and path; 0, or 1 (said why).
 fn parse_url() -> int {
     var url: *char = &url_buf[0];
@@ -97,7 +105,18 @@ fn parse_url() -> int {
         return 1;
     }
     var h: int = 0;
-    while (url[k] != 0 && url[k] != '/' && url[k] != ':' && url[k] != '?' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
+    if (url[k] == '[') {
+        // an IPv6 literal (RFC 3986 §3.2.2): host keeps it without the brackets
+        k += 1;
+        while (url[k] != 0 && url[k] != ']' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
+        if (url[k] != ']') { fputs(STDERR_FILENO, "wget: no ']' after an IPv6 address\n"); return 1; }
+        k += 1;
+        host[h] = 0;
+        var o: [16]int;
+        if (!inet_pton6(&host[0], &o[0])) { fputs(STDERR_FILENO, "wget: bad IPv6 address in the URL\n"); return 1; }
+    } else {
+        while (url[k] != 0 && url[k] != '/' && url[k] != ':' && url[k] != '?' && h < 242) { host[h] = url[k]; h += 1; k += 1; }
+    }
     host[h] = 0;
     if (url[k] == ':') {
         k += 1;
@@ -124,7 +143,7 @@ fn follow_location() {
         strncat(&t[0], loc, 2170);
     } else {
         strcpy(&t[0], secure ? "https://" : "http://");
-        strncat(&t[0], &host[0], 242);
+        put_host(&t[0]);
         var num: [15]char;
         if ((secure && port != 443) || (!secure && port != 80)) {
             strcat(&t[0], ":");
@@ -269,19 +288,18 @@ fn fetch(outname: *char) -> int {
         }
         store_ready = 1;
     }
-    var addr: int = 0;
-    if (!resolve_host(&host[0], &addr)) {
+    var a: sockaddr_in6;
+    var fam: int = resolve_name(&host[0], 0, &a, port);
+    if (fam != AF_INET && fam != AF_INET6) {
         say("wget: unable to resolve host address '", &host[0]);
         say("'\n", "");
         return -4;
     }
     say("Connecting to ", &host[0]);
-    say(" (", inet_ntoa(addr));
+    say(" (", sa_ntoa(&a));
     say(")... ", "");
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    var a: sockaddr_in;
-    sockaddr_set(&a, addr, port);
-    if (sock < 0 || connect(sock, &a, sizeof(sockaddr_in)) < 0) {
+    sock = socket(fam, SOCK_STREAM, 0);
+    if (sock < 0 || connect(sock, &a as *sockaddr_in, sa_len(fam)) < 0) {
         var e: *char = strerror(errno);
         say("failed: ", e);
         say(".\n", "");
@@ -322,7 +340,7 @@ fn fetch(outname: *char) -> int {
     strcpy(&req[0], "GET ");
     strncat(&req[0], &path[0], 1800);
     strcat(&req[0], " HTTP/1.1\r\nHost: ");
-    strncat(&req[0], &host[0], 242);
+    put_host(&req[0]);
     var num: [15]char;
     if ((secure && port != 443) || (!secure && port != 80)) {
         strcat(&req[0], ":");

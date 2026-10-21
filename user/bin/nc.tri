@@ -8,8 +8,8 @@
 //   -z                  only see whether HOST PORT accepts a connection
 //   -v                  say what happens on stderr
 //   -w SECONDS          give up connecting after this long
-//   -4, -6, -t          IPv4 (the default for -l), IPv6, or TNET; an address
-//                       literal for HOST decides by itself
+//   -4, -6, -t          IPv4 (the default for -l), IPv6, or TNET; without one,
+//                       HOST's literal or name decides (IPv4 before IPv6)
 //
 // When stdin ends, a TCP connection is half-closed (shutdown SHUT_WR) and
 // nc keeps printing until the other side closes too.
@@ -130,14 +130,14 @@ fn main(argc: int, argv: **char) -> int {
     var port: int = -1;
     var wait_s: int = 0;
     var family: int = AF_INET;
-    var addr6: [16]int;
+    var want: int = 0;                               // -4, -6 or -t: only that family
     var c: int = getopt(argc, argv, "lubtzv46p:w:");
     while (c != -1) {
         switch (c) {
             case 'l': listen_mode = 1;
-            case 't': family = AF_TNP;
-            case '4': family = AF_INET;
-            case '6': family = AF_INET6;
+            case 't': { family = AF_TNP; want = AF_TNP; }
+            case '4': { family = AF_INET; want = AF_INET; }
+            case '6': { family = AF_INET6; want = AF_INET6; }
             case 'u': udp = 1;
             case 'b': binary = 1;
             case 'z': scan = 1;
@@ -149,10 +149,9 @@ fn main(argc: int, argv: **char) -> int {
         c = getopt(argc, argv, "lubtzv46p:w:");
     }
     var rest: int = argc - optind;
-    var dst: int = 0;
+    var to: sockaddr_in6;
     if (!listen_mode && rest == 2) {
-        if (inet_pton6(argv[optind], &addr6[0])) { family = AF_INET6; }
-        else { family = resolve_any(argv[optind], &dst); }
+        family = resolve_name(argv[optind], want, &to, 0);
         if (family == 0) {
             fputs(STDERR_FILENO, "nc: ");
             fputs(STDERR_FILENO, argv[optind]);
@@ -201,10 +200,10 @@ fn main(argc: int, argv: **char) -> int {
         sa_set(&a, family, INADDR_ANY, null, port);
         if (bind(s, &a as *sockaddr_in, alen) < 0) { return fail("bind"); }
     }
-    sa_set(&a, family, dst, &addr6[0], dport);
+    to.sin6_port = dport;                             // the port's word in either layout
     if (wait_s > 0 && !udp) {
         fcntl(s, 4, O_NONBLOCK);                         // F_SETFL
-        if (connect(s, &a as *sockaddr_in, alen) < 0 && errno != EINPROGRESS) { return fail("connect"); }
+        if (connect(s, &to as *sockaddr_in, alen) < 0 && errno != EINPROGRESS) { return fail("connect"); }
         var p: pollfd;
         p.fd = s;
         p.events = POLLOUT;
@@ -217,7 +216,7 @@ fn main(argc: int, argv: **char) -> int {
         getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen);
         if (err != 0) { errno = err; return fail("connect"); }
         fcntl(s, 4, 0);
-    } else if (connect(s, &a as *sockaddr_in, alen) < 0) {
+    } else if (connect(s, &to as *sockaddr_in, alen) < 0) {
         return fail("connect");
     }
     if (scan || verbose) {
