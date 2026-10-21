@@ -64,4 +64,4 @@ setun --disk prog.disk                      # boot it in a window
 
 `trine build --boot` places the startup code at 19 683, the stack in frame 2 and the globals from frame 3. Its startup code passes `r1` and `r2` to `main` as `disk` and `ram`. [`bios/boot_hello.tri`](../bios/boot_hello.tri) is a complete example.
 
-A one-sector program holds about 3 280 words. The next stage, a real loader, will read the kernel from further sectors.
+A one-sector program holds about 3 280 words. Trinux boots the same way: its sector 0 is a loader (`kernel/boot/loader.tri`) that reads the kernel from the sectors after it ([`KERNEL.md`](KERNEL.md) §14).

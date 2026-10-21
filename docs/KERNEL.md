@@ -1,7 +1,7 @@
 # Trinux: the Setun-11̅ kernel
 
 **Status: v0.1, accepted; all milestones (K1–K8, users, the FPU, networking, shared memory, the vector unit) are implemented** (`kernel/`, built by `mkdisk`). This file is the design log, milestone by milestone; [`TRINUX.md`](TRINUX.md) is the manual, by topic. Where the two differ (early plans that changed as the code was written), the manual describes the code.
-Items marked **⚠ REVIEW** were open choices at drafting time; §13 lists them, and §14 records what K1 settled.
+Items marked **(decided, §13)** were open choices at drafting time; §13 lists them, all kept as built, and §14 records what K1 settled.
 
 Trinux is a Unix kernel for Setun-11̅, **modelled on Linux** and providing
 **POSIX.1-2017 interfaces**. It is written in Trine and boots through the BIOS
@@ -30,7 +30,7 @@ VFS, file systems and drivers all run together in kernel mode.
 | Ring | Linux equivalent | Runs |
 |---|---|---|
 | **+1** kernel | kernel mode | the whole kernel, including drivers |
-| 0 drivers | – | unused in v1 (reserved for sandboxed drivers later) ⚠ REVIEW |
+| 0 drivers | – | unused in v1 (reserved for sandboxed drivers later) (decided, §13) |
 | **−1** user | user mode | every process |
 
 Source layout (in Trine, in the repository's `kernel/` directory):
@@ -68,7 +68,7 @@ kernel/
 
 ## 3. Memory
 
-### 3.1 Address space: user space is the negative half ⚠ REVIEW
+### 3.1 Address space: user space is the negative half (decided, §13)
 
 Balanced ternary gives virtual addresses a natural split by sign. The L1 page-table index is the top 9 trits.
 
@@ -94,7 +94,7 @@ Balanced ternary gives virtual addresses a natural split by sign. The L1 page-ta
 
 ### 3.2 Physical memory
 
-- **Frame allocator:** a buddy allocator over 3^9-tryte frames, the analogue of Linux's 4 KiB pages. Blocks are grouped by powers of **3** (a "triddy" allocator) rather than 2: each block of 3^k frames splits into three. ⚠ REVIEW
+- **Frame allocator:** a buddy allocator over 3^9-tryte frames, the analogue of Linux's 4 KiB pages. Blocks are grouped by powers of **3** (a "triddy" allocator) rather than 2: each block of 3^k frames splits into three. (decided, §13)
 - **`kmalloc`:** a slab allocator for kernel objects (tasks, inodes, files).
 - **Page cache** for file data; **copy-on-write** after `fork`, using the PTE's `SW` trit to mark COW pages.
 
@@ -119,7 +119,7 @@ The fault handler (vector −3 or −4) decides between:
   - memory and time: `brk`, `mmap`/`munmap` (anonymous first), `nanosleep`.
 - **Kernel threads** for deferred work (flushing dirty pages), as in Linux.
 
-## 5. System-call interface ⚠ REVIEW
+## 5. System-call interface (decided, §13)
 
 - **Trap:** `SYS n` (ISA vector 0). Arguments in `r1`–`r6`, result in `r1`, as in Trine's calling convention.
 - **Errors:** a failing call returns **`−errno`**, the Linux convention. The C-library layer sets `errno` and returns −1.
@@ -163,7 +163,7 @@ All of these fit `SYS`'s ±9841 range.
 | `ramfs` | ramfs/tmpfs | the initramfs root, `/tmp` |
 | `devfs` | devtmpfs | `/dev`: `null`, `zero`, `tty`, `console`, `ttyS0`, `fb0`, `hda`, `hdb` |
 | `procfs` | procfs | `/proc/<pid>/…`, `/proc/meminfo`, `/proc/uptime` |
-| **`tfs`** | ext2 | the on-disk file system ⚠ REVIEW |
+| **`tfs`** | ext2 | the on-disk file system (decided, §13) |
 
 **`tfs`, the "ternary file system":**
 - A block is one disk sector (3^9 trytes).
@@ -196,7 +196,7 @@ All of these fit `SYS`'s ±9841 range.
 | divide by zero | `SIGFPE` |
 | breakpoint | `SIGTRAP` |
 
-## 9. Executables ⚠ REVIEW
+## 9. Executables (decided, §13)
 
 **TEF, the Ternary Executable Format**, is a small ELF-like format. Its header holds:
 - a magic word;
@@ -225,7 +225,7 @@ fmt_int(f, pid);
 fmt_nl(f);
 ```
 
-⚠ REVIEW: alternatively, add variadic functions to Trine for a real `printf`.
+Decided (§13): no variadic functions in Trine, so no `printf`; `stdio.tri` has the typed writers.
 
 **Buffered I/O:** `stdin`, `stdout` and `stderr` as `FILE` streams.
 
@@ -264,7 +264,7 @@ fmt_nl(f);
 | K7 ✅ | `tlibc` complete, `sh`, core utilities | an interactive POSIX-like system |
 | K8 ✅ | the window system on the framebuffer | a terminal window runs the shell, with the mouse and keyboard |
 
-**Decisions for review:**
+**Decisions taken at drafting, all kept as built:**
 1. **The name "Trinux".**
 2. **Rings:** the whole kernel, drivers included, in ring +1 (Linux-style), with ring 0 unused in v1.
 3. **Address space:** user space is the negative half; the kernel is identity-mapped in the middle (L1 slots 0…+1); a null pointer faults for user code.
@@ -356,7 +356,7 @@ Anything else returns `−ENOSYS`.
 **TEF v1:** a 6-word header (magic, entry, text start, text size, bss start, bss size), followed by the text.
 - `execve` maps the text read-only + execute.
 - The heap runs from the bss start up to `brk` and is demand-zero.
-- The stack is 27 pages below `USER_LIMIT`, demand-zero, with its top page mapped up front. It holds the `argv` strings, `argv[]`, NULL and an empty `envp`.
+- The stack is 27 pages below `USER_STACK` (−3^18 − 3), demand-zero, with its top page mapped up front. It holds the `argv` strings, `argv[]`, NULL and an empty `envp`.
 - `main(argc, argv)` gets them in `r1` and `r2`.
 
 **Copy-on-write fork:** `clone(SIGCHLD)`.

@@ -6,14 +6,14 @@ size is a power of 3: 9-trit trytes, 27-trit words, a 3^27 address space,
 colours. Then come a compiler, a kernel and a window system, all written for
 the machine itself.
 
-ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md) (v0.4 accepted; v0.5 draft adds floating-point instructions, §14).
+ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md), v0.7: v0.4 (accepted) plus floating point (§14), binary operations (§3.3.1), the ternary idioms and the vector unit (§3.3, §3.4.1, §15), all implemented.
 
 Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole ternary-native world needs, layer by layer, with the decisions taken and a phased plan.
 
 ## Milestones
 
 1. **`ternary` crate** ✅: `Tern<N>`, 9-trit `Tryte`, 27-trit `Word`, trit fields, base-27 notation; the `0t`/`0z`/`0x` literal notation ([`NOTATION.md`](NOTATION.md))
-2. **ISA spec** ✅ v0.4, with v0.5 (FPU) in draft
+2. **ISA spec** ✅ v0.4; v0.5 floating point, v0.6 binary operations, v0.7 ternary idioms and vectors
 3. **Emulator core** (`setun-core`, Rust) ✅
    - CPU: decode, ALU, branches, traps, rings, `MODE`/control registers
    - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages
@@ -57,6 +57,11 @@ Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole t
     - S2 ✅ `tric`, the compiler in Trine: the host compiler's unoptimized assembly, character for character (exact real literals too), and its error messages
     - S3 ✅ the fixed point: `tric` builds itself, and that build builds the same file again
     - ✅ the optimizer in `tric`: all four levels of the host's (`-O1`..`-O4`), each matching the host's assembly
+
+13. **A ternary-native world** ([`TERNARY_WORLD.md`](TERNARY_WORLD.md)): the phases after the machine, each closed by a gate
+    - Phase A ✅ ternary idioms (ISA v0.7): Kleene logic in Trine, trit-mask merge and masked store, trit counts, three-state atomics, the vector unit, text past U+2671
+    - Phase B ✅ formats and reliability: the real27/real81 standard ([`REAL.md`](REAL.md)), balanced varints, TTV, word audio and TIM pictures ([`FORMATS.md`](FORMATS.md)), ECC as a hardware spec ([`ECC.md`](ECC.md)), `long` and timestamps in Trine; conformance suites for the ISA, the floats and the formats
+    - Phase C ✅ native networking ([`TNET.md`](TNET.md)): two emulators linked trit to trit, the TL link layer, TNP/TSP/TDP and their sockets, ssh between Setun machines, ML-KEM-768 and sntrup761 key exchange
 
 ## Next: performance
 

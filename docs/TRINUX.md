@@ -78,7 +78,7 @@ On the default disk (`mkdisk`):
   is attached;
 - `/bin/sh`, a POSIX-style shell with job control, line editing, history
   and completion;
-- 76 programs, several of them under many names: files, text tools
+- over 80 programs, several of them under many names: files, text tools
   (`sed`, `diff`, `find`, `xargs`), processes, users and groups, an editor,
   a calculator on the FPU;
 - a window system (`trwm`) with a terminal, a clock, a colour chart and a
@@ -89,8 +89,8 @@ On the default disk (`mkdisk`):
   program, the compiler included, on Trinux itself;
 - test programs that the host's test suites run inside the system.
 
-The disk built by `mkdisk` holds 171 files in a 486-block volume, with 119
-blocks free; the kernel takes 9 sectors.
+The disk built by `mkdisk` holds 200 files in a 486-block volume, with 78
+blocks free; the kernel takes 12 sectors.
 
 ---
 
@@ -115,14 +115,20 @@ Options of the native front end, `setun` (from its usage message):
 
 | Option | Meaning |
 |---|---|
+| `--rom FILE`, `--demo` | boot another ROM image, or the demo ROM, instead of the BIOS |
 | `--disk FILE` | the disk image in drive 0 |
 | `--ram FRAMES` | RAM in 3^9-tryte pages (default 19683, that is 3^18 trytes) |
 | `--mips N` | emulated speed in millions of instructions per second (default 10) |
+| `--scale 1\|2\|4` | the window's pixel scale (default 2) |
 | `--console` | no window; the terminal is the serial console |
 | `--net HOST:GUEST` | attach the network and forward a host port to a guest port; repeatable. `ADDR:HOST:GUEST` listens on another host address; `--net on` attaches the network without forwards |
+| `--net6 HOST:GUEST` | the same, reaching the guest over IPv6; listens on ::1 unless an address in brackets is given |
+| `--tlink listen:[ADDR:]PORT`, `--tlink connect:HOST:PORT` | a ternary link to another `setun` over UDP ([`TNET.md`](TNET.md)); listens on 127.0.0.1 unless an address is given, and takes frames only from its peer |
+| `--tlink-addr A.B.C` | this station's TNET address (default 0.0.1) |
 | `--headless N`, `--keys TEXT`, `--press A,B,..`, `--screenshot F` | run without a window for N instructions, feed input, save the screen |
+| `--help` | the usage message |
 
-Forwards listen on 127.0.0.1 unless an address is given. Without `--disk`,
+Forwards listen on 127.0.0.1 (or ::1) unless an address is given. Without `--disk`,
 every `--console` boot has a fresh disk, so `sshd` makes a new host key each
 time and an SSH client warns about a changed key. Use a disk file to keep
 it.
@@ -1969,9 +1975,12 @@ error. The suites are in [`crates/trinux/tests/`](../crates/trinux/tests/):
 | `memops.rs` | the kernel's assembly copy and fill routines |
 | `net.rs` | ping, `ifconfig`, broken frames, UDP, `nettest`, TCP against smoltcp, a lossy link, port forwards, telnet, `cryptotest`, `pktest` |
 | `outbound.rs` | connections out through the NAT, DNS, `wget` over HTTP, UDP out, `ntpdate` |
+| `ipv6.rs`, `outbound6.rs` | autoconfiguration, Neighbor Discovery, ICMPv6, `ping6`, the IPv6 conformance vectors (`ip6vec`), UDP and TCP over IPv6, the servers on both families; out through the gateway's NAT to the host's ::1, and `--net6` forwards in |
+| `tnet.rs` | the TLINK card and the TL link layer against frames made on the host, TNP, TSP and TDP, `tping`, sockets and `ssh` over TNET between two machines |
+| `formats.rs` | the ternary data formats: `fmttest`, `fmtvec`, the media tools on WAV, PPM and PGM files and back, a picture on the framebuffer, and their errors |
 | `ssh.rs`, `ssh_client.rs`, `sftp.rs`, `scp_client.rs` | the host's OpenSSH against `sshd`; Trinux's `ssh`, `scp` and `sftp` against `sshd` |
 | `tls.rs`, `httpd.rs` | certificate chains, `wget` against OpenSSL's server, `httpd` over HTTP and HTTPS, `certgen` |
-| `selfhost.rs` | `tas` and `tric` against the host assembler and compiler at every optimization level, their error messages, and `tric` rebuilding itself |
+| `selfhost.rs` | `tas` and `tric` against the host assembler and compiler at every optimization level, their error messages, and `tric` rebuilding itself; it copies in `o1test`, `o2test`, `o3test` (code shapes for each level) and `longtest` (the 81-trit `long`), which are not on the default disk |
 
 The SSH and TLS suites skip their cases when the host has no `ssh` or
 `openssl`. The design log ([`KERNEL.md`](KERNEL.md), [`NETWORK.md`](NETWORK.md),

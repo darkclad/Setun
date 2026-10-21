@@ -86,18 +86,20 @@ The kernel runs with interrupts off and is never preempted, so the stack needs n
 - Timers (ARP retries, TCP retransmission, TIME-WAIT) run on the timer tick (HZ = 100).
 - Sends build the frame in a kernel buffer and DMA it out at once.
 
-The plan (as built, Ethernet shares `arp.tri`, ICMP is in `ip.tri`, and UDP and the interfaces' ioctls are in `socket.tri`; see §7):
+The files, as built (§7 has their sizes; IPv6 and TNET came later, in
+[`IPV6.md`](IPV6.md) and [`TNET.md`](TNET.md)):
 
 | File | Contents |
 |---|---|
 | `drivers/tnic.tri` | card driver: probe, MAC, receive loop, send, counters |
-| `net/netdev.tri` | interfaces `lo` (127.0.0.1/8) and `eth0`: address, netmask, gateway, flags, counters; routing is "on-link or the default gateway" |
-| `net/eth.tri`, `net/arp.tri` | Ethernet II; ARP cache of 27 entries with request retries, and one queued packet per unresolved entry |
-| `net/ip.tri` | IPv4: header checks (version, IHL, total length, checksum, TTL); no fragmentation (fragments are dropped and counted, and DF is set on everything sent) |
-| `net/icmp.tri` | echo request/reply, port unreachable, raw ICMP sockets for `ping` |
-| `net/udp.tri` | UDP with checksums |
-| `net/tcp.tri` | TCP: the RFC 9293 state machine, MSS 1460, a one-page receive window (19 683 < 65 535, so no window scaling), retransmission with RFC 6298 RTO and backoff, delayed ACK off, Nagle off, RST handling, TIME-WAIT of 2·MSL = 2 s, no SACK or timestamps |
-| `net/socket.tri` | socket table (27), socket inodes (`I_SOCK`) behind file descriptors, the system calls, poll |
+| `drivers/tlink.tri` | the TLINK ternary link card's driver, for TNET |
+| `net/net.tri` | what the stack shares: octet helpers, checksums, the interfaces `lo` (127.0.0.1/8) and `eth0` (address, netmask, gateway, flags), counters, the loopback queue; routing is "on-link or the default gateway" |
+| `net/arp.tri` | Ethernet II; ARP cache of 27 entries with request retries, and 9 packets waiting for unresolved entries |
+| `net/ip.tri` | IPv4: header checks (version, IHL, total length, checksum, TTL), no fragmentation (fragments are dropped and counted, and DF is set on everything sent); ICMP echo and destination unreachable |
+| `net/ip6.tri` | IPv6, ICMPv6, Neighbor Discovery and autoconfiguration |
+| `net/tcp.tri` | TCP: the RFC 9293 state machine, MSS 1460, a one-page receive window (19 683 < 65 535, so no window scaling), retransmission with RFC 6298 RTO and backoff, delayed ACK off, Nagle off, RST handling, TIME-WAIT of 2·MSL = 2 s, no SACK or timestamps; the same machine serves IPv6 and TNET's TSP |
+| `net/tl.tri`, `net/tnp.tri`, `net/tsp.tri` | TNET: the TL link layer, TNP and TCMP, TSP streams and TDP datagrams |
+| `net/socket.tri` | socket table (27), socket inodes (`I_SOCK`) behind file descriptors, the system calls, poll, UDP, raw ICMP, the interfaces' ioctls |
 | `fs/procfs.tri` | `/proc/net/dev`, `/proc/net/arp`, `/proc/net/tcp`, `/proc/net/udp` |
 
 - Checksums are the ones'-complement sum of 16-bit words. That is plain addition with an end-around carry, so it needs no binary operations.
@@ -189,8 +191,12 @@ telnet localhost 2323          # from another terminal: Trinux's login prompt
 | `net/net.tri` | ~330 | octet helpers, checksums, `lo`/`eth0`, the 27 counters, the loopback queue, `net_bh`, `net_sleep` |
 | `net/arp.tri` | ~220 | Ethernet, the ARP cache, 9 waiting packets |
 | `net/ip.tri` | ~120 | IPv4 in and out, ICMP echo, destination unreachable |
-| `net/socket.tri` | ~820 | sockets, rings, the system calls, interface ioctls, UDP, raw ICMP |
-| `net/tcp.tri` | ~720 | TCP |
+| `net/socket.tri` | ~1070 | sockets, rings, the system calls, interface ioctls, UDP, raw ICMP (and since, the IPv6 and TNET families) |
+| `net/tcp.tri` | ~770 | TCP (and since, over IPv6 and as TSP) |
+
+Added later: `net/ip6.tri` (~1160 lines, [`IPV6.md`](IPV6.md)), and for TNET
+`drivers/tlink.tri`, `net/tl.tri`, `net/tnp.tri` and `net/tsp.tri` (~450 lines
+in all, [`TNET.md`](TNET.md)).
 
 - **Loopback** packets wait in a one-page queue (9 slots of 3^7) until `net_bh()` delivers them. It runs at the end of every network system call, the card's interrupt and the timer tick.
   - A reply is therefore never built while the packet it answers is still in `txbuf`.

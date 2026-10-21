@@ -18,21 +18,21 @@ The sections run bottom-up. Each has a lead, a table of components (the ternary-
 
 ## Map of major points
 
-Setun-11̅ is ternary from the ISA up; silicon and native links remain. Eight layers stack from the number system up to software. Tooling (§10) checks all of them, and one border layer (§9) is the only place binary is allowed in.
+Setun-11̅ is ternary from the ISA up, native links included; silicon remains research. Eight layers stack from the number system up to software. Tooling (§10) checks all of them, and one border layer (§9) is the only place binary is allowed in.
 
 ```mermaid
 flowchart LR
     T["10 · Tooling and verification<br/>reference interpreter, fuzzing, conformance"]
     subgraph stack ["Ternary-native layers, bottom-up"]
         direction BT
-        L1["1 · Number and logic foundations<br/>balanced arithmetic, Kleene logic done; true/unknown/false next"]
+        L1["1 · Number and logic foundations<br/>balanced arithmetic, Kleene logic, true/unknown/false done"]
         L2["2 · Physical layer and circuits<br/>requirements only; the emulator is the machine"]
-        L3["3 · CPU and ISA<br/>core ISA and FPU done; masks, atomics, vectors next"]
+        L3["3 · CPU and ISA<br/>core ISA, FPU, masks, atomics, vectors done (v0.7)"]
         L4["4 · Memory and storage<br/>addressing, paging, tfs, ECC spec done"]
         L5["5 · Data formats<br/>text, executables, floats, varints, sound, pictures done"]
-        L6["6 · Interconnect, I/O, networking<br/>binary stack done; native ternary links ahead"]
-        L7["7 · Security and cryptography<br/>border crypto done; ML-KEM, GF(3) research ahead"]
-        L8["8 · Software stack<br/>Trinux, self-hosting done; ternary idioms next"]
+        L6["6 · Interconnect, I/O, networking<br/>binary stack and native TNET links done"]
+        L7["7 · Security and cryptography<br/>border crypto, ML-KEM, sntrup761 done; ternary ciphers research"]
+        L8["8 · Software stack<br/>Trinux, self-hosting, ternary idioms done"]
         L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7 --> L8
     end
     B["9 · Binary border<br/>octets, text, integers, floats, hashes, gateway"]
@@ -43,13 +43,13 @@ flowchart LR
     classDef partial fill:#fdf0d0,stroke:#b7791f,color:#111
     classDef research fill:#ececec,stroke:#777,color:#111,stroke-dasharray:4 3
     classDef border fill:#dce9fb,stroke:#1f5fbf,color:#111,stroke-width:2px
-    class L1,L3,L4,L8 done
-    class L5,L6,L7 partial
+    class L1,L3,L4,L5,L6,L8 done
+    class L7 partial
     class L2 research
     class B border
 ```
 
-Green: core done. Amber: the binary side is done, the ternary-native side is ahead. Grey: research only.
+Green: done. Amber: done, with ternary-native research ahead. Grey: research only.
 
 ## 1. Number and logic foundations
 
@@ -186,7 +186,7 @@ Decided 2026-10-06:
 
 ## 8. Software stack
 
-The system software exists and builds itself: Trinux, tlibc, Trine and the `tas`/`tric` toolchain. The next step is to make programs think in trits, not just run on them: three-way control flow in the language, trit operations in place of bit tricks, and data structures that branch by 3.
+The system software exists and builds itself: Trinux, tlibc, Trine and the `tas`/`tric` toolchain. Phase A then made programs think in trits, not just run on them: three-way control flow in the language, trit operations in place of bit tricks, and data structures that branch by 3.
 
 | Component | Ternary-native design | Gain over binary | Status |
 | --- | --- | --- | --- |
@@ -251,14 +251,12 @@ flowchart TB
     R -.- B
     R -.- C
     classDef done fill:#ececec,stroke:#777,color:#111
-    classDef next fill:#dce9fb,stroke:#1f5fbf,color:#111,stroke-width:2px
     classDef gate fill:#fff,stroke:#777,color:#111
     classDef research fill:#fff,stroke:#777,color:#111,stroke-dasharray:4 3
     class D done
     class A done
     class B done
     class C done
-    class GC done
     class GA,GB,GC gate
     class R research
 ```
@@ -274,7 +272,7 @@ Phase A comes first because it is software only and makes every later layer thin
 
 ## Phase A in detail
 
-Phase A is software and ISA work on the emulator, in six parts. Each part lists its design, what already exists, and the negative tests that gate it. Encodings use free slots: ALU functions above 27, 1-word majors 8 to 11, MODE trit 19 and vector −13 are all unused in ISA v0.6.
+Phase A is software and ISA work on the emulator, in six parts. Each part lists its design, what already exists, and the negative tests that gate it. Encodings use free slots: ALU functions above 27, 1-word majors 8 to 11, MODE trit 19 and vector −13 were all unused in ISA v0.6, before phase A took them.
 
 ### A1. Kleene logic in Trine ✅
 

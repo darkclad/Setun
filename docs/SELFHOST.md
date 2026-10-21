@@ -49,8 +49,10 @@ the tests hold them to its output:
   optimization level: the same instructions, label numbers, register
   choices, string and real pools, and global equates. Unoptimized, the
   tests compare `echo`, `cat`, `sh`, `edit`, `tas`, `tric`, `libctest`,
-  `wget`, `calc` and `fputest`; at each of the four levels, thirteen
-  programs including `sh` and `tric` itself.
+  `wget`, `calc` and `fputest`; at each of the four levels, twelve to
+  fourteen programs including `sh` and `tric` itself, and `o1test`,
+  `o2test` and `o3test` (`user/bin/`), written to exercise the code shapes
+  of each level.
 - Its errors are the host's too: for each of 26 bad programs (lexing,
   parsing, types, layout, imports), `tric` gives the host's message at the
   same line and column, exits 1 and leaves no output file behind.
@@ -145,5 +147,8 @@ of RAM.
 
 `crates/trinux/tests/selfhost.rs`: `tas_matches_the_host_assembler`,
 `tas_assembles_the_largest_programs`, `tas_reports_errors_with_their_lines`,
-`tric_matches_the_host_compiler`, `tric_converts_reals_as_the_host_does`,
-`tric_reports_errors_as_the_host_does`, `tric_builds_itself`.
+`tric_matches_the_host_compiler`, `tric_matches_the_host_at_level_1` to
+`_4`, `tric_converts_reals_as_the_host_does`,
+`tric_compiles_truth_values_as_the_host_does`,
+`tric_reports_errors_as_the_host_does`, `tric_on_the_default_disk`,
+`tric_builds_itself`.

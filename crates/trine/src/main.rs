@@ -16,7 +16,8 @@ fn usage() -> ! {
          \x20        --boot: a bootable one-sector disk image instead (`setun --disk OUT.t1b2`)\n\
          \x20        --bios: the BIOS memory layout (frame 1 left free for the boot sector)\n\
          \x20        --user: a Trinux program's layout (its flat image; mkdisk makes the TEF)\n\
-         \x20        --no-opt: without the optimizer (= -O0); -O1..-O3: part of it (cumulative levels)\n\
+         \x20        --no-opt: without the optimizer (= -O0); -O1..-O3: part of it (cumulative\n\
+         \x20        levels); -O4, the default: all of it\n\
          run      compile and run on an emulated machine without a window; prints the\n\
          \x20        serial output and how the program ended. --boot boots it through the BIOS\n\
          -S F     also write the generated assembly to F"

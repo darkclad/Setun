@@ -38,7 +38,7 @@ Sizes follow the power-of-3 rule throughout, since none of it has to meet a bina
 
 The card does not check frames: the link layer does (§2), so a corrupted frame reaches the driver, which counts and drops it.
 
-**The wire.** A front end joins two cards: in one process (two machines stepped in turn, as the tests do) or between processes over UDP (`setun --tlink listen:PORT`, `--tlink connect:HOST:PORT`), one datagram per frame, each tryte as a 16-bit little-endian integer. Either side can inject faults: flip chosen trits, or a trit with a given probability, and drop or duplicate frames.
+**The wire.** A front end joins two cards: in one process (two machines stepped in turn, as the tests do) or between processes over UDP (`setun --tlink listen:PORT`, on 127.0.0.1 unless `listen:ADDR:PORT` names another address, and `--tlink connect:HOST:PORT`), one datagram per frame, frames taken only from the peer, each tryte as a 16-bit little-endian integer. Either side can inject faults: flip chosen trits, or a trit with a given probability, and drop or duplicate frames.
 
 ## 2. The link layer: TL frames
 

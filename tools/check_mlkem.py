@@ -1,3 +1,9 @@
+"""Checks tools/mlkem.py against OpenSSL (3.5 or later): from the seed of
+a key OpenSSL makes, keygen here gives the same encapsulation key, and
+OpenSSL's encapsulation to it decapsulates here to OpenSSL's secret.
+
+    python tools/check_mlkem.py
+"""
 import os, re, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mlkem import keygen, decaps, encaps
