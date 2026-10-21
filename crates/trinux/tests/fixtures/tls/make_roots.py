@@ -22,8 +22,8 @@ for b in blocks:
 missing = [w for w in want if w not in found]
 print("missing:", missing)
 out = ["# /etc/ssl/cert.pem: the roots Trinux trusts for TLS (a few widely used CAs",
-       "# from the Mozilla bundle as packaged by certifi). Text outside the",
-       "# BEGIN/END lines is ignored.", ""]
+       "# from the Mozilla bundle as packaged by certifi, under the MPL 2.0; see",
+       "# NOTICE). Text outside the BEGIN/END lines is ignored.", ""]
 for w in want:
     if w in found:
         c, b = found[w]

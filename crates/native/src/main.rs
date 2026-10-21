@@ -76,7 +76,8 @@ const USAGE: &str = "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] 
          \x20                without --disk, a Trinux disk built from the source tree\n\
          --net [ADDR:]HOST:GUEST  attach the user-mode network, forwarding a host port (repeatable; 'on': none)\n\
          --net6 [ADDR:]HOST:GUEST the same, reaching the guest over IPv6 (ADDR defaults to [::1])\n\
-         --tlink listen:PORT | connect:HOST:PORT  a ternary link to another setun over UDP\n\
+         --tlink listen:[ADDR:]PORT | connect:HOST:PORT  a ternary link to another setun over UDP\n\
+         \x20                (listen: on 127.0.0.1 unless ADDR is given)\n\
          --tlink-addr A.B.C   this station's TNET address, three trytes (default 0.0.1)\n\
          --help           this text";
 

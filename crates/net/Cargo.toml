@@ -2,6 +2,8 @@
 name = "setun-net"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+authors.workspace = true
 description = "A user-mode network behind the Setun-11̅ network card (gateway, port forwards, test connections)"
 
 [dependencies]

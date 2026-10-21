@@ -2272,7 +2272,7 @@ fn builtin_kill(argc: int, argv: **char) -> int {
     if (argc > 2 && streq(argv[1], "-s")) { sig = parse_signal(argv[2]); i = 3; }
     else if (argc > 2 && argv[1][0] == '-') { sig = parse_signal(&argv[1][1]); i = 2; }
     if (sig < 0) { err("kill: bad signal", null); return 1; }
-    if (i == argc) { err("usage: kill [-s sig | -sig] pid | %job ...", null); return 2; }
+    if (i == argc) { err("usage: kill [-s sig | -sig] pid | %job ...; kill -l", null); return 2; }
     var status: int = 0;
     while (i < argc) {
         var pid: int;

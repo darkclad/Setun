@@ -154,8 +154,28 @@ fn udp_link_between_two_machines() {
     assert_eq!(a.dev.tlink.read(6), 1, "a got b's answer");
     got.push(a.dev.tlink.read(5));
     assert_eq!(got, vec![fb.len() as i64]);
+    // a third station's frame is not taken: b has its peer
+    let stranger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bytes: Vec<u8> = fa.iter().flat_map(|t| t.to_le_bytes()).collect();
+    stranger.send_to(&bytes, ("127.0.0.1", port)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    lb.poll(&mut b);
+    assert_eq!(b.dev.tlink.read(6), 1, "the stranger's frame was ignored");
     assert!(UdpLink::open("sideways:1").is_err());
     assert!(UdpLink::open("listen:x").is_err());
+    assert!(UdpLink::open("listen:nowhere:1").is_err());
+}
+
+#[test]
+fn udp_link_listens_on_loopback_unless_told() {
+    use setun_net::tnet::UdpLink;
+    let l = UdpLink::open("listen:0").unwrap();
+    assert!(l.local_addr().unwrap().ip().is_loopback(), "listen:PORT is 127.0.0.1");
+    let l = UdpLink::open("listen:127.0.0.1:0").unwrap();
+    assert_eq!(l.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+    if let Ok(l) = UdpLink::open("listen:[::1]:0") {
+        assert_eq!(l.local_addr().unwrap().ip().to_string(), "::1");
+    }
 }
 
 #[test]

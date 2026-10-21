@@ -193,8 +193,10 @@ pub fn addr_str(a: i64) -> String {
 
 /// A `TLINK` joined to another setun process over UDP (docs/TNET.md §1):
 /// one datagram per frame, each tryte a 16-bit little-endian integer.
-/// `listen:PORT` waits for the peer and answers whoever sent the last
-/// frame; `connect:HOST:PORT` sends to that address.
+/// `listen:PORT` waits on 127.0.0.1 (`listen:ADDR:PORT` on another address)
+/// and takes the first station that sends a frame as its peer;
+/// `connect:HOST:PORT` sends to that address. Frames from anyone but the
+/// peer are ignored.
 pub struct UdpLink {
     sock: std::net::UdpSocket,
     peer: Option<std::net::SocketAddr>,
@@ -203,19 +205,28 @@ pub struct UdpLink {
 impl UdpLink {
     pub fn open(spec: &str) -> std::io::Result<UdpLink> {
         use std::io::{Error, ErrorKind};
-        let bad = || Error::new(ErrorKind::InvalidInput, "expected listen:PORT or connect:HOST:PORT");
-        let (sock, peer) = if let Some(port) = spec.strip_prefix("listen:") {
-            let port: u16 = port.parse().map_err(|_| bad())?;
-            (std::net::UdpSocket::bind(("0.0.0.0", port))?, None)
+        use std::net::{SocketAddr, ToSocketAddrs};
+        let bad = || Error::new(ErrorKind::InvalidInput, "expected listen:[ADDR:]PORT or connect:HOST:PORT");
+        let (sock, peer) = if let Some(at) = spec.strip_prefix("listen:") {
+            let at: SocketAddr = match at.parse::<u16>() {
+                Ok(port) => SocketAddr::from(([127, 0, 0, 1], port)),
+                Err(_) => at.parse().map_err(|_| bad())?,
+            };
+            (std::net::UdpSocket::bind(at)?, None)
         } else if let Some(target) = spec.strip_prefix("connect:") {
-            use std::net::ToSocketAddrs;
             let peer = target.to_socket_addrs()?.next().ok_or_else(bad)?;
-            (std::net::UdpSocket::bind(("0.0.0.0", 0))?, Some(peer))
+            let any: SocketAddr = if peer.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
+            (std::net::UdpSocket::bind(any)?, Some(peer))
         } else {
             return Err(bad());
         };
         sock.set_nonblocking(true)?;
         Ok(UdpLink { sock, peer })
+    }
+
+    /// The address the link's socket is bound to.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.sock.local_addr()
     }
 
     /// Frames out to the peer, and in from it.
@@ -231,7 +242,7 @@ impl UdpLink {
             if self.peer.is_none() {
                 self.peer = Some(from);
             }
-            if n % 2 == 0 {
+            if n % 2 == 0 && self.peer == Some(from) {
                 let f: Vec<i16> = buf[..n].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
                 m.dev.tlink_receive(&f);
             }
