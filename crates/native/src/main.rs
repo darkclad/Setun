@@ -34,8 +34,9 @@ struct Args {
     press: Vec<i64>,
     screenshot: Option<PathBuf>,
     console: bool,
-    /// `--net`: attach a network, with these port forwards (host, guest).
-    net: Option<Vec<(std::net::SocketAddr, u16)>>,
+    /// `--net` / `--net6`: attach a network, with these port forwards
+    /// (host, guest, to the guest over IPv6).
+    net: Option<Vec<(std::net::SocketAddr, u16, bool)>>,
     /// `--tlink`: a ternary link to another setun over UDP, and
     /// `--tlink-addr`: this station's address (docs/TNET.md §1).
     tlink: Option<String>,
@@ -79,6 +80,7 @@ fn usage() -> ! {
          --console        no window: this terminal is the serial console (Ctrl-] leaves);\n\
          \x20                without --disk, a Trinux disk built from the source tree\n\
          --net [ADDR:]HOST:GUEST  attach the user-mode network, forwarding a host port (repeatable; 'on': none)\n\
+         --net6 [ADDR:]HOST:GUEST the same, reaching the guest over IPv6 (ADDR defaults to [::1])\n\
          --tlink listen:PORT | connect:HOST:PORT  a ternary link to another setun over UDP\n\
          --tlink-addr A.B.C   this station's TNET address, three trytes (default 0.0.1)"
     );
@@ -119,11 +121,13 @@ fn parse_args() -> Args {
             }
             "--screenshot" => a.screenshot = Some(val().into()),
             "--console" => a.console = true,
-            "--net" => {
+            flag @ ("--net" | "--net6") => {
+                let v6 = flag == "--net6";
                 let spec = val();
                 let fwds = a.net.get_or_insert_with(Vec::new);
                 if spec != "on" {
-                    fwds.push(parse_forward(&spec).unwrap_or_else(|| usage()));
+                    let (host, guest) = parse_forward(&spec, v6).unwrap_or_else(|| usage());
+                    fwds.push((host, guest, v6));
                 }
             }
             "--tlink" => a.tlink = Some(val()),
@@ -134,11 +138,13 @@ fn parse_args() -> Args {
     a
 }
 
-/// `[ADDR:]HOSTPORT:GUESTPORT`.
-fn parse_forward(spec: &str) -> Option<(std::net::SocketAddr, u16)> {
+/// `[ADDR:]HOSTPORT:GUESTPORT`; ADDR is 127.0.0.1 by default, or [::1]
+/// for a forward over IPv6 (an IPv6 ADDR in brackets).
+fn parse_forward(spec: &str, v6: bool) -> Option<(std::net::SocketAddr, u16)> {
     let (host, guest) = spec.rsplit_once(':')?;
     let guest: u16 = guest.parse().ok()?;
-    let host = if host.contains(':') { host.parse().ok()? } else { format!("127.0.0.1:{host}").parse().ok()? };
+    let local = if v6 { "[::1]" } else { "127.0.0.1" };
+    let host = if host.contains(':') { host.parse().ok()? } else { format!("{local}:{host}").parse().ok()? };
     Some((host, guest))
 }
 
@@ -163,9 +169,10 @@ fn attach_links(m: &mut Machine, args: &Args) -> Links {
 fn attach_net(m: &mut Machine, args: &Args) -> Option<setun_net::Network> {
     let fwds = args.net.as_ref()?;
     let mut net = setun_net::Network::attach(m);
-    for &(host, guest) in fwds {
-        match net.forward(host, guest) {
-            Ok(a) => eprintln!("setun: {a} -> guest port {guest}"),
+    for &(host, guest, v6) in fwds {
+        let r = if v6 { net.forward6(host, guest) } else { net.forward(host, guest) };
+        match r {
+            Ok(a) => eprintln!("setun: {a} -> guest port {guest}{}", if v6 { " over IPv6" } else { "" }),
             Err(e) => {
                 eprintln!("setun: cannot listen on {host}: {e}");
                 std::process::exit(1)

@@ -1,6 +1,6 @@
 # IPv6
 
-**Status (2026-10-14): V1 and V2 built. Trinux autoconfigures from the gateway's Router Advertisements, defends and checks its addresses, resolves neighbours, answers `ping6`, and carries TCP and UDP over IPv6; `nc`, `telnetd`, `httpd` and `sshd` speak it, and `ifconfig` and `netstat` show it. The exchange vectors pass (§7). V3, the gateway's NAT and AAAA, next.** Trinux speaks IPv6 beside IPv4 on the same `TNIC` card ([`NETWORK.md`](NETWORK.md)): a host stack in Trine with Neighbor Discovery, stateless address autoconfiguration, ICMPv6, UDP and TCP, and `AF_INET6` sockets. `setun-net` grows the other side: a router that advertises a prefix, a NAT to the host's IPv6 sockets, and DNS answers with AAAA records. Gate: **the host's OpenSSH logs in to Trinux over IPv6, and Trinux's `wget` and `ssh` reach the host over IPv6.**
+**Status (2026-10-20): V1–V3 built. Trinux autoconfigures from the gateway's Router Advertisements, defends and checks its addresses, resolves neighbours, answers `ping6`, and carries TCP and UDP over IPv6; `nc`, `telnetd`, `httpd` and `sshd` speak it, and `ifconfig` and `netstat` show it. Through the gateway it reaches the host's `::1` and the world over IPv6, DNS answers AAAA queries, and the host's OpenSSH logs in through a `--net6` forward. The exchange vectors pass (§7). V4, names and brackets in the programs, next.** Trinux speaks IPv6 beside IPv4 on the same `TNIC` card ([`NETWORK.md`](NETWORK.md)): a host stack in Trine with Neighbor Discovery, stateless address autoconfiguration, ICMPv6, UDP and TCP, and `AF_INET6` sockets. `setun-net` grows the other side: a router that advertises a prefix, a NAT to the host's IPv6 sockets, and DNS answers with AAAA records. Gate: **the host's OpenSSH logs in to Trinux over IPv6, and Trinux's `wget` and `ssh` reach the host over IPv6.**
 
 | Layer | What | Section | Milestone |
 |---|---|---|---|
@@ -92,7 +92,7 @@ Received packets are checked in order. Each failure is counted and drops the pac
    - Its router lifetime makes the sender the default router; 0 removes it.
    - A Prefix Information option with the A flag, a /64 length and a valid lifetime of at least its preferred one forms the prefix and the interface identifier. The address gets its own DAD, then is used until its preferred lifetime runs out (deprecated), and removed when the valid lifetime runs out. A later RA updates the lifetimes, with RFC 4862 §5.5.3e's two-hour rule against shortening the valid lifetime.
    - The MTU option is accepted from 1280 to 1500.
-   - RDNSS (RFC 8106) is recorded in `/proc/net/rdnss`. `/etc/resolv.conf` stays as it is, since 10.0.2.3 answers AAAA queries too.
+   - RDNSS (RFC 8106) is recorded and shown in `/proc/net/stat6`. `/etc/resolv.conf` stays as it is, since 10.0.2.3 answers AAAA queries too.
 4. Up to 3 global addresses besides the link-local one (unused slots are listed as such).
 
 MLD reports are not sent: the virtual link has no switch that snoops them, and the gateway delivers every multicast frame anyway. This is RFC 8504's one SHOULD-level gap here, and it is said so.
@@ -129,9 +129,9 @@ MLD reports are not sent: the virtual link has no switch that snoops them, and t
   - the prefix `fd00::/64` with L and A set, valid 86400 s, preferred 14400 s;
   - MTU 1500;
   - RDNSS `fd00::3`.
-- **NAT:** a TCP SYN or UDP datagram from the guest to an address off `fd00::/64` goes out through a host IPv6 socket, exactly as IPv4's NAT works (NETWORK.md §9, §13). `fd00::2` stands for the host's `::1`. With no IPv6 route on the host, the guest's SYN is refused, as an unreachable IPv4 address is.
-- **DNS** at `10.0.2.3` and `fd00::3` answers AAAA queries from the host's resolver (up to 8 records), and A queries as before.
-- **Port forwards to the guest over IPv6:** `--net6 HOST:GUEST` listens on the host like `--net` and reaches the guest's global address. Test connections take a family.
+- **NAT:** a TCP SYN or UDP datagram from the guest to an address off the link (not `fd00::/64`, link-local or multicast) goes out through a host IPv6 socket, exactly as IPv4's NAT works (NETWORK.md §9, §13): the same code, with the frame's family deciding the offsets, the addresses and the checksums. `fd00::2` stands for the host's `::1` (on a port with no test listener). With no IPv6 route on the host, the guest's SYN is refused, as an unreachable IPv4 address is. Replies over UDP are at most 1452 octets (1500 − 40 − 8). Tests can make an outside address stand for a host one with `Network::alias6`.
+- **DNS** at `10.0.2.3` and `fd00::3` answers A and AAAA queries from the host's resolver, up to 8 records of the asked family. A name with no addresses at all is NXDOMAIN; one with addresses of the other family only gets an empty answer (so an IPv4-only name is not "unknown" to an AAAA query). Other types get an empty answer, and a malformed query FORMERR. Tests can fix names with `Network::dns_name` and `dns_name6`.
+- **Port forwards to the guest over IPv6:** `--net6 [ADDR:]HOST:GUEST` listens on the host like `--net` (ADDR is `[::1]` unless given, and may be either family) and reaches the guest's global address from `fd00::2` (`Network::forward6`). Test connections take a family (`connect6`, `udp_send6`).
 - Tests can inject raw frames and capture what the guest sends (`Network::inject`, `Network::capture`), for the exchange vectors (§7).
 
 ## 6. User space
@@ -162,5 +162,5 @@ The gateway's smoltcp drops a packet that needs a neighbour it has not resolved,
 |---|---|---|
 | V1 ✅ | §1–§3 in the kernel; raw ICMPv6 sockets, `ping6`, `ip6vec`; `inject`/`capture` and RAs in `setun-net`; `/proc/net/{if_inet6,neigh6,stat6}`; the vectors | Trinux autoconfigures `fd00::5054:ff:fe12:3456` and pings `fd00::2` |
 | V2 ✅ | §4: UDP and TCP over IPv6; `nc -6`; `ifconfig` and `netstat` for IPv6; telnetd, httpd and sshd on both families; `Network::connect6`, `udp_send6` | a test connection over IPv6 reaches `telnetd`; UDP both ways |
-| V3 | §5: NAT, AAAA, `--net6` | `wget http://[fd00::2]:port/` from a host server on `::1`; the host's OpenSSH logs in over `--net6` |
+| V3 ✅ | §5: NAT, AAAA, `--net6` | `nc fd00::2 PORT` reaches a host server on `::1` (bracketed URLs for `wget` are V4's); the host's OpenSSH logs in over `--net6` |
 | V4 | §6: names, brackets, `ssh`/`scp`/`sftp`/`host`, `netstat` | `ssh` from Trinux to the host's sshd on `::1` by name |

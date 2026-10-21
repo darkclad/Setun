@@ -322,3 +322,20 @@ fn public_key_logins() {
     assert_eq!(code, 255);
     has(&s.log("sshd"), &["ignored (group or others may write it): /root/.ssh/authorized_keys"]);
 }
+
+/// IPv6 end to end (docs/IPV6.md, V3's gate): the host's OpenSSH on ::1, a
+/// `--net6` forward, and Trinux's sshd answering over IPv6.
+#[test]
+fn openssh_logs_in_over_ipv6() {
+    if ssh_client().is_none() {
+        eprintln!("no ssh client on this host: skipped");
+        return;
+    }
+    let mut s = Session::boot();
+    let port = s.net.forward6("[::1]:0".parse().unwrap(), 22).unwrap().port();
+    let (code, out, err) = run_ssh(&mut s, port, "root", "root", &["-o", "HostName=::1"], "echo over IPv6; netstat -t | grep tcp6");
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}\nconsole:\n{}", s.out);
+    assert!(out.starts_with("over IPv6\ntcp6 "), "{out}");
+    assert!(out.contains(":22") && out.contains("fd00::2:") && out.contains("ESTABLISHED"), "{out}");
+    has(&s.log("sshd"), &["connection from fd00::2\n", "accepted password for root"]);
+}

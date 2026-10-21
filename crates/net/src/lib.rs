@@ -87,6 +87,8 @@ struct Listener {
 struct Forward {
     listener: TcpListener,
     guest_port: u16,
+    /// Reach the guest over IPv6 (`--net6`).
+    v6: bool,
 }
 
 /// Counters, for tests and the front end's status line.
@@ -172,6 +174,7 @@ pub struct Network {
     udp_flows: Vec<nat::UdpFlow>,
     udp_ports: Vec<u16>,
     dns: SocketHandle,
+    dns6: SocketHandle,
     outbound: bool,
     /// Frames from the guest kept for a test instead of reaching the gateway.
     capture: Option<Vec<Vec<u8>>>,
@@ -214,6 +217,12 @@ impl Network {
         );
         d.bind(smoltcp::wire::IpListenEndpoint { addr: Some(IpAddress::Ipv4(DNS)), port: 53 }).unwrap();
         let dns = sockets.add(d);
+        let mut d6 = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 27], vec![0; 27 * 1514]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 27], vec![0; 27 * 1514]),
+        );
+        d6.bind(smoltcp::wire::IpListenEndpoint { addr: Some(IpAddress::Ipv6(DNS6)), port: 53 }).unwrap();
+        let dns6 = sockets.add(d6);
         Network {
             iface,
             wire,
@@ -230,6 +239,7 @@ impl Network {
             udp_flows: Vec::new(),
             udp_ports: Vec::new(),
             dns,
+            dns6,
             outbound: true,
             capture: None,
             ra_due: false,
@@ -263,12 +273,22 @@ impl Network {
     /// Make guest address `seen` stand for host address `host` (10.0.2.2
     /// stands for 127.0.0.1 from the start).
     pub fn alias(&mut self, seen: [u8; 4], host: IpAddr) {
-        self.nat.aliases.insert(Ipv4Address::from(seen), host);
+        self.nat.aliases.insert(IpAddr::V4(Ipv4Addr::from(seen)), host);
+    }
+
+    /// The same for an IPv6 address the guest sees (fd00::2 stands for ::1).
+    pub fn alias6(&mut self, seen: std::net::Ipv6Addr, host: IpAddr) {
+        self.nat.aliases.insert(IpAddr::V6(seen), host);
     }
 
     /// Let DNS answer `name` with `addr` without asking the host.
     pub fn dns_name(&mut self, name: &str, addr: [u8; 4]) {
-        self.nat.names.insert(name.to_ascii_lowercase(), Ipv4Addr::from(addr));
+        self.nat.names.entry(name.to_ascii_lowercase()).or_default().push(IpAddr::V4(Ipv4Addr::from(addr)));
+    }
+
+    /// The same with an IPv6 address (for AAAA queries).
+    pub fn dns_name6(&mut self, name: &str, addr: std::net::Ipv6Addr) {
+        self.nat.names.entry(name.to_ascii_lowercase()).or_default().push(IpAddr::V6(addr));
     }
 
     /// How long a host connection may take before the guest is refused.
@@ -584,10 +604,20 @@ impl Network {
     /// Forward connections accepted on the host's `addr` to `guest_port`.
     /// Returns the bound address (port 0 lets the system choose).
     pub fn forward(&mut self, addr: SocketAddr, guest_port: u16) -> std::io::Result<SocketAddr> {
+        self.forward_family(addr, guest_port, false)
+    }
+
+    /// A port forward that reaches the guest over IPv6, at its address
+    /// fd00::5054:ff:fe12:3456 (`--net6`). The host side may be either family.
+    pub fn forward6(&mut self, addr: SocketAddr, guest_port: u16) -> std::io::Result<SocketAddr> {
+        self.forward_family(addr, guest_port, true)
+    }
+
+    fn forward_family(&mut self, addr: SocketAddr, guest_port: u16, v6: bool) -> std::io::Result<SocketAddr> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let bound = listener.local_addr()?;
-        self.forwards.push(Forward { listener, guest_port });
+        self.forwards.push(Forward { listener, guest_port, v6 });
         Ok(bound)
     }
 
@@ -597,11 +627,11 @@ impl Network {
             while let Ok((stream, _)) = f.listener.accept() {
                 let _ = stream.set_nonblocking(true);
                 let _ = stream.set_nodelay(true);
-                new.push((stream, f.guest_port));
+                new.push((stream, f.guest_port, f.v6));
             }
         }
-        for (stream, port) in new {
-            let c = self.connect(port);
+        for (stream, port, v6) in new {
+            let c = if v6 { self.connect6(port) } else { self.connect(port) };
             self.conns[c.0].host = Some(stream);
         }
     }
@@ -710,6 +740,15 @@ pub fn tcp_payload(f: &[u8]) -> Option<std::ops::Range<usize>> {
 
 /// Recompute the TCP checksum of an Ethernet/IPv4/TCP frame after an edit.
 pub fn fix_checksums(f: &mut [u8]) {
+    if f.len() >= 54 && f[12] == 0x86 && f[13] == 0xdd {
+        // IPv6: the TCP checksum over its pseudo-header (no IP checksum)
+        let len = u16::from_be_bytes([f[18], f[19]]) as usize;
+        f[70] = 0;
+        f[71] = 0;
+        let c = ip6::checksum(&[&f[22..54], &(len as u32).to_be_bytes(), &[0, 0, 0, 6], &f[54..54 + len]]);
+        f[70..72].copy_from_slice(&c.to_be_bytes());
+        return;
+    }
     let ihl = (f[14] & 15) as usize * 4;
     let total = u16::from_be_bytes([f[16], f[17]]) as usize;
     let t = 14 + ihl;
@@ -741,7 +780,7 @@ impl Network {
         if nat::udp_offsets(&f).is_some() {
             return self.udp_in(f);
         }
-        let Some((_, t)) = nat::tcp_offsets(&f) else { return Some(f) };
+        let Some((v6, t)) = nat::tcp_offsets(&f) else { return Some(f) };
         let dst = nat::ip_dst(&f);
         let sport = nat::port_at(&f, t);
         let dport = nat::port_at(&f, t + 2);
@@ -769,8 +808,8 @@ impl Network {
         if !syn || !self.outbound {
             return Some(f);
         }
-        let outside = !(dst.octets()[0] == 10 && dst.octets()[1] == 0 && dst.octets()[2] == 2);
-        let to_host = dst == GATEWAY && dport < nat::STANDIN_FIRST && !self.listeners.iter().any(|l| l.port == dport);
+        let outside = !nat::on_link(dst);
+        let to_host = dst == nat::gateway_for(v6) && dport < nat::STANDIN_FIRST && !self.listeners.iter().any(|l| l.port == dport);
         if !outside && !to_host {
             return Some(f);
         }
@@ -781,7 +820,7 @@ impl Network {
     }
 
     fn to_standin(f: &mut [u8], t: usize, standin: u16) {
-        nat::set_ip(f, 30, GATEWAY);
+        nat::set_dst(f, nat::gateway_for(nat::is_v6(f)));
         nat::set_port(f, t + 2, standin);
         nat::fix_ip_checksum(f);
         fix_checksums(f);
@@ -801,7 +840,8 @@ impl Network {
                 let _ = stream.set_nonblocking(true);
                 let _ = stream.set_nodelay(true);
                 let mut sock = Self::tcp_socket();
-                sock.listen(smoltcp::wire::IpListenEndpoint { addr: Some(IpAddress::Ipv4(GATEWAY)), port: standin }).expect("listen");
+                let gw = IpAddress::from(nat::gateway_for(self.nat.flows[k].dst.is_ipv6()));
+                sock.listen(smoltcp::wire::IpListenEndpoint { addr: Some(gw), port: standin }).expect("listen");
                 let h = self.sockets.add(sock);
                 let c = self.add_conn(h, Some(stream));
                 self.nat.flows[k].conn = Some(c.0);
@@ -820,14 +860,14 @@ impl Network {
     /// A frame for the guest: from a stand-in port, it must come from the
     /// address the guest connected to.
     fn nat_out(&mut self, f: &mut [u8]) {
-        let Some((_, t)) = nat::tcp_offsets(f) else { return };
-        if nat::ip_src(f) != GATEWAY {
+        let Some((v6, t)) = nat::tcp_offsets(f) else { return };
+        if nat::ip_src(f) != nat::gateway_for(v6) {
             return;
         }
         let sport = nat::port_at(f, t);
         let dport = nat::port_at(f, t + 2);
-        let Some(fl) = self.nat.flows.iter().find(|x| x.standin == sport && x.gport == dport) else { return };
-        nat::set_ip(f, 26, fl.dst);
+        let Some(fl) = self.nat.flows.iter().find(|x| x.standin == sport && x.gport == dport && x.dst.is_ipv6() == v6) else { return };
+        nat::set_src(f, fl.dst);
         nat::set_port(f, t, fl.dport);
         nat::fix_ip_checksum(f);
         fix_checksums(f);
@@ -855,40 +895,40 @@ impl Network {
         }
     }
 
-    /// Answer DNS queries to 10.0.2.3.
+    /// Answer DNS queries to 10.0.2.3 and fd00::3.
     fn dns_poll(&mut self) {
         let mut queries = Vec::new();
-        {
-            let s = self.sockets.get_mut::<udp::Socket>(self.dns);
+        for (on6, h) in [(false, self.dns), (true, self.dns6)] {
+            let s = self.sockets.get_mut::<udp::Socket>(h);
             while let Ok((data, meta)) = s.recv() {
-                queries.push((meta.endpoint, data.to_vec()));
+                queries.push((meta.endpoint, on6, data.to_vec()));
             }
         }
         let mut replies = Vec::new();
-        for (from, q) in queries {
+        for (from, on6, q) in queries {
             match nat::parse_query(&q) {
-                None => replies.push((from, nat::format_error(&q))),
-                Some(p) if p.qtype == 1 => {
+                None => replies.push((from, on6, nat::format_error(&q))),
+                Some(p) if p.qtype == 1 || p.qtype == 28 => {
                     let rx = self.nat.start_resolve(p.name.clone());
-                    self.nat.pending_dns.push((from.port, q, rx));
+                    self.nat.pending_dns.push((from, on6, q, rx));
                 }
-                Some(p) => replies.push((from, nat::answer(&q, &p, &[]))),
+                Some(p) => replies.push((from, on6, nat::answer(&q, &p, &[]))),
             }
         }
         let mut k = 0;
         while k < self.nat.pending_dns.len() {
-            match self.nat.pending_dns[k].2.try_recv() {
+            match self.nat.pending_dns[k].3.try_recv() {
                 Err(std::sync::mpsc::TryRecvError::Empty) => k += 1,
                 r => {
-                    let (port, q, _) = self.nat.pending_dns.remove(k);
+                    let (from, on6, q, _) = self.nat.pending_dns.remove(k);
                     let addrs = r.unwrap_or_default();
                     let p = nat::parse_query(&q).expect("parsed before");
-                    replies.push((IpEndpoint::new(IpAddress::Ipv4(GUEST), port), nat::answer(&q, &p, &addrs)));
+                    replies.push((from, on6, nat::answer(&q, &p, &addrs)));
                 }
             }
         }
-        let s = self.sockets.get_mut::<udp::Socket>(self.dns);
-        for (to, r) in replies {
+        for (to, on6, r) in replies {
+            let s = self.sockets.get_mut::<udp::Socket>(if on6 { self.dns6 } else { self.dns });
             let _ = s.send_slice(&r, to);
         }
     }
@@ -901,11 +941,13 @@ impl Network {
     /// the world (or the host, as 10.0.2.2), to smoltcp otherwise.
     fn udp_in(&mut self, f: Vec<u8>) -> Option<Vec<u8>> {
         let (u, data, len) = nat::udp_offsets(&f).unwrap();
+        let v6 = nat::is_v6(&f);
         let dst = nat::ip_dst(&f);
+        let guest = nat::ip_src(&f);
         let sport = nat::port_at(&f, u);
         let dport = nat::port_at(&f, u + 2);
-        let outside = !(dst.octets()[0] == 10 && dst.octets()[1] == 0 && dst.octets()[2] == 2);
-        let to_host = dst == GATEWAY && !self.udp_ports.contains(&dport);
+        let outside = !nat::on_link(dst);
+        let to_host = dst == nat::gateway_for(v6) && !self.udp_ports.contains(&dport);
         if !self.outbound || !(outside || to_host) {
             return Some(f);
         }
@@ -919,9 +961,9 @@ impl Network {
                     let oldest = (0..self.udp_flows.len()).min_by_key(|&i| self.udp_flows[i].last).unwrap();
                     self.udp_flows.remove(oldest);
                 }
-                let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else { return None };
+                let Ok(sock) = std::net::UdpSocket::bind(if v6 { "[::]:0" } else { "0.0.0.0:0" }) else { return None };
                 let _ = sock.set_nonblocking(true);
-                self.udp_flows.push(nat::UdpFlow { gport: sport, dst, dport, sock, guest_mac: mac, last: std::time::Instant::now() });
+                self.udp_flows.push(nat::UdpFlow { gport: sport, guest, dst, dport, sock, guest_mac: mac, last: std::time::Instant::now() });
                 self.udp_flows.len() - 1
             }
         };
@@ -939,11 +981,11 @@ impl Network {
         let mut buf = [0u8; 2048];
         for fl in &mut self.udp_flows {
             while let Ok((n, from)) = fl.sock.recv_from(&mut buf) {
-                if n > 1472 {
+                if n > if fl.dst.is_ipv6() { 1452 } else { 1472 } {
                     continue; // would need fragments
                 }
                 fl.last = std::time::Instant::now();
-                let f = nat::udp_frame(fl.guest_mac, fl.dst, from.port(), GUEST, fl.gport, &buf[..n]);
+                let f = nat::udp_frame(fl.guest_mac, fl.dst, from.port(), fl.guest, fl.gport, &buf[..n]);
                 self.wire.outbound.push_back(f);
                 self.stats.udp_in += 1;
             }

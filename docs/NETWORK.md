@@ -76,7 +76,7 @@ The emulator stays deterministic: the card only exchanges frames with queues, an
 - Time is the emulator's clock, so a test run is reproducible.
 - Outbound connections (a NAT to host sockets) and DNS at `10.0.2.3` (§9).
 
-The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`). Then `telnet localhost 2323` reaches Trinux's `telnetd`. The web build has no network yet: `LINK` reads 0.
+The native front end: `setun --console --net 2323:23` (repeatable `--net HOST:GUEST`; `--net6` reaches the guest over IPv6, [`IPV6.md`](IPV6.md) §5). Then `telnet localhost 2323` reaches Trinux's `telnetd`. The web build has no network yet: `LINK` reads 0.
 
 ## 3. The kernel stack (`kernel/net/`)
 
@@ -350,7 +350,7 @@ Not covered:
 
 - 10.0.2.3 is a second address of the gateway.
 - A queries are answered by the host's resolver on a thread, with up to 8 records and a TTL of 60. Nothing found is NXDOMAIN.
-- AAAA and other types get an empty answer; a malformed query gets FORMERR.
+- AAAA queries get the host's IPv6 addresses ([`IPV6.md`](IPV6.md) §5); other types get an empty answer, and a malformed query FORMERR.
 - Tests can fix names with `Network::dns_name` and make outside addresses stand for host ones with `Network::alias`. `Network::set_outbound(false)` turns the NAT off.
 
 ### In Trinux

@@ -56,7 +56,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 | `crates/core` | emulator core (`setun-core`): CPU, traps, 9\|9\|9 MMU, memory map, devices (interrupt controller, timer, RTC, keyboard, mouse, serial, DMA disks, display renderer), `Machine` |
 | `crates/asm` | assembler, disassembler and the `setun-asm` tool ([`docs/ASSEMBLER.md`](docs/ASSEMBLER.md)) |
 | `crates/demo` | demo ROM in assembly ([`demo.s`](crates/demo/src/demo.s)): text screen, keyboard/serial echo, 3^9-colour graphics |
-| `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio, `--net` |
+| `crates/native` | native front end, binary `setun`: window, keyboard/mouse, serial on stdio, `--net`, `--net6` |
 | `crates/net` | `setun-net`: the network behind the card, a user-mode gateway (10.0.2.2) on smoltcp with port forwards |
 | `crates/web` + `web/` | browser front end: WebAssembly exports (with the BIOS and the Trinux disk built in) and the front-panel page |
 | `crates/trine` | the Trine compiler (binary `trine`) and its standard library (`lib/`) |
