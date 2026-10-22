@@ -197,3 +197,44 @@ fn hard_links_share_an_inode() {
     fs.set_inode_word(ino, I_NLINK, 2);
     assert!(fs.fsck().iter().any(|e| e.contains("nlink 2 but 3 links")));
 }
+
+#[test]
+fn update_boot_replaces_the_kernel_and_keeps_the_files() {
+    let page = setun_core::PAGE as usize;
+    let boot = trinux::TFS_START * page;
+    let fresh = trinux::build_disk(&trinux::kernel_dir()).unwrap();
+    // a disk someone used: a file of their own, and a boot area that is not this build's
+    let mut used = fresh.trytes.clone();
+    let mut fs = trinux::tfs_of(&used).unwrap();
+    fs.write_file("/home/user/notes", &text("kept across an update"), 0o644).unwrap();
+    used[boot..boot + fs.trytes.len()].copy_from_slice(&fs.trytes);
+    for t in &mut used[page..boot] {
+        *t = 1234; // an older kernel
+    }
+    trinux::update_boot(&mut used, &fresh.trytes).unwrap();
+    assert_eq!(&used[..boot], &fresh.trytes[..boot], "the boot area is the new build's");
+    let fs = trinux::tfs_of(&used).unwrap();
+    assert_eq!(fs.read_text("/home/user/notes").unwrap(), "kept across an update");
+    assert_eq!(fs.fsck(), Vec::<String>::new());
+    // and it boots
+    let mut disk = trinux::build_disk(&trinux::kernel_dir()).unwrap();
+    disk.trytes = used;
+    let mut m = trinux::boot(&disk, 2187, 200_000_000);
+    let out = m.dev.serial.take_output();
+    assert!(out.contains("init: started /sbin/init"), "{out}");
+}
+
+#[test]
+fn update_boot_refuses_what_is_not_a_trinux_disk() {
+    let page = setun_core::PAGE as usize;
+    let fresh = trinux::build_disk(&trinux::kernel_dir()).unwrap();
+    let mut blank = vec![0i16; 729 * page];
+    let e = trinux::update_boot(&mut blank, &fresh.trytes).unwrap_err();
+    assert!(e.contains("not a Trinux disk"), "{e}");
+    assert!(blank.iter().all(|&t| t == 0), "nothing written");
+    let mut short = vec![0i16; 10 * page];
+    assert!(trinux::update_boot(&mut short, &fresh.trytes).is_err());
+    let mut ok = fresh.trytes.clone();
+    let e = trinux::update_boot(&mut ok, &fresh.trytes[..page]).unwrap_err();
+    assert!(e.contains("no boot area"), "{e}");
+}

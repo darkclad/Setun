@@ -102,6 +102,7 @@ cargo run --release -p trine -- run examples/hello.tri        # compile + run he
 cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw
 cargo run --release -p trinux --bin mkdisk -- -o trinux.disk
+cargo run --release -p trinux --bin mkdisk -- --update trinux.disk  # a newer loader and kernel, the files kept
 cargo run --release -p setun-native -- --disk trinux.disk     # boot Trinux to a shell prompt
 cargo run --release -p setun-native -- --console              # no window: this terminal is the console (ssh); Ctrl-] leaves
 cargo run --release -p setun-native -- --console --net 2323:23 # with a network; then `telnet localhost 2323` logs in

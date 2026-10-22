@@ -5,7 +5,10 @@
 # cards, and ttyd in front.
 set -e
 DISK=/data/trinux.disk
-[ -f "$DISK" ] || mkdisk -o "$DISK"
+# A new disk the first time; afterwards its loader and kernel follow the
+# emulator in this image (an old kernel may not run on a newer machine),
+# and its files stay.
+if [ -f "$DISK" ]; then mkdisk --update "$DISK"; else mkdisk -o "$DISK"; fi
 # Booted again whenever it stops (poweroff, reboot, a crash). The forward
 # listens on every address of the container, so the published port reaches it.
 tmux new-session -d -s vm -x 100 -y 30 \

@@ -401,6 +401,20 @@ pub fn disk_contents(m: &mut setun_core::Machine) -> Vec<i16> {
     out
 }
 
+/// Give an existing Trinux disk the boot area (loader, kernel, initramfs:
+/// sectors 0..TFS_START) of `fresh`, keeping its file system, so a disk
+/// whose files are worth keeping boots the kernel that matches the emulator
+/// it runs on. Refused unless `disk` holds a tfs volume where Trinux puts it.
+pub fn update_boot(disk: &mut [i16], fresh: &[i16]) -> Result<(), String> {
+    let boot = TFS_START * PAGE as usize;
+    if fresh.len() < boot {
+        return Err("the new image has no boot area".into());
+    }
+    tfs_of(disk).map_err(|e| format!("not a Trinux disk ({e})"))?;
+    disk[..boot].copy_from_slice(&fresh[..boot]);
+    Ok(())
+}
+
 /// The tfs volume inside a disk image.
 pub fn tfs_of(trytes: &[i16]) -> Result<tfs::Tfs, String> {
     let start = TFS_START * PAGE as usize;
