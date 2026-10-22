@@ -237,7 +237,7 @@ fn fb_va() -> int { return FB_VA_PAGE * 19683 - 9841; }   // its first tryte
 // frames at the first free run of pages above the framebuffer's, which fork
 // shares instead of copying, so processes can share a lock word.
 const MAP_ANONYMOUS: int = 32;
-const SHM_VA_PAGE: int = -14348907 + 243;        // above the framebuffer's 25 pages
+const SHM_VA_PAGE: int = -14348907 + 243;        // above the framebuffer's 118 pages at most
 const SHM_PAGES: int = 243;
 
 // the first word of the page (a word's address is its middle tryte)

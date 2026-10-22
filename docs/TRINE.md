@@ -1717,7 +1717,7 @@ Named `int` constants for every device port of ISA §8 (port = 27 · block
 + register): `SYSCTL_*`, `TPIC_*` (interrupt controller), `TIMER_*`,
 `RTC_*`, `KBD_*`, `MOUSE_*`, `SERIAL_*`, `DISK_*` (disk 0; disk 1 is +27),
 `DISPLAY_*`, `NIC_*`, `RNG_*`; the IRQ numbers `IRQ_TIMER` … `IRQ_NIC`
-(vector = IRQ + 1); and `FB_BASE` (−1 604 164, the first framebuffer
+(vector = IRQ + 1); and `FB_BASE` (−6 387 133, the first framebuffer
 tryte) and `PAGE` (19 683).
 
 ### 10.6 `keymap.tri`: keyboard layouts

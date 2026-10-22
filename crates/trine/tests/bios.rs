@@ -50,7 +50,7 @@ fn banner_shows_setun_11_overlined() {
     let r = run_machine(&bios(), None, 30_000_000, "off\n");
     let banner: String = r.serial.lines().take(8).collect::<Vec<_>>().join("\n");
     assert!(banner.contains("SETUN-11\u{305} BIOS"), "{banner}");
-    assert!(banner.contains("Setun-11\u{305}, ISA v0.7, ring"), "{banner}");
+    assert!(banner.contains("Setun-11\u{305}, ISA v0.8, ring"), "{banner}");
     // the old names are gone
     assert!(!r.serial.contains("386") && !r.serial.contains("387"), "{}", r.serial);
     // not the base-3 alias, and never a plain 11 without the bar

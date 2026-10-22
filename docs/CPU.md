@@ -2,7 +2,7 @@
 
 This is the programmer's manual for the Setun-11̅ CPU: what the machine is, how its numbers, registers, instructions, memory, traps and devices work, and how to program it in assembly. It is organised by topic and meant to be read as a reference.
 
-The normative specification is [`SETUN26_ISA.md`](SETUN26_ISA.md) (ISA v0.7). The emulator in `crates/core` implements it, and where the two differ this manual describes what the emulator does and says so. Other documents cover the rest of the system: [`NOTATION.md`](NOTATION.md) (number notation), [`ASSEMBLER.md`](ASSEMBLER.md), [`BOOT.md`](BOOT.md), [`LANGUAGE.md`](LANGUAGE.md) (the Trine language), [`KERNEL.md`](KERNEL.md) (Trinux), [`NETWORK.md`](NETWORK.md) and [`PERFORMANCE.md`](PERFORMANCE.md).
+The normative specification is [`SETUN26_ISA.md`](SETUN26_ISA.md) (ISA v0.8). The emulator in `crates/core` implements it, and where the two differ this manual describes what the emulator does and says so. Other documents cover the rest of the system: [`NOTATION.md`](NOTATION.md) (number notation), [`ASSEMBLER.md`](ASSEMBLER.md), [`BOOT.md`](BOOT.md), [`LANGUAGE.md`](LANGUAGE.md) (the Trine language), [`KERNEL.md`](KERNEL.md) (Trinux), [`NETWORK.md`](NETWORK.md) and [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Contents
 
@@ -230,7 +230,7 @@ Control registers are `cr-13` … `cr13`. `MFC rd, cr` reads one and `MTC cr, ra
 | −13 … −1, 11 … 13 | – | reserved; read as 0 | read only |
 
 - `MTC` to any register other than 0 … 8 raises vector −1 (illegal instruction). That covers `CPUID`, `CYCLE` and the reserved numbers.
-- **`CPUID`** reads 3^26 + 7 = 2 541 865 828 336 in the emulator: trit 1 is +1 and the version field holds 7 (ISA v0.7). The BIOS prints it as "ISA v0.7".
+- **`CPUID`** reads 3^26 + 8 = 2 541 865 828 337 in the emulator: trit 1 is +1 and the version field holds 8 (ISA v0.8). The BIOS prints it as "ISA v0.8".
 - **`CYCLE`** counts executed instructions, including ones that end in a fault. Delivering an interrupt is not counted. It is the emulator's clock as well: device time advances 100 ns per instruction by default (§15).
 - The ISA asks for `PTB` to be a multiple of 3^10 and `ITB` a multiple of 729. The emulator does not check either.
 
@@ -763,7 +763,7 @@ Physical memory is divided into **frames of 3^9 = 19 683 trytes**. Frame f is ce
 |---|---|---|
 | 0 … N−1 | −9 841 upward | **RAM**. The default N is 3^9 frames = 3^18 trytes; `setun --ram FRAMES` sets it, and `SYSCTL.RAM_FRAMES` reports it. RAM reads 0 until written. |
 | −3 … −1 | −68 890 … −9 842 | **BIOS ROM**, 3^10 trytes. Writes raise a bus error (−10). |
-| −81 … −55 | −1 604 164 … −1 072 724 | **framebuffer**, 27 frames = 3^12 trytes; ordinary read/write memory that the display shows (§10.10) |
+| −324 … −82 | −6 387 133 … −1 604 165 | **framebuffer**, 243 frames = 3^14 trytes; ordinary read/write memory that the display shows (§10.10) |
 | every other frame | – | nothing; an access raises a bus error (vector −10) |
 
 Rule of thumb: **non-negative frames are RAM, negative frames are devices.** Device DMA (disks, network card) uses physical addresses and bypasses the MMU.
@@ -1058,8 +1058,8 @@ A sector is **one page, 3^9 trytes**. The two disks are identical; the ISA lists
 
 | Offset | Register | Access |
 |---|---|---|
-| 0 | `MODE`: −1 text 80×30 (reset), 0 graphics 640×480, +1 graphics 800×600 | read/write |
-| 1 | `FB_BASE`: physical address of the first framebuffer tryte, −1 604 164 | read |
+| 0 | `MODE`: −1 text 80×30 (reset), 0 graphics 640×480, +1 800×600, +2 1024×768, +3 1280×1024, +4 1600×1200, +5 1920×1080, +6 1920×1200; other values are ignored | read/write |
+| 1 | `FB_BASE`: physical address of the first framebuffer tryte, −6 387 133 | read |
 | 2 | `WIDTH`: pixels, or 80 cells in text mode | read |
 | 3 | `HEIGHT`: pixels, or 30 cells in text mode | read |
 | 4 | `PITCH`: trytes per line: 640, 800, or 240 in text mode (80 one-word cells) | read |
@@ -1081,7 +1081,7 @@ A sector is **one page, 3^9 trytes**. The two disks are identical; the ISA lists
 | `D̅D̅D` | blue |
 | `000` | 50 % grey (a zeroed framebuffer is mid-grey) |
 
-Negating a pixel inverts its colour. 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
+Negating a pixel inverts its colour. The largest mode, 1920×1200, needs 2 304 000 trytes, which fit the 3^14-tryte region.
 
 **Text mode: 80×30 cells, one word per cell**, drawn with an 8×8 font with doubled rows into 640×480. Cell k (row-major, k = 80·row + col) occupies trytes `FB_BASE + 3k` (character), `FB_BASE + 3k + 1` (attribute) and `FB_BASE + 3k + 2` (reserved); as a word it is at address `FB_BASE + 3k + 1`, with the character in its most significant tryte.
 

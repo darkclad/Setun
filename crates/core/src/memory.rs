@@ -7,7 +7,7 @@
 //! |-------------|-----------------------------------|
 //! | 0 … N−1     | RAM (allocated lazily, reads 0)   |
 //! | −3 … −1     | BIOS ROM (read-only)              |
-//! | −81 … −55   | framebuffer (27 frames = 3^12)    |
+//! | −324 … −82  | framebuffer (243 frames = 3^14)   |
 //! | other       | bus error                         |
 
 use crate::{HALF_PAGE, PAGE};
@@ -15,8 +15,8 @@ use ternary::{pow3, Tryte, Word};
 
 pub const ROM_FIRST_FRAME: i64 = -3;
 pub const ROM_FRAMES: i64 = 3;
-pub const FB_FIRST_FRAME: i64 = -81;
-pub const FB_FRAMES: i64 = 27;
+pub const FB_FIRST_FRAME: i64 = -324;
+pub const FB_FRAMES: i64 = 243;
 /// Default RAM: 3^9 frames = 3^18 trytes.
 pub const DEFAULT_RAM_FRAMES: i64 = 19_683;
 
@@ -303,7 +303,7 @@ impl Memory {
         }
     }
 
-    /// Raw framebuffer trytes (27 frames), for the display device.
+    /// Raw framebuffer trytes (243 frames), for the display device.
     pub fn framebuffer(&self) -> &[i16] {
         &self.fb
     }
@@ -343,8 +343,12 @@ mod tests {
         assert!(m.read_tryte(-68_891).is_err()); // frame −4: nothing
         assert!(m.read_tryte(2 * 19683 + 9841).is_ok());
         assert!(m.read_tryte(3 * 19683 - 9841).is_err()); // frame 3: no RAM
-        assert_eq!(frame_start(FB_FIRST_FRAME), -1_604_164);
-        assert!(m.write_tryte(-1_604_164, Tryte::MAX).is_ok());
+        assert_eq!(frame_start(FB_FIRST_FRAME), -6_387_133);
+        assert!(m.write_tryte(-6_387_133, Tryte::MAX).is_ok()); // the framebuffer's first tryte
+        assert!(m.write_tryte(-6_387_134, Tryte::MAX).is_err()); // frame −325: nothing
+        assert!(m.write_tryte(frame_start(-81) - 1, Tryte::MAX).is_ok()); // the last tryte of frame −82, its last frame
+        assert!(m.write_tryte(frame_start(-81), Tryte::MAX).is_err()); // frame −81: nothing since ISA v0.8
+        assert!(m.write_tryte(-1_604_164, Tryte::MAX).is_err()); // where the framebuffer was
         assert_eq!(m.write_tryte(-59_049, Tryte::MAX), Err(BusError)); // ROM
     }
 

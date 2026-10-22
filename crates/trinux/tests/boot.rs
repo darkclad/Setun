@@ -95,7 +95,7 @@ fn k1_kernel_boots_with_paging_and_timer() {
         "Traps: 243 vectors",
         "Memory: 671 pages free (frames 58..728), triddy orders 0..9",
         "mm: triddy self-test OK",
-        "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 759 pages",
+        "Paging: 9|9|9, kernel identity-mapped in L1 slots 0..+1, 975 pages", // 729 RAM + 3 ROM + 243 framebuffer
         "VFS: Mounted root (tfs filesystem): 486 blocks",
         "VFS: devfs on /dev, proc on /proc, tmpfs on /tmp, console tty",
         "init: started /sbin/init as pid 1",

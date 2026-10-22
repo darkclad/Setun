@@ -450,13 +450,14 @@ fn memory_map_holes() {
         frame_start(2),              // past RAM
         frame_start(-4),             // below ROM
         frame_start(-54),            // between framebuffer and ROM
-        frame_start(-55) - 1,        // just below framebuffer top… (frame −56 is FB)
-        frame_start(-82),            // below framebuffer
+        frame_start(-81),            // where the framebuffer was before ISA v0.8
+        frame_start(-81) - 1,        // just below framebuffer top… (frame −82 is FB)
+        frame_start(-325),           // below framebuffer
         Word::MAX.value(),
         Word::MIN.value(),
     ] {
-        if pa == frame_start(-55) - 1 {
-            assert!(m.read_tryte(pa).is_ok(), "frame −56 is framebuffer");
+        if pa == frame_start(-81) - 1 {
+            assert!(m.read_tryte(pa).is_ok(), "frame −82 is framebuffer");
             continue;
         }
         assert_eq!(m.read_tryte(pa), Err(BusError), "read {pa}");
@@ -754,12 +755,16 @@ fn file_disk_failures() {
 #[test]
 fn display_tolerates_odd_values() {
     let mut m = machine();
-    out(&mut m, block::DISPLAY, 0, 5); // any positive = 800×600
-    assert_eq!(inp(&mut m, block::DISPLAY, 0), 1);
-    out(&mut m, block::DISPLAY, 0, -99);
+    // a mode that does not exist leaves the mode as it is
+    out(&mut m, block::DISPLAY, 0, 1);
+    for bad in [7, 8, -2, -99, 9841] {
+        out(&mut m, block::DISPLAY, 0, bad);
+        assert_eq!(inp(&mut m, block::DISPLAY, 0), 1, "MODE {bad}");
+    }
+    out(&mut m, block::DISPLAY, 0, -1);
     assert_eq!(inp(&mut m, block::DISPLAY, 0), -1);
     out(&mut m, block::DISPLAY, 1, 0); // FB_BASE is read-only
-    assert_eq!(inp(&mut m, block::DISPLAY, 1), -1_604_164);
+    assert_eq!(inp(&mut m, block::DISPLAY, 1), -6_387_133);
     // Cursor and characters out of range, mouse cursor off-screen: no panic.
     out(&mut m, block::DISPLAY, 7, 10_000);
     for (x, y) in [(-5, -5), (636, 476), (1_000_000, 3), (-1_000_000, -1_000_000)] {

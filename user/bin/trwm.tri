@@ -1,8 +1,10 @@
 // trwm: the Trinux window system (a display server and window manager).
 //
-//   trwm [client ...]      e.g. trwm term clock
+//   trwm [-g WxH] [client ...]      e.g. trwm term clock
 //
-// It owns /dev/fb0 (mapped, 640x480), /dev/mouse and /dev/kbd, draws a
+// -g picks the screen: 640x480 (the default), 800x600, 1024x768, 1280x1024,
+// 1600x1200, 1920x1080 or 1920x1200.
+// It owns /dev/fb0 (mapped), /dev/mouse and /dev/kbd, draws a
 // panel with launchers, and composites one window per client from the
 // pixels it keeps for them (the protocol is in lib/trw.tri). Click a title
 // bar to raise and drag a window, the box at its right end to close it;
@@ -585,6 +587,20 @@ fn reap() {
     }
 }
 
+// The display mode -g asks for (0: 640x480).
+var want_mode: int;
+
+// The mode for "WxH", or -1 if there is none of that size.
+fn mode_of(g: *char) -> int {
+    var sizes: [7]*char = { "640x480", "800x600", "1024x768", "1280x1024", "1600x1200", "1920x1080", "1920x1200" };
+    var m: int = 0;
+    while (m < 7) {
+        if (strcmp(g, sizes[m]) == 0) { return m; }
+        m += 1;
+    }
+    return -1;
+}
+
 fn setup() -> int {
     fb_fd = open("/dev/fb0", O_RDWR, 0);
     if (fb_fd < 0) { perror2("trwm", "/dev/fb0"); return -1; }
@@ -594,7 +610,7 @@ fn setup() -> int {
     if (kbd_fd < 0) { perror2("trwm", "/dev/kbd"); return -1; }
     if (font_load("/usr/share/font8x8") < 0) { perror2("trwm", "/usr/share/font8x8"); return -1; }
     var info: fb_info;
-    info.mode = 0;
+    info.mode = want_mode;
     if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &info as int) < 0) { perror2("trwm", "set mode"); return -1; }
     ioctl(fb_fd, FBIOGET_VSCREENINFO, &info as int);
     var addr: int = mmap(0, info.pitch * info.yres, PROT_READ + PROT_WRITE, MAP_SHARED, fb_fd, 0);
@@ -621,8 +637,16 @@ fn setup() -> int {
 }
 
 fn main(argc: int, argv: **char) -> int {
-    if (setup() < 0) { return 1; }
     var a: int = 1;
+    if (a < argc && strcmp(argv[a], "-g") == 0) {
+        want_mode = a + 1 < argc ? mode_of(argv[a + 1]) : -1;
+        if (want_mode < 0) {
+            fputs(STDERR_FILENO, "usage: trwm [-g 640x480|800x600|1024x768|1280x1024|1600x1200|1920x1080|1920x1200] [client ...]\n");
+            return 2;
+        }
+        a += 2;
+    }
+    if (setup() < 0) { return 1; }
     while (a < argc) {
         var path: [81]char;
         if (argv[a][0] == '/') { strncpy(&path[0], argv[a], 80); }

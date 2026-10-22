@@ -539,7 +539,7 @@ quits.
 
 | Command | Synopsis | Description |
 |---|---|---|
-| `trwm` | `trwm [client ...]` | the display server and window manager (§12); a client name without `/` is taken from `/bin` |
+| `trwm` | `trwm [-g WxH] [client ...]` | the display server and window manager (§12); `-g` picks the screen, 640x480 (default), 800x600, 1024x768, 1280x1024, 1600x1200, 1920x1080 or 1920x1200; a client name without `/` is taken from `/bin` |
 | `term` | | a terminal window running `/bin/sh` |
 | `clock` | | the time (UTC), once a second |
 | `colors` | | all 3^9 pixel colours, once each |
@@ -1296,7 +1296,7 @@ so clients never redraw on exposure.
 
 | ioctl | Number | Argument |
 |---|---|---|
-| `FBIOGET_VSCREENINFO`, `FBIOPUT_VSCREENINFO` | 17920, 17921 | `{xres, yres, pitch, mode}`; mode −1 text, 0 640×480, 1 800×600 |
+| `FBIOGET_VSCREENINFO`, `FBIOPUT_VSCREENINFO` | 17920, 17921 | `{xres, yres, pitch, mode}`; mode −1 text, 0 640×480, 1 800×600, 2 1024×768, 3 1280×1024, 4 1600×1200, 5 1920×1080, 6 1920×1200 (EINVAL otherwise) |
 | `FBIO_CURSOR` | 17928 | the hardware cursor |
 
 `read`, `write` and `lseek` work over the pixels, and `mmap` maps them
@@ -1316,7 +1316,7 @@ oldest when full.
 ### 12.2 trwm
 
 ```text
-trwm [client ...]           e.g. trwm term clock colors paint
+trwm [-g WxH] [client ...]  e.g. trwm -g 1024x768 term clock colors paint
 ```
 
 - The panel at the top has launchers (Terminal, Clock, Colors, Paint),

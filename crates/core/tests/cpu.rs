@@ -476,7 +476,7 @@ fn interrupts_and_single_step() {
 #[test]
 fn missing_vector_table_is_a_triple_fault() {
     let mut m = M::new(1);
-    m.cpu.set_cr(cr::ITB, word(-3 * 1_000_000)); // nothing there
+    m.cpu.set_cr(cr::ITB, word(-9 * 1_000_000)); // frame −457: nothing there
     Prog::at(0).load(&mut m.mem);
     m.cpu.pc = word(0);
     assert_eq!(m.cpu.step(&mut m.mem, &mut m.io), Step::TripleFault);

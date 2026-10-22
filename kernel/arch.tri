@@ -262,7 +262,7 @@ fn kernel_pte(frame: int) -> int {
 }
 
 fn is_device_frame(f: int) -> int {
-    return (f >= -3 && f <= -1) || (f >= -81 && f <= -55);     // BIOS ROM, framebuffer
+    return (f >= -3 && f <= -1) || (f >= -324 && f <= -82);    // BIOS ROM, framebuffer
 }
 
 // Build the kernel half: L1 slots 0 and +1 map all RAM, the ROM and the

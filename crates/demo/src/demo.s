@@ -12,7 +12,7 @@
 
 ENTRY       = -59049            ; reset PC: -3^10
 ITB         = -29160            ; vector table: a multiple of 729 in ROM frame -1
-FB_BASE     = -1604164          ; first framebuffer tryte
+FB_BASE     = -6387133          ; first framebuffer tryte (frame -324, ISA v0.8)
 STACK_TOP   = 9000
 
 PROMPT_CELL = 14*80

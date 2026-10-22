@@ -117,5 +117,5 @@ const IRQ_NIC: int = 8;
 const IRQ_TLINK: int = 9;
 
 // Memory
-const FB_BASE: int = -1604164;        // first framebuffer tryte
+const FB_BASE: int = -6387133;        // first framebuffer tryte (frame -324, ISA v0.8)
 const PAGE: int = 19683;              // 3^9 trytes

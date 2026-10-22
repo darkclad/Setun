@@ -41,7 +41,7 @@ header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; b
 .bezel { background: var(--bezel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; position: relative; flex: 1 1 560px; min-width: 0; box-sizing: border-box; }
 .deck.fixed .bezel { flex: 0 1 auto; }
 /* The machine's picture keeps its proportions inside the box (letterboxed
-   when the box is another shape, as 1200×800 is to a 4:3 mode). */
+   when the box is another shape, as 1920×1080 is to a 4:3 mode). */
 canvas#screen { display: block; width: 100%; aspect-ratio: 4 / 3; max-width: 100%; background: var(--screen); image-rendering: pixelated; object-fit: contain; border-radius: 3px; outline: none; cursor: crosshair; }
 .deck.fixed canvas#screen { width: var(--w); aspect-ratio: var(--ar); height: auto; }
 /* Full screen, or where the browser refuses that, the whole window. */
@@ -145,7 +145,10 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           <option value="640x480">640×480</option>
           <option value="800x600">800×600</option>
           <option value="1024x768">1024×768</option>
-          <option value="1200x800">1200×800</option>
+          <option value="1280x1024">1280×1024</option>
+          <option value="1600x1200">1600×1200</option>
+          <option value="1920x1080">1920×1080</option>
+          <option value="1920x1200">1920×1200</option>
         </select>
         <button type="button" id="btn-full">Full screen</button>
       </div>
@@ -170,7 +173,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           <option value="relay">Internet</option>
         </select>
       </div>
-      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page; <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. <b>Network</b> → Internet power-cycles the machine with its network card linked, through the server, to the internet (not to the server's own network): then try <kbd>host example.com</kbd>, <kbd>wget -O - https://example.com</kbd> or <kbd>ssh</kbd> to a machine you have an account on.</p>
+      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page, and <b>Window system</b> then runs at that size (<kbd>trwm -g 1024x768</kbd>); <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. <b>Network</b> → Internet power-cycles the machine with its network card linked, through the server, to the internet (not to the server's own network): then try <kbd>host example.com</kbd>, <kbd>wget -O - https://example.com</kbd> or <kbd>ssh</kbd> to a machine you have an account on.</p>
       <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
     </aside>
   </div>
@@ -416,7 +419,12 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       $("line").value = "";
     });
     function sendLine(text) { for (const ch of text + "\n") wasm.setun_serial_char(ch.codePointAt(0)); }
-    $("btn-wm").addEventListener("click", () => { sendLine("trwm term clock colors paint &"); canvas.focus(); });
+    // the window system at the size the page shows (Fit: the default 640x480)
+    $("btn-wm").addEventListener("click", () => {
+      const v = $("size").value, g = v === "fit" ? "" : "-g " + v + " ";
+      sendLine("trwm " + g + "term clock colors paint &");
+      canvas.focus();
+    });
 
     // The screen's size on the page (remembered in this browser), and full screen.
     function applySize() {
@@ -473,7 +481,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     });
 
     let img = null, last = performance.now(), executed = 0, statT = last, off = false;
-    const modes = { "-1": "text 80×30", "0": "640×480", "1": "800×600" };
+    const modes = { "-1": "text 80×30", "0": "640×480", "1": "800×600", "2": "1024×768", "3": "1280×1024", "4": "1600×1200", "5": "1920×1080", "6": "1920×1200" };
     const ringNames = { "-1": "−1 user", "0": "0 drivers", "1": "+1 kernel" };
 
     function frame(now) {

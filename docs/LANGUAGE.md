@@ -119,7 +119,7 @@ extern var ticks: int;
 - **Initialisers:** `{ … }` for arrays and structs, and string literals for `[N]char`.
 - **Placement attributes** (for the BIOS and kernel):
   - `@align(729) var itb: [243]int;` aligns a global.
-  - `@at(-1604164) var fb: [307200]tryte;` places a global at a fixed address without allocating it (memory-mapped devices).
+  - `@at(-6387133) var fb: [307200]tryte;` places a global at a fixed address without allocating it (memory-mapped devices).
 
 ## 6. Expressions
 
@@ -324,7 +324,7 @@ fn find(a: *int, n: int, key: int) -> int {
 **Pixels (27 levels per channel):**
 
 ```
-const FB: *tryte = -1604164 as *tryte;
+const FB: *tryte = -6387133 as *tryte;
 
 fn rgb(r: int, g: int, b: int) -> tryte {       // each −13..13
     return (r * 729 + g * 27 + b) as tryte;

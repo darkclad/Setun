@@ -2,7 +2,9 @@
 //
 // One process may have it open (EBUSY otherwise): the display server.
 //   ioctl FBIOGET_VSCREENINFO  { xres, yres, pitch, mode }  (one word each)
-//   ioctl FBIOPUT_VSCREENINFO  set `mode`: -1 text, 0 = 640x480, 1 = 800x600
+//   ioctl FBIOPUT_VSCREENINFO  set `mode`: -1 text, 0 = 640x480, 1 = 800x600,
+//                              2 = 1024x768, 3 = 1280x1024, 4 = 1600x1200,
+//                              5 = 1920x1080, 6 = 1920x1200 (EINVAL otherwise)
 //   ioctl FBIO_CURSOR          { x, y, enable }: the hardware mouse cursor
 //   read/write                 pixels at the file position (tryte = pixel)
 //   mmap                       the pixels, shared (see sys_mmap)
@@ -17,8 +19,9 @@ import "tty.tri";
 const FBIOGET_VSCREENINFO: int = 17920;
 const FBIOPUT_VSCREENINFO: int = 17921;
 const FBIO_CURSOR: int = 17928;
-const FB_FIRST_FRAME: int = -81;      // FB_BASE is the first tryte of frame -81
-const FB_MAX_FRAMES: int = 25;        // 800 x 600 trytes fit in 25 frames
+const FB_FIRST_FRAME: int = -324;     // FB_BASE is the first tryte of frame -324
+const FB_MAX_FRAMES: int = 118;       // 1920 x 1200 trytes fit in 118 frames
+const FB_MAX_MODE: int = 6;
 
 struct FbInfo {
     xres: int;
@@ -80,7 +83,7 @@ fn fb_dev_ioctl(cmd: int, arg: int) -> int {
         }
         case FBIOPUT_VSCREENINFO: {
             var j: *FbInfo = arg as *FbInfo;
-            if (j.mode < -1 || j.mode > 1) { return -EINVAL; }
+            if (j.mode < -1 || j.mode > FB_MAX_MODE) { return -EINVAL; }
             if (j.mode != fb_mode()) { fb_set_mode(j.mode); }
             return 0;
         }

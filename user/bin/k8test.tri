@@ -22,7 +22,7 @@ fn framebuffer() {
     ok("EBUSY: a second open of /dev/fb0", fails(open("/dev/fb0", O_RDWR, 0), EBUSY));
     var info: fb_info;
     ok("text mode to start with", ioctl(fd, FBIOGET_VSCREENINFO, &info as int) == 0 && info.mode == -1 && info.xres == 80);
-    info.mode = 5;
+    info.mode = 9;
     ok("EINVAL: an unknown mode", fails(ioctl(fd, FBIOPUT_VSCREENINFO, &info as int), EINVAL));
     info.mode = 0;
     ioctl(fd, FBIOPUT_VSCREENINFO, &info as int);
@@ -53,6 +53,23 @@ fn framebuffer() {
     ok("the mapping is shared after fork (no copy on write)", px[20] == -777);
     ok("EINVAL: munmap of another address", fails(munmap(addr + 3, size), EINVAL));
     ok("munmap", munmap(addr, size) == 0);
+    // the largest mode: all of it can be mapped, and no more
+    info.mode = 7;
+    ok("EINVAL: mode 7", fails(ioctl(fd, FBIOPUT_VSCREENINFO, &info as int), EINVAL));
+    info.mode = 6;
+    ioctl(fd, FBIOPUT_VSCREENINFO, &info as int);
+    ioctl(fd, FBIOGET_VSCREENINFO, &info as int);
+    ok("1920x1200", info.mode == 6 && info.xres == 1920 && info.yres == 1200 && info.pitch == 1920);
+    var big: int = 1920 * 1200;
+    ok("EINVAL: more than 1920x1200", mmap(0, big + 1, PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED && errno == EINVAL);
+    var addr2: int = mmap(0, big, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0);
+    ok("mmap 1920x1200", addr2 != MAP_FAILED);
+    var px2: *tryte = addr2 as *tryte;
+    px2[big - 1] = 4321;
+    lseek(fd, big - 1, SEEK_SET);
+    read(fd, &back[0], 1);
+    ok("the last pixel of 1920x1200 is read back", back[0] == 4321);
+    ok("munmap 1920x1200", munmap(addr2, big) == 0);
     close(fd);
     fd = open("/dev/fb0", O_RDWR, 0);
     ioctl(fd, FBIOGET_VSCREENINFO, &info as int);

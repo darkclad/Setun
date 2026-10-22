@@ -43,7 +43,7 @@ fn sysctl() {
     assert_eq!(inp(&mut m, block::SYSCTL, 1), 27);
     out(&mut m, block::SYSCTL, 3, 'x' as i64);
     assert_eq!(m.dev.debug_log, vec!['x' as i64]);
-    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.7 with the FPU trit");
+    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.8 with the FPU trit");
 }
 
 #[test]
@@ -272,9 +272,20 @@ fn display_registers_and_vsync() {
         (inp(&mut m, block::DISPLAY, 2), inp(&mut m, block::DISPLAY, 3), inp(&mut m, block::DISPLAY, 4)),
         (80, 30, 240)
     );
-    assert_eq!(inp(&mut m, block::DISPLAY, 1), -1_604_164);
+    assert_eq!(inp(&mut m, block::DISPLAY, 1), -6_387_133);
     out(&mut m, block::DISPLAY, 0, 1);
     assert_eq!((inp(&mut m, block::DISPLAY, 2), inp(&mut m, block::DISPLAY, 3)), (800, 600));
+    for (mode, w, h) in [(0, 640, 480), (1, 800, 600), (2, 1024, 768), (3, 1280, 1024), (4, 1600, 1200), (5, 1920, 1080), (6, 1920, 1200)] {
+        out(&mut m, block::DISPLAY, 0, mode);
+        assert_eq!(inp(&mut m, block::DISPLAY, 0), mode);
+        assert_eq!(
+            (inp(&mut m, block::DISPLAY, 2), inp(&mut m, block::DISPLAY, 3), inp(&mut m, block::DISPLAY, 4)),
+            (w, h, w),
+            "mode {mode}"
+        );
+        assert_eq!(m.dev.display.pixel_size(), (w as usize, h as usize));
+    }
+    out(&mut m, block::DISPLAY, 0, 1);
     out(&mut m, block::DISPLAY, 6, 1);
     out(&mut m, block::TPIC, 3, irq::DISPLAY as i64);
     m.dev.advance_us(devices::FRAME_US);
@@ -299,6 +310,28 @@ fn graphics_pixels_are_rgb_digits() {
     let row = &buf[640 * 2..640 * 2 + 6];
     assert_eq!(row, &[0xFFFFFF, 0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0x808080]);
     assert_eq!(buf[0], 0x808080, "zeroed framebuffer is mid-grey");
+}
+
+#[test]
+fn the_large_modes_fit_the_framebuffer() {
+    let mut m = machine();
+    let base = Display::fb_base();
+    let white = Tryte::from_b27("DDD").unwrap();
+    for (mode, w, h) in [(2, 1024usize, 768usize), (3, 1280, 1024), (4, 1600, 1200), (5, 1920, 1080), (6, 1920, 1200)] {
+        out(&mut m, block::DISPLAY, 0, mode);
+        // the first and the last pixel of the mode are framebuffer trytes
+        let last = base + (w * h) as i64 - 1;
+        m.mem.write_tryte(base, white).unwrap();
+        m.mem.write_tryte(last, white).unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(m.dev.display.render(&m.mem, &mut buf), (w, h), "mode {mode}");
+        assert_eq!((buf[0], buf[w * h - 1], buf[w * h - 2]), (0xFFFFFF, 0xFFFFFF, 0x808080), "mode {mode}");
+        m.mem.write_tryte(last, Tryte::ZERO).unwrap();
+    }
+    // the region is 3^14 trytes: its last one is the last of frame −82
+    let end = base + 3i64.pow(14) - 1;
+    assert!(m.mem.write_tryte(end, white).is_ok());
+    assert!(m.mem.write_tryte(end + 1, white).is_err());
 }
 
 #[test]

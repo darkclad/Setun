@@ -6,14 +6,14 @@ size is a power of 3: 9-trit trytes, 27-trit words, a 3^27 address space,
 colours. Then come a compiler, a kernel and a window system, all written for
 the machine itself.
 
-ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md), v0.7: v0.4 (accepted) plus floating point (§14), binary operations (§3.3.1), the ternary idioms and the vector unit (§3.3, §3.4.1, §15), all implemented.
+ISA: [`SETUN26_ISA.md`](SETUN26_ISA.md), v0.8: v0.4 (accepted) plus floating point (§14), binary operations (§3.3.1), the ternary idioms and the vector unit (§3.3, §3.4.1, §15), and the VESA display sizes up to 1920×1200 (§8.3), all implemented.
 
 Beyond this machine: [`TERNARY_WORLD.md`](TERNARY_WORLD.md) lists what a whole ternary-native world needs, layer by layer, with the decisions taken and a phased plan.
 
 ## Milestones
 
 1. **`ternary` crate** ✅: `Tern<N>`, 9-trit `Tryte`, 27-trit `Word`, trit fields, base-27 notation; the `0t`/`0z`/`0x` literal notation ([`NOTATION.md`](NOTATION.md))
-2. **ISA spec** ✅ v0.4; v0.5 floating point, v0.6 binary operations, v0.7 ternary idioms and vectors
+2. **ISA spec** ✅ v0.4; v0.5 floating point, v0.6 binary operations, v0.7 ternary idioms and vectors, v0.8 VESA display sizes to 1920×1200
 3. **Emulator core** (`setun-core`, Rust) ✅
    - CPU: decode, ALU, branches, traps, rings, `MODE`/control registers
    - MMU: 2-level 9|9|9 walk, faults, instruction fetch across pages

@@ -1,6 +1,8 @@
 //! Display controller and renderer (ISA §8.2, §8.3).
 //!
-//! Registers: 0 `MODE` (−1 text 80×30, 0 = 640×480, +1 = 800×600),
+//! Registers: 0 `MODE` (−1 text 80×30; the VESA sizes 0 = 640×480,
+//! +1 = 800×600, +2 = 1024×768, +3 = 1280×1024, +4 = 1600×1200,
+//! +5 = 1920×1080, +6 = 1920×1200; other values leave the mode as it is),
 //! 1 `FB_BASE`, 2 `WIDTH`, 3 `HEIGHT`, 4 `PITCH`, 5 `FRAME`, 6 `CTRL`,
 //! 7 `CURSOR`, 8 `HWC_X`, 9 `HWC_Y`, 10 `HWC_ON`.
 //!
@@ -16,6 +18,9 @@ pub const FRAME_US: i64 = 16_667;
 
 /// Text-mode blink half-period in host milliseconds.
 pub const BLINK_MS: u64 = 500;
+
+/// The largest `MODE`: 1920×1200.
+pub const MAX_MODE: i64 = 6;
 
 pub const TEXT_COLS: usize = 80;
 pub const TEXT_ROWS: usize = 30;
@@ -58,17 +63,29 @@ impl Display {
     pub fn geometry(&self) -> (i64, i64, i64) {
         match self.mode {
             -1 => (TEXT_COLS as i64, TEXT_ROWS as i64, 3 * TEXT_COLS as i64),
-            1 => (800, 600, 800),
-            _ => (640, 480, 640),
+            m => {
+                let (w, h) = Self::mode_size(m);
+                (w as i64, h as i64, w as i64)
+            }
+        }
+    }
+
+    /// The pixels of graphics mode `m` (0..=6); text mode renders at 640×480.
+    pub fn mode_size(m: i64) -> (usize, usize) {
+        match m {
+            1 => (800, 600),
+            2 => (1024, 768),
+            3 => (1280, 1024),
+            4 => (1600, 1200),
+            5 => (1920, 1080),
+            6 => (1920, 1200),
+            _ => (640, 480),
         }
     }
 
     /// Output size in pixels.
     pub fn pixel_size(&self) -> (usize, usize) {
-        match self.mode {
-            1 => (800, 600),
-            _ => (640, 480),
-        }
+        Self::mode_size(self.mode)
     }
 
     /// Advance to `now_us`; true on a vsync with the IRQ enabled.
@@ -108,7 +125,7 @@ impl Display {
 
     pub fn write(&mut self, r: i64, v: i64) {
         match r {
-            0 => self.mode = v.signum(),
+            0 if (-1..=MAX_MODE).contains(&v) => self.mode = v,
             6 => self.irq_on = v == 1,
             7 => self.cursor = v,
             8 => self.hwc.0 = v,

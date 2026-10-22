@@ -821,7 +821,7 @@ A busybox-style multi-call program, stored once with hard links, provides `rmdir
 | `/dev/ptmx` | 5,2 | Each open makes a pseudo-terminal pair; the slave appears as `/dev/pts/N`. |
 
 - **`/dev/fb0` details:**
-  - `FBIOGET_VSCREENINFO` and `FBIOPUT_VSCREENINFO` (`{xres, yres, pitch, mode}`; mode −1 text, 0 = 640×480, 1 = 800×600);
+  - `FBIOGET_VSCREENINFO` and `FBIOPUT_VSCREENINFO` (`{xres, yres, pitch, mode}`; mode −1 text, 0 = 640×480, 1 = 800×600, 2 = 1024×768, 3 = 1280×1024, 4 = 1600×1200, 5 = 1920×1080, 6 = 1920×1200);
   - `FBIO_CURSOR` drives the hardware cursor;
   - `read`, `write` and `lseek` work over the pixels;
   - `mmap` (`MAP_SHARED`, offset 0) maps its device frames at a fixed user address (page −3^15). The PTE's SW trit is −1 there, so the pages are never copy-on-write or reference-counted;

@@ -672,6 +672,43 @@ fn k8_window_system_refusals() {
 }
 
 #[test]
+fn trwm_runs_at_every_screen_size() {
+    let mut s = Session::boot();
+    // sizes the display does not have are refused before the screen changes
+    for bad in ["trwm -g 2000x100", "trwm -g", "trwm -g 640x481", "trwm -g 1200x800"] {
+        s.console(bad);
+        s.expect("usage: trwm [-g", 60);
+        s.run(5);
+        assert_eq!(s.m.dev.display.mode(), -1, "{bad}");
+    }
+    for (g, mode, w, h) in [
+        ("800x600", 1, 800usize, 600usize),
+        ("1024x768", 2, 1024, 768),
+        ("1280x1024", 3, 1280, 1024),
+        ("1600x1200", 4, 1600, 1200),
+        ("1920x1080", 5, 1920, 1080),
+        ("1920x1200", 6, 1920, 1200),
+    ] {
+        s.console(&format!("trwm -g {g} clock &"));
+        s.expect(&format!("trwm: started {w}x{h}"), 200);
+        s.expect("'Clock'", 200);
+        s.run(30);
+        assert_eq!(s.m.dev.display.mode(), mode, "{g}");
+        let mut buf = Vec::new();
+        assert_eq!(s.m.dev.display.render(&s.m.mem, &mut buf), (w, h), "{g}");
+        // trwm drew the whole screen: the panel across the top, the desktop to the far corner
+        let fb = s.m.mem.framebuffer();
+        assert_eq!(fb[w - 1], fb[1], "{g}: the panel reaches the right edge");
+        assert_eq!(fb[(h - 1) * w + w - 1], fb[(h - 1) * w], "{g}: the desktop reaches the bottom right");
+        assert_ne!(fb[1], fb[(h - 1) * w], "{g}: panel and desktop differ");
+        s.click(340, 8); // [Exit]
+        s.expect("trwm: exit", 60);
+        s.run(20);
+        assert_eq!(s.m.dev.display.mode(), -1, "{g}: the console is back");
+    }
+}
+
+#[test]
 fn k8_kernel_interfaces() {
     let mut s = Session::boot();
     s.console("k8test");

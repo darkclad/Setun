@@ -509,7 +509,7 @@ def execute(st):
         raise Fault(-1)
     st.pc = nxt
 
-CPUID = 7 + 3 ** 26
+CPUID = 8 + 3 ** 26
 
 def step(pre):
     """The state after one instruction (or its trap), and the fault if any.

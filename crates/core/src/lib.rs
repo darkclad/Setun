@@ -1,4 +1,4 @@
-//! Setun-11̅ emulator core, implementing `docs/SETUN26_ISA.md` v0.7.
+//! Setun-11̅ emulator core, implementing `docs/SETUN26_ISA.md` v0.8.
 //!
 //! * [`memory`]: physical memory map (RAM, BIOS ROM, framebuffer).
 //! * [`cpu`]: registers, decode/execute, traps and the 9|9|9 MMU.

@@ -123,7 +123,14 @@ fn rom(name: &'static str, path: &Path, cap: u64) -> Outcome {
     for c in serial.chars() {
         r.add(c as i64);
     }
-    for &t in m.mem.framebuffer() {
+    // the 27 frames the framebuffer had before ISA v0.8, then only what is
+    // drawn past them, so a program's outcome does not depend on the size
+    let fb = m.mem.framebuffer();
+    let old = 27 * setun_core::PAGE as usize;
+    for &t in &fb[..old] {
+        r.add(t as i64);
+    }
+    for &t in fb[old..].iter().filter(|&&t| t != 0) {
         r.add(t as i64);
     }
     let mut out = Outcome { result: r.0, jit: m.cpu.jit_stats(), name, steps, instructions: instructions(&m), secs, hash: 0 };

@@ -2,7 +2,7 @@
 
 Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
-**Status: v0.7 (2026-10-07): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14), binary operations (§3.3.1) and the ternary idioms and vector unit (§3.3, §3.4.1, §15), all implemented.** §13 records the decisions. [`CPU.md`](CPU.md) is the programmer's manual built on this specification.
+**Status: v0.8 (2026-10-22): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14), binary operations (§3.3.1), the ternary idioms and vector unit (§3.3, §3.4.1, §15), and the VESA display sizes up to 1920×1200 (§8.3), all implemented.** §13 records the decisions. [`CPU.md`](CPU.md) is the programmer's manual built on this specification.
 
 Setun-11̅ is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
@@ -37,6 +37,7 @@ Version history:
 - v0.5: renamed Setun-11̅ (formerly Setun-386, with a separate "Setun-387" FPU); floating-point instructions (§14), the overlined digit notation (§1.1), and the boot signature `0zB007AB13`.
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
 - v0.7: `SBC` adds the carry (`ra − b + C`, so `SUB`/`SBC` chain; §3.3); ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), the three-way compare-and-swap `CAS3` (§3.4.1), and the vector unit (majors 9–11, `MODE.VE`, vector −13; §15).
+- v0.8: the VESA display sizes 1024×768, 1280×1024, 1600×1200, 1920×1080 and 1920×1200 (`MODE` +2 … +6); `MODE` keeps its value when written one it does not have (it took the sign before); the framebuffer grows to 243 frames = 3^14 trytes and moves to frames −324 … −82 (`FB_BASE` −6 387 133), so frames −81 … −55 are a hole now (§4, §8.3).
 
 ---
 
@@ -384,7 +385,7 @@ Memory is divided into **frames of 3^9 = 19 683 trytes**. Frame `f` is centred o
 |---|---|---|
 | `0 … N−1` | from −9 841 upward | **RAM**. The default is **N = 3^9 frames = 3^18 = 9^9 trytes** (387 420 489 trytes ≈ 691 MB), a "page of pages". Configurable from 3^15 up to host RAM; the browser (WASM) build is capped at 3^18. |
 | −3 … −1 | −68 890 … −9 842 | **BIOS ROM**, 3^10 trytes (§9.2) |
-| −81 … −55 | −1 604 164 … −1 072 724 | **framebuffer**, 27 frames = 3^12 trytes (§8.3) |
+| −324 … −82 | −6 387 133 … −1 604 165 | **framebuffer**, 243 frames = 3^14 trytes (§8.3) |
 | other negative frames | – | reserved for devices; accessing them raises a bus error (vector −10) |
 
 Rule of thumb: **non-negative frames are RAM, negative frames are devices.**
@@ -624,7 +625,7 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `MODE`: −1 text 80×30, 0 = 640×480, +1 = 800×600 |
+| 0 | `MODE`: −1 text 80×30, 0 = 640×480, +1 = 800×600, +2 = 1024×768, +3 = 1280×1024, +4 = 1600×1200, +5 = 1920×1080, +6 = 1920×1200; writing any other value leaves the mode as it is |
 | 1 | `FB_BASE` (read-only physical address of the first tryte) |
 | 2 | `WIDTH` |
 | 3 | `HEIGHT` |
@@ -691,7 +692,7 @@ Control values are ternary wherever that is natural.
   - `DD0` yellow-ish
   - Negating a pixel inverts its colour.
 - Pixel `(x, y)` is the tryte at `FB_BASE + y·PITCH + x`.
-- 800×600 needs 480 000 trytes, which fits the 3^12-tryte region.
+- The largest mode, 1920×1200, needs 2 304 000 trytes, which fit the 3^14-tryte region (4 782 969).
 - **Text mode: 80×30 cells, one word per cell** (character, attribute, reserved), rendered with an 8×16 font to 640×480. Cell `k` occupies trytes `FB_BASE + 3k` (character), `FB_BASE + 3k + 1` (attribute) and `FB_BASE + 3k + 2` (reserved). The v1 emulator's font is 8×8 with doubled rows. It covers Latin, Greek, box drawing, blocks and the Cyrillic block U+0400..U+045F (Russian, Ukrainian, Belarusian, Serbian, Macedonian; drawn for the machine in the same style, see `crates/core/src/devices/font.rs`). Other characters show as a hollow box.
   - The **attribute tryte** is foreground RGB in trits 1–3 and background RGB in trits 4–6, each trit 0%, 50% or 100%, so 27 colours each. Trits 7–9 are style: underline, blink, bold.
 
