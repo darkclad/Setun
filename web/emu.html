@@ -141,7 +141,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       <div class="controls">
         <label class="label" for="size" style="align-self:center">Screen</label>
         <select id="size">
-          <option value="fit" selected>Fit</option>
+          <option value="fit" selected>Fit (640×480)</option>
           <option value="640x480">640×480</option>
           <option value="800x600">800×600</option>
           <option value="1024x768">1024×768</option>
@@ -173,7 +173,7 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
           <option value="relay">Internet</option>
         </select>
       </div>
-      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> sets the picture's size on the page, and <b>Window system</b> then runs at that size (<kbd>trwm -g 1024x768</kbd>); <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. <b>Network</b> → Internet power-cycles the machine with its network card linked, through the server, to the internet (not to the server's own network): then try <kbd>host example.com</kbd>, <kbd>wget -O - https://example.com</kbd> or <kbd>ssh</kbd> to a machine you have an account on.</p>
+      <p class="legend" data-trinux>Log in as <kbd>user</kbd> (password <kbd>user</kbd>) or <kbd>root</kbd> (password <kbd>root</kbd>). Click the screen to type, or use the serial console. Try <kbd>ls /bin</kbd>, <kbd>ps</kbd>, <kbd>uname -a</kbd>, <kbd>calc</kbd>, the crypto self-test <kbd>cryptotest</kbd>, <kbd>ssh-keygen -f key</kbd> or <kbd>x509 -l</kbd> (the TLS roots), or <b>Window system</b> for <kbd>trwm term clock colors paint</kbd>: drag windows by their title bars, type in the terminal, close with the red box, leave with Exit. Power-cycle keeps the disk; Fresh disk restores it. <b>Screen</b> is the machine's monitor: changing it power-cycles into a console that fills it (<kbd>stty size</kbd> says how many characters), and <b>Window system</b> runs at that size too; <b>Full screen</b> fills the display (hold <kbd>Esc</kbd> to leave). <kbd>Alt</kbd>+<kbd>Shift</kbd> switches the keyboard between English and Russian. <b>Network</b> → Internet power-cycles the machine with its network card linked, through the server, to the internet (not to the server's own network): then try <kbd>host example.com</kbd>, <kbd>wget -O - https://example.com</kbd> or <kbd>ssh</kbd> to a machine you have an account on.</p>
       <p class="legend" data-demo hidden>Type on the screen or in the serial console. <kbd>Tab</kbd> shows the 3^9-colour sweep; any key returns.</p>
     </aside>
   </div>
@@ -342,6 +342,10 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     try { const saved = localStorage.getItem("setun-net"); if (saved === "relay") $("net").value = "relay"; } catch (e) {}
     if (typeof wasm.setun_net_link === "function" && $("net").value === "relay") await setNetwork(true);
 
+    // the monitor the machine boots with: the size chosen last time
+    try { const saved = localStorage.getItem("setun-size"); if (saved && [...$("size").options].some((o) => o.value === saved)) $("size").value = saved; } catch (e) {}
+    const SIZE_LIST = ["640x480", "800x600", "1024x768", "1280x1024", "1600x1200", "1920x1080", "1920x1200"];
+    if (typeof wasm.setun_screen === "function") wasm.setun_screen(Math.max(0, SIZE_LIST.indexOf($("size").value)));
     seed();
     wasm.setun_boot(Number($("machine").value), 2187, Date.now() / 1000);
     showKind();
@@ -419,14 +423,15 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
       $("line").value = "";
     });
     function sendLine(text) { for (const ch of text + "\n") wasm.setun_serial_char(ch.codePointAt(0)); }
-    // the window system at the size the page shows (Fit: the default 640x480)
-    $("btn-wm").addEventListener("click", () => {
-      const v = $("size").value, g = v === "fit" ? "" : "-g " + v + " ";
-      sendLine("trwm " + g + "term clock colors paint &");
-      canvas.focus();
-    });
+    // the window system fills the monitor, as the console does
+    $("btn-wm").addEventListener("click", () => { sendLine("trwm term clock colors paint &"); canvas.focus(); });
 
-    // The screen's size on the page (remembered in this browser), and full screen.
+    // The screen's size (remembered in this browser): the machine's monitor,
+    // which Trinux's console and window system fill from the next boot, and
+    // the picture's size on the page. Fit: a 640x480 monitor, the picture as
+    // large as the page allows.
+    const SIZES = ["640x480", "800x600", "1024x768", "1280x1024", "1600x1200", "1920x1080", "1920x1200"];
+    function screenMode() { const i = SIZES.indexOf($("size").value); return i < 0 ? 0 : i; }
     function applySize() {
       const v = $("size").value, deck = $("deck");
       if (v === "fit") { deck.classList.remove("fixed"); return; }
@@ -440,6 +445,10 @@ input#line { flex: 1; min-width: 0; font: 13px var(--font-display); color: var(-
     $("size").addEventListener("change", () => {
       applySize();
       try { localStorage.setItem("setun-size", $("size").value); } catch (e) {}
+      if (typeof wasm.setun_screen === "function") {
+        wasm.setun_screen(screenMode());
+        seed(); wasm.setun_power_cycle(Date.now() / 1000); serialEl.textContent = "";
+      }
       canvas.focus();
     });
     $("btn-full").addEventListener("click", async () => {

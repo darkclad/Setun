@@ -175,7 +175,7 @@ All of these fit `SYS`'s ±9841 range.
 
 ## 7. Terminals
 
-- **tty layer:** the console (keyboard plus the 80×30 text screen) is `/dev/tty1`, and the serial port is `/dev/ttyS0`.
+- **tty layer:** the console (keyboard plus the text screen, which fills the monitor: 80×30 on a 640×480 one) is `/dev/tty1`, and the serial port is `/dev/ttyS0`.
 - **Line discipline:** canonical mode (line editing with erase, kill and EOF characters) and raw mode. Signals from `^C` (SIGINT), `^\` (SIGQUIT) and `^Z` (SIGTSTP).
 - **termios:** `tcgetattr`/`tcsetattr` through `ioctl`, supporting `ICANON`, `ECHO`, `ISIG`, `VMIN`/`VTIME`, and the window size `TIOCGWINSZ`.
 - **Job control:** foreground process groups, `tcsetpgrp`, and `SIGTTIN`/`SIGTTOU`.
@@ -443,7 +443,7 @@ Every terminal node is the same tty in K4; separate virtual consoles come with t
   - the console and `trwm` each keep their own layout, and `trwm` shows its layout (`EN`/`RU`) at the right end of the panel. The timer tick and every read also poll both devices, so type-ahead queued before the IRQs were enabled is not lost.
 - **Canonical mode:** erase (`^H`, DEL), kill (`^U`), EOF (`^D`), `ICRNL`, echo (control characters as `^X`). A read returns at most one line.
 - **Raw mode:** clear `ICANON` and characters pass straight through.
-- **ioctl:** `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF` and `TIOCGWINSZ` (80×30, 640×480). `termios` has one word per flag field, then `c_line` and `c_cc[19]` as trytes; Linux bit values.
+- **ioctl:** `TCGETS`, `TCSETS`/`TCSETSW`/`TCSETSF` and `TIOCGWINSZ` (the console's cells and pixels: 80×30 and 640×480 on a 640×480 monitor). `termios` has one word per flag field, then `c_line` and `c_cc[19]` as trytes; Linux bit values.
 - **Output:** the serial port and the text screen.
 
 **Pipes** ([`kernel/fs/pipe.tri`](../kernel/fs/pipe.tri)): 27 pipes, each a 3^9-tryte ring buffer in one frame. Reads block while the pipe is empty and a writer is left; after that they return EOF. Writes block while it is full; writing with no reader returns `EPIPE` (`SIGPIPE` comes in K5).
@@ -823,6 +823,7 @@ A busybox-style multi-call program, stored once with hard links, provides `rmdir
 - **`/dev/fb0` details:**
   - `FBIOGET_VSCREENINFO` and `FBIOPUT_VSCREENINFO` (`{xres, yres, pitch, mode}`; mode −1 text, 0 = 640×480, 1 = 800×600, 2 = 1024×768, 3 = 1280×1024, 4 = 1600×1200, 5 = 1920×1080, 6 = 1920×1200);
   - `FBIO_CURSOR` drives the hardware cursor;
+  - `FBIOGET_PREFERRED` (18144, Trinux's own) gives the monitor's size as a graphics mode: the display's `PREFERRED`, which the console's text mode fills from boot (`start_kernel` switches to text mode −(p + 1)); mode −1 in `FBIOPUT_VSCREENINFO` means the console's text mode, whatever its size;
   - `read`, `write` and `lseek` work over the pixels;
   - `mmap` (`MAP_SHARED`, offset 0) maps its device frames at a fixed user address (page −3^15). The PTE's SW trit is −1 there, so the pages are never copy-on-write or reference-counted;
   - while a graphics mode is on, console output still reaches the serial port but not the screen;

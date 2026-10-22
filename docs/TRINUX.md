@@ -532,6 +532,7 @@ quits.
 | `uname` | `uname [-asnrvm]` | |
 | `date` | `date [-u] [-d date \| -r file] [+format]` | now, a date (as `touch -d`) or a file's modification time; UTC (`-u` is accepted); default format `%a %b %e %H:%M:%S UTC %Y`; `strftime`'s conversions (§16.2) and `%N`, the nanoseconds |
 | `clear` | `clear` | `ESC[H ESC[2J` |
+| `stty` | `stty size` | the terminal's rows and columns, from `TIOCGWINSZ` on standard input; nothing else of `stty` |
 | `reboot`, `poweroff`, `halt` | | `/sbin`; §2.5 |
 | `ntpdate` | `ntpdate [-q] [-p port] server` | §4.6 |
 
@@ -539,7 +540,7 @@ quits.
 
 | Command | Synopsis | Description |
 |---|---|---|
-| `trwm` | `trwm [-g WxH] [client ...]` | the display server and window manager (§12); `-g` picks the screen, 640x480 (default), 800x600, 1024x768, 1280x1024, 1600x1200, 1920x1080 or 1920x1200; a client name without `/` is taken from `/bin` |
+| `trwm` | `trwm [-g WxH] [client ...]` | the display server and window manager (§12); `-g` picks the screen, 640x480, 800x600, 1024x768, 1280x1024, 1600x1200, 1920x1080 or 1920x1200 (without it, the monitor's size); a client name without `/` is taken from `/bin` |
 | `term` | | a terminal window running `/bin/sh` |
 | `clock` | | the time (UTC), once a second |
 | `colors` | | all 3^9 pixel colours, once each |
@@ -996,7 +997,7 @@ tlibc builds a mutex on these (§16.1).
 
 ### 8.1 The console
 
-The console is the keyboard and the 80×30 text screen, together with the
+The console is the keyboard and the text screen, together with the
 serial port. Output goes to both; input comes from both. The screen
 understands a VT100 subset: cursor position (`ESC[r;cH`), `ESC[J` and
 `ESC[2J`, `ESC[K`, cursor moves (`ESC[nA` to `D`) and colours (`ESC[…m`
@@ -1046,12 +1047,17 @@ ECHOE|ECHOK`; `VINTR`=3, `VQUIT`=28, `VERASE`=127, `VKILL`=21, `VEOF`=4,
 | `TCGETS` | 21505 | read termios |
 | `TCSETS`, `TCSETSW`, `TCSETSF` | 21506–21508 | set termios; `TCSETSF` also flushes input |
 | `TIOCGPGRP`, `TIOCSPGRP` | 21519, 21520 | the foreground group; it must exist in the caller's session |
-| `TIOCGWINSZ`, `TIOCSWINSZ` | 21523, 21524 | the window size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, one word each): the console is 80 × 30 cells, 640 × 480 pixels; a pty has what `TIOCSWINSZ` set (pixels 0 until then); a new size sends `SIGWINCH` to the foreground group; `EINVAL` for no rows or columns or a negative pixel size |
+| `TIOCGWINSZ`, `TIOCSWINSZ` | 21523, 21524 | the window size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, one word each): the console is as many 8 × 16 cells as fill the monitor (80 × 30, 640 × 480 pixels on a 640 × 480 one); a pty has what `TIOCSWINSZ` set (pixels 0 until then); a new size sends `SIGWINCH` to the foreground group; `EINVAL` for no rows or columns or a negative pixel size |
 | `TIOCGPTN` | 2147767344 | pty master: the pty number |
 | `TIOCSPTLCK` | 1074025521 | pty master: accepted |
 
 An unknown `ioctl` gives `ENOTTY`, before its argument is checked. The
-console reports 80×30; a new pty starts at 80×24.
+console reports its own size (`stty size`); a new pty starts at 80×24.
+
+The text screen fills the monitor: at boot the kernel reads the display's
+`PREFERRED` (the monitor's size, which `setun --screen WxH` or the page's
+Screen sets) and takes the text mode of that size, 80×30 on 640×480 up to
+240×75 on 1920×1200; `trwm` without `-g` opens at that size too.
 
 ### 8.3 Pseudo-terminals
 
@@ -1298,6 +1304,7 @@ so clients never redraw on exposure.
 |---|---|---|
 | `FBIOGET_VSCREENINFO`, `FBIOPUT_VSCREENINFO` | 17920, 17921 | `{xres, yres, pitch, mode}`; mode −1 text, 0 640×480, 1 800×600, 2 1024×768, 3 1280×1024, 4 1600×1200, 5 1920×1080, 6 1920×1200 (EINVAL otherwise) |
 | `FBIO_CURSOR` | 17928 | the hardware cursor |
+| `FBIOGET_PREFERRED` | 18144 | the monitor's size as a graphics mode (an `int`), the one the console's text mode fills |
 
 `read`, `write` and `lseek` work over the pixels, and `mmap` maps them
 (§7.5). A pixel is one tryte: blue in trits 1–3, green in 4–6, red in 7–9,
@@ -1316,7 +1323,7 @@ oldest when full.
 ### 12.2 trwm
 
 ```text
-trwm [-g WxH] [client ...]  e.g. trwm -g 1024x768 term clock colors paint
+trwm [-g WxH] [client ...]  e.g. trwm term clock colors paint (the monitor's size)
 ```
 
 - The panel at the top has launchers (Terminal, Clock, Colors, Paint),

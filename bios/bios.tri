@@ -45,7 +45,7 @@ fn print2(v: int) {                       // two digits, leading zero
 
 fn title_bar() {
     var i: int = 0;
-    while (i < COLS) {
+    while (i < con_cols) {
         var c: *tryte = cell(i);
         c[0] = ' ';
         c[1] = A_TITLE;
@@ -236,9 +236,9 @@ fn read_line() {
                 putc(8 as char); putc(' '); putc(8 as char);   // erase on a terminal
                 if (screen_col > 0) {
                     screen_col -= 1;
-                    var p: *tryte = cell(screen_row * COLS + screen_col);
+                    var p: *tryte = cell(screen_row * con_cols + screen_col);
                     p[0] = ' ';
-                    out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+                    out(DISPLAY_CURSOR, screen_row * con_cols + screen_col);
                 }
             }
             continue;

@@ -140,10 +140,10 @@ fn tty_init() {
     tty_reset(0);
     ttys[0].used = 1;
     ttys[0].pgrp = 1;
-    ttys[0].rows = ROWS;
-    ttys[0].cols = COLS;
-    ttys[0].xpixel = COLS * 8;        // text mode: 8 x 16 pixel cells, 640 x 480
-    ttys[0].ypixel = ROWS * 16;
+    ttys[0].rows = con_rows;
+    ttys[0].cols = con_cols;
+    ttys[0].xpixel = con_cols * 8;    // text mode: 8 x 16 pixel cells
+    ttys[0].ypixel = con_rows * 16;
     out(KBD_CTRL, 1);
     out(SERIAL_CTRL, 1);
     out(TPIC_UNMASK, IRQ_KEYBOARD);
@@ -168,12 +168,12 @@ fn colour_trit(c: int, bit: int) -> trit { return (c / bit % 2 != 0 ? 1 : -1) as
 
 fn screen_set_cursor(row: int, col: int) {
     if (row < 0) { row = 0; }
-    if (row > ROWS - 1) { row = ROWS - 1; }
+    if (row > con_rows - 1) { row = con_rows - 1; }
     if (col < 0) { col = 0; }
-    if (col > COLS - 1) { col = COLS - 1; }
+    if (col > con_cols - 1) { col = con_cols - 1; }
     screen_row = row;
     screen_col = col;
-    out(DISPLAY_CURSOR, row * COLS + col);
+    out(DISPLAY_CURSOR, row * con_cols + col);
 }
 
 fn screen_blank(from: int, to: int) {
@@ -196,10 +196,10 @@ fn csi(final: char) {
         case 'C': screen_set_cursor(screen_row, screen_col + n);
         case 'D': screen_set_cursor(screen_row, screen_col - n);
         case 'J': {
-            if (p0 == 2) { screen_blank(0, COLS * ROWS); }
-            else { screen_blank(screen_row * COLS + screen_col, COLS * ROWS); }
+            if (p0 == 2) { screen_blank(0, con_cols * con_rows); }
+            else { screen_blank(screen_row * con_cols + screen_col, con_cols * con_rows); }
         }
-        case 'K': screen_blank(screen_row * COLS + screen_col, (screen_row + 1) * COLS);
+        case 'K': screen_blank(screen_row * con_cols + screen_col, (screen_row + 1) * con_cols);
         case 'm': {
             var k: int = 0;
             while (k < esc_count) {
@@ -247,7 +247,7 @@ fn console_output(c: char) {
     if (c == 8) {                                   // backspace: the screen cursor steps back
         if (screen_col > 0) {
             screen_col -= 1;
-            out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+            out(DISPLAY_CURSOR, screen_row * con_cols + screen_col);
         }
         return;
     }

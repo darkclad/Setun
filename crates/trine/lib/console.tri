@@ -1,4 +1,5 @@
-// Console output: the serial port and the 80x30 text screen.
+// Console output: the serial port and the text screen (80x30 to start
+// with; screen_text_mode picks another size).
 
 import "ports.tri";
 import "rt.tri";
@@ -27,8 +28,10 @@ fn getc() -> char {
 
 // ---- text screen -------------------------------------------------------------
 
-const COLS: int = 80;
-const ROWS: int = 30;
+// The text mode in use and its cells.
+var con_mode: int = -1;
+var con_cols: int = 80;
+var con_rows: int = 30;
 
 // Attribute tryte: foreground R G B, background R G B, style (one trit each).
 fn attr(fr: trit, fg: trit, fb: trit, br: trit, bg: trit, bb: trit) -> tryte {
@@ -42,9 +45,9 @@ var screen_attr: tryte = 0t111TTT000;     // white on black
 fn cell(i: int) -> *tryte { return (FB_BASE + 3 * i) as *tryte; }
 
 fn screen_clear() {
-    out(DISPLAY_MODE, -1);
+    out(DISPLAY_MODE, con_mode);
     var i: int = 0;
-    while (i < COLS * ROWS) {
+    while (i < con_cols * con_rows) {
         var c: *tryte = cell(i);
         c[0] = ' ';
         c[1] = screen_attr;
@@ -55,16 +58,26 @@ fn screen_clear() {
     out(DISPLAY_CURSOR, 0);
 }
 
+// Text mode m (-1 .. -7): the screen of graphics mode -m-1 in 8x16 cells.
+// The display reports the cells; the screen starts empty.
+fn screen_text_mode(m: int) {
+    con_mode = m;
+    out(DISPLAY_MODE, m);
+    con_cols = in(DISPLAY_WIDTH);
+    con_rows = in(DISPLAY_HEIGHT);
+    screen_clear();
+}
+
 fn screen_scroll() {
     var i: int = 0;
-    while (i < COLS * (ROWS - 1)) {
+    while (i < con_cols * (con_rows - 1)) {
         var d: *tryte = cell(i);
-        var s: *tryte = cell(i + COLS);
+        var s: *tryte = cell(i + con_cols);
         d[0] = s[0];
         d[1] = s[1];
         i += 1;
     }
-    while (i < COLS * ROWS) {
+    while (i < con_cols * con_rows) {
         var c: *tryte = cell(i);
         c[0] = ' ';
         c[1] = screen_attr;
@@ -77,14 +90,14 @@ fn screen_putc(c: char) {
         screen_col = 0;
         screen_row += 1;
     } else {
-        var p: *tryte = cell(screen_row * COLS + screen_col);
+        var p: *tryte = cell(screen_row * con_cols + screen_col);
         p[0] = c;
         p[1] = screen_attr;
         screen_col += 1;
-        if (screen_col == COLS) { screen_col = 0; screen_row += 1; }
+        if (screen_col == con_cols) { screen_col = 0; screen_row += 1; }
     }
-    if (screen_row == ROWS) { screen_scroll(); screen_row = ROWS - 1; }
-    out(DISPLAY_CURSOR, screen_row * COLS + screen_col);
+    if (screen_row == con_rows) { screen_scroll(); screen_row = con_rows - 1; }
+    out(DISPLAY_CURSOR, screen_row * con_cols + screen_col);
 }
 
 fn screen_puts(s: *char) {

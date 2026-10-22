@@ -757,7 +757,7 @@ fn display_tolerates_odd_values() {
     let mut m = machine();
     // a mode that does not exist leaves the mode as it is
     out(&mut m, block::DISPLAY, 0, 1);
-    for bad in [7, 8, -2, -99, 9841] {
+    for bad in [7, 8, -8, -99, 9841] {
         out(&mut m, block::DISPLAY, 0, bad);
         assert_eq!(inp(&mut m, block::DISPLAY, 0), 1, "MODE {bad}");
     }

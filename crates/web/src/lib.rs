@@ -42,6 +42,9 @@ thread_local! {
     /// The network card has a link (the page has a relay): Trinux looks at
     /// boot, so this applies to the next boot or power-cycle.
     static NET_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The monitor's size as a graphics mode (the display's PREFERRED), for
+    /// the next boot or power-cycle: Trinux's console and trwm fill it.
+    static SCREEN: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     /// Frames the card sent, waiting for the page; the one handed out last.
     static NET_TX: RefCell<std::collections::VecDeque<Vec<u8>>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static NET_OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -110,6 +113,7 @@ fn new_machine_unseeded(kind: u32, ram: i64, unix: i64, disk: Option<Box<dyn set
         return setun_demo::machine(ram, unix);
     }
     let mut m = Machine::new(ram, unix);
+    m.dev.display.set_preferred(SCREEN.with(|s| s.get()));
     m.cpu.set_jit_enabled(JIT_ON.with(|j| j.get()));
     m.dev.nic.link = NET_LINK.with(|l| l.get());
     NET_TX.with(|q| q.borrow_mut().clear());
@@ -173,6 +177,13 @@ const _: () = assert!(PAGE == 19_683);
 // The page carries the card's Ethernet frames to a relay (setun-relay) over
 // a WebSocket: `setun_net_take` + `setun_net_ptr` for each frame the card
 // sent, `setun_net_buf` + `setun_net_receive` for each frame that came back.
+
+/// The monitor's size, as graphics mode `m` (0 = 640×480 … 6 = 1920×1200),
+/// from the next boot or power-cycle.
+#[no_mangle]
+pub extern "C" fn setun_screen(m: u32) {
+    SCREEN.with(|s| s.set((m as i64).min(setun_core::devices::MAX_MODE)));
+}
 
 /// Give the card a link (1) or not (0) from the next boot or power-cycle.
 #[no_mangle]
@@ -536,6 +547,25 @@ mod tests {
         assert!(out.contains("2 packets transmitted"), "{out}");
         assert!(net.stats.frames_from_guest > 0 && net.stats.frames_to_guest > 0);
         setun_net_link(0);
+    }
+
+    #[test]
+    fn trinux_fills_the_screen_it_is_given() {
+        setun_screen(6);
+        setun_boot(KIND_TRINUX, 729, 1_790_000_000.0);
+        login();
+        assert_eq!(with(|e| e.m.dev.display.mode()), -7, "the text mode of 1920x1200");
+        type_line("stty size\n");
+        run_until("75 240", 40);
+        setun_render(0.0);
+        assert_eq!((setun_width(), setun_height()), (1920, 1200), "the picture is the monitor's size");
+        // and back to 640x480 at the next power-cycle
+        setun_screen(0);
+        setun_power_cycle(1_790_000_100.0);
+        login();
+        assert_eq!(with(|e| e.m.dev.display.mode()), -1);
+        type_line("stty size\n");
+        run_until("30 80", 40);
     }
 
     #[test]

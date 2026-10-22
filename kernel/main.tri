@@ -60,7 +60,10 @@ fn mount_root() {
 
 fn start_kernel(disk: int, frames: int) {
     boot_disk = disk;
-    screen_clear();
+    // the console fills the monitor: the text mode of its preferred size
+    var pref: int = in(DISPLAY_PREFERRED);
+    if (pref < 0 || pref > 6) { pref = 0; }
+    screen_text_mode(-pref - 1);
     printk("Trinux version ");
     pr(TRINUX_VERSION);
     pr(" (trine) on Setun-11̅, balanced ternary\n");

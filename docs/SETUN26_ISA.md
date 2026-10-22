@@ -2,7 +2,7 @@
 
 Setun-11̅ (Setun-26): 11̅ is 26 in balanced base 27, one less than 3³.
 
-**Status: v0.8 (2026-10-22): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14), binary operations (§3.3.1), the ternary idioms and vector unit (§3.3, §3.4.1, §15), and the VESA display sizes up to 1920×1200 (§8.3), all implemented.** §13 records the decisions. [`CPU.md`](CPU.md) is the programmer's manual built on this specification.
+**Status: v0.9 (2026-10-22): v0.4 (accepted 2026-09-30) plus floating-point instructions (§14), binary operations (§3.3.1), the ternary idioms and vector unit (§3.3, §3.4.1, §15), and the VESA display sizes up to 1920×1200 with text modes at each and the monitor's size (§8.3), all implemented.** §13 records the decisions. [`CPU.md`](CPU.md) is the programmer's manual built on this specification.
 
 Setun-11̅ is a balanced-ternary machine sized like an Intel 386: rich
 enough for a kernel with processes and a windowing GUI. It is a new CPU
@@ -38,6 +38,7 @@ Version history:
 - v0.6: binary operations for data from binary systems (§3.3.1): `BAND`, `BOR`, `BXOR`, `BANDN`, `BSH`, `BEXT`, `BROT`.
 - v0.7: `SBC` adds the carry (`ra − b + C`, so `SUB`/`SBC` chain; §3.3); ternary idioms: the trit-mask merge `MRG` and the masked store `STWM` (major 8, §3.4.1), trit counting and reversal `TCP`, `TCN`, `TREV` (§3.3), the three-way compare-and-swap `CAS3` (§3.4.1), and the vector unit (majors 9–11, `MODE.VE`, vector −13; §15).
 - v0.8: the VESA display sizes 1024×768, 1280×1024, 1600×1200, 1920×1080 and 1920×1200 (`MODE` +2 … +6); `MODE` keeps its value when written one it does not have (it took the sign before); the framebuffer grows to 243 frames = 3^14 trytes and moves to frames −324 … −82 (`FB_BASE` −6 387 133), so frames −81 … −55 are a hole now (§4, §8.3).
+- v0.9: text modes at every display size (`MODE` −2 … −7: text mode −(m + 1) fills graphics mode m's screen in 8×16 cells), and `PREFERRED` (display register 11, read-only): the monitor's size as a graphics mode, which the front end sets as a monitor reports its size, so software can fill the screen (§8.2).
 
 ---
 
@@ -625,17 +626,18 @@ Control values are ternary wherever that is natural.
 
 | Offset | Register |
 |---|---|
-| 0 | `MODE`: −1 text 80×30, 0 = 640×480, +1 = 800×600, +2 = 1024×768, +3 = 1280×1024, +4 = 1600×1200, +5 = 1920×1080, +6 = 1920×1200; writing any other value leaves the mode as it is |
+| 0 | `MODE`: graphics 0 = 640×480, +1 = 800×600, +2 = 1024×768, +3 = 1280×1024, +4 = 1600×1200, +5 = 1920×1080, +6 = 1920×1200; text at the same sizes in 8×16 cells, −1 = 80×30, −2 = 100×37, −3 = 128×48, −4 = 160×64, −5 = 200×75, −6 = 240×67, −7 = 240×75 (text mode −(m + 1) fills graphics mode m's screen); −1 at reset; writing any other value leaves the mode as it is |
 | 1 | `FB_BASE` (read-only physical address of the first tryte) |
 | 2 | `WIDTH` |
 | 3 | `HEIGHT` |
-| 4 | `PITCH` (trytes per line). In text mode `WIDTH`/`HEIGHT` count cells (80×30) and `PITCH` is 240 (80 one-word cells). |
+| 4 | `PITCH` (trytes per line). In a text mode `WIDTH`/`HEIGHT` count cells (80×30 in mode −1) and `PITCH` is three trytes a cell (one word). |
 | 5 | `FRAME` (vsync counter) |
 | 6 | `CTRL`: +1 IRQ on vsync |
 | 7 | `CURSOR` (text cell index) |
 | 8 | `HWC_X` (hardware mouse cursor) |
 | 9 | `HWC_Y` |
 | 10 | `HWC_ON` |
+| 11 | `PREFERRED` (read-only): the monitor's size as a graphics mode, 0 … +6; set by the front end before the machine starts, 0 if it says nothing |
 
 **Network card (270), `TNIC`.** Ethernet II frames without the FCS, 14..1514 octets, **one octet (0..255) per tryte**. DMA uses physical tryte addresses of any alignment and bypasses the MMU. Every command completes before the next instruction. Details and rationale: [`NETWORK.md`](NETWORK.md) §1.
 

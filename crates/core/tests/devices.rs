@@ -43,7 +43,7 @@ fn sysctl() {
     assert_eq!(inp(&mut m, block::SYSCTL, 1), 27);
     out(&mut m, block::SYSCTL, 3, 'x' as i64);
     assert_eq!(m.dev.debug_log, vec!['x' as i64]);
-    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.8 with the FPU trit");
+    assert_eq!(m.cpu.cr(cr::CPUID).value(), setun_core::cpu::CPUID, "v0.9 with the FPU trit");
 }
 
 #[test]
@@ -310,6 +310,57 @@ fn graphics_pixels_are_rgb_digits() {
     let row = &buf[640 * 2..640 * 2 + 6];
     assert_eq!(row, &[0xFFFFFF, 0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0x808080]);
     assert_eq!(buf[0], 0x808080, "zeroed framebuffer is mid-grey");
+}
+
+#[test]
+fn text_modes_fill_each_screen_and_preferred_is_the_monitors() {
+    let mut m = machine();
+    // text mode −(m + 1) fills graphics mode m's screen in 8×16 cells
+    for (mode, cols, rows, w, h) in [
+        (-1, 80, 30, 640usize, 480usize),
+        (-2, 100, 37, 800, 600),
+        (-3, 128, 48, 1024, 768),
+        (-4, 160, 64, 1280, 1024),
+        (-5, 200, 75, 1600, 1200),
+        (-6, 240, 67, 1920, 1080),
+        (-7, 240, 75, 1920, 1200),
+    ] {
+        out(&mut m, block::DISPLAY, 0, mode);
+        assert_eq!(inp(&mut m, block::DISPLAY, 0), mode);
+        assert_eq!(
+            (inp(&mut m, block::DISPLAY, 2), inp(&mut m, block::DISPLAY, 3), inp(&mut m, block::DISPLAY, 4)),
+            (cols, rows, 3 * cols),
+            "mode {mode}"
+        );
+        assert_eq!(m.dev.display.pixel_size(), (w, h), "mode {mode}");
+    }
+    // the last cell of 240×75 is drawn at the bottom right
+    let base = Display::fb_base();
+    let last = base + 3 * (240 * 75 - 1);
+    m.mem.write_tryte(last, Tryte::new('H' as i64).unwrap()).unwrap();
+    m.mem.write_tryte(last + 1, "111TTT000".parse().unwrap()).unwrap(); // white on black
+    m.dev.display.write(7, -1);
+    let mut buf = Vec::new();
+    assert_eq!(m.dev.display.render(&m.mem, &mut buf), (1920, 1200));
+    // font8x8 'H' row 1 is 0x33: its first pixel lit, at scanline 2 of the cell
+    let (x0, y0) = (1920 - 8, 1200 - 16);
+    assert_eq!(buf[(y0 + 2) * 1920 + x0], 0xFFFFFF, "the glyph's pixel");
+    assert_eq!(buf[(y0 + 2) * 1920 + x0 + 2], 0x000000, "and the background");
+    // modes past either end leave the mode as it is
+    for bad in [-8, -9, 7] {
+        out(&mut m, block::DISPLAY, 0, bad);
+        assert_eq!(inp(&mut m, block::DISPLAY, 0), -7, "MODE {bad}");
+    }
+    // PREFERRED: 0 unless the front end says, read-only for the machine
+    assert_eq!(inp(&mut m, block::DISPLAY, 11), 0);
+    out(&mut m, block::DISPLAY, 11, 5);
+    assert_eq!(inp(&mut m, block::DISPLAY, 11), 0, "the machine cannot set it");
+    m.dev.display.set_preferred(6);
+    assert_eq!(inp(&mut m, block::DISPLAY, 11), 6);
+    m.dev.display.set_preferred(99);
+    assert_eq!(inp(&mut m, block::DISPLAY, 11), 6, "clamped to the modes there are");
+    m.dev.display.set_preferred(-3);
+    assert_eq!(inp(&mut m, block::DISPLAY, 11), 0);
 }
 
 #[test]

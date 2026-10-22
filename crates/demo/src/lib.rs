@@ -36,11 +36,16 @@ pub fn machine(ram_frames: i64, unix_time_s: i64) -> Machine {
 /// An overlined character comes out as the character and U+0305, as on serial.
 pub fn screen_text(m: &Machine) -> Vec<String> {
     let fb = m.mem.framebuffer();
-    (0..30)
+    let (cols, rows) = if m.dev.display.mode() < 0 {
+        setun_core::devices::Display::text_size(m.dev.display.mode())
+    } else {
+        (80, 30)
+    };
+    (0..rows)
         .map(|row| {
-            (0..80)
+            (0..cols)
                 .map(|col| {
-                    let c = fb[3 * (row * 80 + col)] as i64;
+                    let c = fb[3 * (row * cols + col)] as i64;
                     let ch = |c: i64| u32::try_from(c).ok().and_then(char::from_u32).filter(|c| *c > ' ');
                     match c {
                         c if c < 0 => ch(-c).map_or(" ".into(), |ch| format!("{ch}\u{305}")),

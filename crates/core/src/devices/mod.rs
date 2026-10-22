@@ -17,7 +17,7 @@ mod timer;
 pub use disk::{BlockStore, Disk, MemDisk};
 #[cfg(not(target_arch = "wasm32"))]
 pub use disk::FileDisk;
-pub use display::{Display, FRAME_US};
+pub use display::{Display, FRAME_US, MAX_MODE};
 pub use font::{glyph8x8, overlined, CYRILLIC_FIRST, CYRILLIC_LAST, NUMERO};
 pub use input::{Keyboard, Mouse, Serial};
 pub use nic::{Nic, DEFAULT_MAC, MAX_FRAME, MIN_FRAME, NIC_QUEUE};

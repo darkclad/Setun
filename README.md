@@ -38,7 +38,7 @@ The font covers Latin, Greek and the Cyrillic block. Here `cat /etc/pangrams` ru
 - [`docs/REAL.md`](docs/REAL.md): the real27/real81 floating-point standard, with its conformance vectors
 - [`docs/FORMATS.md`](docs/FORMATS.md): the ternary data formats: tvarint balanced varints, TTV tagged values, TAU sound, TIM pictures
 - [`docs/ECC.md`](docs/ECC.md): error correction for memory: SEC-DED [33,27,4], Hamming [31,27,3] and Golay [11,6,5] over GF(3), with a reference codec
-- [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the normative ISA specification (v0.8: integer, floating-point and vector instructions)
+- [`docs/SETUN26_ISA.md`](docs/SETUN26_ISA.md): the normative ISA specification (v0.9: integer, floating-point and vector instructions)
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): how the emulator runs fast without changing behaviour, and the benchmarks
 - [`docs/LANGUAGE.md`](docs/LANGUAGE.md): Trine, the compact language reference
 - [`docs/ASSEMBLER.md`](docs/ASSEMBLER.md): the assembly language and `setun-asm`
@@ -98,6 +98,7 @@ cargo run --release -p setun-native            # window: boots the BIOS (--demo:
 cargo run --release -p trine -- build --boot bios/boot_hello.tri -o hello.disk
 cargo run --release -p setun-native -- --disk hello.disk     # BIOS boots it
 cargo run --release -p setun-native -- --help  # every option
+cargo run --release -p setun-native -- --screen 1920x1200   # a bigger monitor: Trinux's console and trwm fill it
 cargo run --release -p trine -- run examples/hello.tri        # compile + run headless
 cargo run --release -p trine -- build examples/mandel.tri -o mandel.t1b2
 cargo run --release -p setun-native -- --rom mandel.t1b2      # watch it draw

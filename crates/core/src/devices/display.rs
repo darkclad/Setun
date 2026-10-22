@@ -1,13 +1,17 @@
 //! Display controller and renderer (ISA §8.2, §8.3).
 //!
-//! Registers: 0 `MODE` (−1 text 80×30; the VESA sizes 0 = 640×480,
+//! Registers: 0 `MODE`: graphics at the VESA sizes 0 = 640×480,
 //! +1 = 800×600, +2 = 1024×768, +3 = 1280×1024, +4 = 1600×1200,
-//! +5 = 1920×1080, +6 = 1920×1200; other values leave the mode as it is),
+//! +5 = 1920×1080, +6 = 1920×1200, and text at the same sizes in 8×16
+//! cells, −1 (80×30) to −7 (240×75): text mode −(m + 1) fills the screen of
+//! graphics mode m. Other values leave the mode as it is.
 //! 1 `FB_BASE`, 2 `WIDTH`, 3 `HEIGHT`, 4 `PITCH`, 5 `FRAME`, 6 `CTRL`,
-//! 7 `CURSOR`, 8 `HWC_X`, 9 `HWC_Y`, 10 `HWC_ON`.
+//! 7 `CURSOR`, 8 `HWC_X`, 9 `HWC_Y`, 10 `HWC_ON`, 11 `PREFERRED`: the
+//! graphics mode of the monitor's own size (read-only; the front end sets
+//! it, as a monitor reports its size), 0 = 640×480 unless told.
 //!
-//! In text mode `WIDTH`/`HEIGHT` count cells and `PITCH` is 240 trytes (80
-//! one-word cells). Rendering happens host-side into 0xRRGGBB pixels.
+//! In text mode `WIDTH`/`HEIGHT` count cells and `PITCH` is three trytes a
+//! cell (one word). Rendering happens host-side into 0xRRGGBB pixels.
 
 use crate::memory::{frame_start, Memory, FB_FIRST_FRAME};
 use std::sync::OnceLock;
@@ -19,11 +23,10 @@ pub const FRAME_US: i64 = 16_667;
 /// Text-mode blink half-period in host milliseconds.
 pub const BLINK_MS: u64 = 500;
 
-/// The largest `MODE`: 1920×1200.
+/// The largest `MODE`: graphics at 1920×1200.
 pub const MAX_MODE: i64 = 6;
-
-pub const TEXT_COLS: usize = 80;
-pub const TEXT_ROWS: usize = 30;
+/// The smallest: text at 1920×1200 (240×75 cells).
+pub const MIN_MODE: i64 = -MAX_MODE - 1;
 
 pub struct Display {
     mode: i64,
@@ -31,6 +34,7 @@ pub struct Display {
     irq_on: bool,
     cursor: i64,
     hwc: (i64, i64, i64),
+    preferred: i64,
     next_vsync_us: i64,
     /// Host wall-clock time in milliseconds, set by the front end before
     /// rendering. Blinking follows it when present, so the cursor blinks at
@@ -47,7 +51,7 @@ impl Default for Display {
 
 impl Display {
     pub fn new() -> Self {
-        Display { mode: -1, frame: 0, irq_on: false, cursor: 0, hwc: (0, 0, 0), next_vsync_us: FRAME_US, wall_ms: None }
+        Display { mode: -1, frame: 0, irq_on: false, cursor: 0, hwc: (0, 0, 0), preferred: 0, next_vsync_us: FRAME_US, wall_ms: None }
     }
 
     /// Physical address of the first framebuffer tryte.
@@ -59,10 +63,39 @@ impl Display {
         self.mode
     }
 
+    /// The monitor's size, as graphics mode `m` (0..=MAX_MODE), for
+    /// `PREFERRED`: the front end's part, before the machine boots.
+    pub fn set_preferred(&mut self, m: i64) {
+        self.preferred = m.clamp(0, MAX_MODE);
+    }
+
+    pub fn preferred(&self) -> i64 {
+        self.preferred
+    }
+
+    /// The graphics mode with `m`'s pixels: `m` itself, or for text mode m
+    /// the one it fills.
+    fn screen_of(m: i64) -> i64 {
+        if m < 0 {
+            -m - 1
+        } else {
+            m
+        }
+    }
+
+    /// Text cells of text mode `m` (−1..=MIN_MODE): 8×16 pixels each.
+    pub fn text_size(m: i64) -> (usize, usize) {
+        let (w, h) = Self::mode_size(Self::screen_of(m));
+        (w / 8, h / 16)
+    }
+
     /// (width, height, pitch) as the registers report them.
     pub fn geometry(&self) -> (i64, i64, i64) {
         match self.mode {
-            -1 => (TEXT_COLS as i64, TEXT_ROWS as i64, 3 * TEXT_COLS as i64),
+            m if m < 0 => {
+                let (c, r) = Self::text_size(m);
+                (c as i64, r as i64, 3 * c as i64)
+            }
             m => {
                 let (w, h) = Self::mode_size(m);
                 (w as i64, h as i64, w as i64)
@@ -70,7 +103,7 @@ impl Display {
         }
     }
 
-    /// The pixels of graphics mode `m` (0..=6); text mode renders at 640×480.
+    /// The pixels of graphics mode `m` (0..=6).
     pub fn mode_size(m: i64) -> (usize, usize) {
         match m {
             1 => (800, 600),
@@ -85,7 +118,7 @@ impl Display {
 
     /// Output size in pixels.
     pub fn pixel_size(&self) -> (usize, usize) {
-        Self::mode_size(self.mode)
+        Self::mode_size(Self::screen_of(self.mode))
     }
 
     /// Advance to `now_us`; true on a vsync with the IRQ enabled.
@@ -119,13 +152,14 @@ impl Display {
             8 => self.hwc.0,
             9 => self.hwc.1,
             10 => self.hwc.2,
+            11 => self.preferred,
             _ => 0,
         }
     }
 
     pub fn write(&mut self, r: i64, v: i64) {
         match r {
-            0 if (-1..=MAX_MODE).contains(&v) => self.mode = v,
+            0 if (MIN_MODE..=MAX_MODE).contains(&v) => self.mode = v,
             6 => self.irq_on = v == 1,
             7 => self.cursor = v,
             8 => self.hwc.0 = v,
@@ -155,7 +189,7 @@ impl Display {
         out.clear();
         out.resize(w * h, 0);
         let fb = mem.framebuffer();
-        if self.mode == -1 {
+        if self.mode < 0 {
             self.render_text(fb, out, w);
         } else {
             let pitch = self.geometry().2 as usize;
@@ -175,9 +209,10 @@ impl Display {
 
     fn render_text(&self, fb: &[i16], out: &mut [u32], w: usize) {
         let blink_off = self.blink_off();
-        for row in 0..TEXT_ROWS {
-            for col in 0..TEXT_COLS {
-                let cell = row * TEXT_COLS + col;
+        let (cols, rows) = Self::text_size(self.mode);
+        for row in 0..rows {
+            for col in 0..cols {
+                let cell = row * cols + col;
                 let ch = fb[3 * cell] as i64;
                 let at = Tryte::new(fb[3 * cell + 1] as i64).unwrap_or(Tryte::ZERO).trits();
                 let fg = trit_rgb(at[0] as i64, at[1] as i64, at[2] as i64);

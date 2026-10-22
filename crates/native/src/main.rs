@@ -24,7 +24,10 @@ struct Args {
     disk: Option<PathBuf>,
     ram_frames: i64,
     mips: f64,
-    scale: usize,
+    /// `--scale`; None: 2 at 640x480, else 1.
+    scale: Option<usize>,
+    /// `--screen`: the monitor's size, as a graphics mode (the display's `PREFERRED`).
+    screen: i64,
     headless: Option<u64>,
     keys: String,
     press: Vec<i64>,
@@ -61,13 +64,15 @@ impl Links {
     }
 }
 
-const USAGE: &str = "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale 1|2|4]\n\
+const USAGE: &str = "usage: setun [--rom FILE.t1b2 | --demo] [--disk FILE.t1b2] [--ram FRAMES] [--mips N] [--scale 1|2|4] [--screen WxH]\n\
          \x20            [--headless INSTRUCTIONS] [--keys TEXT] [--press A,B,..] [--screenshot FILE.png]\n\
          \x20            [--net SPEC]... [--net6 SPEC]... [--tlink SPEC] [--tlink-addr A.B.C]\n\
          \x20      setun --console [--disk FILE.t1b2] [--ram FRAMES] [--net SPEC]... [--net6 SPEC]... [--tlink SPEC]\n\
          \n\
          --ram FRAMES     RAM in 3^9-tryte pages (default 19683 = 3^18 trytes)\n\
          --mips N         emulated speed in millions of instructions per second (default 10)\n\
+         --screen WxH     the monitor: 640x480 (default), 800x600, 1024x768, 1280x1024, 1600x1200,\n\
+         \x20                1920x1080 or 1920x1200; Trinux's console and window system fill it\n\
          --headless N     run N instructions without a window, print serial output and the text screen\n\
          --keys TEXT      (headless) feed TEXT to the serial console after booting\n\
          --press A,B,..   (headless) press these USB HID keys after booting\n\
@@ -100,7 +105,8 @@ fn parse_args() -> Args {
         disk: None,
         ram_frames: setun_core::memory::DEFAULT_RAM_FRAMES,
         mips: 10.0,
-        scale: 2,
+        scale: None,
+        screen: 0,
         headless: None,
         keys: String::new(),
         press: Vec::new(),
@@ -134,10 +140,20 @@ fn parse_args() -> Args {
                 }
             }
             "--scale" => {
-                a.scale = val().parse().unwrap_or_else(|_| usage());
-                if ![1, 2, 4].contains(&a.scale) {
+                let s: usize = val().parse().unwrap_or_else(|_| usage());
+                if ![1, 2, 4].contains(&s) {
                     bad("--scale", "1, 2 or 4");
                 }
+                a.scale = Some(s);
+            }
+            "--screen" => {
+                let v = val();
+                a.screen = (0..=setun_core::devices::MAX_MODE)
+                    .find(|&m| {
+                        let (w, h) = setun_core::devices::Display::mode_size(m);
+                        v == format!("{w}x{h}")
+                    })
+                    .unwrap_or_else(|| bad("--screen", "640x480, 800x600, 1024x768, 1280x1024, 1600x1200, 1920x1080 or 1920x1200"));
             }
             "--headless" => a.headless = Some(val().parse().unwrap_or_else(|_| usage())),
             "--keys" => a.keys = val(),
@@ -249,6 +265,7 @@ fn build_machine(args: &Args) -> Machine {
         }
     };
     m.dev.rng.seed(setun_core::devices::host_entropy(), true);
+    m.dev.display.set_preferred(args.screen);
     if let Some(path) = &args.disk {
         match FileDisk::open(path) {
             Ok(d) => m.dev.disks[0].attach(Box::new(d)),
@@ -379,15 +396,16 @@ fn main() {
         }
     });
 
-    let scale = match args.scale {
+    let scale = match args.scale.unwrap_or(if args.screen == 0 { 2 } else { 1 }) {
         1 => Scale::X1,
         4 => Scale::X4,
         _ => Scale::X2, // parse_args lets only 1, 2 and 4 through
     };
+    let (ww, wh) = setun_core::devices::Display::mode_size(args.screen);
     let mut window = Window::new(
         "Setun-11̅",
-        640,
-        480,
+        ww,
+        wh,
         WindowOptions { scale, ..WindowOptions::default() },
     )
     .unwrap_or_else(|e| {

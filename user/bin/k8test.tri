@@ -22,6 +22,10 @@ fn framebuffer() {
     ok("EBUSY: a second open of /dev/fb0", fails(open("/dev/fb0", O_RDWR, 0), EBUSY));
     var info: fb_info;
     ok("text mode to start with", ioctl(fd, FBIOGET_VSCREENINFO, &info as int) == 0 && info.mode == -1 && info.xres == 80);
+    var pref: int = -5;
+    ok("the monitor is 640x480 unless told", ioctl(fd, 18144, &pref as int) == 0 && pref == 0);    // FBIOGET_PREFERRED
+    info.mode = -2;
+    ok("EINVAL: a text mode other than the console's", fails(ioctl(fd, FBIOPUT_VSCREENINFO, &info as int), EINVAL));
     info.mode = 9;
     ok("EINVAL: an unknown mode", fails(ioctl(fd, FBIOPUT_VSCREENINFO, &info as int), EINVAL));
     info.mode = 0;

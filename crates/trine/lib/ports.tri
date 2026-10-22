@@ -59,7 +59,7 @@ const DISK_ERROR: int = 195;
 const DISK_CTRL: int = 196;
 
 // Display (block 9)
-const DISPLAY_MODE: int = 243;        // -1 text 80x30, 0 = 640x480, +1 = 800x600
+const DISPLAY_MODE: int = 243;        // 0..6 graphics 640x480 .. 1920x1200, -1..-7 text at those sizes
 const DISPLAY_FB_BASE: int = 244;
 const DISPLAY_WIDTH: int = 245;
 const DISPLAY_HEIGHT: int = 246;
@@ -70,6 +70,7 @@ const DISPLAY_CURSOR: int = 250;
 const DISPLAY_HWC_X: int = 251;
 const DISPLAY_HWC_Y: int = 252;
 const DISPLAY_HWC_ON: int = 253;
+const DISPLAY_PREFERRED: int = 254;   // the monitor's size as a graphics mode (read-only)
 
 // Network card TNIC (block 10): Ethernet frames, one octet per tryte
 const NIC_CMD: int = 270;             // +1 send, -1 receive into RX_ADDR, 0 drop the oldest

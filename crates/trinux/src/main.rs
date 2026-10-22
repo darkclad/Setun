@@ -55,7 +55,7 @@ fn update_disk(path: &PathBuf, fresh: &trinux::Disk) {
         std::process::exit(1)
     };
     let bytes = std::fs::read(path).unwrap_or_else(|e| fail(e.to_string()));
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         fail("an odd number of bytes: not a .t1b2 image".into());
     }
     let mut trytes: Vec<i16> = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();

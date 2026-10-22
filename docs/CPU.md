@@ -2,7 +2,7 @@
 
 This is the programmer's manual for the Setun-11̅ CPU: what the machine is, how its numbers, registers, instructions, memory, traps and devices work, and how to program it in assembly. It is organised by topic and meant to be read as a reference.
 
-The normative specification is [`SETUN26_ISA.md`](SETUN26_ISA.md) (ISA v0.8). The emulator in `crates/core` implements it, and where the two differ this manual describes what the emulator does and says so. Other documents cover the rest of the system: [`NOTATION.md`](NOTATION.md) (number notation), [`ASSEMBLER.md`](ASSEMBLER.md), [`BOOT.md`](BOOT.md), [`LANGUAGE.md`](LANGUAGE.md) (the Trine language), [`KERNEL.md`](KERNEL.md) (Trinux), [`NETWORK.md`](NETWORK.md) and [`PERFORMANCE.md`](PERFORMANCE.md).
+The normative specification is [`SETUN26_ISA.md`](SETUN26_ISA.md) (ISA v0.9). The emulator in `crates/core` implements it, and where the two differ this manual describes what the emulator does and says so. Other documents cover the rest of the system: [`NOTATION.md`](NOTATION.md) (number notation), [`ASSEMBLER.md`](ASSEMBLER.md), [`BOOT.md`](BOOT.md), [`LANGUAGE.md`](LANGUAGE.md) (the Trine language), [`KERNEL.md`](KERNEL.md) (Trinux), [`NETWORK.md`](NETWORK.md) and [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Contents
 
@@ -230,7 +230,7 @@ Control registers are `cr-13` … `cr13`. `MFC rd, cr` reads one and `MTC cr, ra
 | −13 … −1, 11 … 13 | – | reserved; read as 0 | read only |
 
 - `MTC` to any register other than 0 … 8 raises vector −1 (illegal instruction). That covers `CPUID`, `CYCLE` and the reserved numbers.
-- **`CPUID`** reads 3^26 + 8 = 2 541 865 828 337 in the emulator: trit 1 is +1 and the version field holds 8 (ISA v0.8). The BIOS prints it as "ISA v0.8".
+- **`CPUID`** reads 3^26 + 9 = 2 541 865 828 338 in the emulator: trit 1 is +1 and the version field holds 9 (ISA v0.9). The BIOS prints it as "ISA v0.9".
 - **`CYCLE`** counts executed instructions, including ones that end in a fault. Delivering an interrupt is not counted. It is the emulator's clock as well: device time advances 100 ns per instruction by default (§15).
 - The ISA asks for `PTB` to be a multiple of 3^10 and `ITB` a multiple of 729. The emulator does not check either.
 
@@ -1058,17 +1058,18 @@ A sector is **one page, 3^9 trytes**. The two disks are identical; the ISA lists
 
 | Offset | Register | Access |
 |---|---|---|
-| 0 | `MODE`: −1 text 80×30 (reset), 0 graphics 640×480, +1 800×600, +2 1024×768, +3 1280×1024, +4 1600×1200, +5 1920×1080, +6 1920×1200; other values are ignored | read/write |
+| 0 | `MODE`: graphics 0 640×480, +1 800×600, +2 1024×768, +3 1280×1024, +4 1600×1200, +5 1920×1080, +6 1920×1200; text −1 80×30 (reset), −2 100×37, −3 128×48, −4 160×64, −5 200×75, −6 240×67, −7 240×75, each filling the screen of graphics mode −(m + 1); other values are ignored | read/write |
 | 1 | `FB_BASE`: physical address of the first framebuffer tryte, −6 387 133 | read |
-| 2 | `WIDTH`: pixels, or 80 cells in text mode | read |
-| 3 | `HEIGHT`: pixels, or 30 cells in text mode | read |
-| 4 | `PITCH`: trytes per line: 640, 800, or 240 in text mode (80 one-word cells) | read |
+| 2 | `WIDTH`: pixels, or cells in a text mode | read |
+| 3 | `HEIGHT`: pixels, or cells in a text mode | read |
+| 4 | `PITCH`: trytes per line: the width in graphics, three a cell in text (one word each) | read |
 | 5 | `FRAME`: vsync counter, 60 per emulated second | read |
 | 6 | `CTRL`: +1 IRQ on vsync | read/write |
 | 7 | `CURSOR`: text cell index of the cursor | read/write |
 | 8 | `HWC_X`: hardware mouse cursor, pixels | read/write |
 | 9 | `HWC_Y` | read/write |
 | 10 | `HWC_ON`: +1 show it | read/write |
+| 11 | `PREFERRED`: the monitor's size as a graphics mode (0 … +6), set by the front end (`setun --screen`, the page's Screen) | read |
 
 **Graphics modes: one tryte per pixel, 3^9 colours.** Pixel (x, y) is the tryte at `FB_BASE + y·PITCH + x`. Trits 1–3 are red, 4–6 green and 7–9 blue, each a balanced value v from −13 to +13 shown at sRGB intensity `round(255·(v + 13)/26)`.
 
@@ -1533,7 +1534,7 @@ Handler address: the word at `ITB + 3·vector`.
 | 6 | 149 … 175 | 162 | serial console | 3 | +4 | 0 DATA, 1 RX_COUNT, 2 TX_READY, 3 CTRL |
 | 7 | 176 … 202 | 189 | disk 0 | 4 | +5 | 0 CMD, 1 STATUS, 2 LBA, 3 COUNT, 4 DMA, 5 SECTORS, 6 ERROR, 7 CTRL |
 | 8 | 203 … 229 | 216 | disk 1 | 7 | +8 | as disk 0 |
-| 9 | 230 … 256 | 243 | display | 6 | +7 | 0 MODE, 1 FB_BASE, 2 WIDTH, 3 HEIGHT, 4 PITCH, 5 FRAME, 6 CTRL, 7 CURSOR, 8 HWC_X, 9 HWC_Y, 10 HWC_ON |
+| 9 | 230 … 256 | 243 | display | 6 | +7 | 0 MODE, 1 FB_BASE, 2 WIDTH, 3 HEIGHT, 4 PITCH, 5 FRAME, 6 CTRL, 7 CURSOR, 8 HWC_X, 9 HWC_Y, 10 HWC_ON, 11 PREFERRED |
 | 10 | 257 … 283 | 270 | `TNIC` | 8 | +9 | 0 CMD, 1 STATUS, 2 TX_ADDR, 3 TX_LEN, 4 RX_ADDR, 5 RX_LEN, 6 RX_COUNT, 7 CTRL, 8 MAC_HI, 9 MAC_LO, 10 LINK, 11 ERROR, 12 DROPS |
 | 11 | 284 … 310 | 297 | `TRNG` | – | – | 0 DATA, 1 SOURCE |
 | −364 … −1, 12 … 364 | | | unassigned (negative blocks reserved for expansion buses) | | | read 0, writes ignored |

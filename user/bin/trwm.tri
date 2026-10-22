@@ -2,8 +2,9 @@
 //
 //   trwm [-g WxH] [client ...]      e.g. trwm term clock
 //
-// -g picks the screen: 640x480 (the default), 800x600, 1024x768, 1280x1024,
-// 1600x1200, 1920x1080 or 1920x1200.
+// -g picks the screen: 640x480, 800x600, 1024x768, 1280x1024, 1600x1200,
+// 1920x1080 or 1920x1200; without it, the monitor's size (the one the text
+// console fills).
 // It owns /dev/fb0 (mapped), /dev/mouse and /dev/kbd, draws a
 // panel with launchers, and composites one window per client from the
 // pixels it keeps for them (the protocol is in lib/trw.tri). Click a title
@@ -587,8 +588,9 @@ fn reap() {
     }
 }
 
-// The display mode -g asks for (0: 640x480).
-var want_mode: int;
+// The display mode -g asks for; -1: the monitor's.
+var want_mode: int = -1;
+const FBIOGET_PREFERRED: int = 18144;
 
 // The mode for "WxH", or -1 if there is none of that size.
 fn mode_of(g: *char) -> int {
@@ -610,6 +612,7 @@ fn setup() -> int {
     if (kbd_fd < 0) { perror2("trwm", "/dev/kbd"); return -1; }
     if (font_load("/usr/share/font8x8") < 0) { perror2("trwm", "/usr/share/font8x8"); return -1; }
     var info: fb_info;
+    if (want_mode < 0 && ioctl(fb_fd, FBIOGET_PREFERRED, &want_mode as int) < 0) { want_mode = 0; }
     info.mode = want_mode;
     if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &info as int) < 0) { perror2("trwm", "set mode"); return -1; }
     ioctl(fb_fd, FBIOGET_VSCREENINFO, &info as int);

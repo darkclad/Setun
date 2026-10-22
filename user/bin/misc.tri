@@ -8,6 +8,7 @@
 //   id [user]            whoami                   groups [user]
 //   chown owner[:group] file ...                  chgrp group file ...
 //   stat [-c format] file ...                     time command [args]
+//   stty size            the terminal's rows and columns (standard input)
 
 import "../lib/tlibc.tri";
 import "../lib/string.tri";
@@ -369,6 +370,19 @@ fn do_seq(argc: int, argv: **char) -> int {
     return 0;
 }
 
+// stty size: "rows cols" of the terminal on standard input, as Linux's
+// stty prints them. Nothing else of stty is here.
+fn do_stty(argc: int, argv: **char) -> int {
+    if (argc != 2 || !streq(argv[1], "size")) { return usage("stty size"); }
+    var w: winsize;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &w as int) < 0) { perror2("stty", "standard input"); return 1; }
+    put_int(w.ws_row);
+    puts(" ");
+    put_int(w.ws_col);
+    puts("\n");
+    return 0;
+}
+
 fn do_tee(argc: int, argv: **char) -> int {
     var i: int = 1;
     var flags: int = O_WRONLY + O_CREAT + O_TRUNC;
@@ -604,6 +618,7 @@ fn main(argc: int, argv: **char) -> int {
     if (streq(me, "clear")) { puts("\e[H\e[2J"); return 0; }
     if (streq(me, "seq")) { return do_seq(argc, argv); }
     if (streq(me, "tee")) { return do_tee(argc, argv); }
+    if (streq(me, "stty")) { return do_stty(argc, argv); }
     if (streq(me, "yes")) { return do_yes(argc, argv); }
     if (streq(me, "kill")) { return do_kill(argc, argv); }
     if (streq(me, "test") || streq(me, "[")) { return test_eval(argc, argv); }

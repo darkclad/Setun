@@ -35,8 +35,16 @@ impl Session {
 
     /// Boot and log in as `user` with `password`.
     fn boot_as(user: &str, password: &str) -> Session {
+        Session::boot_on(0, user, password)
+    }
+
+    /// Boot on a monitor of graphics mode `screen`'s size (the display's
+    /// PREFERRED) and log in.
+    fn boot_on(screen: i64, user: &str, password: &str) -> Session {
         let disk = trinux::build_disk(&trinux::kernel_dir()).unwrap_or_else(|e| panic!("{e}"));
-        let mut s = Session { m: trinux::boot_trytes(&disk.trytes, 729, 0, ""), out: String::new(), mark: 0 };
+        let mut m = trinux::boot_trytes(&disk.trytes, 729, 0, "");
+        m.dev.display.set_preferred(screen);
+        let mut s = Session { m, out: String::new(), mark: 0 };
         s.wait_for("login: ", 60);
         s.m.dev.serial_input(&format!("{user}\n"));
         s.wait_for("Password: ", 30);
@@ -669,6 +677,37 @@ fn k8_window_system_refusals() {
     s.expect("trwm: exit", 60);
     s.run(20);
     assert_eq!(s.m.dev.display.mode(), -1);
+}
+
+/// The text on row `r` of a text screen `cols` cells wide.
+fn screen_row(m: &Machine, cols: usize, r: usize) -> String {
+    let fb = m.mem.framebuffer();
+    (0..cols).map(|c| char::from_u32(fb[3 * (r * cols + c)].max(0) as u32).unwrap_or(' ')).collect()
+}
+
+#[test]
+fn the_console_and_trwm_fill_the_monitor() {
+    let mut s = Session::boot_on(6, "root", "root"); // a 1920x1200 monitor
+    assert_eq!(s.m.dev.display.mode(), -7, "the console's text mode fills it");
+    s.console("stty size");
+    s.expect("75 240", 60);
+    // a line longer than 80 characters stays on one row of the screen
+    let long = format!("{}END", "x".repeat(150));
+    s.console(&format!("echo {long}"));
+    s.expect("END\n", 60);
+    s.run(5);
+    assert!((0..75).any(|r| screen_row(&s.m, 240, r).starts_with(&long)), "a row holds the whole line");
+    // trwm takes the monitor's size without -g, and gives the console back at its size
+    s.console("trwm clock &");
+    s.expect("trwm: started 1920x1200", 300);
+    assert_eq!(s.m.dev.display.mode(), 6);
+    s.expect("'Clock'", 200);
+    s.click(340, 8); // [Exit]
+    s.expect("trwm: exit", 60);
+    s.run(20);
+    assert_eq!(s.m.dev.display.mode(), -7, "the console's own mode again");
+    s.console("stty size");
+    s.expect("75 240", 60);
 }
 
 #[test]

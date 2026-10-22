@@ -148,7 +148,7 @@ pub fn default_files() -> Vec<(String, PathBuf)> {
     }
     for applet in [
         "rmdir", "basename", "dirname", "env", "printenv", "uname", "date", "clear", "seq", "tee", "yes", "kill", "test", "[",
-        "id", "whoami", "groups", "chown", "chgrp", "stat", "time",
+        "id", "whoami", "groups", "chown", "chgrp", "stat", "time", "stty",
     ] {
         v.push((format!("/bin/{applet}"), u.join("bin/misc.tri")));
     }
